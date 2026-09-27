@@ -38,6 +38,36 @@ mechanism behind measured reachability.
 opposed to *configured* reachability, which is an operator assertion that no
 test has yet contradicted.
 
+Reachability is a ladder, not a boolean:
+
+- **unknown** — not yet determined
+- **testing** — a test is in flight
+- **unreachable** — no path reaches this router
+- **introducer-only** — a Charlie completes the hole punch and the session, but
+  unsolicited inbound never arrives, so a Charlie is always needed
+- **reachable** — unsolicited inbound arrives
+
+It is reported with a separate **reason**, naming where the chain broke:
+**own-config** (the operator asserted inbound is impossible, so no test ran) ·
+**clock-skew** (the peer's signed timestamp disagrees with ours) ·
+**no-charlie-report** (the Charlie never confirmed the test arrived) ·
+**punch-not-delivered** (it did confirm, but the unsolicited punch never came) ·
+**punch-delivered-no-session** (punch arrived, no session request followed) ·
+**session-incomplete** (both happened, the session never established).
+
+The reasons exist because the distinction is what makes a failure diagnosable.
+*Punch-not-delivered* is the important one: a stateful firewall usually permits
+traffic on a session that is already established while silently dropping
+unsolicited inbound, so the test succeeds on the live session and the punch
+never lands. That is a firewall rule, not a routing fault, and without the
+reason it is indistinguishable from a router that cannot be reached at all.
+
+**Firewalled mode** — the state of publishing an introducer address instead of a
+dialable one, so peers reach this router through a Charlie. Entering it is
+cheap and reversible; leaving it is not, because a router that wrongly believes
+itself reachable never gets introduced at all. So the two directions are not
+symmetric.
+
 **Network credibility** — how the live network treats this router: whether peers
 can introduce it to others, and whether it can determine their reachability.
 
