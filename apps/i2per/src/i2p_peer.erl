@@ -483,15 +483,64 @@ handle_ssu2_ready(ConnPid, State) ->
 %% framing blocks `#{type := 3, data := Data}`. Rebuild the 9-byte short-header
 %% wire for each so `handle_frame/3` treats both transports identically.
 handle_ssu2_data(ConnPid, Blocks, State) ->
+    {Messages, Unhandled} = lists:partition(fun is_i2np_block/1, Blocks),
     Framed = [
         #{type => 3, data => <<Type:8, MsgId:32, ShortExp:32, Body/binary>>}
-     || {i2np, Type, MsgId, ShortExp, Body} <- Blocks
+     || {i2np, Type, MsgId, ShortExp, Body} <- Messages
     ],
-    lists:foldl(
+    State1 = lists:foldl(
         fun(Block, AccState) -> handle_block(ConnPid, ssu2, Block, AccState) end,
         State,
         Framed
+    ),
+    lists:foldl(
+        fun(Block, AccState) -> note_unhandled_ssu2_block(ConnPid, Block, AccState) end,
+        State1,
+        Unhandled
     ).
+
+is_i2np_block({i2np, _, _, _, _}) -> true;
+is_i2np_block(_) -> false.
+
+%% A non-I2NP SSU2 block reached the peer manager, which has no handler for it.
+%% Every shape `m:i2p_ssu2_conn` forwards is meaningful to somebody: the
+%% introducer-relay blocks (7/8/9 and the 15/16 tag exchange) and the peer-test
+%% blocks (1-4) belong to `m:i2p_relay_coord` and `m:i2p_peertest_coord`, and
+%% the RouterInfo and path-challenge blocks are forwarded so the owner can
+%% observe an introduction or liveness exchange. Nothing consumes them here, so
+%% they are named and counted rather than discarded: silently losing exactly the
+%% blocks those coordinators need is how a future implementation ends up looking
+%% broken for a reason that lives in this module.
+%%
+%% The event carries the block name alone, which is the dimension a counter
+%% wants; the peer is named in the log line, where cardinality does not matter.
+%% The warning is emitted once per peer and kind, because a peer that floods us
+%% with these must not turn the log into the flood it is causing.
+note_unhandled_ssu2_block(ConnPid, Block, State) ->
+    Name = ssu2_block_name(Block),
+    i2p_events:notify({ssu2_block_unhandled, Name}),
+    Identity =
+        case find_conn_peer(ConnPid, State) of
+            {Hash, _PeerState} -> {peer, base64:encode(Hash)};
+            not_found -> unknown
+        end,
+    Key = {Identity, Name},
+    Seen = maps:get(unhandled_ssu2_blocks, State, #{}),
+    case maps:is_key(Key, Seen) of
+        true ->
+            State;
+        false ->
+            logger:warning(
+                "unhandled ssu2 ~0p block from ~0p", [Name, Identity]
+            ),
+            State#{unhandled_ssu2_blocks => Seen#{Key => true}}
+    end.
+
+%% The first element is the block's own name for every shape the SSU2 codec
+%% produces, so this classifies without repeating `f:i2p_ssu2_conn:block_kind/1`
+%% and cannot drift from it.
+ssu2_block_name(Block) when is_tuple(Block) -> element(1, Block);
+ssu2_block_name(Block) -> Block.
 
 %% Tear down a connection whose session process died or closed, keyed by pid
 %% rather than by monitor ref (SSU2 sessions close with `{ssu2_closed, ...}`

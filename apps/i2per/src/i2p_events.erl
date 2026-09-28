@@ -55,6 +55,7 @@ data path instead of crashing working connections over it.
     | {sam_session_closed, binary()}
     | {peertest_result, i2p_peertest:address_type(), i2p_peertest:result()}
     | {reachability, ssu2, firewalled | reachable | unknown}
+    | {ssu2_block_unhandled, atom()}
     | {config_changed, atom(), term()}.
 
 -doc """
