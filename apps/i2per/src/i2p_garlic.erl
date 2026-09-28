@@ -369,6 +369,13 @@ side effects — this function remains a pure library call.
 - **type 2 (DatabaseLookup):** `{lookup, ParsedBody}`.
 - **type 3 (DatabaseSearchReply):** `{search_reply, ParsedBody}`.
 
+A DatabaseStore whose `store_type` this router does not implement decodes
+successfully and is ignored, with a `warning` naming the type. Both reference
+routers can emit types this router has no parser for — 5 (EncryptedLeaseSet)
+is live in both, 7 (MetaLeaseSet) is draft — and the decoder reports every byte
+on the wire rather than only the types it understands, so a successful decode is
+not a promise this router can act on.
+
 Input: `Msg` — an `t:i2p_i2np:i2np_message/0`; `NowMs` — wall-clock
 milliseconds since epoch (for timestamping store operations).
 
@@ -387,6 +394,16 @@ dispatch_db_message(#{type := 1, body := Body}, NowMs) ->
         %% Store types 1 (LeaseSet) and 3 (LeaseSet2) both advertise leases.
         {ok, #{store_type := T, key := Key, data := Data}} when T =:= 1; T =:= 3 ->
             {store, lease, Key, Data, NowMs};
+        %% A store type this router has no parser for. Types 5 and 7 decode
+        %% successfully, so without this clause they fall off the `case` and
+        %% raise `case_clause` — which killed the tunnel manager outright,
+        %% because its child spec is `permanent` and the caller has no `try`.
+        {ok, #{store_type := T, key := Key}} ->
+            logger:warning(
+                "ignoring netdb store of unimplemented type ~0p for ~s",
+                [T, base64:encode(Key)]
+            ),
+            ignore;
         error ->
             ignore
     end;
