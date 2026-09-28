@@ -124,7 +124,31 @@ counters() ->
         ntcp2_bytes_out,
         ntcp2_bytes_in,
         ssu2_bytes_out,
-        ssu2_bytes_in
+        ssu2_bytes_in,
+
+        %% %%%%% Bytes carried for other routers %%%%%
+        %%
+        %% **These are wire bytes, not client bytes, and the difference is not an
+        %% approximation — it is unknowable.** A transit hop never decrypts the
+        %% tunnel data it carries, so the payload inside the frame belongs to two
+        %% parties who are not this router and who have not told it what is in
+        %% there. The honest figure is therefore what crossed the relay, which is
+        %% the full tunnel-data frame: 1028 bytes on the wire, of which the great
+        %% majority is a tunnel id, an IV and a layered cipher.
+        %%
+        %% So these two numbers are an *upper bound* on the client traffic a
+        %% router has carried, and they are not comparable with the transport
+        %% figures above, which do measure real payload framing. A router that
+        %% relays heavily will show transit figures orders of magnitude larger
+        %% than its transport figures, and that is correct rather than a bug.
+        %%
+        %% Charged on acceptance and on forwarding respectively. A frame the token
+        %% bucket refused is charged to neither, because it was not carried. A
+        %% frame that was accepted but could not be forwarded is charged inbound
+        %% only, which is the honest asymmetry. On a transit hop the two are
+        %% equal frame for frame, because the hop does not alter the body.
+        transit_bytes_in,
+        transit_bytes_out
     ].
 
 -doc """

@@ -17,6 +17,8 @@
     build_pacing_limits_transit_acceptance/1,
     transit_bandwidth_unlimited_by_default/1,
     transit_bandwidth_drops_over_budget_frames/1,
+    transit_bytes_counted_per_carried_frame/1,
+    transit_bytes_counted_when_budget_allows_every_frame/1,
     stb_endpoint_role_accepted/1,
     stb_unaddressed_dropped/1,
     inbound_build_roundtrip/1,
@@ -57,6 +59,8 @@ all() ->
         build_pacing_limits_transit_acceptance,
         transit_bandwidth_unlimited_by_default,
         transit_bandwidth_drops_over_budget_frames,
+        transit_bytes_counted_per_carried_frame,
+        transit_bytes_counted_when_budget_allows_every_frame,
         stb_endpoint_role_accepted,
         stb_unaddressed_dropped,
         inbound_build_roundtrip,
@@ -253,6 +257,96 @@ transit_bandwidth_drops_over_budget_frames(_Config) ->
         %% would surface here; keep it tied to the bucket rate.
         assert_quiet(400),
         ?assert(is_process_alive(whereis(i2p_tunnel_srv)))
+    after
+        unregister_peer(),
+        stop_tunnel_srv(Pid)
+    end.
+
+%%%%%%%%% Transit bytes: counted per frame actually carried %%%%%%%%%
+
+%% What is counted is the **wire** figure, and the reason is not an
+%% approximation. A transit hop never decrypts tunnel data, so the payload inside
+%% the frame belongs to two parties who are not this router and who have never
+%% told it what is in there. The honest number is what crossed the relay: the
+%% full 1028-byte tunnel-data frame, most of which is a tunnel id, an IV and a
+%% layered cipher. These figures are therefore an upper bound on client traffic
+%% carried, and are deliberately not comparable with the transport-boundary byte
+%% counters, which do measure real framing.
+%%
+%% The interesting assertion is the one about the frame that was **refused**.
+%% With a 1 kbit/s budget only three of four delivered frames fit, and the
+%% outbound total is checked against the bytes that actually appeared on the
+%% wire — captured from the mock peer, not from the counter. So a charge for the
+%% refused frame would make the counter exceed the wire, and a charge for nothing
+%% at all would make it fall short. Both fail.
+transit_bytes_counted_per_carried_frame(_Config) ->
+    ok = application:set_env(?APP, transit_bandwidth_kbps, 1),
+    [Router, Next] = [make_router() || _ <- lists:seq(1, 2)],
+    lists:foreach(
+        fun(R) -> store_netdb(maps:get(ri, R)) end,
+        [Router, Next]
+    ),
+    {Pid, _Local} = start_tunnel_srv(Router),
+    TestPid = self(),
+    try
+        ok = create_transit_entry(Router, Next, 930),
+        MockPeer = spawn(fun() -> mock_peer_loop(TestPid) end),
+        true = register(i2p_peer, MockPeer),
+        #{transit_bytes_in := In0, transit_bytes_out := Out0} = i2p_stats:snapshot(),
+
+        lists:foreach(
+            fun(I) -> deliver_transit_frame(930, I) end,
+            lists:seq(1, 4)
+        ),
+        Wires = receive_frames(3, []),
+        OnWire = lists:sum([byte_size(W) || W <- Wires]),
+
+        %% What left the router is what left the router.
+        ?assertEqual(OnWire, maps:get(transit_bytes_out, i2p_stats:snapshot()) - Out0),
+        %% A transit hop does not alter the body, so carried in equals carried
+        %% out, frame for frame.
+        ?assertEqual(
+            maps:get(transit_bytes_out, i2p_stats:snapshot()) - Out0,
+            maps:get(transit_bytes_in, i2p_stats:snapshot()) - In0
+        ),
+        %% And it is the wire frame, not the payload inside it. Three frames at
+        %% the tunnel-data frame size; a fourth would mean the refused frame was
+        %% charged, and a payload-sized figure would mean we had somehow measured
+        %% what we cannot decrypt.
+        ?assertEqual(3 * 1028, OnWire),
+        ?assertEqual(1028, byte_size(hd(Wires)))
+    after
+        unregister_peer(),
+        stop_tunnel_srv(Pid)
+    end.
+
+%% The same thing with the budget wide open, so the figure tracks the number of
+%% frames carried rather than being a constant the over-budget case happens to
+%% agree with. Four in, four counted, in each direction.
+transit_bytes_counted_when_budget_allows_every_frame(_Config) ->
+    application:unset_env(?APP, transit_bandwidth_kbps),
+    [Router, Next] = [make_router() || _ <- lists:seq(1, 2)],
+    lists:foreach(
+        fun(R) -> store_netdb(maps:get(ri, R)) end,
+        [Router, Next]
+    ),
+    {Pid, _Local} = start_tunnel_srv(Router),
+    TestPid = self(),
+    try
+        ok = create_transit_entry(Router, Next, 931),
+        MockPeer = spawn(fun() -> mock_peer_loop(TestPid) end),
+        true = register(i2p_peer, MockPeer),
+        #{transit_bytes_in := In0, transit_bytes_out := Out0} = i2p_stats:snapshot(),
+
+        N = 4,
+        lists:foreach(
+            fun(I) -> deliver_transit_frame(931, I) end,
+            lists:seq(1, N)
+        ),
+        Wires = receive_frames(N, []),
+        ?assertEqual(N * 1028, maps:get(transit_bytes_out, i2p_stats:snapshot()) - Out0),
+        ?assertEqual(N * 1028, maps:get(transit_bytes_in, i2p_stats:snapshot()) - In0),
+        ?assertEqual(N * 1028, lists:sum([byte_size(W) || W <- Wires]))
     after
         unregister_peer(),
         stop_tunnel_srv(Pid)

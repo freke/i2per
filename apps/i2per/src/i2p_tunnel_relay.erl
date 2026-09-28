@@ -313,13 +313,27 @@ relay_transit_data(Body, Info, State) ->
         deny ->
             State;
         {allow, State1} ->
+            %% Charged on acceptance, not on arrival and not on forwarding. A
+            %% frame the token bucket refused was never carried, so charging it
+            %% would let a router under pressure report the traffic it turned
+            %% away as traffic it did — and the bucket is consulted before the
+            %% crypto precisely because that is the cheapest place to stop.
+            ok = i2p_stats:add(transit_bytes_in, byte_size(Body)),
             NextID = maps:get(next_tunnel_id, Info),
             NextHash = maps:get(next_hash, Info),
             case i2p_tunnel:process_tunnel_data(Body, Info, NextID, i2p_i2np:fresh_msg_id()) of
                 {ok, FwdBody} ->
+                    %% Charged here rather than inside `f:send_tunnel_data/2`,
+                    %% which is also the gateway's own path for injecting local
+                    %% client data. Counting there would report another router's
+                    %% traffic and our own as the same figure.
+                    ok = i2p_stats:add(transit_bytes_out, byte_size(FwdBody)),
                     send_tunnel_data(NextHash, FwdBody),
                     State1;
                 error ->
+                    %% Accepted and received, but not forwarded — so counted
+                    %% once, in the inbound figure, and that asymmetry is the
+                    %% honest one.
                     State1
             end
     end.
