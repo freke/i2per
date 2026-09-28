@@ -3,10 +3,17 @@
 -moduledoc """
 Supervisor of the `i2per_status` web service.
 
-Owns the snapshot server (`m:i2per_status_state`) and the cowboy listener
-(started in init so its lifetime is bound to this supervisor: application
-stop takes the HTTP endpoint down with the tree). The listener binds to
-`i2per_status` -> `listen_host` and defaults to loopback.
+Owns the snapshot server (`m:i2per_status_state`) and the HTTP listener
+(`m:i2per_status_listener`), in that order: the listener accepts requests that
+immediately ask the snapshot server for data, so it starts second and is not
+serving before there is anything to serve.
+
+Both are real children. The listener used to be started from `f:init/1` with
+`ok = start_listener()` before any child spec was returned, which linked it to
+this supervisor without registering it as a child — so a listener that died
+stayed dead while the supervisor reported healthy. Application stop still takes
+the HTTP endpoint down with the tree, which was the only thing that arrangement
+bought.
 """.
 
 -behaviour(supervisor).
@@ -20,8 +27,11 @@ stop takes the HTTP endpoint down with the tree). The listener binds to
 start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
+%% A single child crashing takes down the service, so the intensity window is
+%% tight: a listener that cannot bind, or a snapshot server that cannot reach its
+%% router, should surface as a failed start rather than as a restart loop that
+%% looks healthy from outside.
 init([]) ->
-    ok = start_listener(),
     {ok,
         {#{strategy => one_for_one, intensity => 5, period => 10}, [
             #{
@@ -31,61 +41,13 @@ init([]) ->
                 shutdown => 5000,
                 type => worker,
                 modules => [i2per_status_state]
+            },
+            #{
+                id => i2per_status_listener,
+                start => {i2per_status_listener, start_link, []},
+                restart => permanent,
+                shutdown => 5000,
+                type => worker,
+                modules => [i2per_status_listener]
             }
         ]}}.
-
-%% Bind the HTTP listener here: linked to the supervisor, named so restarts
-%% replace any lingering instance deterministically.
-start_listener() ->
-    Port = application:get_env(i2per_status, port, 7662),
-    Dispatch = cowboy_router:compile([
-        {'_', [
-            {"/", i2per_status_page, []},
-            {"/status.json", i2per_status_json, []}
-        ]}
-    ]),
-    case open_listener(Port, Dispatch) of
-        ok ->
-            ok;
-        {error, {already_started, _}} ->
-            %% A previous instance (old port) is still around: replace it.
-            ok = cowboy:stop_listener(i2per_status_http),
-            case open_listener(Port, Dispatch) of
-                ok -> ok;
-                {error, Reason} -> erlang:error({status_listener, Reason})
-            end;
-        {error, Reason} ->
-            erlang:error({status_listener, Reason})
-    end.
-
-open_listener(Port, Dispatch) ->
-    ListenIP = listen_ip(),
-    case
-        cowboy:start_clear(
-            i2per_status_http,
-            [{port, Port}, {ip, ListenIP}],
-            #{env => #{dispatch => Dispatch}}
-        )
-    of
-        {ok, _Pid} ->
-            ok;
-        {error, _} = Err ->
-            Err
-    end.
-
-listen_ip() ->
-    case application:get_env(i2per_status, listen_host, {127, 0, 0, 1}) of
-        {127, _, _, _} = IP ->
-            IP;
-        {0, 0, 0, 0} = IP ->
-            IP;
-        IP when is_tuple(IP), tuple_size(IP) =:= 8 ->
-            IP;
-        Host when is_binary(Host) ->
-            case inet:parse_address(binary_to_list(Host)) of
-                {ok, IP} -> IP;
-                {error, _} -> erlang:error({status_listener, {invalid_listen_host, Host}})
-            end;
-        Other ->
-            erlang:error({status_listener, {invalid_listen_host, Other}})
-    end.

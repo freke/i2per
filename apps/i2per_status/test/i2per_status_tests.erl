@@ -14,12 +14,15 @@ start_status(Port) ->
     {ok, _} = application:ensure_all_started(i2per_status),
     ok.
 
+%% The status code is returned rather than asserted, because it is part of what
+%% these tests check: the endpoints answer 200 only when the router is online and
+%% 503 when it is not, so a test that only wanted a body should say so.
 http_get(Path) ->
-    {ok, {{_, 200, _}, Headers, Body}} =
+    {ok, {{_, Status, _}, Headers, Body}} =
         httpc:request(
             get, {"http://127.0.0.1:" ++ integer_to_list(cfg_port()) ++ Path, []}, [], []
         ),
-    {proplists:get_value("content-type", Headers), iolist_to_binary(Body)}.
+    {Status, proplists:get_value("content-type", Headers), iolist_to_binary(Body)}.
 
 cfg_port() ->
     {ok, P} = application:get_env(i2per_status, port),
@@ -41,7 +44,12 @@ offline_snapshot_body() ->
     try
         Snap = i2per_status_state:snapshot(),
         ?assertEqual(false, maps:get(online, Snap)),
-        {_, Body} = http_get("/status.json"),
+        %% 503, not 200: a monitoring consumer must be able to tell a
+        %% dead router from a healthy one by the status code. `online` in
+        %% the body is no substitute for a consumer that only reads the code.
+        {Status, CT, Body} = http_get("/status.json"),
+        ?assertEqual(503, Status),
+        ?assert(lists:prefix("application/json", CT)),
         #{<<"online">> := false} = json:decode(Body)
     after
         application:stop(i2per_status)
@@ -55,7 +63,8 @@ offline_page_body() ->
     application:set_env(i2per_status, router_node, 'ghost@nowhere'),
     start_status(Port),
     try
-        {CT, Body} = http_get("/"),
+        {Status, CT, Body} = http_get("/"),
+        ?assertEqual(503, Status),
         ?assert(lists:prefix("text/html", CT)),
         ?assertNotEqual(nomatch, binary:match(Body, <<"router offline">>))
     after
@@ -73,7 +82,8 @@ live_router_online_body() ->
     start_status(Port),
     try
         wait_online(),
-        {_, Body} = http_get("/status.json"),
+        {Status, _CT, Body} = http_get("/status.json"),
+        ?assertEqual(200, Status),
         Json = json:decode(Body),
         ?assertEqual(true, maps:get(<<"online">>, Json)),
         ?assert(maps:is_key(<<"identity">>, Json)),

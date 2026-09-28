@@ -21,12 +21,18 @@ i2per_status_state:snapshot().
 
 -behaviour(gen_server).
 
--export([start_link/0, snapshot/0]).
+-export([start_link/0, snapshot/0, fetch/0]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -define(POLL_MS, 5000).
 -define(RPC_TIMEOUT_MS, 2000).
+%% How long a request handler waits for a snapshot. The collector holds no lock
+%% across the poll — every message returns promptly — so this only needs to
+%% cover scheduling; the RPC timeout inside the poll bounds the slow part. Set
+%% generously rather than tightly, because a 503 costs the operator a retry and
+%% a spurious timeout causes exactly that.
+-define(FETCH_TIMEOUT_MS, 2000).
 
 -doc "Start the collector. Registered locally as `i2per_status_state`.".
 -spec start_link() -> {ok, pid()} | {error, term()}.
@@ -38,10 +44,30 @@ Current view of the monitored router.
 
 Output: `t:snapshot/0` — `online` is false whenever the last poll could not
 reach the router; event counters accumulate what the bus delivered.
+
+Exits if the collector is not running. For a request handler that must answer
+either way, use `f:fetch/0`.
 """.
 -spec snapshot() -> snapshot().
 snapshot() ->
     gen_server:call(?MODULE, snapshot).
+
+-doc """
+Current view, or why there is none.
+
+Output: `{ok, t:snapshot/0()}`, or `{error, Reason}` if the collector is not
+running or did not answer in time. This is the accessor for anything that has to
+reply to a request regardless: the snapshot server being down is a state this
+service can be in, because the two are supervised separately and the collector's
+own poll can block.
+""".
+-spec fetch() -> {ok, snapshot()} | {error, term()}.
+fetch() ->
+    try gen_server:call(?MODULE, snapshot, ?FETCH_TIMEOUT_MS) of
+        Snap -> {ok, Snap}
+    catch
+        exit:Reason -> {error, Reason}
+    end.
 
 -type counters() :: #{
     tunnel_built => non_neg_integer(),
@@ -52,7 +78,24 @@ snapshot() ->
     sam_session_closed => non_neg_integer()
 }.
 
--doc "Latest known state of the observed router.".
+-doc """
+Latest known state of the observed router.
+
+The base keys (`online`, `router_node`, `subscribed`, `events`) are this
+service's own. Everything else is the router's `m:i2p_status_data:view/0`
+merged in whole, which is why those keys are optional here and required there:
+when the router is unreachable there is no view, and this type has to describe
+that case too. `identity` is optional for the same reason — it is required in
+the view, because a view exists only for a router that was reached.
+
+The view's shape is duplicated rather than referenced, because this app does not
+depend on `i2per` at build time: it is a standalone service an operator can run
+on a different node, and the router's modules reach it by name over erpc. That
+makes the duplication a real cost, so it is pinned by a test
+(`apps/i2per_status/test/i2per_status_contract_tests.erl`) which fails when the
+two disagree — a key added to `f:view/0` without being added here is caught
+there, not by a reader noticing.
+""".
 -type snapshot() :: #{
     online := boolean(),
     router_node := node(),
@@ -63,7 +106,9 @@ snapshot() ->
         outbound => non_neg_integer(),
         inbound => non_neg_integer(),
         transit => non_neg_integer(),
-        pending => non_neg_integer()
+        pending => non_neg_integer(),
+        exploratory_outbound => non_neg_integer(),
+        exploratory_inbound => non_neg_integer()
     },
     netdb => #{ri => non_neg_integer(), ls => non_neg_integer()},
     sessions => non_neg_integer(),
