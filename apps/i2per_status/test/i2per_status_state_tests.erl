@@ -23,16 +23,6 @@ dead_state() ->
         events => zero_counters()
     }.
 
-zero_counters() ->
-    #{
-        tunnel_built => 0,
-        tunnel_failed => 0,
-        tunnel_expired => 0,
-        leaseset_published => 0,
-        sam_session_created => 0,
-        sam_session_closed => 0
-    }.
-
 %% Feed one event through handle_info and return the counter map.
 counts_for(Event) ->
     State = dead_state(),
@@ -72,9 +62,28 @@ sam_session_created_counts_test() ->
 sam_session_closed_counts_test() ->
     only_bumped(sam_session_closed, 1, counts_for({sam_session_closed, <<"sid">>})).
 
-unknown_event_ignored_test() ->
+previously_dropped_event_is_counted_test() ->
+    %% This case used to be `unknown_event_ignored_test` and asserted that
+    %% `{peer_connected, _}` was *dropped*. That was the defect, written down as
+    %% intended behaviour: a peer connecting was an event nobody counted, and the
+    %% test said so.
+    %%
+    %% `peer_connected` is a tag this service knows about -- it is one of the seven
+    %% the old catch-all threw away -- so it is counted and *not* flagged.
     C = counts_for({peer_connected, crypto:strong_rand_bytes(32)}),
-    ?assertEqual(zero_counters(), C).
+    ?assertEqual(1, maps:get(peer_connected, C)),
+    ?assertEqual(0, maps:get(unrecognised_event, C)).
+
+%% A tag this service has never heard of is counted under its own name *and*
+%% flagged, so it is visible as an unrecognised arrival rather than blending into
+%% the keys the service does know. Without the flag a future bus event would be
+%% recorded and nobody would notice it was not one of the ones being displayed.
+unrecognised_event_is_counted_and_flagged_test() ->
+    C = counts_for({some_future_event, 1}),
+    ?assertEqual(1, maps:get(some_future_event, C)),
+    ?assertEqual(1, maps:get(unrecognised_event, C)),
+    %% And it is not mistaken for one of the known keys.
+    ?assertEqual(0, maps:get(tunnel_expired, C)).
 
 counters_accumulate_across_events_test() ->
     State0 = dead_state(),
@@ -133,3 +142,9 @@ terminate_and_code_change_test() ->
     State = dead_state(),
     ?assertEqual(ok, i2per_status_state:terminate(any, State)),
     ?assertEqual({ok, State}, i2per_status_state:code_change(0, State, [])).
+
+%% The zero map is whatever the module says it is, read from the module rather
+%% than restated here -- a hand-written copy of the key set in the test is exactly
+%% the second description that drifts.
+zero_counters() ->
+    maps:from_list([{Key, 0} || Key <- i2per_status_state:known_event_keys()]).

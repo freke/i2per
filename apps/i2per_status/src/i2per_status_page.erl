@@ -87,11 +87,45 @@ rows(Snap) ->
             {"netdb router infos", count(Snap, netdb, ri)},
             {"netdb leasesets", count(Snap, netdb, ls)},
             {"SAM sessions", sessions(Snap)}
-        ] ++ derived_rows(Snap),
+        ] ++
+            [
+                {"reachability", reachability(Snap)},
+                {"reachability events", reachability_events(Snap)}
+            ] ++ derived_rows(Snap),
     [
         ["<tr><td>", K, "</td><td>", V, "</td></tr>"]
      || {K, V} <- Flat
     ].
+
+%% The router's current inbound-reachability verdict, or `n/a` before it has
+%% announced one. The single number that says whether anyone can reach this
+%% router, and the reason the `reachability` event is counted at all.
+reachability(Snap) ->
+    case maps:find(last_reachability, Snap) of
+        {ok, Verdict} when is_atom(Verdict) -> atom_to_binary(Verdict, utf8);
+        _ -> <<"n/a">>
+    end.
+
+%% How many times each verdict has been announced, so the operator can see whether
+%% the current one is settled or the verdict is still moving.
+reachability_events(Snap) ->
+    Events = maps:get(events, Snap, #{}),
+    case
+        [
+            {atom_to_binary(V, utf8), maps:get({reachability, V}, Events, 0)}
+         || V <- [reachable, firewalled, unknown]
+        ]
+    of
+        [] ->
+            <<"n/a">>;
+        Pairs ->
+            iolist_to_binary(
+                lists:join(", ", [
+                    <<K/binary, " ", (integer_to_binary(N))/binary>>
+                 || {K, N} <- Pairs
+                ])
+            )
+    end.
 
 %% The derived block is absent until the first successful poll, and `undefined`
 %% before that, so every reader here tolerates both and says so rather than

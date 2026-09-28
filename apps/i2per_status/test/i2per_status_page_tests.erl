@@ -155,6 +155,33 @@ ratio_with_no_attempts_renders_na_test() ->
     ?assertNotEqual(nomatch, binary:match(Body, metric_row(<<"tunnel success">>, <<"n/a">>))),
     ?assertEqual(nomatch, binary:match(Body, <<"0%">>)).
 
+%% The reachability verdict is the reason the `reachability` event is counted, and
+%% the reason is visible: a total of reachability events would be a history, and
+%% what an operator needs is what the router currently believes.
+reachability_verdict_is_shown_test() ->
+    Snap = (full_snapshot())#{last_reachability => firewalled},
+    Body = render(Snap),
+    ?assertNotEqual(nomatch, binary:match(Body, metric_row(<<"reachability">>, <<"firewalled">>))).
+
+%% Before the router has announced one, the page says so rather than guessing.
+reachability_verdict_is_na_before_it_is_announced_test() ->
+    Body = render(full_snapshot()),
+    ?assertNotEqual(nomatch, binary:match(Body, metric_row(<<"reachability">>, <<"n/a">>))).
+
+%% The per-verdict counts are shown beside the verdict, so an operator can tell a
+%% settled verdict from one that is still moving.
+reachability_verdict_counts_are_shown_test() ->
+    Snap = (full_snapshot())#{
+        last_reachability => reachable,
+        events => #{
+            {reachability, reachable} => 4,
+            {reachability, firewalled} => 1,
+            {reachability, unknown} => 0
+        }
+    },
+    Body = render(Snap),
+    ?assertNotEqual(nomatch, binary:match(Body, <<"reachable 4, firewalled 1, unknown 0">>)).
+
 %% A metric and its rendered value, as the page emits them.
 metric_row(Metric, Value) ->
     iolist_to_binary(["<tr><td>", Metric, "</td><td>", Value, "</td></tr>"]).

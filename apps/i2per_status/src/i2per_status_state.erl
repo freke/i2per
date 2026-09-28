@@ -21,11 +21,47 @@ i2per_status_state:snapshot().
 
 -behaviour(gen_server).
 
--export([start_link/0, snapshot/0, fetch/0]).
+-export([start_link/0, snapshot/0, fetch/0, known_event_keys/0]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -define(POLL_MS, 5000).
+
+%% Every tag the router's event type admits, as of this version. Kept beside the
+%% folding code because it *documents* the set, not because the folding depends on
+%% it: `bump/2` counts anything, and a tag missing from this list is counted
+%% anyway and flagged. Adding an event to the bus is therefore not a change to
+%% this service, which is the property that stops the next five shapes being
+%% dropped the way the last five were.
+%%
+%% The two variant vocabularies below mirror `m:i2p_ssu2_reachability:status/0`
+%% and `m:i2p_peertest:result/0`. They are duplicated rather than referenced
+%% because this application does not depend on the core at build time -- it is a
+%% standalone service an operator runs on another node and reaches over erpc -- so
+%% the core's types are not available to compile against.
+-define(KNOWN_TAGS, [
+    peer_connected,
+    peer_disconnected,
+    tunnel_built,
+    tunnel_failed,
+    tunnel_expired,
+    leaseset_published,
+    sam_session_created,
+    sam_session_closed,
+    ssu2_block_unhandled,
+    db_store_not_stored,
+    config_changed
+]).
+
+-define(REACHABILITY_VERDICTS, [reachable, firewalled, unknown]).
+
+-define(PEERTEST_ADDRESS_TYPES, [ipv4, ipv6]).
+
+-define(PEERTEST_RESULTS, [ok, firewalled, unknown]).
+
+%% The key an event this service does not recognise is flagged under, alongside the
+%% event's own tag.
+-define(UNRECOGNISED, unrecognised_event).
 -define(RPC_TIMEOUT_MS, 2000).
 %% How long a request handler waits for a snapshot. The collector holds no lock
 %% across the poll — every message returns promptly — so this only needs to
@@ -73,14 +109,26 @@ fetch() ->
 %% two unrelated things that would otherwise share a name: these are the event
 %% bus fold, under the `events` key, while the router's own cumulative counters
 %% arrive under `counters`. One word, two meanings, in one map.
--type event_counters() :: #{
-    tunnel_built => non_neg_integer(),
-    tunnel_failed => non_neg_integer(),
-    tunnel_expired => non_neg_integer(),
-    leaseset_published => non_neg_integer(),
-    sam_session_created => non_neg_integer(),
-    sam_session_closed => non_neg_integer()
-}.
+-doc """
+What this service has observed on the bus, since it attached.
+
+Open by design, and that is deliberate: the map is keyed by whatever
+`f:key_for/1` derives from an event, so a shape the router adds later is recorded
+without a change here. A closed map would have been a second hand-written
+description of the bus's event type, and would have been wrong the first time a
+shape was added.
+
+`f:known_event_keys/0` is the documented set: every key this service knows about
+before any event arrives, plus `unrecognised_event`. A consumer should read that
+rather than retyping it, and `maps:get/3` with a default covers anything a newer
+router produces.
+
+These are **observations since this service attached**, not router lifetime. That
+is a different clock on purpose: the router's own lifetime totals are in
+`m:i2p_stats` (#0HSTTVC), and presenting these as though they were lifetime would
+make a figure look authoritative when it is not.
+""".
+-type event_counters() :: #{atom() | tuple() => non_neg_integer()}.
 
 -doc """
 Latest known state of the observed router.
@@ -120,6 +168,9 @@ there, not by a reader noticing.
     },
     netdb => #{ri => non_neg_integer(), ls => non_neg_integer()},
     sessions => non_neg_integer(),
+    %% The router's current inbound-reachability verdict, or `undefined` before it
+    %% has announced one. `n/a` on the page, not a guess.
+    last_reachability => reachable | firewalled | unknown | undefined,
     events := event_counters(),
     %% What the client derived from consecutive readings. Absent until the first
     %% successful poll, and `undefined` inside before that. Not part of the
@@ -148,6 +199,9 @@ init([]) ->
         online => false,
         view => offline_view(),
         events => empty_counters(),
+        %% The router's current inbound-reachability verdict, or `undefined` until
+        %% it has announced one. Not a counter: see `f:latest_reachability/2`.
+        last_reachability => undefined,
         %% The reading before this one, for the rate. `undefined` until the first
         %% successful poll, which is why the first reading yields no rate: a rate
         %% is a difference and one reading has nothing to difference against.
@@ -167,7 +221,7 @@ handle_cast(_Msg, State) ->
 %% Realtime path: one message per bus event.
 handle_info({event, Event}, #{events := Events0} = State) ->
     Events = bump(Event, Events0),
-    {noreply, State#{events := Events}};
+    {noreply, State#{events := Events, last_reachability => latest_reachability(Event, State)}};
 %% Reconnect path: resubscribe when the router node comes back.
 handle_info({nodeup, Node}, #{router_node := Node} = State) ->
     Subscribed = subscribe(Node),
@@ -207,31 +261,94 @@ subscribe(Node) ->
     Result = catch gen_event:add_handler({i2p_events, Node}, i2p_events_forward, [self()]),
     Result =:= ok.
 
-%% bump/2 — fold one bus event into the counters.
-bump({tunnel_built, _, _}, Ev) ->
-    maps:update_with(tunnel_built, fun(N) -> N + 1 end, 1, Ev);
-bump({tunnel_failed, _, _}, Ev) ->
-    maps:update_with(tunnel_failed, fun(N) -> N + 1 end, 1, Ev);
-bump({tunnel_expired, _}, Ev) ->
-    maps:update_with(tunnel_expired, fun(N) -> N + 1 end, 1, Ev);
-bump({leaseset_published, _}, Ev) ->
-    maps:update_with(leaseset_published, fun(N) -> N + 1 end, 1, Ev);
-bump({sam_session_created, _, _}, Ev) ->
-    maps:update_with(sam_session_created, fun(N) -> N + 1 end, 1, Ev);
-bump({sam_session_closed, _}, Ev) ->
-    maps:update_with(sam_session_closed, fun(N) -> N + 1 end, 1, Ev);
-bump(_, Ev) ->
-    Ev.
+%% %%%%% %%% Folding bus events %%%%% %%%
 
+%% Fold one bus event into the counters.
+%%
+%% **This function is total, and that is the whole point.** It derives the counter
+%% key from the event's own tag rather than matching a list of shapes, so an event
+%% the bus adds in future is counted without a line being changed here. The
+%% previous version matched six shapes and had a catch-all that dropped the rest,
+%% which is how `reachability` and `peertest_result` -- destination claim #2 of
+%% this map -- came to be published over distribution and thrown away.
+bump(Event, Ev) ->
+    Ev1 = add(key_for(Event), Ev),
+    case lists:member(tag_of(Event), ?KNOWN_TAGS) of
+        true ->
+            Ev1;
+        false ->
+            %% Counted under its own tag *and* flagged, so an event this service
+            %% does not recognise is visible as such rather than blending into the
+            %% keys it does know.
+            add(?UNRECOGNISED, Ev1)
+    end.
+
+%% The most recent reachability verdict, kept alongside the counters because the
+%% counters cannot supply it: "three `reachable` events" is a history, and what an
+%% operator needs to know is what the router currently believes. The verdict is the
+%% router's own aggregate inbound decision, derived from peer tests, so it is the
+%% single number that says whether anyone can reach this router.
+latest_reachability({reachability, _Transport, Verdict}, _State) ->
+    Verdict;
+latest_reachability(_Event, State) ->
+    maps:get(last_reachability, State, undefined).
+
+add(Key, Ev) ->
+    maps:update_with(Key, fun(N) -> N + 1 end, 1, Ev).
+
+tag_of(Event) when is_tuple(Event) ->
+    element(1, Event);
+tag_of(_Event) ->
+    ?UNRECOGNISED.
+
+%% The counter one event is counted under.
+%%
+%% Two shapes are broken out by payload rather than totalled, because their whole
+%% value *is* the payload: a total of `reachability` events says only that
+%% something happened, and what an operator needs to know is whether this router
+%% is reachable. Both payloads are small closed vocabularies, so the breakdown is
+%% bounded.
+%%
+%% `db_store_not_stored` is deliberately **not** broken out, for the opposite
+%% reason: its reason vocabulary has an open `{atom()}` clause, so keying on it
+%% would grow the map without bound. A total is the honest figure there, and the
+%% reason is on the bus for anyone who needs it.
+key_for({reachability, _Transport, Verdict}) ->
+    {reachability, Verdict};
+key_for({peertest_result, AddressType, Result}) ->
+    {peertest_result, AddressType, Result};
+key_for(Event) ->
+    tag_of(Event).
+
+%% `underspecs` is off here, for the reason it is off on the read API: the spec
+%% is the promise ("every counter key this service knows about") and the success
+%% typing is today's literal list of them. Narrowing the spec to match would make
+%% it a hand-maintained copy that has to be edited whenever the bus gains a tag,
+%% which is the maintenance this list exists to avoid. The published list is what a
+%% consumer reads, and `every_shape_in_the_type_vocabulary_is_covered` in
+%% `apps/i2per_status/test/i2per_status_events_tests.erl` is what pins it.
+-dialyzer({no_underspecs, [known_event_keys/0]}).
+
+-doc """
+Every counter key this service knows about, before any event has arrived.
+
+Output: the documented key set -- one per plain tag, plus the broken-out
+`reachability` and `peertest_result` variants, plus `unrecognised_event`. A
+consumer that wants to read every counter should read this rather than retyping
+it. Keys a *newer* router produces are not in here, so read with a default.
+""".
+-spec known_event_keys() -> [atom() | tuple()].
+known_event_keys() ->
+    Plain = ?KNOWN_TAGS,
+    Reachability = [{reachability, V} || V <- ?REACHABILITY_VERDICTS],
+    Peertest = [{peertest_result, A, R} || A <- ?PEERTEST_ADDRESS_TYPES, R <- ?PEERTEST_RESULTS],
+    lists:usort(Plain ++ Reachability ++ Peertest ++ [?UNRECOGNISED]).
+
+%% Every known key present at zero, so a consumer can read any of them without a
+%% default, and a dashboard can tell "nothing has happened" from "this key does not
+%% exist". An unrecognised tag is the one key that appears only when it happens.
 empty_counters() ->
-    #{
-        tunnel_built => 0,
-        tunnel_failed => 0,
-        tunnel_expired => 0,
-        leaseset_published => 0,
-        sam_session_created => 0,
-        sam_session_closed => 0
-    }.
+    maps:from_list([{Key, 0} || Key <- known_event_keys()]).
 
 %% %%%%% %%% Polling %%%%% %%%
 
@@ -291,6 +408,7 @@ build_snapshot(#{router_node := Node, subscribed := Sub, events := Events} = Sta
         router_node => Node,
         subscribed => Sub,
         events => Events,
+        last_reachability => maps:get(last_reachability, State, undefined),
         derived => maps:get(derived, State, undefined)
     },
     case maps:get(view, State) of
