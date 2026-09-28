@@ -113,10 +113,16 @@ view_reports_version_and_uptime(_Config) ->
         Boot = maps:get(boot_time, View),
         ?assert(Boot > 1_000_000_000_000),
         ?assert(Boot =< erlang:system_time(millisecond)),
-        %% And it is the same boot the uptime is measured from, not a second
-        %% independently-taken reading that could disagree with it.
+        %% And it is the same boot the uptime is measured from, rather than a
+        %% second independently-taken reading that could disagree with it. Boot
+        %% time is stored, so two reads are equal; uptime is recomputed from the
+        %% clock on every call, so two reads are only equal within the
+        %% millisecond that elapsed between them. Asserting they were equal was a
+        %% flake that only showed up when the whole suite ran.
         ?assertEqual(i2p_stats:boot_time(), maps:get(boot_time, View)),
-        ?assertEqual(i2p_stats:uptime_ms(), maps:get(uptime_ms, View))
+        %% What can be said about uptime without racing the clock: a second
+        %% reading is never behind the first.
+        ?assert(i2p_stats:uptime_ms() >= maps:get(uptime_ms, View))
     end).
 
 %% The reason the counters live in the core. Before this, the only counters in

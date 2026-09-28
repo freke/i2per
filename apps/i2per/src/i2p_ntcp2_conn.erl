@@ -234,6 +234,14 @@ enter_data_phase(Owner, Sock, Keys, SendDir, RecvDir, Timer, RemoteRI) ->
 data_loop(Owner, Sock, Send, Recv, IdleRef, KeepaliveRef) ->
     receive
         {tcp, Sock, Data} ->
+            %% Counted on arrival, before the framing is touched. `Data` is the
+            %% raw socket read, so it may hold a partial frame or several of
+            %% them and either way it is exactly the bytes that arrived. Charging
+            %% it before the parse also means a frame this connection rejects as
+            %% malformed is still counted: it crossed the wire, and a counter
+            %% that quietly excluded bytes the router received would be harder to
+            %% reconcile against anything.
+            ok = i2p_stats:add(ntcp2_bytes_in, byte_size(Data)),
             case i2p_stream:push(Recv, Data) of
                 {ok, Recv1, Payloads} ->
                     lists:foreach(
@@ -291,7 +299,9 @@ data_loop(Owner, Sock, Send, Recv, IdleRef, KeepaliveRef) ->
 send_payload(Sock, Send, Payload) ->
     #{key := Key, sip := Sip, msg := Msg} = Send,
     {Frame, Sip1} = i2p_framing:encrypt_frame(Key, Msg, Payload, Sip),
-    ok = gen_tcp:send(Sock, i2p_framing:frame_bytes(Frame)),
+    Wire = i2p_framing:frame_bytes(Frame),
+    ok = i2p_stats:add(ntcp2_bytes_out, byte_size(Wire)),
+    ok = gen_tcp:send(Sock, Wire),
     Send#{sip => Sip1, msg => Msg + 1}.
 
 keepalive_payload() ->

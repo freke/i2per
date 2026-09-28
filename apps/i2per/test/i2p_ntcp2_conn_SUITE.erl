@@ -11,6 +11,7 @@
 -export([all/0, suite/0]).
 -export([init_per_testcase/2, end_per_testcase/2]).
 -export([
+    transport_bytes_are_counted/1,
     shared_helpers_roundtrip/1,
     listener_binds_loopback_by_default/1,
     connection_limit_rejects_new_child/1,
@@ -35,6 +36,7 @@ all() ->
         connection_limit_rejects_new_child,
         keepalive_refreshes_quiet_session,
         handshake_and_frames_roundtrip,
+        transport_bytes_are_counted,
         multiple_frames_ordered,
         idle_reap,
         peer_close_kills_conn,
@@ -158,6 +160,72 @@ handshake_and_frames_roundtrip(_Config) ->
     after
         i2p_ntcp2_listener:stop(Listener)
     end.
+
+%% Bytes counted at the transport boundary.
+%%
+%% The counter's claim is that it reports what crossed the socket, once per
+%% direction, per frame. Two exact assertions establish that, and neither hard-codes
+%% the framing:
+%%
+%%   - the sender's outbound total and the receiver's inbound total move by the
+%%     *same* amount. A second counting site on either path, or a double charge
+%%     for one frame, breaks that equality. This is what "one choke point" means
+%%     when stated as a test rather than as a claim.
+%%   - the per-frame overhead is identical for two different payload sizes. A
+%%     counter tracking packets would charge a constant whatever the size; one
+%%     tracking payload only would charge no overhead. This pins it to
+%%     bytes-plus-fixed-framing, and names the overhead without the test needing
+%%     to know what it is — so a framing change does not fail a test that was
+%%     only ever about the accounting.
+%%
+%% Handshake traffic has already moved both counters by the time the pair is
+%% established, so every measurement is read after that point rather than from
+%% zero.
+transport_bytes_are_counted(_Config) ->
+    {Bob, Alice} = pair(),
+    {ok, Listener} = i2p_ntcp2_listener:listen(0, Bob, self()),
+    try
+        {ok, CA} = i2p_ntcp2_conn:connect(ri_at(listen_port(Listener), Bob), Alice, #{}),
+        CB = await_ready(),
+
+        #{ntcp2_bytes_out := Out0, ntcp2_bytes_in := In0} = i2p_stats:snapshot(),
+
+        Probe = <<"probe">>,
+        ok = i2p_ntcp2_conn:send(CA, Probe),
+        <<Probe/binary>> = receive_frame(CB),
+        Out1 = ntcp2_bytes_out(),
+        In1 = ntcp2_bytes_in(),
+        First = Out1 - Out0,
+        First = In1 - In0,
+        %% Framing is included, so this is strictly more than the payload. Were
+        %% it ever equal, the counter would have quietly become a payload counter
+        %% and the documented meaning would no longer hold.
+        true = (First > byte_size(Probe)),
+
+        Body = crypto:strong_rand_bytes(777),
+        ok = i2p_ntcp2_conn:send(CA, Body),
+        <<Body/binary>> = receive_frame(CB),
+        Second = ntcp2_bytes_out() - Out1,
+        Second = ntcp2_bytes_in() - In1,
+        true = (First - byte_size(Probe) =:= Second - byte_size(Body)),
+
+        %% And the figures are reachable under the names a consumer reads them
+        %% by, rather than only from inside the connection process. The read API
+        %% reports whatever the registry declares, so this is the same names the
+        %% view will carry; `m:i2p_read_api_SUITE` covers the view end to end,
+        %% and this suite has no reason to boot the parts the view reads.
+        Counters = i2p_stats:snapshot(),
+        true = (Out1 + Second =:= maps:get(ntcp2_bytes_out, Counters)),
+        true = (In1 + Second =:= maps:get(ntcp2_bytes_in, Counters))
+    after
+        i2p_ntcp2_listener:stop(Listener)
+    end.
+
+ntcp2_bytes_out() ->
+    maps:get(ntcp2_bytes_out, i2p_stats:snapshot()).
+
+ntcp2_bytes_in() ->
+    maps:get(ntcp2_bytes_in, i2p_stats:snapshot()).
 
 %% Multiple frames in one direction stay ordered across the stream.
 multiple_frames_ordered(_Config) ->

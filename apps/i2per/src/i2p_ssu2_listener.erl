@@ -183,7 +183,13 @@ handle_call(_Other, _From, State) ->
     {noreply, State}.
 
 handle_cast({send, Datagram, Endpoint}, State = #{sock := Sock}) ->
-    trace({listener_send, self(), Endpoint, byte_size(Datagram)}),
+    Size = byte_size(Datagram),
+    trace({listener_send, self(), Endpoint, Size}),
+    %% The single funnel for every outbound datagram — data, keepalives,
+    %% handshake retransmits and data-phase resends all arrive here — so this is
+    %% the only place a byte can be charged once and counted once. A resend
+    %% therefore counts again, which is what bytes-on-the-wire means.
+    ok = i2p_stats:add(ssu2_bytes_out, Size),
     ok = gen_udp:send(Sock, Endpoint, Datagram),
     {noreply, State};
 handle_cast({register, Pid, ConnId}, State) ->
@@ -202,6 +208,10 @@ handle_cast(_Other, State) ->
     {noreply, State}.
 
 handle_info({udp, Sock, IP, PortNum, Datagram}, State = #{sock := Sock}) ->
+    %% Charged on arrival, before classification. UDP preserves message
+    %% boundaries, so this is the exact datagram size with no framing guesswork
+    %% in it.
+    ok = i2p_stats:add(ssu2_bytes_in, byte_size(Datagram)),
     classify(self(), Datagram, IP, PortNum, State),
     _ = inet:setopts(Sock, [{active, once}]),
     {noreply, State};

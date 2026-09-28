@@ -94,7 +94,37 @@ counters() ->
         %% Announcements made on the status bus. Not an obvious operational
         %% figure, but it is the one that answers "is anything instrumented
         %% yet", which is the first question when a status page looks empty.
-        events_notified
+        events_notified,
+
+        %% %%%%% Bytes at the transport boundary %%%%%
+        %%
+        %% What is counted is what crossed the socket, in each direction, per
+        %% transport. That is the useful figure for a network operator, and it is
+        %% also the only one that can be taken at a single point per direction.
+        %%
+        %% Consequences worth stating, because a reader comparing these to a
+        %% payload count will find them different:
+        %%
+        %%   - a **retransmit counts**, and a resend of an unacknowledged SSU2
+        %%     packet counts a second time. The alternative — counting distinct
+        %%     payload — needs state per peer per packet number, on a path that
+        %%     cannot afford it, to produce a number that answers "how much
+        %%     useful data moved" rather than "how busy was the link".
+        %%   - NTCP2's outbound figure is the framed length handed to the
+        %%     socket, so it includes the 16-byte header and MAC on every frame
+        %%     and so runs slightly ahead of the payload total. Its inbound
+        %%     figure is the raw socket read, which may hold part of a frame or
+        %%     several of them; either way it is exactly what arrived.
+        %%   - SSU2's figures are exact datagram sizes, since UDP preserves
+        %%     message boundaries.
+        %%
+        %% Per-peer and per-tunnel breakdown is deliberately absent: SSU2's send
+        %% carries an endpoint rather than a router hash, and the transport
+        %% boundary has no tunnel identity to attribute bytes to. See #VZVB7X8.
+        ntcp2_bytes_out,
+        ntcp2_bytes_in,
+        ssu2_bytes_out,
+        ssu2_bytes_in
     ].
 
 -doc """

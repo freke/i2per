@@ -14,6 +14,7 @@
 -export([init_per_testcase/2, end_per_testcase/2]).
 -export([
     full_handshake_and_data/1,
+    transport_bytes_are_counted/1,
     keepalive_roundtrip/1,
     idle_reaps_silent_session/1,
     large_fragmented_message_reassembled/1,
@@ -30,6 +31,7 @@ suite() ->
 all() ->
     [
         full_handshake_and_data,
+        transport_bytes_are_counted,
         keepalive_roundtrip,
         idle_reaps_silent_session,
         large_fragmented_message_reassembled,
@@ -51,6 +53,13 @@ init_per_testcase(keepalive_roundtrip, Config) ->
 init_per_testcase(idle_reaps_silent_session, Config) ->
     ok = application:set_env(?APP, idle_timeout_ms, 1000),
     ok = application:set_env(?APP, keepalive_interval_ms, 60000),
+    start_app(Config, 30000);
+init_per_testcase(transport_bytes_are_counted, Config) ->
+    %% Deliberately the default keepalive interval, not a short one. The
+    %% assertions compare two counter deltas for equality, and a keepalive
+    %% firing between the two readings would move only one of them. The default
+    %% is 60s and this case finishes in well under a second, so nothing else can
+    %% move a counter mid-measurement.
     start_app(Config, 30000);
 init_per_testcase(large_fragmented_message_reassembled, Config) ->
     start_app(Config, 60000);
@@ -95,6 +104,83 @@ full_handshake_and_data(_Config) ->
     ok = wait_i2np(APid, 4243, Reply),
     i2p_ssu2_conn:terminate_session(APid, 0),
     ok = wait_closed(BPid, 0).
+
+%% A generous ceiling on per-message overhead: SSU2 adds a short header per
+%% datagram, a 2000-byte body may be split across a few, and one acknowledgement
+%% or path probe may arrive mid-measurement. A few hundred bytes covers all three
+%% with room to spare, and is still far too small to hide a double count.
+-define(MAX_OVERHEAD, 1024).
+
+%% Bytes counted at the SSU2 transport boundary.
+%%
+%% The listener owns the socket and every outbound datagram funnels through
+%% `m:i2p_ssu2_listener:send/3`, so that is the one place a byte can be charged
+%% once — data, keepalives, handshake retransmits and data-phase resends all
+%% arrive there, which is also why a retransmit counts a second time.
+%%
+%% **Why this does not assert that the two counters move by the same amount**,
+%% which is the strongest statement available and the one the NTCP2 case beside
+%% it does make: SSU2 interleaves acknowledgement and path-probe datagrams with
+%% data. Two router-wide readings a few milliseconds apart therefore differ by
+%% whatever control traffic landed in between, so asserting equality would be
+%% asserting a property of the scheduler rather than of the counter. That is not
+%% a weaker test, it is a different one, and it failed for exactly this reason
+%% when the whole suite ran and passed when the suite ran alone.
+%%
+%% What is asserted instead, and what a message counter would fail:
+%%
+%%   - each message costs strictly more than its body, so framing is included;
+%%   - a body thirty times larger costs strictly more, so it tracks bytes;
+%%   - neither cost exceeds its body by more than a small bound, so a charge for
+%%     the wrong thing — a whole session, a retransmit storm, a double count —
+%%     cannot hide inside a generous-looking number;
+%%   - inbound tracked outbound, never behind it, and within that same bound.
+%%     Anything above the outbound figure is by construction control traffic.
+%%
+%% The keepalive interval is left at its 60s default by this case's
+%% `init_per_testcase`, so nothing with a short cadence can move a counter here.
+transport_bytes_are_counted(_Config) ->
+    {APid, BPid} = establish_pair(),
+
+    #{ssu2_bytes_out := Out0, ssu2_bytes_in := In0} = i2p_stats:snapshot(),
+
+    Small = crypto:strong_rand_bytes(64),
+    i2p_ssu2_conn:send_i2np(APid, 6, 7101, Small),
+    ok = wait_i2np(BPid, 7101, Small),
+    #{ssu2_bytes_out := Out1, ssu2_bytes_in := In1} = i2p_stats:snapshot(),
+    SmallCost = Out1 - Out0,
+
+    Large = crypto:strong_rand_bytes(2000),
+    i2p_ssu2_conn:send_i2np(APid, 6, 7102, Large),
+    ok = wait_i2np(BPid, 7102, Large),
+    #{ssu2_bytes_out := Out2, ssu2_bytes_in := In2} = i2p_stats:snapshot(),
+    LargeCost = Out2 - Out1,
+
+    %% Framing is included, so each costs more than its body.
+    true = (SmallCost > byte_size(Small)),
+    true = (LargeCost > byte_size(Large)),
+    %% Thirty times the body costs more than the small one: bytes, not messages.
+    true = (LargeCost > SmallCost),
+    %% And neither is inflated beyond recognition. A charge for the wrong thing
+    %% cannot hide inside a number this close to the payload.
+    true = (SmallCost - byte_size(Small) < ?MAX_OVERHEAD),
+    true = (LargeCost - byte_size(Large) < ?MAX_OVERHEAD),
+
+    %% Inbound followed outbound, never behind it and never far ahead of it.
+    %% Anything above the outbound figure is control traffic by construction.
+    SmallIn = In1 - In0,
+    LargeIn = In2 - In1,
+    true = (SmallIn >= SmallCost),
+    true = (LargeIn >= LargeCost),
+    true = (SmallIn - SmallCost < ?MAX_OVERHEAD),
+    true = (LargeIn - LargeCost < ?MAX_OVERHEAD),
+
+    %% Reachable under the names a consumer reads them by, rather than only from
+    %% inside the listener. The read API reports whatever the registry declares;
+    %% `m:i2p_read_api_SUITE` covers the view itself.
+    Counters = i2p_stats:snapshot(),
+    true = (Out2 =:= maps:get(ssu2_bytes_out, Counters)),
+    true = (In2 =:= maps:get(ssu2_bytes_in, Counters)).
 
 %% Data-phase keepalive: with a short keepalive interval the session sends a
 %% path_challenge (type 18) probe and the peer echoes it as a path_response

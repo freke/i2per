@@ -22,10 +22,16 @@ every_registered_counter_appears_in_the_snapshot_test() ->
         ?assertEqual(Expected, i2p_stats:snapshot())
     end).
 
+%% Uniqueness, checked as uniqueness. An earlier version of this case asserted
+%% `lists:usort(Names) =:= Names`, which is a *sortedness* check wearing a
+%% uniqueness check's clothes: it passed on a one-element registry and failed the
+%% moment a second counter arrived, because the registry is grouped by transport
+%% and direction rather than alphabetically. A test that only holds while the
+%% list has one element is not a test.
 counters_are_unique_test() ->
     Names = i2p_stats:counters(),
-    ?assertEqual(lists:usort(Names), Names),
-    ?assertEqual(length(Names), length(lists:usort(Names))).
+    ?assertEqual(length(Names), length(lists:usort(Names))),
+    ?assert(length(Names) > 0).
 
 %% %%%%% %%% Counting %%%%% %%%
 
