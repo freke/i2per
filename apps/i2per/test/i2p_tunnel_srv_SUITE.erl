@@ -18,6 +18,7 @@
     transit_bandwidth_unlimited_by_default/1,
     transit_bandwidth_drops_over_budget_frames/1,
     transit_bytes_counted_per_carried_frame/1,
+    tunnel_outcome_counted_with_and_without_a_consumer/1,
     transit_bytes_counted_when_budget_allows_every_frame/1,
     stb_endpoint_role_accepted/1,
     stb_unaddressed_dropped/1,
@@ -61,6 +62,7 @@ all() ->
         transit_bandwidth_drops_over_budget_frames,
         transit_bytes_counted_per_carried_frame,
         transit_bytes_counted_when_budget_allows_every_frame,
+        tunnel_outcome_counted_with_and_without_a_consumer,
         stb_endpoint_role_accepted,
         stb_unaddressed_dropped,
         inbound_build_roundtrip,
@@ -351,6 +353,95 @@ transit_bytes_counted_when_budget_allows_every_frame(_Config) ->
         unregister_peer(),
         stop_tunnel_srv(Pid)
     end.
+
+%%%%%%%%% Tunnel lifecycle counters %%%%%%%%%
+
+%% The defect this exists to close: the only tunnel tallies in the tree used to
+%% live in the separate status application, zero-initialised when it started. So
+%% the success ratio was answerable only from the moment something attached to
+%% watch — a router nobody watched reported no builds at all, and one watched for
+%% an hour reported an hour rather than its lifetime.
+%%
+%% So the same build is driven twice and the two deltas compared. **Not** a
+%% comparison against a magic number: whatever the build path counts internally,
+%% it counts identically whether a consumer is attached or not, and that equality
+%% is the property. It is also exact — both runs do the same work, so there is
+%% nothing to tolerate.
+%%
+%% The "without" half is the regression, and it is the *default* state: no
+%% `gen_event` handler is installed on the bus at all when the first build runs.
+tunnel_outcome_counted_with_and_without_a_consumer(_Config) ->
+    [Local | Hops] = [make_router() || _ <- lists:seq(1, 4)],
+    lists:foreach(
+        fun(R) -> store_netdb(maps:get(ri, R)) end,
+        [Local | Hops]
+    ),
+    {Pid, _Local} = start_tunnel_srv(Local),
+    %% The bus really is bare for the first half, and that is load-bearing rather
+    %% than tidiness. An earlier version of this case compared a run with a
+    %% collector against a run without *one of its own*, and a leftover
+    %% `i2p_events_forward` from an earlier suite was installed on the bus the
+    %% whole time — so both halves had a handler and the comparison could not have
+    %% told a core-owned counter from a subscriber-owned one. That is exactly the
+    %% distinction under test.
+    %%
+    %% Clearing the bus is safe here because no suite relies on inheriting a
+    %% handler: every consumer in the test tree installs its own, and the ones
+    %% left behind are the accident this is removing for the length of the case.
+    ok = clear_event_handlers(),
+    try
+        Without = drive_one_build(Local, Hops),
+
+        ok = gen_event:add_handler(i2p_events, i2p_events_tests_collector, [self()]),
+        try
+            With = drive_one_build(Local, Hops),
+            %% Identical. Whatever the build path counts internally, it counts the
+            %% same with a consumer attached and with none. Also exact: both runs
+            %% do the same work, so there is nothing to tolerate.
+            ?assertEqual(Without, With),
+            %% And the figure is not the "nothing happened" answer, so the
+            %% equality above is not two zeroes.
+            ?assert(maps:get(tunnels_built_outbound, With) >= 1),
+            ?assert(maps:get(tunnels_built_inbound, With) >= 1)
+        after
+            _ = gen_event:delete_handler(i2p_events, i2p_events_tests_collector, [])
+        end
+    after
+        %% Same teardown the neighbouring build cases use, and for the same
+        %% reason: the mock peer registered for a build is process state that
+        %% outlives the case unless it is explicitly removed, and a case that
+        %% leaves it behind breaks the next one that registers its own.
+        unregister_peer(),
+        stop_tunnel_srv(Pid)
+    end.
+
+%% Remove every handler currently on the bus. Used by the case above to reach a
+%% genuinely unobserved state.
+clear_event_handlers() ->
+    lists:foreach(
+        fun(Handler) ->
+            _ = gen_event:delete_handler(i2p_events, Handler, [])
+        end,
+        gen_event:which_handlers(i2p_events)
+    ).
+
+%% Build one inbound and one outbound tunnel over `Hops`, and return the movement
+%% in every tunnel counter. Counting is at the point the build succeeds, so the
+%% delta is the build's own — and it is read after both builds have been consumed
+%% from the tunnel server, which is the barrier.
+drive_one_build(Local, Hops) ->
+    Before = tunnel_counters(),
+    Inbound = build_an_inbound(Local, Hops),
+    _ = build_an_outbound(Hops, Inbound),
+    After = tunnel_counters(),
+    maps:map(fun(_K, V) -> V - maps:get(_K, Before, 0) end, After).
+
+tunnel_counters() ->
+    Snap = i2p_stats:snapshot(),
+    maps:with(
+        [K || K <- maps:keys(Snap), lists:prefix("tunnels_", atom_to_list(K))],
+        Snap
+    ).
 
 %%%%%%%%% Endpoint roles are accepted; reply rides the record's path %%%%%%%%%
 

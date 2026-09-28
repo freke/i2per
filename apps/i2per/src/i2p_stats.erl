@@ -148,7 +148,34 @@ counters() ->
         %% only, which is the honest asymmetry. On a transit hop the two are
         %% equal frame for frame, because the hop does not alter the body.
         transit_bytes_in,
-        transit_bytes_out
+        transit_bytes_out,
+
+        %% %%%%% Tunnel lifecycle %%%%%
+        %%
+        %% Cumulative since router start, and **not** a ratio: the ratio is the
+        %% consumer's to compute, by dividing these, which is what keeps this
+        %% module free of a timer. Both directions are kept apart, and each
+        %% failure reason gets its own counter rather than one `failed` total —
+        %% a build a hop declined and a build whose records did not survive
+        %% processing are different facts, and a reader who cannot tell them
+        %% apart cannot act on the number.
+        %%
+        %% These used to live in the separate status application, zero-initialised
+        %% when it started, which is why the success ratio was answerable only
+        %% from the moment something attached to watch. They are here so "since
+        %% start" has one answer that does not depend on who is listening.
+        %%
+        %% The names are derived from the event vocabulary by `m:i2p_tunnel_outcome`;
+        %% this list is the authority on what exists, and a test asserts the
+        %% derived set is contained here.
+        tunnels_built_inbound,
+        tunnels_built_outbound,
+        tunnels_failed_inbound_invalid,
+        tunnels_failed_inbound_rejected,
+        tunnels_failed_outbound_invalid,
+        tunnels_failed_outbound_rejected,
+        tunnels_expired_inbound,
+        tunnels_expired_outbound
     ].
 
 -doc """

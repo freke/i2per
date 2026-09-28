@@ -236,7 +236,7 @@ sweep_pool(State, Key, Direction, AliveTunnel) ->
 %% notify_expired/3 — announce each tunnel the sweep is about to drop.
 notify_expired(Direction, Tunnels, Alive) ->
     [
-        i2p_events:notify({tunnel_expired, Direction})
+        i2p_tunnel_outcome:expired(Direction)
      || {_ID, #{built_at := BuiltAt}} <- maps:to_list(Tunnels), not Alive(BuiltAt)
     ],
     ok.
