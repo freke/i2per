@@ -49,7 +49,14 @@ start_link() ->
 init([]) ->
     LocalSeeds = resolve_local(),
     Children =
-        [events_child(), config_srv_child(), netdb_child(), peer_rep_child(), reachability_child()] ++
+        [
+            events_child(),
+            stats_child(),
+            config_srv_child(),
+            netdb_child(),
+            peer_rep_child(),
+            reachability_child()
+        ] ++
             ntcp2_sup_children(LocalSeeds) ++ ssu2_sup_children(LocalSeeds) ++
             manager_children(LocalSeeds),
     {ok, {#{strategy => one_for_one, intensity => 10, period => 10}, Children}}.
@@ -63,6 +70,20 @@ events_child() ->
         shutdown => 5000,
         type => worker,
         modules => [i2p_events]
+    }.
+
+%% Second child, and early on purpose: the counter home. Nothing here blocks on
+%% it — `i2p_stats:add/2` is a no-op while it is absent — but the counters a
+%% transport increments on its first packet should not be the ones lost to a
+%% start order.
+stats_child() ->
+    #{
+        id => i2p_stats,
+        start => {i2p_stats, start_link, []},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker,
+        modules => [i2p_stats]
     }.
 
 %% Validated runtime configuration front door (`m:i2p_config_srv`).

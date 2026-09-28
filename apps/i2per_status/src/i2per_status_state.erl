@@ -69,7 +69,11 @@ fetch() ->
         exit:Reason -> {error, Reason}
     end.
 
--type counters() :: #{
+%% Named `event_counters` rather than `counters` because the snapshot now carries
+%% two unrelated things that would otherwise share a name: these are the event
+%% bus fold, under the `events` key, while the router's own cumulative counters
+%% arrive under `counters`. One word, two meanings, in one map.
+-type event_counters() :: #{
     tunnel_built => non_neg_integer(),
     tunnel_failed => non_neg_integer(),
     tunnel_expired => non_neg_integer(),
@@ -100,6 +104,10 @@ there, not by a reader noticing.
     online := boolean(),
     router_node := node(),
     subscribed := boolean(),
+    version => pos_integer(),
+    uptime_ms => non_neg_integer(),
+    boot_time => integer() | undefined,
+    counters => #{atom() => non_neg_integer()},
     identity => binary(),
     peers => #{connected => non_neg_integer(), other => non_neg_integer()},
     tunnels => #{
@@ -112,7 +120,7 @@ there, not by a reader noticing.
     },
     netdb => #{ri => non_neg_integer(), ls => non_neg_integer()},
     sessions => non_neg_integer(),
-    events := counters()
+    events := event_counters()
 }.
 
 %% %%%%% %%% gen_server %%%%% %%%

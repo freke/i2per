@@ -77,6 +77,7 @@ discarded deliberately (see the module doc).
 """.
 -spec notify(event()) -> ok.
 notify(Event) ->
+    ok = i2p_stats:add(events_notified, 1),
     case whereis(?MODULE) of
         undefined ->
             ok;
