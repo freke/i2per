@@ -368,8 +368,12 @@ ssu2_inbound_session_round_trips(Config) ->
         %% Bob's (our own) RouterInfo is announced back as the first data-phase
         %% store over the SSU2 lane.
         ?assertEqual(OurHash, recv_ssu2_store(APid)),
-        %% The peer manager learned the dialer into the NetDb.
-        ?assertMatch({ok, _}, await_netdb(AliceHash)),
+        %% The peer manager learned the dialer into the NetDb. A call is handled
+        %% after every message already queued on the peer manager, and the store
+        %% arrived over that queue, so this answers "has the store been applied"
+        %% rather than "has it happened within ten seconds".
+        _ = gen_server:call(i2p_peer, dialed),
+        ?assertMatch({ok, _}, i2p_netdb_srv:find(AliceHash)),
         unlink(APid),
         i2p_ssu2_conn:terminate_session(APid, 0),
         i2p_ssu2_listener:stop(AliceListener)
@@ -432,10 +436,27 @@ reseed_runs_after_live_opt_in(Config) ->
         {ok, _} = application:ensure_all_started(?APP),
         %% Behavioural: the reseed worker feeds the NetDb; each reseeded
         %% RouterInfo becomes findable.
+        %%
+        %% **Barrier, not a poll.** The previous version polled the NetDb with a
+        %% ten-second deadline. That is a different thing with a different
+        %% failure mode: `m:i2p_reseed`'s HTTP client is configured with a
+        %% thirty-second timeout, so a fetch the production code is entitled to
+        %% take fifteen seconds is a test failure — and a slow machine and a
+        %% broken one produce the same report. It failed under full-suite load
+        %% while passing twelve times in a row on its own, which is what a
+        %% deadline standing in for a synchronisation looks like.
+        %%
+        %% The two steps below remove the race instead of widening the window.
+        %% The worker stops only after the fetch returned and every `learn_ri`
+        %% cast was sent, so its exit means the casts are in flight. A call to the
+        %% peer manager is then handled after every message already in its queue,
+        %% so once it answers, the RouterInfos are in the NetDb. After that there
+        %% is no deadline on the assertion at all.
+        ok = await_reseed_worker(),
+        _ = gen_server:call(i2p_peer, dialed),
         lists:foreach(
             fun(RI) ->
-                Hash = i2p_router_info:hash(RI),
-                ?assertMatch({ok, _}, await_netdb(Hash))
+                ?assertMatch({ok, _}, i2p_netdb_srv:find(i2p_router_info:hash(RI)))
             end,
             Ris
         )
@@ -1027,13 +1048,25 @@ serve_once(Listen, Su3) ->
 reseed_url(Port) ->
     lists:flatten(io_lib:format("http://127.0.0.1:~b/", [Port])).
 
-%% Deadline-based NetDb poll: waits for the hash to appear instead of
-%% counter+timer:sleep.
-await_netdb(Hash) ->
-    i2p_ct_helpers:await(fun() ->
-        case i2p_netdb_srv:find(Hash) of
-            {ok, _} -> true;
-            not_found -> false
-        end
-    end),
-    i2p_netdb_srv:find(Hash).
+%% Wait for the reseed worker to stop, which it does after the fetch returned
+%% and the `learn_ri` casts were sent — whether the fetch succeeded or failed.
+%% Either way the casts are in flight, so the caller's barrier on the peer manager
+%% is sound. A failed reseed therefore shows up as a RouterInfo that is not
+%% findable, which names the cause, rather than as a timeout.
+%%
+%% The process may already be gone: it is a child of the supervisor the test just
+%% started, so it was registered when `ensure_all_started` returned, and a missing
+%% name therefore means it finished rather than that it never started. The
+%% deadline below guards a genuine hang, not a slow one.
+await_reseed_worker() ->
+    case whereis(i2p_reseed_srv) of
+        undefined ->
+            ok;
+        Pid ->
+            Ref = erlang:monitor(process, Pid),
+            receive
+                {'DOWN', Ref, process, Pid, _Reason} -> ok
+            after 60_000 ->
+                erlang:error(reseed_worker_never_stopped)
+            end
+    end.

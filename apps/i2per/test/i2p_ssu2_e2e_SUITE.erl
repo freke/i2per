@@ -55,11 +55,12 @@ init_per_testcase(idle_reaps_silent_session, Config) ->
     ok = application:set_env(?APP, keepalive_interval_ms, 60000),
     start_app(Config, 30000);
 init_per_testcase(transport_bytes_are_counted, Config) ->
-    %% Deliberately the default keepalive interval, not a short one. The
-    %% assertions compare two counter deltas for equality, and a keepalive
-    %% firing between the two readings would move only one of them. The default
-    %% is 60s and this case finishes in well under a second, so nothing else can
-    %% move a counter mid-measurement.
+    %% No interval needs pinning here, and that is the point of the case's shape:
+    %% it stands up a listener with **no sessions on it**, so there are no
+    %% keepalives, no acknowledgements and no path probes to interleave — the only
+    %% datagrams that exist are the ones this case sends. The earlier version of
+    %% this case used a live peer pair, where all three could, which is what made
+    %% its assertions a hope rather than a synchronisation.
     start_app(Config, 30000);
 init_per_testcase(large_fragmented_message_reassembled, Config) ->
     start_app(Config, 60000);
@@ -105,82 +106,119 @@ full_handshake_and_data(_Config) ->
     i2p_ssu2_conn:terminate_session(APid, 0),
     ok = wait_closed(BPid, 0).
 
-%% A generous ceiling on per-message overhead: SSU2 adds a short header per
-%% datagram, a 2000-byte body may be split across a few, and one acknowledgement
-%% or path probe may arrive mid-measurement. A few hundred bytes covers all three
-%% with room to spare, and is still far too small to hide a double count.
--define(MAX_OVERHEAD, 1024).
-
 %% Bytes counted at the SSU2 transport boundary.
 %%
 %% The listener owns the socket and every outbound datagram funnels through
-%% `m:i2p_ssu2_listener:send/3`, so that is the one place a byte can be charged
-%% once — data, keepalives, handshake retransmits and data-phase resends all
-%% arrive there, which is also why a retransmit counts a second time.
+%% `m:i2p_ssu2_listener:send/3` — data, keepalives, the handshake resend and the
+%% data-phase `resend_unacked` alike — so that is the one place a byte can be
+%% charged once.
 %%
-%% **Why this does not assert that the two counters move by the same amount**,
-%% which is the strongest statement available and the one the NTCP2 case beside
-%% it does make: SSU2 interleaves acknowledgement and path-probe datagrams with
-%% data. Two router-wide readings a few milliseconds apart therefore differ by
-%% whatever control traffic landed in between, so asserting equality would be
-%% asserting a property of the scheduler rather than of the counter. That is not
-%% a weaker test, it is a different one, and it failed for exactly this reason
-%% when the whole suite ran and passed when the suite ran alone.
+%% **Why this case stands up its own listener with no sessions on it.** An earlier
+%% version of it ran against a live peer pair and compared the inbound and
+%% outbound totals for equality. That is not a synchronisation, it is a hope: SSU2
+%% interleaves acknowledgements and path probes with data, so two router-wide
+%% readings a few milliseconds apart differ by whatever control traffic landed in
+%% between. It passed when the suite ran alone and failed in the full gate, and I
+%% "fixed" it by widening the assertion to a tolerance. That was the wrong repair —
+%% a tolerance is a flake with extra steps, and it stops the test from being able to
+%% fail.
 %%
-%% What is asserted instead, and what a message counter would fail:
+%% A session-less listener has no peer, so no control traffic exists to intrude. And
+%% each measurement is taken against a datagram the test is *holding*, which makes
+%% it a barrier rather than a poll:
 %%
-%%   - each message costs strictly more than its body, so framing is included;
-%%   - a body thirty times larger costs strictly more, so it tracks bytes;
-%%   - neither cost exceeds its body by more than a small bound, so a charge for
-%%     the wrong thing — a whole session, a retransmit storm, a double count —
-%%     cannot hide inside a generous-looking number;
-%%   - inbound tracked outbound, never behind it, and within that same bound.
-%%     Anything above the outbound figure is by construction control traffic.
+%%   - **inbound**: the charge happens before the datagram is classified, and an
+%%     out-of-session PeerTest is answered. Receiving that answer proves the charge
+%%     already happened, so the inbound total can be compared for exact equality
+%%     against the size of the packet that was sent.
+%%   - **outbound**: the charge happens before `gen_udp:send/4`, so the reply
+%%     arriving on the test's own socket proves that charge happened too, and the
+%%     outbound total equals the size of the reply that arrived.
 %%
-%% The keepalive interval is left at its 60s default by this case's
-%% `init_per_testcase`, so nothing with a short cadence can move a counter here.
+%% Both directions are therefore exact equalities against bytes the test can name,
+%% with no window, no deadline and no tolerance.
 transport_bytes_are_counted(_Config) ->
-    {APid, BPid} = establish_pair(),
+    %% One keypair, bound once. The Charlie responder signs its reply with
+    %% `static_priv`, so a pub and priv drawn from two separate generations would
+    %% make the reply unverifiable and the case would pass for the wrong reason.
+    {CPub, CPriv} = i2p_crypto:x25519_keygen(),
+    Bik = crypto:strong_rand_bytes(32),
+    CharlieLocal = #{static_priv => CPriv, static_pub => CPub, intro_key => Bik},
+    {ok, Listener} = i2p_ssu2_listener:listen(<<"127.0.0.1">>, 0, CharlieLocal, self()),
+    Port = i2p_ssu2_listener:port(Listener),
+    {ok, Sock} = gen_udp:open(0, [binary, {active, true}]),
+    try
+        #{ssu2_bytes_in := In0, ssu2_bytes_out := Out0} = i2p_stats:snapshot(),
 
-    #{ssu2_bytes_out := Out0, ssu2_bytes_in := In0} = i2p_stats:snapshot(),
+        %% An out-of-session PeerTest, which a session-less listener answers.
+        %% Receiving the answer is the barrier for both charges.
+        Packet = peertest_packet(Bik, 16#12345678, 4567),
+        ok = gen_udp:send(Sock, {127, 0, 0, 1}, Port, Packet),
+        Reply = await_datagram(Sock),
+        true = (byte_size(Packet) =:= ssu2_bytes_in() - In0),
+        true = (byte_size(Reply) =:= ssu2_bytes_out() - Out0),
+        %% An answer really was produced, or the barrier is not a barrier.
+        true = (byte_size(Reply) > 0),
+        %% A packet of tens of bytes charged as its exact length is already more
+        %% than a per-datagram counter would produce, and the 700-byte payload
+        %% below is a second, very different size measured the same way. Together
+        %% they are what separates byte-counting from message-counting — no
+        %% tolerance and no second round trip needed.
 
-    Small = crypto:strong_rand_bytes(64),
-    i2p_ssu2_conn:send_i2np(APid, 6, 7101, Small),
-    ok = wait_i2np(BPid, 7101, Small),
-    #{ssu2_bytes_out := Out1, ssu2_bytes_in := In1} = i2p_stats:snapshot(),
-    SmallCost = Out1 - Out0,
+        %% And an outbound datagram of a size this test chose, sent straight
+        %% through the funnel, is charged exactly its own length.
+        Out1 = Out0 + byte_size(Reply),
+        Payload = crypto:strong_rand_bytes(700),
+        %% The endpoint is a two-tuple `{IP, Port}`. `i2p_ssu2_listener:send/3`
+        %% matches `{_IP, _Port}`, and an Erlang tuple pattern matches exact
+        %% arity — so the five-element `{127,0,0,1,Port}` form that `gen_udp:send/4`
+        %% wants raises `function_clause` here. Easy to get wrong, and the failure
+        %% names the wrong function.
+        ok = i2p_ssu2_listener:send(Listener, Payload, {{127, 0, 0, 1}, my_port(Sock)}),
+        true = (Payload =:= await_datagram(Sock)),
+        true = (byte_size(Payload) =:= ssu2_bytes_out() - Out1)
+    after
+        ok = gen_udp:close(Sock),
+        ok = i2p_ssu2_listener:stop(Listener)
+    end.
 
-    Large = crypto:strong_rand_bytes(2000),
-    i2p_ssu2_conn:send_i2np(APid, 6, 7102, Large),
-    ok = wait_i2np(BPid, 7102, Large),
-    #{ssu2_bytes_out := Out2, ssu2_bytes_in := In2} = i2p_stats:snapshot(),
-    LargeCost = Out2 - Out1,
+%% A well-formed out-of-session PeerTest, which a session-less listener answers
+%% with a Charlie reply. Shaped exactly as `i2p_ssu2_peertest_SUITE` builds it.
+peertest_packet(Bik, Nonce, PeerPort) ->
+    peertest_packet(Bik, Nonce, PeerPort, <<>>).
 
-    %% Framing is included, so each costs more than its body.
-    true = (SmallCost > byte_size(Small)),
-    true = (LargeCost > byte_size(Large)),
-    %% Thirty times the body costs more than the small one: bytes, not messages.
-    true = (LargeCost > SmallCost),
-    %% And neither is inflated beyond recognition. A charge for the wrong thing
-    %% cannot hide inside a number this close to the payload.
-    true = (SmallCost - byte_size(Small) < ?MAX_OVERHEAD),
-    true = (LargeCost - byte_size(Large) < ?MAX_OVERHEAD),
+peertest_packet(Bik, Nonce, PeerPort, RouterHash) ->
+    Block =
+        i2p_peertest:block(
+            6, 0, 0, RouterHash, 2, Nonce, 1_700_000_000, PeerPort, <<127, 0, 0, 1>>, <<>>
+        ),
+    {ok, Packet} =
+        i2p_ssu2:encode_peertest(
+            Bik,
+            0,
+            i2p_peertest:src_conn_id(Nonce),
+            i2p_peertest:dst_conn_id(Nonce),
+            [Block]
+        ),
+    Packet.
 
-    %% Inbound followed outbound, never behind it and never far ahead of it.
-    %% Anything above the outbound figure is control traffic by construction.
-    SmallIn = In1 - In0,
-    LargeIn = In2 - In1,
-    true = (SmallIn >= SmallCost),
-    true = (LargeIn >= LargeCost),
-    true = (SmallIn - SmallCost < ?MAX_OVERHEAD),
-    true = (LargeIn - LargeCost < ?MAX_OVERHEAD),
+%% The test's own socket: a receive is the proof the listener has finished with
+%% the datagram, so no deadline is needed to say "it has been processed".
+await_datagram(Sock) ->
+    receive
+        {udp, S, _IP, _Port, Datagram} when S =:= Sock ->
+            Datagram
+    end.
 
-    %% Reachable under the names a consumer reads them by, rather than only from
-    %% inside the listener. The read API reports whatever the registry declares;
-    %% `m:i2p_read_api_SUITE` covers the view itself.
-    Counters = i2p_stats:snapshot(),
-    true = (Out2 =:= maps:get(ssu2_bytes_out, Counters)),
-    true = (In2 =:= maps:get(ssu2_bytes_in, Counters)).
+my_port(Sock) ->
+    {ok, Port} = inet:port(Sock),
+    Port.
+
+ssu2_bytes_in() ->
+    maps:get(ssu2_bytes_in, i2p_stats:snapshot()).
+
+ssu2_bytes_out() ->
+    maps:get(ssu2_bytes_out, i2p_stats:snapshot()).
 
 %% Data-phase keepalive: with a short keepalive interval the session sends a
 %% path_challenge (type 18) probe and the peer echoes it as a path_response

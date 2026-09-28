@@ -152,21 +152,18 @@ uptime_is_monotonic_and_never_negative_test() ->
         ?assertEqual(Readings, lists:sort(Readings))
     end).
 
-%% Monotonic, not wall clock: a large negative shift of the system clock must not
-%% be able to make the uptime go backwards. This is the property the choice of
-%% clock buys, and it is asserted rather than assumed.
-uptime_survives_a_wall_clock_jump_test() ->
-    with_stats(fun() ->
-        Before = i2p_stats:uptime_ms(),
-        %% `erlang:timestamp/0` is the only wall-clock source a test can move,
-        %% so assert the weaker but still meaningful property: uptime is
-        %% independent of the wall clock reading taken alongside it.
-        _WallBefore = erlang:system_time(millisecond),
-        _ = erlang:system_time(millisecond),
-        After = i2p_stats:uptime_ms(),
-        ?assert(After >= Before)
-    end).
-
+%% The wall clock is a real reading, not a duration. Both bounds matter: a
+%% duration would be small and would pass a positivity check, and a monotonic
+%% reading would be arbitrary and would pass a "not in the future" check.
+%%
+%% **What this module deliberately does not test:** that the uptime is immune to
+%% a system-clock step. It is, by construction — it is derived from a monotonic
+%% reading, and the reason is recorded in the module — but a test cannot move the
+%% system clock, so any case purporting to cover it would only be asserting
+%% monotonicity a second time under a misleading name. An earlier version of this
+%% file did exactly that. The claim is therefore documented and untested rather
+%% than tested and hollow, and a test that would break if the clock choice changed
+%% belongs at the point the clock is chosen, not here.
 boot_time_is_a_wall_clock_reading_test() ->
     with_stats(fun() ->
         Boot = i2p_stats:boot_time(),

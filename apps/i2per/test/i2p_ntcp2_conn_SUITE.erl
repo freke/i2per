@@ -43,6 +43,18 @@ all() ->
         isolation
     ].
 
+init_per_testcase(transport_bytes_are_counted, Config) ->
+    %% The measurement window in this case must contain only the frames it sends
+    %% itself. An NTCP2 keepalive is a payload that goes through the very same
+    %% `send_payload/3`, so it would be charged and would break the equality
+    %% between the two directions. The default interval is 60s and the case
+    %% finishes in milliseconds, so it never fires in practice — but "never fires
+    %% in practice" is the same hope the SSU2 case was rebuilt to remove, so the
+    %% precondition is pinned here instead. The env is read when the connection
+    %% arms its timer, which is after this returns.
+    {ok, _} = application:ensure_all_started(?APP),
+    ok = application:set_env(?APP, ntcp2_keepalive_interval_ms, 600_000),
+    Config;
 init_per_testcase(idle_reap, Config) ->
     {ok, _} = application:ensure_all_started(?APP),
     ok = application:set_env(?APP, idle_timeout_ms, 300),
@@ -53,6 +65,10 @@ init_per_testcase(_Case, Config) ->
     {ok, _} = application:ensure_all_started(?APP),
     Config.
 
+end_per_testcase(transport_bytes_are_counted, _Config) ->
+    ok = application:unset_env(?APP, ntcp2_keepalive_interval_ms),
+    application:stop(?APP),
+    ok;
 end_per_testcase(idle_reap, _Config) ->
     ok = application:unset_env(?APP, idle_timeout_ms),
     application:stop(?APP),
