@@ -5,7 +5,9 @@
 %% - an event-driven wait/poll that never sleeps a fixed total — each test that
 %%   needs a condition to become true polls with a backoff until a deadline,
 %%   and a receive wrapper skips (drains) non-matching messages, so a leftover
-%%   message from a previous case cannot poison a later assertion.
+%%   message from a previous case cannot poison a later assertion;
+%% - signed RouterInfo fixtures, so a suite that needs routers in the NetDb
+%%   builds them here instead of keeping its own copy of the keygen.
 %%
 %% Test code is not rendered by ExDoc (docs are generated from the `default`
 %% profile ebin dirs), so this module carries only header comments.
@@ -15,9 +17,13 @@
 -export([
     temp_data_dir/1,
     free_port/0,
+    stop_app/0,
     await/1,
     await/2,
     wait_msg/2,
+    floodfill_router_info/2,
+    db_store_block/3,
+    dead_pid/0,
     start_ssu2_trace/0,
     stop_ssu2_trace/0,
     dump_ssu2_trace/0
@@ -53,6 +59,75 @@ free_port() ->
     {ok, Port} = inet:port(Sock),
     ok = gen_tcp:close(Sock),
     Port.
+
+%% Stop the i2per application and wait for the name to actually be free.
+%% `application:stop/1` returns before the children have unlinked, so a suite
+%% that starts a registered process straight afterwards can collide with the
+%% outgoing one and fail every later suite with `already_started`. Suites that
+%% need a process of their own should start only that process, not the
+%% application — see the header note.
+-spec stop_app() -> ok.
+stop_app() ->
+    _ = application:stop(i2per),
+    wait_stopped(i2per, 5000).
+
+wait_stopped(_App, 0) ->
+    timeout;
+wait_stopped(App, Budget) ->
+    case lists:keymember(App, 1, application:which_applications()) of
+        true ->
+            timer:sleep(20),
+            wait_stopped(App, Budget - 20);
+        false ->
+            ok
+    end.
+
+%% A signed, floodfill-capable RouterInfo. `TimestampMs` is the publish
+%% timestamp and is the caller's to choose, because the NetDb's acceptance
+%% window is what several tests are about: `f:i2p_netdb:valid_window/2` rejects
+%% anything published more than 27 hours before `Now`, and anything more than
+%% 2 minutes after it. `Host` is a documentation-range address, so a fixture
+%% never names a real host.
+-spec floodfill_router_info(integer(), binary()) -> i2p_router_info:router_info().
+floodfill_router_info(TimestampMs, Host) ->
+    {SPub, Seed} = i2p_crypto:ed25519_keygen(),
+    {CPub, _} = i2p_crypto:x25519_keygen(),
+    Identity = i2p_keys:from_keys(CPub, SPub),
+    Addr = i2p_router_info:ntcp2_address(
+        Host, 4668, crypto:strong_rand_bytes(32), crypto:strong_rand_bytes(16)
+    ),
+    Opts = #{
+        <<"netId">> => <<"2">>,
+        <<"router.version">> => <<"0.9.74">>,
+        <<"caps">> => <<"Of">>
+    },
+    i2p_router_info:build(Identity, TimestampMs, [Addr], Opts, Seed).
+
+%% A DatabaseStore I2NP message shaped the way `m:i2p_ssu2_conn:forward_block/2`
+%% hands one to the peer manager: `{i2np, Type, MsgId, ShortExp, Body}`, with
+%% the I2NP header already stripped. Type 0 wraps the RouterInfo in the
+%% DatabaseStore data field; any other type is sent as opaque bytes, which is
+%% the point — the manager must refuse to push on an entry it never parsed
+%% rather than re-encode what it was handed.
+-spec db_store_block(byte(), i2p_crypto:hash(), i2p_router_info:router_info() | binary()) ->
+    {i2np, byte(), non_neg_integer(), non_neg_integer(), binary()}.
+
+%% A pid that has already exited, for exercising a teardown path without
+%% taking the test process down with it. A store the peer manager cannot parse
+%% makes it stop the connection, so a test that wants to check that path must not
+%% pass itself as the connection.
+-spec dead_pid() -> pid().
+dead_pid() ->
+    Pid = spawn(fun() -> ok end),
+    MRef = erlang:monitor(process, Pid),
+    receive
+        {'DOWN', MRef, process, Pid, _} -> Pid
+    end.
+db_store_block(0, Key, RI) when is_map(RI) ->
+    db_store_block(0, Key, i2p_i2np:router_info_data(i2p_router_info:to_binary(RI)));
+db_store_block(Type, Key, Data) when is_binary(Data) ->
+    #{body := Body} = i2p_i2np:db_store(Key, Type, 0, undefined, Data),
+    {i2np, 1, 7, 0, Body}.
 
 %% Poll `Fun` (a zero-arity predicate) until it returns true or the default
 %% 10-second deadline passes, then fail with error(timeout). No fixed sleeps.

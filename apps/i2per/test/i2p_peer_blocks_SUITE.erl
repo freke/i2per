@@ -34,7 +34,7 @@ all() ->
     ].
 
 init_per_testcase(_Case, Config) ->
-    ok = stop_app(),
+    ok = i2p_ct_helpers:stop_app(),
     %% Standalone processes only. Starting the whole application would leave
     %% `i2p_tunnel_srv` running when this suite ends, and the suites that
     %% follow start it themselves — which fails them with `already_started`.
@@ -52,26 +52,8 @@ end_per_testcase(_Case, _Config) ->
     _ = catch gen_event:delete_handler(i2p_events, i2p_events_forward, []),
     _ = catch i2p_peer:stop(),
     _ = catch gen_event:stop(i2p_events),
-    ok = stop_app(),
+    ok = i2p_ct_helpers:stop_app(),
     ok.
-
-%% `application:stop/1` returns before the children have unlinked, so a suite
-%% that starts a registered process straight afterwards can collide with the
-%% outgoing one. Wait for the name to actually be free.
-stop_app() ->
-    _ = application:stop(i2per),
-    wait_stopped(i2per, 500).
-
-wait_stopped(_App, 0) ->
-    timeout;
-wait_stopped(App, Budget) ->
-    case lists:keymember(App, 1, application:which_applications()) of
-        true ->
-            timer:sleep(20),
-            wait_stopped(App, Budget - 20);
-        false ->
-            ok
-    end.
 
 %% --------------------------------------------------------------------------
 %% Cases

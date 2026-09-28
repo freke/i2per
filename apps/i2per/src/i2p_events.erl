@@ -56,6 +56,7 @@ data path instead of crashing working connections over it.
     | {peertest_result, i2p_peertest:address_type(), i2p_peertest:result()}
     | {reachability, ssu2, firewalled | reachable | unknown}
     | {ssu2_block_unhandled, atom()}
+    | {db_store_not_stored, i2p_peer:store_not_stored_reason()}
     | {config_changed, atom(), term()}.
 
 -doc """

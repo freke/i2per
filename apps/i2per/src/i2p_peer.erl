@@ -109,7 +109,7 @@ i2p_peer:stop().
 ]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
--export_type([local_keys/0]).
+-export_type([local_keys/0, store_outcome/0, store_not_stored_reason/0]).
 
 -define(HANDSHAKE_TIMEOUT, 15000).
 -define(MAX_BACKOFF_SECONDS, 300).
@@ -1010,23 +1010,144 @@ handle_block(ConnPid, Transport, #{type := 3, data := Data}, State) ->
 handle_block(_ConnPid, _Transport, _Block, State) ->
     State.
 
+-doc """
+Why a DatabaseStore was not kept, as carried on the `i2p_events` bus.
+
+`{unsupported_type, Type}` is a store type that decodes but is not implemented
+(ELS2 and MetaLeaseSet today). `{refused_with_reason, Outcome}` is the NetDb's
+own verdict in its own vocabulary — `older`, `from_future`, `too_old`,
+`expired`. A bare `{Reason}` is a decode failure from the NetDb, and
+`unparseable_router_info_data` is ours, for a type 0 store whose data field is
+not a RouterInfo.
+
+This is the reason vocabulary the telemetry work needs at the store recording
+point. It is deliberately not flattened into a single atom: "we do not implement
+this type" and "the NetDb thought it was too old" call for different responses,
+and a counter that cannot tell them apart cannot answer the question it was
+built to answer.
+""".
+-type store_not_stored_reason() ::
+    {unsupported_type, byte()}
+    | {refused_with_reason, older | from_future | too_old | expired}
+    | {atom()}
+    | unparseable_router_info_data.
+
+-doc """
+What became of a decoded DatabaseStore.
+
+`stored` is the only outcome that licenses floodfill replication, because
+replication is the side effect that tells the rest of the network to hold an
+entry. A type we do not implement and an entry the NetDb refused are both
+`not_stored`, and pushing either onward would be us asking three other routers
+to serve something we never held. See `t:store_not_stored_reason/0` for the
+reason a `not_stored` carries.
+""".
+-type store_outcome() :: stored | not_stored.
+
+%% `store_entry/4` returns `{Outcome, State}` where a `not_stored` outcome
+%% carries its reason in a three-tuple, so the reason travels with the decision
+%% rather than needing a second return value that only one branch populates.
+-spec store_entry(byte(), binary(), pid() | undefined, term()) ->
+    {stored, term()} | {not_stored, store_not_stored_reason(), term()}.
+
+%% `f:handle_db_store/4` decided what became of an entry and then ignored its
+%% own decision, replicating unconditionally on a path that had already
+%% determined the entry was unusable. Two consequences, both of which this
+%% function is the only defence against:
+%%
+%%  - a store type we do not implement (ELS2, MetaLeaseSet) was handed to
+%%    `f:i2p_floodfill:replication_outbox/5` with its original type byte, so
+%%    three other routers were asked to serve an entry we never parsed;
+%%  - an entry the NetDb's clock window refused was pushed on the same way.
+%%
+%% On top of that, the per-type handlers replicated through `f:replicate_if_new/6`
+%% *and* the caller replicated again, so every entry we did store went out
+%% twice. The duplication of delivery is its own harm: the second copy reaches
+%% the same three floodfills, each of which stores it and re-broadcasts in turn.
+%%
+%% So: replicate once, on `stored`, and report everything else with its reason
+%% so an operator can tell a refusal from a corruption and neither from silence.
 handle_db_store(ConnPid, MsgID, Body, State) ->
     case i2p_i2np:decode_db_store(Body) of
         {ok, #{key := Key, store_type := StoreType, data := Data} = Store} ->
             reply_to_store(Store, MsgID, State),
-            State1 =
-                case StoreType of
-                    0 -> handle_ri_store(Key, Data, ConnPid, State);
-                    1 -> handle_ls_store(Key, Data, State);
-                    3 -> handle_ls_store(Key, Data, State);
-                    _ -> State
-                end,
-            maybe_replicate(StoreType, Key, Data, ConnPid, State1),
-            State1;
+            Result = store_entry(StoreType, Data, ConnPid, State),
+            replicate_stored(StoreType, Key, Data, Result, ConnPid);
         error ->
+            %% A DatabaseStore we cannot even parse came from a peer that is
+            %% not speaking the protocol. Nothing is replicated and nothing is
+            %% stored, so there is no entry to report a reason for.
             stop_conn(ConnPid),
             State
     end.
+
+%% Route a decoded DatabaseStore by type and report what became of it, as
+%% `{Outcome, State}` with the reason carried inside a `not_stored` outcome. Type
+%% 0 is a RouterInfo, 1 a LeaseSet, 3 a local LeaseSet; 5 (ELS2) and 7
+%% (MetaLeaseSet) decode but are not implemented, and neither is anything a
+%% future type brings.
+store_entry(0, Data, ConnPid, State) ->
+    store_ri_entry(Data, ConnPid, State);
+store_entry(StoreType, Data, _ConnPid, State) when StoreType =:= 1; StoreType =:= 3 ->
+    store_ls_entry(Data, State);
+store_entry(StoreType, _Data, _ConnPid, State) ->
+    {not_stored, {unsupported_type, StoreType}, State}.
+
+store_ri_entry(Data, _ConnPid, State) ->
+    case i2p_i2np:parse_router_info_data(Data) of
+        {ok, RIBytes} ->
+            NowMs = erlang:system_time(millisecond),
+            case i2p_netdb_srv:store_binary(RIBytes, NowMs) of
+                {ok, Outcome} ->
+                    netdb_outcome(Outcome, remember_ri_entry(RIBytes, State));
+                {error, Reason} ->
+                    {not_stored, {Reason}, State}
+            end;
+        error ->
+            {not_stored, unparseable_router_info_data, State}
+    end.
+
+store_ls_entry(Data, State) ->
+    case i2p_netdb_srv:store_ls_binary(Data, erlang:system_time(second)) of
+        {ok, Outcome} ->
+            netdb_outcome(Outcome, State);
+        {error, Reason} ->
+            {not_stored, {Reason}, State}
+    end.
+
+%% The NetDb's own verdict, in its own vocabulary. `added` and `updated` mean we
+%% hold the entry; every other outcome — `older`, `from_future`, `too_old`,
+%% `expired` — means we do not, and must not forward it. An `older` outcome is
+%% worth a second thought: the key *is* in the store, but a copy we already had,
+%% so forwarding the bytes we were just handed would push a stale one.
+netdb_outcome(Outcome, State) when Outcome =:= added; Outcome =:= updated -> {stored, State};
+netdb_outcome(Outcome, State) -> {not_stored, {refused_with_reason, Outcome}, State}.
+
+%% Only `stored` licenses replication, and it licenses exactly one. Everything
+%% else is reported, because an entry that arrived and was not kept is the fact
+%% an operator needs: silently dropping it is indistinguishable from a peer that
+%% never sent anything.
+replicate_stored(StoreType, Key, Data, {stored, State}, ConnPid) ->
+    _ = maybe_replicate(StoreType, Key, Data, ConnPid, State),
+    State;
+replicate_stored(_StoreType, _Key, _Data, {not_stored, Reason, State}, _ConnPid) ->
+    i2p_events:notify({db_store_not_stored, Reason}),
+    report_not_stored(Reason),
+    State.
+
+%% A refusal and an unimplemented type are both normal enough in the aggregate
+%% that neither is worth a `warning` per message: `f:reply_to_store/3` has
+%% already acknowledged the store, so a peer that keeps sending one is not doing
+%% anything wrong and we must not turn its traffic into our log volume. The
+%% reason is on the bus, which is where a counter will read it, and `debug`
+%% keeps a packet off the wire's worth of default-level log. An unparseable type
+%% 0 is different — it means a peer sent us a RouterInfo that is not one, which
+%% is a protocol fault rather than a version we have not caught up with — so that
+%% one is worth saying out loud.
+report_not_stored(unparseable_router_info_data) ->
+    logger:warning("peer sent a netdb store whose router info data does not parse", []);
+report_not_stored(Reason) ->
+    logger:debug("netdb store not stored: ~0p", [Reason]).
 
 %% A DatabaseStore with a nonzero (and not 0xFFFFFFFF) reply token asks for a
 %% DeliveryStatus acknowledgement. i2pd replies unconditionally, before any
@@ -1049,33 +1170,6 @@ reply_to_store(#{reply_token := _, reply := {0, Gateway}}, MsgID, State) ->
     end;
 reply_to_store(#{reply_token := _, reply := _}, _MsgID, _State) ->
     ok.
-
-handle_ri_store(Key, Data, ConnPid, State) ->
-    case i2p_i2np:parse_router_info_data(Data) of
-        {ok, RIBytes} ->
-            NowMs = erlang:system_time(millisecond),
-            case i2p_netdb_srv:store_binary(RIBytes, NowMs) of
-                {ok, Outcome} ->
-                    replicate_if_new(0, Key, Data, ConnPid, Outcome, State),
-                    case i2p_router_info:decode(RIBytes) of
-                        {ok, RI} -> remember_ri(RI, State);
-                        {error, _} -> State
-                    end;
-                {error, _} ->
-                    State
-            end;
-        error ->
-            State
-    end.
-
-handle_ls_store(Key, Data, State) ->
-    case i2p_netdb_srv:store_ls_binary(Data, erlang:system_time(second)) of
-        {ok, Outcome} ->
-            replicate_if_new(1, Key, Data, undefined, Outcome, State),
-            State;
-        {error, _} ->
-            State
-    end.
 
 handle_db_lookup(ConnPid, Transport, Body, State) ->
     case i2p_i2np:decode_db_lookup(Body) of
@@ -1199,10 +1293,13 @@ send_store(ConnPid, Transport, Key, RI, Token, Reply) ->
     Data = i2p_i2np:router_info_data(i2p_router_info:to_binary(RI)),
     send_i2np(ConnPid, Transport, i2p_i2np:db_store(Key, 0, Token, Reply, Data)).
 
-%% Floodfill replication: forward a newly stored entry to the 3 closest
-%% eligible floodfills (excluding self and the sender).  Only triggers on
-%% `added` or `updated` outcomes — `older`, `from_future`, and `too_old`
-%% are not forwarded (matching i2pd NetDb::Store).
+%% Floodfill replication: forward a stored entry to the 3 closest eligible
+%% floodfills (excluding self and the sender).
+%%
+%% The caller is what makes this safe: `f:replicate_stored/6` reaches here only
+%% on a `stored` outcome, so the `added`/`updated` filter this comment used to
+%% describe now lives in one place, at the point where the decision is made,
+%% rather than in a helper every caller had to remember to use.
 maybe_replicate(StoreType, Key, Data, ConnPid, State) ->
     case i2p_floodfill:is_floodfill() of
         false ->
@@ -1220,12 +1317,13 @@ maybe_replicate(StoreType, Key, Data, ConnPid, State) ->
             ok
     end.
 
-replicate_if_new(StoreType, Key, Data, ConnPid, added, State) ->
-    maybe_replicate(StoreType, Key, Data, ConnPid, State);
-replicate_if_new(StoreType, Key, Data, ConnPid, updated, State) ->
-    maybe_replicate(StoreType, Key, Data, ConnPid, State);
-replicate_if_new(_StoreType, _Key, _Data, _ConnPid, _Outcome, _State) ->
-    ok.
+%% A RouterInfo the NetDb accepted, which also means we should be willing to
+%% dial it. `remember_ri/2` is the same list the seed set lives in.
+remember_ri_entry(RIBytes, State) ->
+    case i2p_router_info:decode(RIBytes) of
+        {ok, RI} -> remember_ri(RI, State);
+        {error, _} -> State
+    end.
 
 sender_hash(ConnPid, State) ->
     case conn_peer_hash(ConnPid, State) of
