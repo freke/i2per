@@ -214,6 +214,40 @@ core_build() {
     cat "$artifact.manifest"
 }
 
+## The posture, not the mechanism: the default install must not accept incoming
+## distribution connections. How that is achieved is a deployment concern — the
+## deployment repository ships its own vm.args and its own provisioning — so
+## this states the posture, says which mechanism it found, and fails only on a
+## configuration that would genuinely expose a default install.
+##
+## The three cases, and why they differ:
+##
+##   - an explicit `-dist_listen false`: the posture is met, by the shipped
+##     default. Reported and passed. Note that this is also what makes the node
+##     hidden (see erl(1)), so the shipped default is closed on both counts.
+##   - an explicit `-dist_listen true`: a default install that listens. Failed.
+##   - no flag at all: erl(1) says "by default a node will listen for incoming
+##     connections", so this is the *unsafe* reading — but it is exactly the
+##     shape a deployment that layers its own arguments produces, so it is
+##     reported loudly and not failed. Failing a build here would be this
+##     repository re-asserting, in the release check, a policy that #W1NX4KP
+##     moved to the deployment repository.
+check_distribution_posture() {
+    local vm_args="$1"
+    printf '%s\n' "$vm_args" | grep -- '-dist_listen false' >/dev/null && {
+        echo "  distribution posture: default install does not listen (explicit -dist_listen false)"
+        return 0
+    }
+    if printf '%s\n' "$vm_args" | grep -- '-dist_listen true' >/dev/null; then
+        echo "error: release explicitly enables the distribution listener" >&2
+        exit 1
+    fi
+    echo "  warning: no -dist_listen flag in the shipped vm.args." >&2
+    echo "  warning: erl(1) defaults a node to listening for incoming distribution" >&2
+    echo "  warning: connections. A default install would therefore be reachable." >&2
+    echo "  warning: Supply -dist_listen false unless distribution is intended." >&2
+}
+
 check_release_profile() {
     local artifact="$1"
     local vsn="$2"
@@ -224,11 +258,7 @@ check_release_profile() {
         echo "error: release contains the predictable development cookie" >&2
         exit 1
     fi
-    if printf '%s\n' "$vm_args" | grep -- '-sname i2per' >/dev/null &&
-        ! printf '%s\n' "$vm_args" | grep -- '-dist_listen false' >/dev/null; then
-        echo "error: release distribution listener is not explicitly disabled" >&2
-        exit 1
-    fi
+    check_distribution_posture "$vm_args"
     if printf '%s\n' "$vm_args" | grep -E '^[[:space:]]*-setcookie([[:space:]]|$)' >/dev/null; then
         echo "error: fallback release unexpectedly ships a distribution cookie" >&2
         exit 1

@@ -4,6 +4,13 @@
 ## and no cookie is shipped. An operator who needs distribution access supplies
 ## their own -sname and a random -setcookie, and re-enables the listener with
 ## -dist_listen true.
+##
+## -dist_listen false is deliberate, and is not the same as leaving it out:
+## erl(1) says "by default a node will listen for incoming distribution
+## connections", so an absent flag would make the default install reachable. It
+## also implies -hidden. See #W1NX4KP for why the release check asserts this
+## posture rather than any particular way of achieving it, and why the choice of
+## per-install distribution policy belongs to the deployment repository.
 ## Kernel poll keeps socket wakeups off the polling loop (an I2P router is
 ## mostly sockets).
 -sname i2per
