@@ -87,11 +87,95 @@ rows(Snap) ->
             {"netdb router infos", count(Snap, netdb, ri)},
             {"netdb leasesets", count(Snap, netdb, ls)},
             {"SAM sessions", sessions(Snap)}
-        ],
+        ] ++ derived_rows(Snap),
     [
         ["<tr><td>", K, "</td><td>", V, "</td></tr>"]
      || {K, V} <- Flat
     ].
+
+%% The derived block is absent until the first successful poll, and `undefined`
+%% before that, so every reader here tolerates both and says so rather than
+%% showing a zero an operator would read as "no traffic".
+derived_block(Snap) ->
+    case maps:find(derived, Snap) of
+        {ok, Derived} when is_map(Derived) -> Derived;
+        _ -> undefined
+    end.
+
+derived_rows(Snap) ->
+    case derived_block(Snap) of
+        undefined ->
+            [
+                {"transfer rate", <<"n/a">>},
+                {"tunnel success", <<"n/a">>},
+                {"rate window", <<"no reading yet">>}
+            ];
+        Derived ->
+            [
+                {"transfer rate", bps(maps:get(total, maps:get(transfer_bps, Derived)))},
+                {"tunnel success", ratio(maps:get(tunnel_success_ratio, Derived))},
+                {"tunnels built", count_or_na(maps:get(tunnels_built, Derived))},
+                {"tunnels failed", count_or_na(maps:get(tunnels_failed, Derived))},
+                {"rate window", window_note(Derived)},
+                {"last reading", last_reading_note(Derived)},
+                %% On the page, not only in the source: a reader comparing this
+                %% with another router's monitor should not have to guess whether
+                %% the figures are maintained averages or differences of two
+                %% samples.
+                {"figures", <<"derived by this client from cumulative counters">>}
+            ]
+    end.
+
+%% The three discard reasons are distinct failures, and collapsing them into "n/a"
+%% would hide the one that matters: a router that restarted is a different problem
+%% from a router that has not been sampled twice yet.
+window_note(Derived) ->
+    case maps:get(window_status, Derived) of
+        ok ->
+            case maps:get(window_ms, Derived) of
+                undefined -> <<"n/a">>;
+                Ms -> <<(integer_to_binary(Ms))/binary, " ms">>
+            end;
+        no_previous_sample ->
+            <<"one reading so far -- a rate needs two">>;
+        router_restarted ->
+            <<"discarded: the router restarted, so the counters went backwards">>;
+        counter_went_backwards ->
+            <<"discarded: a counter decreased within one boot">>;
+        zero_window ->
+            <<"discarded: both readings have the same uptime">>
+    end.
+
+%% An operator reading a rate needs to know when it was taken, in a form they can
+%% match against a log file. UTC, so it does not depend on the client's idea of
+%% where it is.
+last_reading_note(Derived) ->
+    case maps:get(sampled_at, Derived, undefined) of
+        undefined -> <<"n/a">>;
+        Ms -> unix_ms_to_utc(Ms)
+    end.
+
+unix_ms_to_utc(Ms) ->
+    {{Y, Mo, D}, {H, Mi, Se}} =
+        calendar:system_time_to_universal_time(Ms div 1000, second),
+    iolist_to_binary(
+        io_lib:format("~4..0b-~2..0b-~2..0b ~2..0b:~2..0b:~2..0bZ", [Y, Mo, D, H, Mi, Se])
+    ).
+
+bps(undefined) ->
+    <<"n/a">>;
+bps(N) when is_integer(N) ->
+    <<(integer_to_binary(N))/binary, " B/s">>.
+
+ratio(undefined) ->
+    <<"n/a">>;
+ratio(R) when is_float(R) ->
+    <<(integer_to_binary(round(R * 100)))/binary, "%">>.
+
+count_or_na(undefined) ->
+    <<"n/a">>;
+count_or_na(N) when is_integer(N) ->
+    integer_to_binary(N).
 
 count(Snap, Section, Key) ->
     case maps:find(Section, Snap) of

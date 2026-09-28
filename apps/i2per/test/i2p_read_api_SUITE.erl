@@ -22,6 +22,7 @@
     stats_is_restarted_after_dying/1,
     view_key_set_matches_the_declared_list/1,
     view_reports_version_and_uptime/1,
+    core_exposes_only_cumulative_values/1,
     counters_are_readable_with_no_presentation_app/1,
     bus_announcements_are_counted/1,
     counters_are_volatile_across_a_router_restart/1
@@ -35,6 +36,7 @@ all() ->
         stats_is_restarted_after_dying,
         view_key_set_matches_the_declared_list,
         view_reports_version_and_uptime,
+        core_exposes_only_cumulative_values,
         counters_are_readable_with_no_presentation_app,
         bus_announcements_are_counted,
         counters_are_volatile_across_a_router_restart
@@ -124,6 +126,74 @@ view_reports_version_and_uptime(_Config) ->
         %% reading is never behind the first.
         ?assert(i2p_stats:uptime_ms() >= maps:get(uptime_ms, View))
     end).
+
+%% The other half of the division of labour, asserted from the core's side.
+%%
+%% The client is supposed to difference and divide; the core is supposed to
+%% publish cumulative totals and a boot time and nothing else. If a rate or a
+%% ratio ever appears here, the counter home has acquired a timer or a smoothing
+%% window, and the property that lets the whole thing stay cheap — one atomic add
+%% on a packet path, no derived state to keep — has been given up. A derived value
+%% in the read API is also the thing that cannot be recomputed by a reader, which
+%% is the property that makes the displayed ratio trustworthy.
+%%
+%% Checked three ways, because a name filter alone would miss a ratio hidden
+%% under an innocent-looking key: the key names, the value types, and that a
+%% second reading of an unchanged router is bit-identical. That last one is the
+%% strong form — any timer, smoothing, or window would make two readings differ.
+core_exposes_only_cumulative_values(_Config) ->
+    ok = with_router(fun() ->
+        View = i2p_status_data:view(),
+
+        %% Nothing named like a derived quantity.
+        Derived = [K || K <- i2p_status_data:view_keys(), looks_derived(K)],
+        ?assertEqual([], Derived),
+        DerivedCounters = [K || K <- maps:keys(maps:get(counters, View)), looks_derived(K)],
+        ?assertEqual([], DerivedCounters),
+        ?assertEqual([], [N || N <- i2p_stats:counters(), looks_derived(N)]),
+
+        %% Every counter is a plain non-negative integer: a total, not an average.
+        Values = maps:values(maps:get(counters, View)),
+        ?assertEqual([], [V || V <- Values, not (is_integer(V) andalso V >= 0)]),
+
+        %% And two readings of an unchanged router agree on everything except the
+        %% clock. A timer, a smoothing window, or any other derived state would
+        %% make a cumulative value move between two reads; cumulative totals and a
+        %% boot time cannot.
+        %%
+        %% `uptime_ms` is the one field that legitimately differs, because it is
+        %% recomputed from the clock on every call. It is the sample clock the
+        %% client differences against, not a total, so it is excluded here and
+        %% checked separately -- and it may only move forwards.
+        Again = i2p_status_data:view(),
+        ?assertEqual(
+            maps:without([uptime_ms], View),
+            maps:without([uptime_ms], Again)
+        ),
+        ?assert(maps:get(uptime_ms, Again) >= maps:get(uptime_ms, View))
+    end).
+
+%% A counter or key whose name says it was computed from other numbers rather than
+%% counted. Deliberately narrow: it looks for the vocabulary of derived
+%% quantities, not for "anything new".
+looks_derived(Name) when is_atom(Name) ->
+    Text = string:lowercase(atom_to_list(Name)),
+    lists:any(
+        fun(Word) -> string:find(Text, Word) =/= nomatch end,
+        [
+            "rate",
+            "ratio",
+            "per_second",
+            "persecond",
+            "average",
+            "ewma",
+            "smoothed",
+            "_pct",
+            "percent",
+            "window",
+            "recent"
+        ]
+    ).
 
 %% The reason the counters live in the core. Before this, the only counters in
 %% the tree were in the separate status application, so every total was measured

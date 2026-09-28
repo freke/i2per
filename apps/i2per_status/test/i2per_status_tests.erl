@@ -93,6 +93,71 @@ live_router_online_body() ->
         teardown_live_router()
     end.
 
+%% The end-to-end half of the derivation, and the only test that proves the wiring.
+%%
+%% The unit tests prove `m:i2per_status_derive` arithmetic and the page tests
+%% prove rendering, and neither of those would notice if the poll stopped feeding
+%% readings into the derivation — the derived block would simply be `undefined`
+%% forever and every figure on the page would read "n/a". So this drives a real
+%% router through a real status service and waits for the block to appear.
+%%
+%% The wait is a *condition*, not a sleep: the poll interval is five seconds, so
+%% two readings take about five. `await/2` returns the moment the second arrives
+%% and the case proceeds, so the common path costs one poll and not two. It is not
+%% a fixed sleep in disguise, because the assertion is about reaching a state
+%% rather than about elapsed time.
+derived_figures_appear_after_two_readings_test_() ->
+    {timeout, 60, fun derived_figures_appear_after_two_readings_body/0}.
+
+derived_figures_appear_after_two_readings_body() ->
+    boot_live_router(),
+    Port = free_port(),
+    application:unset_env(i2per_status, router_node),
+    start_status(Port),
+    try
+        wait_online(),
+        %% One reading is not enough for a rate, and the first reading says so
+        %% rather than showing a zero.
+        ?assertEqual(no_previous_sample, derived_window_status()),
+        %% `await/2` returns `ok`; the block is read afterwards. Returning the
+        %% predicate's value would read better but is not what it does.
+        ok = i2p_ct_helpers:await(fun() -> derived_window_ok() end, 30000),
+        Derived = derived_block(),
+        ?assertEqual(ok, maps:get(window_status, Derived)),
+        ?assert(is_integer(maps:get(window_ms, Derived))),
+        ?assert(maps:get(window_ms, Derived) > 0),
+        %% And it reaches the wire, with the window and the provenance beside it.
+        {Status, _CT, Body} = http_get("/status.json"),
+        ?assertEqual(200, Status),
+        Json = json:decode(Body),
+        OnWire = maps:get(<<"derived">>, Json),
+        %% A string, not the atom: the JSON encoder renders atoms as strings and
+        %% only `true`/`false` stay boolean. So a consumer of the wire compares
+        %% `"ok"`, and the atom-to-string step is worth knowing about before a
+        %% consumer is written against it.
+        ?assertEqual(<<"ok">>, maps:get(<<"window_status">>, OnWire)),
+        ?assert(maps:is_key(<<"window_ms">>, OnWire)),
+        ?assert(maps:is_key(<<"transfer_bps">>, OnWire)),
+        ?assert(maps:is_key(<<"tunnel_success_ratio">>, OnWire))
+    after
+        application:stop(i2per_status),
+        teardown_live_router()
+    end.
+
+derived_window_status() ->
+    maps:get(window_status, derived_block()).
+
+derived_block() ->
+    case maps:get(derived, i2per_status_state:snapshot(), undefined) of
+        undefined -> #{window_status => no_reading_yet};
+        Derived -> Derived
+    end.
+
+%% `await/2` wants a boolean. Returning the block would be `case_clause` inside
+%% the helper, which is a confusing place to be told the predicate is malformed.
+derived_window_ok() ->
+    maps:get(window_status, derived_block()) =:= ok.
+
 bus_event_counter_test_() ->
     {timeout, 30, fun bus_event_counter_body/0}.
 

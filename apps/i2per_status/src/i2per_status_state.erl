@@ -120,7 +120,12 @@ there, not by a reader noticing.
     },
     netdb => #{ri => non_neg_integer(), ls => non_neg_integer()},
     sessions => non_neg_integer(),
-    events := event_counters()
+    events := event_counters(),
+    %% What the client derived from consecutive readings. Absent until the first
+    %% successful poll, and `undefined` inside before that. Not part of the
+    %% router's read API: the core publishes cumulative totals and the client
+    %% turns them into a rate and a ratio. See `m:i2per_status_derive`.
+    derived => i2per_status_derive:derived() | undefined
 }.
 
 %% %%%%% %%% gen_server %%%%% %%%
@@ -142,7 +147,13 @@ init([]) ->
         subscribed => Subscribed,
         online => false,
         view => offline_view(),
-        events => empty_counters()
+        events => empty_counters(),
+        %% The reading before this one, for the rate. `undefined` until the first
+        %% successful poll, which is why the first reading yields no rate: a rate
+        %% is a difference and one reading has nothing to difference against.
+        %% See `m:i2per_status_derive`.
+        previous => undefined,
+        derived => undefined
     }}.
 
 handle_call(snapshot, _From, State) ->
@@ -229,15 +240,40 @@ empty_counters() ->
 poll_once(#{router_node := Node, online := WasOnline} = State) ->
     View = fetch_all(Node),
     Online = is_map(View),
+    Polled =
+        State#{
+            online => Online,
+            view =>
+                case Online of
+                    true -> View;
+                    false when WasOnline -> offline_view();
+                    false -> maps:get(view, State)
+                end
+        },
+    %% Derived only from a reading that exists. An offline poll leaves the last
+    %% good reading in place, so a router that goes away does not also throw away
+    %% the window the rate was computed over — the `online` flag says the data is
+    %% stale, which is the honest thing to say, and a reader that needs to know
+    %% how stale can look at the window beside it.
+    case Online of
+        false -> Polled;
+        true -> derive_once(Polled, View)
+    end.
+
+%% One derivation per successful reading, from the reading before it.
+derive_once(State, View) ->
+    Current = sample(View),
+    Derived = i2per_status_derive:derive(maps:get(previous, State), Current),
     State#{
-        online => Online,
-        view =>
-            case Online of
-                true -> View;
-                false when WasOnline -> offline_view();
-                false -> maps:get(view, State)
-            end
+        previous => Current,
+        derived => Derived#{sampled_at => erlang:system_time(millisecond)}
     }.
+
+%% The parts of the read API the derivation needs: cumulative counters and the
+%% router's own monotonic uptime, which is the sample clock. No wall clock is
+%% taken from the router, so a client clock step cannot produce a negative rate.
+sample(#{counters := Counters, uptime_ms := UptimeMs, boot_time := BootTime}) ->
+    #{counters => Counters, uptime_ms => UptimeMs, boot_time => BootTime}.
 %% Fetch everything in one pass over erpc. erpc EXITS ({erpc,noconnection},
 %% noproc, timeout) when the router is absent or slow — expected states here,
 %% so the boundary collapses them into `error`, which marks offline.
@@ -254,7 +290,8 @@ build_snapshot(#{router_node := Node, subscribed := Sub, events := Events} = Sta
         online => maps:get(online, State),
         router_node => Node,
         subscribed => Sub,
-        events => Events
+        events => Events,
+        derived => maps:get(derived, State, undefined)
     },
     case maps:get(view, State) of
         #{} = View when map_size(View) > 0 -> maps:merge(Base, View);
