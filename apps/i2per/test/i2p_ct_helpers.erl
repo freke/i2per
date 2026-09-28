@@ -21,6 +21,7 @@
     await/1,
     await/2,
     wait_msg/2,
+    events_from/1,
     floodfill_router_info/2,
     db_store_block/3,
     dead_pid/0,
@@ -30,6 +31,12 @@
 ]).
 
 -define(SSU2_TRACE_MAX, 512).
+
+%% How long to wait for the bus to deliver a barrier event before declaring it
+%% broken. A hang guard, not a synchronisation -- see `f:await_bus/0`.
+%% How long to wait for a barrier event to come back from the bus. A hang guard,
+%% not a synchronisation -- see `f:events_from/1`. Crossing it raises.
+-define(BUS_DELIVERY_TIMEOUT_MS, 5000).
 
 %% A directory that exists and is writable for the current test case, created
 %% beneath the CT priv dir. Store it in Config as `{temp_data_dir, Dir}` and
@@ -349,3 +356,84 @@ ssu2_trace_collector(Events) ->
         stop ->
             ok
     end.
+
+%%%%%%%%% Observing the event bus %%%%%%%%%
+
+%% Run `Fun`, then return every event the bus delivered while it ran.
+%%
+%% Used for positive and negative assertions alike, and the negative case is why
+%% this exists rather than a drain with a zero timeout.
+%%
+%% Two things about the bus are easy to get wrong, and both were got wrong here
+%% first:
+%%
+%% 1. **`i2p_events:notify/1` returning is not a delivery barrier.** `gen_event`
+%%    answers the notify call as soon as the event is queued and dispatches it to
+%%    the handlers afterwards, in its own process. A caller that has just announced
+%%    something has learned nothing about whether a handler has seen it.
+%%
+%% 2. **Waiting for a barrier must not consume the events being collected.**
+%%    `f:wait_msg/2` drops everything that does not match, so using it to wait for
+%%    the barrier would throw away the very events under assertion.
+%%
+%% So the barrier is a *known* event announced after `Fun` has returned, and the
+%% wait accumulates rather than discards: once the barrier arrives, every event
+%% announced before it has been delivered, because the manager walks its handler
+%% list in order for each one. That makes the absence of an event a real absence
+%% rather than a race that happened to pass -- and it works for the negative
+%% assertions too, which no deadline can do honestly.
+-spec events_from(fun(() -> any())) -> [tuple()].
+events_from(Fun) ->
+    Owned = start_bus(),
+    try
+        ok = gen_event:add_handler(i2p_events, i2p_events_tests_collector, [self()]),
+        _ = Fun(),
+        Barrier = {config_changed, {bus_barrier, make_ref()}, 1},
+        ok = i2p_events:notify(Barrier),
+        {Before, After} = collect_until(Barrier, []),
+        lists:reverse(Before) ++ After
+    after
+        _ = gen_event:delete_handler(i2p_events, i2p_events_tests_collector, []),
+        stop_bus(Owned)
+    end.
+
+%% Everything the bus delivered up to and including `Barrier`, and separately
+%% anything already queued behind it.
+%%
+%% A barrier that never arrives is raised, not returned. Waiting five seconds and
+%% then carrying on would turn a broken bus into a test that passes for the wrong
+%% reason, which is the one outcome worse than a failure.
+collect_until(Barrier, Acc) ->
+    receive
+        Barrier ->
+            {Acc, drain_events([])};
+        Event ->
+            collect_until(Barrier, [Event | Acc])
+    after ?BUS_DELIVERY_TIMEOUT_MS ->
+        erlang:error({bus_barrier_not_delivered, Barrier})
+    end.
+
+drain_events(Acc) ->
+    receive
+        Event -> drain_events([Event | Acc])
+    after 0 ->
+        lists:reverse(Acc)
+    end.
+
+%% The manager normally belongs to the router application and is started by its
+%% supervisor. A case that drives a callback directly may run with no application
+%% up, so one is started here -- and stopped again only when this function was what
+%% started it, so no case leaves the bus down for the rest of the run. Unlinked,
+%% because a test process dying must not take the bus with it.
+start_bus() ->
+    case whereis(i2p_events) of
+        undefined ->
+            {ok, Pid} = i2p_events:start_link(),
+            unlink(Pid),
+            Pid;
+        _Existing ->
+            none
+    end.
+
+stop_bus(none) -> ok;
+stop_bus(Pid) -> gen_event:stop(Pid).

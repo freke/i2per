@@ -54,6 +54,8 @@ ok = i2p_tunnel_relay:send_tunnel_data(FirstHopHash, Frame).
     send_tunnel_data/2
 ]).
 
+-export_type([transit_denied_reason/0]).
+
 -define(DEFAULT_MAX_TRANSIT, 1000).
 -define(REPLY_RET_OFFSET, 201).
 -define(TRANSIT_FRAME_BYTES, 1028).
@@ -119,6 +121,32 @@ send_tunnel_data(NextHash, FwdBody) ->
             ok
     end.
 
+%%%%%%% %%% Types %%%%%%%
+
+-doc """
+Why the router refused to carry a tunnel.
+
+The three causes are the three branches of `f:decide_ret/2`, kept apart because
+a single "ret 30" is undiagnosable: an operator seeing denials needs to know
+whether the transit pool is full (expected at capacity, nothing to fix), the
+build-pacing budget is drained (a rate-limit decision, and raising
+`tunnel_build_rate` would help), or the receive ID is one we already serve (a
+duplicate, and the creator is retrying into a tunnel it already holds).
+
+A closed vocabulary on purpose — these are the code's own branches, so an open
+one would let a reason be invented that no path can produce.
+""".
+-type transit_denied_reason() ::
+    %% `transit_max_tunnels` reached: every receive ID we hold is a legitimate
+    %% transit tunnel and there is no room for another.
+    capacity
+    %% The receive ID is already in the transit map, so this build is a retry of
+    %% one we are already carrying rather than a new request.
+    | duplicate_receive_id
+    %% The `tunnel_build_rate` token bucket is drained, so acceptance is being
+    %% paced rather than refused on the merits.
+    | build_budget_drained.
+
 %%%%%%% %%% Internal %%%%%%%
 
 -spec handle_stb(map(), i2p_tunnel_srv:tunnel_srv_state()) ->
@@ -151,7 +179,13 @@ handle_stb(Msg, #{local := Local} = State) ->
 -spec seal_and_forward(map(), i2p_tunnel:hop_info(), [binary()], i2p_tunnel_srv:tunnel_srv_state()) ->
     i2p_tunnel_srv:tunnel_srv_state().
 seal_and_forward(Msg, HopInfo, Records, State) ->
-    {Ret, State2} = decide_ret(HopInfo, State),
+    {Ret, Denied, State2} = decide_ret(HopInfo, State),
+    %% Announced at the point the decision is taken, carrying *why* it went the
+    %% other way. A bare ret 30 is the one thing an operator seeing a router that
+    %% is not carrying anyone's tunnels cannot act on, and it is the only part of
+    %% transit participation that left no trace at all. One event per denied
+    %% record, so one per build request — never per relayed frame.
+    maybe_deny(recv_tunnel_id(HopInfo), Denied),
     Records1 = i2p_tunnel:apply_build_reply(HopInfo, Ret, Records),
     State3 =
         case Ret of
@@ -240,15 +274,44 @@ deliver_otbrm(Msg, HopInfo, Records1, State) ->
 %% endpoint); 30 rejects on capacity, duplicate receive ID, or a drained
 %% build-pacing bucket. Rejections are still sealed into the record list so
 %% the creator learns immediately.
+%% decide_ret/2 — accept or reject a build record, and say why.
+%%
+%% A denial now names its cause (`t:transit_denied_reason/0`) instead of collapsing
+%% to ret 30, so the event the caller announces can be actionable. The capacity
+%% and duplicate tests were one boolean and are now two clauses for exactly that
+%% reason: `transit_max_tunnels` being reached and a receive ID we already hold
+%% call for different responses from an operator, and were indistinguishable.
 -spec decide_ret(i2p_tunnel:hop_info(), i2p_tunnel_srv:tunnel_srv_state()) ->
-    {0 | 30, i2p_tunnel_srv:tunnel_srv_state()}.
+    {0 | 30, accept | transit_denied_reason(), i2p_tunnel_srv:tunnel_srv_state()}.
 decide_ret(#{recv_tunnel_id := RecvID}, #{transit := Transit} = State) ->
     MaxTransit = application:get_env(i2per, transit_max_tunnels, ?DEFAULT_MAX_TRANSIT),
-    Duplicate = maps:is_key(RecvID, Transit) orelse map_size(Transit) >= MaxTransit,
-    case Duplicate of
-        true -> {30, State};
-        false -> pace_build(State)
+    case maps:is_key(RecvID, Transit) of
+        true ->
+            {30, duplicate_receive_id, State};
+        false ->
+            case map_size(Transit) >= MaxTransit of
+                true -> {30, capacity, State};
+                false -> accept_and_pace(State)
+            end
     end.
+
+%% accept_and_pace/1 — the record is acceptable on the merits, so the only thing
+%% left is whether the build-pacing budget allows another acceptance.
+accept_and_pace(State) ->
+    case pace_build(State) of
+        {0, State1} -> {0, accept, State1};
+        {30, State1} -> {30, build_budget_drained, State1}
+    end.
+
+%% recv_tunnel_id/1 and maybe_deny/2 — announce a denial, if this was one. Kept
+%% apart so `seal_and_forward/4` reads as the sequence of decisions it is, and so
+%% an accepted record has no path to the bus at all.
+-spec recv_tunnel_id(i2p_tunnel:hop_info()) -> 0..16#FFFFFFFF.
+recv_tunnel_id(#{recv_tunnel_id := RecvID}) -> RecvID.
+
+-spec maybe_deny(0..16#FFFFFFFF, accept | transit_denied_reason()) -> ok.
+maybe_deny(_RecvID, accept) -> ok;
+maybe_deny(RecvID, Reason) -> ok = i2p_events:notify({transit_denied, RecvID, Reason}).
 
 %% pace_build/1 — charge one build-decision token against the build-accept
 %% bucket. When the bucket is drained the acceptance becomes ret 30; a

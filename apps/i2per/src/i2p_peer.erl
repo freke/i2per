@@ -398,8 +398,14 @@ handle_cast(_Msg, State) ->
 
 handle_info({conn_started, PeerHash, ConnPid, Transport}, State) ->
     {noreply, handle_conn_started(PeerHash, ConnPid, Transport, State)};
+%% A connect failure with a reason, and one without. The second shape is what a
+%% failure before the connection process exists can only say: `ntcp2_connect/4`
+%% reports a supervisor refusal with nothing more to go on, and inventing a reason
+%% for it would be worse than admitting there is not one.
+handle_info({connect_failed, PeerHash, Reason}, State) ->
+    {noreply, handle_connect_failed(PeerHash, Reason, State)};
 handle_info({connect_failed, PeerHash}, State) ->
-    {noreply, handle_connect_failed(PeerHash, State)};
+    {noreply, handle_connect_failed(PeerHash, unknown, State)};
 handle_info({ntcp2_ready, ConnPid, RemoteRI}, State) ->
     case find_conn_peer(ConnPid, State) of
         {_PeerHash, _PeerState} ->
@@ -549,7 +555,8 @@ handle_conn_down_by_pid(ConnPid, State) ->
     case find_conn_peer(ConnPid, State) of
         {PeerHash, _PeerState} ->
             i2p_events:notify({peer_disconnected, PeerHash}),
-            enter_backoff(PeerHash, State);
+            {State1, _Backoff} = enter_backoff(PeerHash, State),
+            State1;
         not_found ->
             case inbound_conn_by_pid(ConnPid, State) of
                 {ok, Hash} ->
@@ -561,10 +568,24 @@ handle_conn_down_by_pid(ConnPid, State) ->
             end
     end.
 
-handle_connect_failed(PeerHash, State) ->
+%% handle_connect_failed/3 — a connect attempt did not become a connection.
+%%
+%% The event is announced here, at the one point a connect failure and the backoff
+%% it causes are the same decision, and it carries the resulting interval. The
+%% interval is the point: a peer being retried in a tight loop and a peer the
+%% router has effectively given up on differ only in that number, and without it
+%% the two look identical from outside. Reported as one event rather than two
+%% because they cannot disagree — the backoff is computed by the very call this
+%% makes, so a separate "failed" and a separate "backing off" could only ever be
+%% two views of one value.
+handle_connect_failed(PeerHash, Reason, State) ->
     case peer_status(PeerHash, State) of
-        connecting -> enter_backoff(PeerHash, State);
-        _ -> State
+        connecting ->
+            {State1, Backoff} = enter_backoff(PeerHash, State),
+            ok = i2p_events:notify({peer_connect_failed, PeerHash, Reason, Backoff}),
+            State1;
+        _ ->
+            State
     end.
 
 handle_conn_ready(ConnPid, Transport, State) ->
@@ -597,7 +618,8 @@ handle_conn_down(MonRef, State) ->
     case find_peer_by_mon(MonRef, State) of
         {PeerHash, _PeerState} ->
             i2p_events:notify({peer_disconnected, PeerHash}),
-            enter_backoff(PeerHash, State);
+            {State1, _Backoff} = enter_backoff(PeerHash, State),
+            State1;
         not_found ->
             case find_inbound_by_mon(MonRef, State) of
                 {ConnPid, Hash} ->
@@ -965,8 +987,8 @@ ntcp2_connect(PeerHash, RemoteRI, Local, Owner) ->
             Owner ! {conn_started, PeerHash, ConnPid, ntcp2};
         {ok, ConnPid, _} ->
             Owner ! {conn_started, PeerHash, ConnPid, ntcp2};
-        {error, _} ->
-            Owner ! {connect_failed, PeerHash}
+        {error, Reason} ->
+            Owner ! {connect_failed, PeerHash, {supervisor, Reason}}
     end.
 
 handle_frame(ConnPid, Payload, State) ->
@@ -1626,7 +1648,12 @@ enter_backoff(PeerHash, State) ->
     },
     i2p_peer_rep:connect_failed(PeerHash),
     _ = erlang:send_after(Backoff * 1000, self(), {retry_peer, PeerHash}),
-    put_peer(PeerHash, Updated, State).
+    %% The interval is returned as well as stored. It is the only figure that
+    %% distinguishes a peer being retried aggressively from one the router has
+    %% written off, and `f:handle_connect_failed/3` announces it. The other two
+    %% callers of this function are connection *drops*, not connect failures, and
+    %% are left to `peer_disconnected`.
+    {put_peer(PeerHash, Updated, State), Backoff}.
 
 calculate_backoff(Attempts) ->
     min(?MAX_BACKOFF_SECONDS, trunc(math:pow(2, Attempts))).

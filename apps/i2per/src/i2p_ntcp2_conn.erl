@@ -192,11 +192,21 @@ run_handshake(alice, #{
     case alice_handshake(RemoteRI, Local) of
         {Keys, Sock, ab, ba} ->
             enter_data_phase(Owner, Sock, Keys, ab, ba, Timer, RemoteRI);
-        {error, _Reason} ->
+        {error, Reason} ->
             _ = erlang:cancel_timer(Timer),
-            Owner ! {connect_failed, i2p_router_info:hash(RemoteRI)},
+            %% The reason travels with the failure. It used to be dropped here, so
+            %% the connection manager knew a connect had failed and not why, and
+            %% the only honest thing it could report was that a peer was in
+            %% backoff — which is the same figure for a timeout, a rejected
+            %% handshake, and a key mismatch.
+            Owner ! {connect_failed, i2p_router_info:hash(RemoteRI), {handshake, Reason}},
             exit(normal);
         error ->
+            %% A protocol error is still a failed connect, and it is the one case
+            %% that previously left no failure at all: the process exits, the
+            %% manager sees a DOWN for a peer that never connected, and reports it
+            %% as a disconnect. Announced here, where the cause is still known.
+            Owner ! {connect_failed, i2p_router_info:hash(RemoteRI), protocol_error},
             exit({protocol_error, handshake})
     end;
 run_handshake(bob, #{sock := Sock, local := Local, owner := Owner, handshake_timeout := Timeout}) ->

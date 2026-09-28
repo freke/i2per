@@ -40,10 +40,13 @@ bus_event_shapes() ->
     [
         {peer_connected, crypto:strong_rand_bytes(32)},
         {peer_disconnected, crypto:strong_rand_bytes(32)},
+        {peer_connect_failed, crypto:strong_rand_bytes(32), {handshake, timeout}, 8},
         {tunnel_built, outbound, 3},
         {tunnel_failed, inbound, invalid},
         {tunnel_expired, inbound},
+        {transit_denied, 400, capacity},
         {leaseset_published, crypto:strong_rand_bytes(32)},
+        {leaseset_publish_failed, crypto:strong_rand_bytes(32), no_floodfill_targets},
         {sam_session_created, <<"sid">>, stream},
         {sam_session_closed, <<"sid">>},
         {peertest_result, ipv4, ok},
@@ -82,9 +85,13 @@ every_shape_in_the_type_vocabulary_is_covered_test() ->
     ?assertEqual([], (DocumentedTags -- EmittedTags) -- [unrecognised_event]),
     ?assertEqual([], EmittedTags -- DocumentedTags).
 
-%% The seven shapes the old catch-all dropped, by name, so this case fails if one
-%% is ever dropped again rather than passing because the list happened to grow.
-the_seven_previously_dropped_shapes_are_counted_test() ->
+%% The shapes the old catch-all dropped, by name, so this case fails if one is ever
+%% dropped again rather than passing because the list happened to grow. The last
+%% three joined them in #FBRVSBE: `peer_connect_failed`, `transit_denied` and
+%% `leaseset_publish_failed` were not in the bus at all, so a router that could not
+%% reach a peer, would not carry a tunnel, or could not publish a client's LeaseSet
+%% said nothing anywhere.
+the_ten_previously_dropped_shapes_are_counted_test() ->
     PreviouslyDropped = [
         {peer_connected, crypto:strong_rand_bytes(32)},
         {peer_disconnected, crypto:strong_rand_bytes(32)},
@@ -92,7 +99,10 @@ the_seven_previously_dropped_shapes_are_counted_test() ->
         {reachability, ssu2, reachable},
         {ssu2_block_unhandled, peer_test},
         {db_store_not_stored, expired},
-        {config_changed, transit_max_tunnels, 50}
+        {config_changed, transit_max_tunnels, 50},
+        {peer_connect_failed, crypto:strong_rand_bytes(32), timeout, 16},
+        {transit_denied, 401, build_budget_drained},
+        {leaseset_publish_failed, crypto:strong_rand_bytes(32), local_store_rejected}
     ],
     lists:foreach(
         fun(Event) ->

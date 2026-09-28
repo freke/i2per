@@ -233,7 +233,125 @@ connect_failed_connecting_test() ->
     ?assertEqual(backoff, Status),
     ?assertEqual(10, Attempts).
 
-%% Pending work and sends are flushed to a freshly connected NTCP2 peer.
+%%%%%%%%% Connect failures are announced, with the reason and the backoff %%%%%%%%%
+
+%% The reason travels with the failure. `i2p_ntcp2_conn` used to match
+%% `{error, _Reason}` and drop it, so the manager knew a connect had failed and
+%% not why — and "this peer is backing off" is the same figure for a timeout, a
+%% rejected handshake and a key mismatch.
+connect_failure_is_announced_with_its_reason_test() ->
+    H = mk_hash(),
+    S = with_peer(H, peer(H, #{attempts => 3}), base_state()),
+    ?assertEqual(
+        {peer_connect_failed, H, {handshake, timeout}, 8},
+        announced(fun() -> i2p_peer:handle_info({connect_failed, H, {handshake, timeout}}, S) end)
+    ).
+
+%% A failure with nothing more to report keeps its place rather than being
+%% dropped: `ntcp2_connect/4` can only say that the supervisor refused, and
+%% inventing a reason would be worse than admitting there is not one.
+connect_failure_without_a_reason_is_still_announced_test() ->
+    H = mk_hash(),
+    S = with_peer(H, peer(H, #{attempts => 1}), base_state()),
+    ?assertEqual(
+        {peer_connect_failed, H, unknown, 2},
+        announced(fun() -> i2p_peer:handle_info({connect_failed, H}, S) end)
+    ).
+
+%% The backoff is the load-bearing field, and the announced interval is the one
+%% actually in force. Asserted against the state the same call produced, because
+%% an event carrying a *different* number from the one the router waits would be
+%% the worst kind of duplicated figure: it would look right and be wrong.
+announced_backoff_is_the_one_in_force_test() ->
+    lists:foreach(
+        fun(Attempts) ->
+            H = mk_hash(),
+            S = with_peer(H, peer(H, #{attempts => Attempts}), base_state()),
+            Event = announced(fun() -> i2p_peer:handle_info({connect_failed, H, boom}, S) end),
+            {peer_connect_failed, H, boom, Announced} = Event,
+            {noreply, S1} = i2p_peer:handle_info({connect_failed, H, boom}, S),
+            #{backoff := InForce} = maps:get(H, maps:get(peers, S1)),
+            ?assertEqual(InForce, Announced)
+        end,
+        [0, 1, 3, 9]
+    ),
+    %% And the cap holds, so a long-failing peer announces the ceiling rather than
+    %% an ever-growing number.
+    H = mk_hash(),
+    S = with_peer(H, peer(H, #{attempts => 40}), base_state()),
+    ?assertMatch(
+        {peer_connect_failed, H, boom, 300},
+        announced(fun() -> i2p_peer:handle_info({connect_failed, H, boom}, S) end)
+    ).
+
+%% Two peers failing differently are distinguishable. Without the reason and the
+%% interval these were one counter, and "retrying in a tight loop" and "given up"
+%% were the same number.
+different_failures_are_distinguishable_test() ->
+    Event = fun(Attempts, Reason) ->
+        H = mk_hash(),
+        S = with_peer(H, peer(H, #{attempts => Attempts}), base_state()),
+        announced(fun() -> i2p_peer:handle_info({connect_failed, H, Reason}, S) end)
+    end,
+    ?assertNotEqual(Event(0, timeout), Event(9, timeout)),
+    ?assertNotEqual(Event(3, timeout), Event(3, protocol_error)).
+
+%% A connect failure for a peer that is not connecting is not a failure of
+%% anything: there is no backoff to enter, so nothing is announced. The state is
+%% returned untouched, which is what makes this a no-op rather than a spurious
+%% event.
+failure_for_a_non_connecting_peer_announces_nothing_test() ->
+    H = mk_hash(),
+    S0 = with_peer(H, peer(H, #{status => connected}), base_state()),
+    ?assertEqual(none, announced(fun() -> i2p_peer:handle_info({connect_failed, H, boom}, S0) end)),
+    {noreply, S1} = i2p_peer:handle_info({connect_failed, H, boom}, S0),
+    ?assertEqual(S0, S1).
+
+%% A *drop* is not a failed connect and must not be reported as one. The two share
+%% `enter_backoff/2`, which is exactly why this case is here: instrumenting the
+%% backoff rather than the failure would have announced every disconnect as a
+%% connect failure, and the two mean opposite things — one was never established,
+%% the other was and has gone.
+drop_is_not_reported_as_a_connect_failure_test() ->
+    H = mk_hash(),
+    Conn = i2p_ct_helpers:dead_pid(),
+    Mon = make_ref(),
+    S = with_peer(H, peer(H, #{conn => Conn, mon => Mon, attempts => 4}), base_state()),
+    ?assertEqual(
+        {peer_disconnected, H},
+        announced(fun() -> i2p_peer:handle_info({'DOWN', Mon, process, Conn, boom}, S) end)
+    ),
+    ?assertEqual(
+        [],
+        peer_connect_failures(fun() ->
+            i2p_peer:handle_info({'DOWN', Mon, process, Conn, boom}, S)
+        end)
+    ).
+
+%%%%%%%%% Event observation %%%%%%%%%
+
+%% `i2p_ct_helpers:events_from/1` waits for a *known* event to come back from the
+%% bus before draining, rather than draining on a zero timeout. `i2p_events:notify/1`
+%% returning proves nothing about delivery: `gen_event` queues the event and
+%% dispatches it to the handlers afterwards, in its own process. The first version
+%% of these helpers drained immediately and every case passed for the wrong reason.
+
+announced(Fun) ->
+    case i2p_ct_helpers:events_from(Fun) of
+        [Event] -> Event;
+        [] -> none
+    end.
+
+%% As `announced/1`, but for the case where the point is that a particular event
+%% did not fire and others may have. The barrier means the absence is a real
+%% absence: the bus was demonstrably live, and had already delivered everything
+%% the work under test announced, by the time the list came back.
+peer_connect_failures(Fun) ->
+    [E || E <- i2p_ct_helpers:events_from(Fun), is_connect_failure(E)].
+
+is_connect_failure({peer_connect_failed, _, _, _}) -> true;
+is_connect_failure(_) -> false.
+
 ntcp2_ready_test() ->
     H = mk_hash(),
     Dead = dead_pid(),

@@ -34,6 +34,12 @@ i2per_status_state:snapshot().
 %% this service, which is the property that stops the next five shapes being
 %% dropped the way the last five were.
 %%
+%% It is still the list worth keeping current, because `unrecognised_event` is
+%% the tripwire: a router that has learned a tag this service does not know about
+%% pushes that counter off zero, and a non-zero reading says the two are out of
+%% step. Losing an event entirely is impossible (see `f:bump/2`); failing to
+%% *notice* that a new one exists is what the flag makes visible.
+%%
 %% The two variant vocabularies below mirror `m:i2p_ssu2_reachability:status/0`
 %% and `m:i2p_peertest:result/0`. They are duplicated rather than referenced
 %% because this application does not depend on the core at build time -- it is a
@@ -42,10 +48,13 @@ i2per_status_state:snapshot().
 -define(KNOWN_TAGS, [
     peer_connected,
     peer_disconnected,
+    peer_connect_failed,
     tunnel_built,
     tunnel_failed,
     tunnel_expired,
+    transit_denied,
     leaseset_published,
+    leaseset_publish_failed,
     sam_session_created,
     sam_session_closed,
     ssu2_block_unhandled,
