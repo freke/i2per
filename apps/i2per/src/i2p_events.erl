@@ -26,6 +26,9 @@ Emitted events (`t:event/0`):
 - `{peertest_result, AddressType, Result}` — one SSU2 peer test concluded
 - `{reachability, ssu2, Status}` — the router's inbound reachability decision,
   derived from `peertest_result` events (`firewalled` | `reachable` | `unknown`)
+- `{lookup_failed, Key, Kind, Reason}` — a lookup did not produce its record; the
+  reason separates a responder that answered with something unreadable from one
+  that never answered
 - `{sam_session_created, SessionId, Style}` / `{sam_session_closed, SessionId}`
 - `{config_changed, Key, Value}`
 
@@ -47,10 +50,18 @@ data path instead of crashing working connections over it.
 
 -export([init/1, handle_event/2, handle_call/2, handle_info/2, terminate/2, code_change/3]).
 
--export_type([event/0, direction/0]).
+-export_type([event/0, direction/0, lookup_kind/0]).
 
 -doc "Tunnel direction.".
 -type direction() :: inbound | outbound.
+
+-doc """
+Which kind of record a `lookup_failed` event was about.
+
+`none` for a failure that is not about a particular record — currently only the
+lookup service not being running, where there is no key and nothing was asked for.
+""".
+-type lookup_kind() :: lease | router | none.
 
 -doc "One router status change, as announced on the bus.".
 -type event() ::
@@ -80,6 +91,12 @@ data path instead of crashing working connections over it.
     | {reachability, ssu2, firewalled | reachable | unknown}
     | {ssu2_block_unhandled, atom()}
     | {db_store_not_stored, i2p_peer:store_not_stored_reason()}
+    %% A lookup that did not produce the record it was asked for. The reason is the
+    %% whole point: `no_answer` means nobody answered, while `{not_stored, _}` means
+    %% a peer *did* answer and this router could not use what it was given. Those are
+    %% opposite problems and used to be the same result.
+    | {lookup_failed, i2p_crypto:hash() | undefined, lookup_kind(),
+        i2p_lookup_srv:lookup_failed_reason()}
     | {config_changed, atom(), term()}.
 
 -doc """

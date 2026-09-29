@@ -59,6 +59,7 @@ i2per_status_state:snapshot().
     sam_session_closed,
     ssu2_block_unhandled,
     db_store_not_stored,
+    lookup_failed,
     config_changed
 ]).
 

@@ -35,8 +35,9 @@ counted and flagged rather than dropped.
 
 %% How many shapes `t:i2p_events:event/0` is meant to have. Asserted so a parse that
 %% has quietly gone wrong fails loudly rather than agreeing with itself on a
-%% smaller world.
--define(SHAPE_COUNT, 16).
+%% smaller world, and so adding a shape without updating it is a decision rather
+%% than an accident.
+-define(SHAPE_COUNT, 17).
 
 %%% %%%%% The two sides agree %%%%% %%%
 
@@ -59,14 +60,14 @@ every_call_site_announces_a_literal_shape_test() ->
     ],
     ?assertEqual([], Dynamic).
 
-%% The three events added in #FBRVSBE are in the type, by name. Asserted so the
-%% agreement case above cannot pass on a vocabulary that has quietly shrunk back to
-%% something smaller and still self-consistent.
+%% The failure events are in the type, by name. Asserted so the agreement case above
+%% cannot pass on a vocabulary that has quietly shrunk back to something smaller and
+%% still self-consistent.
 the_three_failure_events_are_in_the_type_test() ->
     Declared = declared_tags(),
     lists:foreach(
         fun(Tag) -> ?assert(lists:member(Tag, Declared)) end,
-        [peer_connect_failed, transit_denied, leaseset_publish_failed]
+        [peer_connect_failed, transit_denied, leaseset_publish_failed, lookup_failed]
     ).
 
 %% A peer's connect failure and its disconnect are different facts, and a tunnel

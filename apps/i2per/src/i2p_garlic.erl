@@ -49,7 +49,7 @@ Cloves = i2p_garlic:extract_cloves(Blocks).
 -define(BLOCK_GARLIC_CLOVE, 11).
 -define(BLOCK_PADDING, 254).
 
--export_type([delivery/0, clove/0, block_type/0, block/0, dispatch_msg/0]).
+-export_type([delivery/0, clove/0, block_type/0, block/0, dispatch_msg/0, ignore_reason/0]).
 
 -export([
     encode_delivery/1,
@@ -75,6 +75,28 @@ Cloves = i2p_garlic:extract_cloves(Blocks).
     unwrap_existing_session/3,
     dispatch_db_message/2
 ]).
+
+-doc """
+Why `f:dispatch_db_message/2` did not handle a message.
+
+Kept apart because the two store cases are opposites from the network's point of
+view and must not be collapsed again: `{unsupported_type, T}` means the peer *did*
+answer and the record arrived intact, and this router has no parser for what is
+inside it — the network is helping and the router cannot read it.
+`undecodable_store` means the bytes themselves did not parse, which is a fault on
+the wire rather than a gap in this implementation.
+
+`{unsupported_type, T}` is deliberately in the same shape as the corresponding
+clause of `m:i2p_peer:store_not_stored_reason/0`, so a store this router declines to
+parse carries one vocabulary all the way up instead of being renamed on the way.
+""".
+-type ignore_reason() ::
+    %% The store decoded and named a type with no parser here (types 5 and 7).
+    {unsupported_type, byte()}
+    | undecodable_store
+    | undecodable_lookup
+    | undecodable_search_reply
+    | not_a_db_message.
 
 -doc "Database message subset accepted by `f:dispatch_db_message/2`.".
 -type dispatch_msg() :: #{type := 0..255, body := binary()}.
@@ -380,13 +402,23 @@ Input: `Msg` — an `t:i2p_i2np:i2np_message/0`; `NowMs` — wall-clock
 milliseconds since epoch (for timestamping store operations).
 
 Output: `{store, router | lease, Key :: binary(), Data :: binary(), non_neg_integer()} |
-{lookup, map()} | {search_reply, map()} | ignore`.
+{lookup, map()} | {search_reply, map()} | {ignored, t:ignore_reason/0}`.
 """.
+%% Dispatch one Database-family I2NP message.
+%%
+%% An unhandled message now says *which* way it was unhandled. It used to be a bare
+%% `ignore`, and every caller dropped it identically — so a store of a type this
+%% router has no parser for, a store whose body did not decode, and an I2NP message
+%% that was never a database message all looked the same, at every layer above. That
+%% mattered for lookups in particular: a peer that answered with a record `i2per`
+%% cannot read, and a peer that never answered, produced one indistinguishable
+%% outcome, so a router could not tell "the network is not helping me" from "the
+%% network is helping me with something I cannot read".
 -spec dispatch_db_message(dispatch_msg(), integer()) ->
     {store, router | lease, i2p_crypto:hash(), binary(), non_neg_integer()}
     | {lookup, i2p_i2np:db_lookup()}
     | {search_reply, i2p_i2np:db_search_reply()}
-    | ignore.
+    | {ignored, ignore_reason()}.
 dispatch_db_message(#{type := 1, body := Body}, NowMs) ->
     case i2p_i2np:decode_db_store(Body) of
         {ok, #{store_type := 0, key := Key, data := Data}} ->
@@ -403,22 +435,22 @@ dispatch_db_message(#{type := 1, body := Body}, NowMs) ->
                 "ignoring netdb store of unimplemented type ~0p for ~s",
                 [T, base64:encode(Key)]
             ),
-            ignore;
+            {ignored, {unsupported_type, T}};
         error ->
-            ignore
+            {ignored, undecodable_store}
     end;
 dispatch_db_message(#{type := 2, body := Body}, _NowMs) ->
     case i2p_i2np:decode_db_lookup(Body) of
         {ok, Parsed} -> {lookup, Parsed};
-        error -> ignore
+        error -> {ignored, undecodable_lookup}
     end;
 dispatch_db_message(#{type := 3, body := Body}, _NowMs) ->
     case i2p_i2np:decode_db_search_reply(Body) of
         {ok, Parsed} -> {search_reply, Parsed};
-        error -> ignore
+        error -> {ignored, undecodable_search_reply}
     end;
 dispatch_db_message(_Msg, _NowMs) ->
-    ignore.
+    {ignored, not_a_db_message}.
 
 %%%%%%% Internal %%%%%%%
 

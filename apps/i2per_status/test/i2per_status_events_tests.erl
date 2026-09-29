@@ -53,6 +53,7 @@ bus_event_shapes() ->
         {reachability, ssu2, firewalled},
         {ssu2_block_unhandled, some_block_kind},
         {db_store_not_stored, unparseable_router_info_data},
+        {lookup_failed, crypto:strong_rand_bytes(32), lease, no_answer},
         {config_changed, some_key, some_value}
     ].
 
@@ -87,11 +88,12 @@ every_shape_in_the_type_vocabulary_is_covered_test() ->
 
 %% The shapes the old catch-all dropped, by name, so this case fails if one is ever
 %% dropped again rather than passing because the list happened to grow. The last
-%% three joined them in #FBRVSBE: `peer_connect_failed`, `transit_denied` and
-%% `leaseset_publish_failed` were not in the bus at all, so a router that could not
-%% reach a peer, would not carry a tunnel, or could not publish a client's LeaseSet
-%% said nothing anywhere.
-the_ten_previously_dropped_shapes_are_counted_test() ->
+%% four joined them in #FBRVSBE and #902G3ZN: `peer_connect_failed`,
+%% `transit_denied`, `leaseset_publish_failed` and `lookup_failed` were not in the bus
+%% at all, so a router that could not reach a peer, would not carry a tunnel, could
+%% not publish a client's LeaseSet, or could not answer a lookup said nothing
+%% anywhere.
+the_eleven_previously_dropped_shapes_are_counted_test() ->
     PreviouslyDropped = [
         {peer_connected, crypto:strong_rand_bytes(32)},
         {peer_disconnected, crypto:strong_rand_bytes(32)},
@@ -102,7 +104,8 @@ the_ten_previously_dropped_shapes_are_counted_test() ->
         {config_changed, transit_max_tunnels, 50},
         {peer_connect_failed, crypto:strong_rand_bytes(32), timeout, 16},
         {transit_denied, 401, build_budget_drained},
-        {leaseset_publish_failed, crypto:strong_rand_bytes(32), local_store_rejected}
+        {leaseset_publish_failed, crypto:strong_rand_bytes(32), local_store_rejected},
+        {lookup_failed, crypto:strong_rand_bytes(32), lease, no_answer}
     ],
     lists:foreach(
         fun(Event) ->

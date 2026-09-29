@@ -54,7 +54,7 @@ ok = i2p_tunnel_relay:send_tunnel_data(FirstHopHash, Frame).
     send_tunnel_data/2
 ]).
 
--export_type([transit_denied_reason/0]).
+-export_type([transit_denied_reason/0, store_result/0]).
 
 -define(DEFAULT_MAX_TRANSIT, 1000).
 -define(REPLY_RET_OFFSET, 201).
@@ -146,6 +146,23 @@ one would let a reason be invented that no path can produce.
     %% The `tunnel_build_rate` token bucket is drained, so acceptance is being
     %% paced rather than refused on the merits.
     | build_budget_drained.
+
+-doc """
+What became of a responder's store on its way into the NetDb, with the reason
+attached when it did not make it.
+
+Deliberately **not** named `store_outcome`, because `m:i2p_peer:store_outcome/0`
+already exists and means something slightly different: it is the two-atom verdict
+that path hands back, with the reason travelling separately in a three-tuple. This
+one is built to be *put in a message*, so the reason is inline — a wake-up that
+omits it would be indistinguishable from a wake-up that had none.
+
+The reason vocabulary itself is `m:i2p_peer:store_not_stored_reason/0`, reused rather
+than reinvented. These are the same conditions the store path already reports, and a
+parallel set of reasons for "the NetDb would not take this record" would have to be
+kept in step with the original forever.
+""".
+-type store_result() :: stored | {not_stored, i2p_peer:store_not_stored_reason()}.
 
 %%%%%%% %%% Internal %%%%%%%
 
@@ -486,14 +503,16 @@ dispatch_local_message(StdMsg, State) ->
             DbMsg = #{type => maps:get(type, Msg), body => maps:get(body, Msg)},
             case i2p_garlic:dispatch_db_message(DbMsg, 0) of
                 {store, lease, Key, LsBin, _Ts} ->
-                    _ = i2p_netdb_srv:store_ls_binary(LsBin, erlang:system_time(second)),
-                    notify_lookup(Key, lease);
+                    notify_lookup(Key, lease, store_lease(LsBin));
                 {store, router, Key, RiBin, _Ts} ->
-                    _ = i2p_netdb_srv:store_binary(RiBin, erlang:system_time(millisecond)),
-                    notify_lookup(Key, router);
+                    notify_lookup(Key, router, store_router(RiBin));
                 {search_reply, #{key := Key, peers := Peers}} ->
                     notify_search_reply(Key, Peers);
-                _OtherOutcome ->
+                {ignored, _Reason} ->
+                    %% Nothing to tell a lookup about: no store arrived for any key,
+                    %% so a pending lookup stays pending and will time out on its own
+                    %% terms. Reporting an unparsed message as a failed lookup would
+                    %% be inventing a key that was never looked up.
                     ok
             end,
             State;
@@ -519,12 +538,47 @@ dispatch_inbound_garlic(GarlicBody, State) ->
             State
     end.
 
-%% notify_lookup/2 — wake pending remote lookups (m:i2p_lookup_srv). The
-%% orchestrator is an optional subscriber: standalone tunnel servers (tests,
-%% tooling) run without it.
--spec notify_lookup(i2p_crypto:hash(), router | lease) -> ok.
-notify_lookup(Key, Kind) ->
-    maybe_notify({db_stored, Key, Kind}).
+%% notify_lookup/3 — hand a store outcome to the pending remote lookups
+%% (m:i2p_lookup_srv). The orchestrator is an optional subscriber: standalone tunnel
+%% servers (tests, tooling) run without it.
+%%
+%% The outcome travels with the wake-up because it is the only thing that
+%% distinguishes a responder whose answer arrived and could not be used from one
+%% that never arrived. Both sites used to write `_ = i2p_netdb_srv:store_ls_binary(...)`
+%% and then send the same `{db_stored, Key, Kind}` either way, so a lookup could not
+%% tell them apart and both read as a timeout.
+-spec notify_lookup(i2p_crypto:hash(), router | lease, store_result()) -> ok.
+notify_lookup(Key, Kind, Outcome) ->
+    maybe_notify({db_stored, Key, Kind, Outcome}).
+
+%% What became of a store on its way into the NetDb, in the vocabulary
+%% `m:i2p_peer:store_not_stored_reason/0` already settled on — reused rather than
+%% reinvented, because these are the same conditions that path reports and a parallel
+%% set of reasons for them would have to be kept in step forever.
+-spec store_router(binary()) -> store_result().
+store_router(RiBin) ->
+    outcome(i2p_netdb_srv:store_binary(RiBin, erlang:system_time(millisecond))).
+
+-spec store_lease(binary()) -> store_result().
+store_lease(LsBin) ->
+    outcome(i2p_netdb_srv:store_ls_binary(LsBin, erlang:system_time(second))).
+
+%% Two accepted shapes and two refused ones, across two NetDb entry points that do not
+%% spell the vocabulary identically: `store_binary/2` says `too_old` where
+%% `store_ls_binary/2` says `expired`.
+%%
+%% The refused clause is deliberately *open*. Naming each refusal atom separately
+%% looks tidier and is worse: the union is only closed as far as today's two specs
+%% agree, and a catch-all on the outer match would be dead code that dialyzer
+%% correctly reports as unreachable -- so the day the NetDb gained a fourth refusal
+%% the mapping would raise `function_clause` inside a `permanent` child, which is how
+%% an unimplemented store type once took the tunnel manager down with it. An
+%% unfamiliar refusal is named here and surfaces as a lookup failure rather than as a
+%% dead router, and if it is not in the declared reason vocabulary the build says so.
+outcome({ok, added}) -> stored;
+outcome({ok, updated}) -> stored;
+outcome({ok, Refused}) -> {not_stored, {refused_with_reason, Refused}};
+outcome({error, Reason}) -> {not_stored, Reason}.
 
 %% notify_search_reply/2 — hand a search reply's closer-peer list to the
 %% pending lookup so it can chase the responders' suggestions.
@@ -533,7 +587,7 @@ notify_search_reply(Key, Peers) ->
     maybe_notify({search_reply, Key, Peers}).
 
 -spec maybe_notify(
-    {db_stored, i2p_crypto:hash(), router | lease}
+    {db_stored, i2p_crypto:hash(), router | lease, store_result()}
     | {search_reply, i2p_crypto:hash(), [i2p_crypto:hash()]}
 ) -> ok.
 maybe_notify(Msg) ->
@@ -746,14 +800,14 @@ dispatch_one_clove(_ConnPid, PeerHash, #{type := T, data := Data}, State) when
         {store, router, Key, RiBin, _Ts} ->
             %% RouterInfo clocks are milliseconds; LeaseSet clocks are
             %% seconds (matching the m:i2p_netdb store APIs).
-            _ = i2p_netdb_srv:store_binary(RiBin, erlang:system_time(millisecond)),
+            Outcome = store_router(RiBin),
             replicate_clove_store(0, Key, RiBin, PeerHash, State),
-            notify_lookup(Key, router),
+            notify_lookup(Key, router, Outcome),
             State;
         {store, lease, Key, LsBin, _Ts} ->
-            _ = i2p_netdb_srv:store_ls_binary(LsBin, erlang:system_time(second)),
+            Outcome = store_lease(LsBin),
             replicate_clove_store(1, Key, LsBin, PeerHash, State),
-            notify_lookup(Key, lease),
+            notify_lookup(Key, lease, Outcome),
             State;
         {lookup, Parsed} ->
             OurHash = maps:get(hash, maps:get(local, State)),
@@ -762,7 +816,10 @@ dispatch_one_clove(_ConnPid, PeerHash, #{type := T, data := Data}, State) when
         {search_reply, #{key := Key, peers := Peers}} ->
             notify_search_reply(Key, Peers),
             State;
-        ignore ->
+        {ignored, _Reason} ->
+            %% As at the other site: a message with no key in it says nothing about
+            %% any pending lookup, so it is dropped here. What a *store* was refused
+            %% for is a different matter and is carried by `notify_lookup/3`.
             State
     end;
 dispatch_one_clove(_ConnPid, _PeerHash, _Clove, State) ->
