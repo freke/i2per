@@ -273,18 +273,5 @@ is_atom_char(_) -> false.
 %% broken glob.
 -spec core_source_files() -> [file:filename_all()].
 core_source_files() ->
-    Glob = filename:join(project_root(), "apps/i2per/src/*.erl"),
+    Glob = filename:join(i2p_ct_helpers:project_root(), "apps/i2per/src/*.erl"),
     [F || F <- filelib:wildcard(Glob), filelib:is_regular(F)].
-
-%% Walk up from this module's beam until the source tree is in sight, so the test does
-%% not depend on whichever working directory rebar3 happened to choose.
-project_root() ->
-    climb(filename:dirname(code:which(?MODULE)), 8).
-
-climb(_Dir, 0) ->
-    erlang:error({project_root_not_found_from, code:which(?MODULE)});
-climb(Dir, Fuel) ->
-    case filelib:is_regular(filename:join([Dir, "apps", "i2per", "src", "i2p_log.erl"])) of
-        true -> Dir;
-        false -> climb(filename:dirname(Dir), Fuel - 1)
-    end.

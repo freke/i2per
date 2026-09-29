@@ -457,7 +457,211 @@ only_allowed_keys_that_are_set_appear_in_the_line_test() ->
     ?assertNotEqual(nomatch, string:find(Rendered, "log_level=info")),
     ?assertEqual(nomatch, string:find(Rendered, "not_allowed_at_all")).
 
+%%% %%%%% The shipped release profile %%%%% %%%
+
+%% `config/sys.config` and the module must agree on the default.
+%%
+%% This is the case that stops a release whose stated default is not the one it
+%% starts at. The file is read with `file:consult/1` rather than grepped, so the
+%% level is compared as a term and a commented-out or misspelled entry cannot pass
+%% as agreement.
+the_shipped_sys_config_level_matches_the_module_default_test() ->
+    ?assertEqual(
+        i2p_log:default_level(), sys_config_logger_level()
+    ).
+
+%% The formatter in the shipped file is *rendered*, not merely read.
+%%
+%% This is the only case that catches a wrong template key, and it earns its
+%% existence. `logger_formatter:check_config/1` validates the *shape* of a template
+%% and not whether its metadata keys exist, so
+%% `template => [time, " ", nope, "\n"]` is **accepted** at configuration time and
+%% only misbehaves when a line is rendered: an unknown key renders as an empty
+%% string, so the line comes out shorter and nothing anywhere reports an error. An
+%% unknown formatter *config* key is refused outright
+%% (`{invalid_formatter_config, ...}`), which is what makes "the config was
+%% accepted" necessary and nowhere near sufficient -- both were checked against this
+%% OTP rather than assumed.
+%%
+%% So the case does what an operator does: it takes the shipped template, renders a
+%% log event through it, and inspects the text.
+%%
+%% **Asserting the template's own keys resolve is what gives this its teeth.**
+%% `time`, `level` and `mfa` are all things a formatter knows how to render, and a
+%% bad key renders as nothing -- so each is asserted to be *present* in the output.
+%% Without that, a template of `[nope, "\n"]` would render to just the message and
+%% pass. The `nomatch` assertion for the literal string `nope` is kept as well, but
+%% on its own it only catches that one particular mistake; the three presence
+%% assertions are what catch the general one.
+the_shipped_logger_formatter_renders_a_line_test() ->
+    {logger_formatter, Formatter} = shipped_default_formatter(),
+    at_notice_level(
+        fun() ->
+            Rendered = render_through(Formatter),
+            %% Each of the template's own placeholders, resolved.
+            ?assertNotEqual(nomatch, string:find(Rendered, "notice")),
+            ?assertNotEqual(nomatch, string:find(Rendered, "i2per_t")),
+            ?assertNotEqual(nomatch, string:find(Rendered, "i2per_t:render_probe")),
+            %% A timestamp, because the template asks for one and `single_line`
+            %% still puts it there. Checked as a shape rather than a value: the point
+            %% is that the key resolved to *something*, not what time it was. RFC 3339
+            %% opens with the year, so four leading digits is the whole claim.
+            ?assertEqual(true, starts_with_a_year(Rendered)),
+            %% The message, verbatim.
+            ?assertNotEqual(nomatch, string:find(Rendered, "release profile render probe")),
+            %% `level` and `msg` are resolved by the formatter itself rather than read
+            %% out of `meta`, so this pair is the cheapest proof that the two atoms the
+            %% template names most are handled as level and message -- which is what a
+            %% typo'd `lvel` would lose.
+            %% And one line. This is the *shipped* template rendered with
+            %% `single_line` as the file sets it, so the two are asserted together
+            %% rather than separately: a template whose own newlines do not survive
+            %% `single_line` renders as several lines, which is the shape this
+            %% assertion is actually about. Read through `f:format/2`, where
+            %% `single_line` rewrites newlines in the *message* -- but this template
+            %% puts its one newline in the template, where nothing rewrites it, which
+            %% is precisely why the assertion is placed here.
+            ?assertEqual(1, length(string:split(Rendered, "\n", all)) - 1),
+            %% `single_line` gets its own case, and it is a *behaviour* assertion
+            %% rather than a read of the file, because reading it back would only
+            %% prove the file says what it says. A message carrying its own newlines
+            %% is rendered through the shipped config: with `single_line` set they
+            %% become `", "` and the entry stays one line, and with it unset they stay
+            %% newlines. That is the property an operator sees when the router reports
+            %% something multi-line, so that is what is asserted.
+            ?assertEqual(true, maps:get(single_line, Formatter)),
+            Multiline = render_through(Formatter, "first line\nsecond line"),
+            ?assertEqual(1, length(string:split(Multiline, "\n", all)) - 1),
+            ?assertNotEqual(nomatch, string:find(Multiline, "first line, second line"))
+        end
+    ).
+
+%% Whether `Rendered` opens with four digits, which is what an RFC 3339 timestamp
+%% starts with.
+%%
+%% A helper rather than an inline guard because `?assertMatch` does not bind a
+%% pattern variable on either side of the assertion, and a digit check that cannot
+%% name its digit is hard to read back in a failure.
+-spec starts_with_a_year(string()) -> boolean().
+starts_with_a_year(Rendered) ->
+    lists:all(fun(C) -> C >= $0 andalso C =< $9 end, lists:sublist(Rendered, 4)).
+
+%% Render one event through `Formatter`, as `logger` would.
+%%
+%% The event carries a `mfa` and a `meta` map, because the shipped template asks for
+%% `mfa` and an unresolvable key renders as an empty string -- so an event with no
+%% `mfa` would let a broken template pass. The probe's own values are what the
+%% assertions above look for.
+-spec render_through(map()) -> string().
+render_through(Formatter) ->
+    render_through(Formatter, "release profile render probe").
+
+-spec render_through(map(), string()) -> string().
+render_through(Formatter, Message) ->
+    Event = #{
+        level => notice,
+        msg => {"~ts", [Message]},
+        meta => #{mfa => {i2per_t, render_probe, 0}, time => erlang:system_time(microsecond)}
+    },
+    lists:flatten(
+        logger_formatter:format(Event, complete_formatter_config(Formatter))
+    ).
+
+%% The formatter the shipped file names for the `default` handler, read out of the
+%% file rather than restated -- so this case cannot pass against a copy of the
+%% shipped config that the file no longer matches, which is the whole point of
+%% reading it.
+-spec shipped_default_formatter() -> {module(), map()}.
+shipped_default_formatter() ->
+    maps:get(formatter, shipped_default_handler()).
+
+%% The `default` handler entry as `logger` would have built it, from the `logger`
+%% section of the `kernel` environment.
+%%
+%% `kernel` and not the top level: `kernel.erl` calls `logger:add_handlers(kernel)`,
+%% which reads `{kernel, [{logger, ...}]}`. A top-level `{logger, [...]}` section is
+%% not read by that path, which is why the first version of this helper found
+%% nothing and reported `false` instead of the shipped handler.
+-spec shipped_default_handler() -> map().
+shipped_default_handler() ->
+    case lists:keyfind(logger, 1, kernel_env()) of
+        {logger, Entries} ->
+            case lists:keyfind(default, 2, Entries) of
+                {handler, default, Module, Config} ->
+                    Config#{module => Module};
+                Other ->
+                    erlang:error({no_default_logger_handler_in_shipped_sys_config, Other})
+            end;
+        Other ->
+            erlang:error({no_logger_section_in_shipped_kernel_env, Other})
+    end.
+
+%% The shipped `sys.config` as one application environment per element.
+%%
+%% Consulted, not read as text. This file ends `].` -- one top-level list holding
+%% every application -- which is how a release writes it, but it means
+%% `file:consult/1` returns a *single* list of terms rather than a list of
+%% `{App, Env}` pairs. Flattened here so the rest of this module can read it the
+%% way the format looks, and so a second reader is not written to cope.
+%%
+%% It is a file of operator-facing configuration, so it is read rather than
+%% parsed by hand: `file:consult/1` is the only reader here, and the terms come
+%% back exactly as OTP will read them at boot.
+-spec sys_config() -> [{atom(), [{atom(), term()}]}].
+sys_config() ->
+    Path = filename:join(i2p_ct_helpers:project_root(), "config/sys.config"),
+    {ok, [Sections]} = file:consult(Path),
+    Sections.
+
+-spec sys_config_logger_level() -> atom().
+sys_config_logger_level() ->
+    case lists:keyfind(logger_level, 1, kernel_env()) of
+        {logger_level, Level} -> Level;
+        false -> erlang:error({no_logger_level_in_shipped_sys_config, sys_config()})
+    end.
+
+%% The shipped `kernel` environment.
+-spec kernel_env() -> [{atom(), term()}].
+kernel_env() ->
+    case lists:keyfind(kernel, 1, sys_config()) of
+        {kernel, Entries} -> Entries;
+        Other -> erlang:error({no_kernel_section_in_shipped_sys_config, Other})
+    end.
+
+%% Run `Fun` with the primary level at `notice`, then put the level back.
+%%
+%% Restoration matters more here than in the boot-line cases: a case that left the
+%% level changed would silently alter the verbosity of every case that ran after it,
+%% which is a failure nobody would look for.
+%%
+%% The handler is *not* reinstalled. The shipped handler config is already the live
+%% one under a test run started from this repository's profile, and reinstalling it
+%% would make the case assert that the file's config survives being applied -- a
+%% different claim, and one that would be testing `logger` rather than the file.
+-spec at_notice_level(fun(() -> Result)) -> Result when Result :: term().
+at_notice_level(Fun) ->
+    Before = applied_level(),
+    try
+        ok = logger:update_primary_config(#{level => notice}),
+        Fun()
+    after
+        ok = logger:update_primary_config(#{level => Before})
+    end.
+
 %%% %%%%% Internal %%%%% %%%%%
+
+-spec complete_formatter_config(map()) -> map().
+complete_formatter_config(Formatter) when is_map(Formatter) ->
+    Defaults = #{
+        chars_limit => unlimited,
+        depth => 8,
+        legacy_header => false,
+        single_line => true,
+        time_designator => $T,
+        max_size => unlimited,
+        time_offset => ""
+    },
+    maps:merge(Defaults, Formatter).
 
 %% The level `logger` is actually running at, read back rather than assumed. Asking
 %% `f:i2p_log:level/0` would be circular: it reports intent, and the point of these

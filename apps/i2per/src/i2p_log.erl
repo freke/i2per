@@ -31,17 +31,27 @@ that has to satisfy it. Declared here, both the code and the test read one list.
 wrapper that only forwarded to `logger` would not be worth its indirection; this one
 is narrowly more than that.
 
-## Where the level may be set
+## Where the level may be set, and who wins
 
-`log_level`, as an `i2per` application environment key, from three places: the
-`logger` section of `sys.config` via the `i2per` section, an `i2per.conf` line, and
-`f:i2p_config_srv:set/2` at runtime. All three land in the same key, and
-`f:apply_configured/0` is what turns that into a level at boot.
+Two places, and they answer different windows. `config/sys.config` sets
+`kernel`/`logger_level`, which is in force from the moment the node starts until
+`m:i2per_app:start/2` runs -- so it governs the kernel, stdlib and the config
+loader, which all report before this module exists. `f:apply_configured/0` then
+applies the `log_level` key, and from that point `log_level` is the level.
 
-Setting `logger`'s primary level directly in `sys.config` is **not** a supported
-path. `f:apply_configured/0` applies the level unconditionally at boot, so such a
-setting would be silently overwritten. `log_level` is the one way in, and it is
-hot: the level is the thing you want to change at 3am without a restart.
+The two must therefore agree, and they are pinned together by
+`the_shipped_sys_config_level_matches_the_module_default_test`: a release whose
+file says one thing and whose code says another starts at one verbosity and
+becomes another without anything saying so. `config/sys.config` ships
+`i2p_log:default_level/0`'s value for exactly that reason.
+
+The handler in that file carries **no** level of its own. It inherits
+`logger_level`, so there is one verbosity control rather than two, and no way to
+leave them disagreeing.
+
+`log_level` is the one way to change it while running, and it is hot: the level is
+the thing you want to change at 3am without a restart. The file is for what a node
+starts at, not for what it becomes.
 
 ## The checklist, and the one way to record a fact
 

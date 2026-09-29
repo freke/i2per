@@ -23,6 +23,7 @@
     wait_msg/2,
     events_from/1,
     log_events_from/1,
+    project_root/0,
     log_lines_from/1,
     render_log_event/1,
     floodfill_router_info/2,
@@ -42,6 +43,30 @@
 %% The same for the log-capture path. A hang guard, not a synchronisation: the
 %% barrier decides, not the clock. See `f:log_lines_from/1`.
 -define(LOG_DELIVERY_TIMEOUT_MS, 5000).
+
+%% The repository root, found by walking up from this module's beam until the
+%% source tree is in sight.
+%%
+%% Lives here because three test modules now need it and each had its own copy:
+%% `i2p_events_vocabulary_tests`, `i2p_log_checklist_tests`, and the release-profile
+%% cases in `i2p_log_tests`. A per-module copy is harmless until one of them is
+%% wrong, and then two of the three are wrong in different ways -- and the copies
+%% are only ever exercised by the case that needs them, so the drift is invisible.
+%%
+%% Walking up from the beam rather than reading the CWD, because rebar3 does not
+%% promise a working directory and a test that depends on one fails on someone's
+%% machine and not yours.
+-spec project_root() -> file:filename_all().
+project_root() ->
+    climb(filename:dirname(code:which(?MODULE)), 8).
+
+climb(_Dir, 0) ->
+    erlang:error({project_root_not_found_from, code:which(?MODULE)});
+climb(Dir, Fuel) ->
+    case filelib:is_regular(filename:join([Dir, "apps", "i2per", "src", "i2p_log.erl"])) of
+        true -> Dir;
+        false -> climb(filename:dirname(Dir), Fuel - 1)
+    end.
 
 %% A directory that exists and is writable for the current test case, created
 %% beneath the CT priv dir. Store it in Config as `{temp_data_dir, Dir}` and

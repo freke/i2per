@@ -220,24 +220,11 @@ source_files() ->
     Glob = filename:join(source_dir(), "*.erl"),
     [F || F <- filelib:wildcard(Glob), filelib:is_regular(F)].
 
-source_dir() -> filename:join(project_root(), "apps/i2per/src").
+source_dir() -> filename:join(i2p_ct_helpers:project_root(), "apps/i2per/src").
 
 read_source_lines(Path) ->
     {ok, Bin} = file:read_file(Path),
     string:split(unicode:characters_to_list(Bin), "\n", all).
-
-%% Walk up from this module's beam until the source tree is in sight, so the test does
-%% not depend on whichever working directory rebar3 happened to choose.
-project_root() ->
-    climb(filename:dirname(code:which(?MODULE)), 8).
-
-climb(_Dir, 0) ->
-    erlang:error({project_root_not_found_from, code:which(?MODULE)});
-climb(Dir, Fuel) ->
-    case filelib:is_regular(filename:join([Dir, "apps", "i2per", "src", "i2p_events.erl"])) of
-        true -> Dir;
-        false -> climb(filename:dirname(Dir), Fuel - 1)
-    end.
 
 strip_comment(Line) ->
     case string:split(Line, "%%", leading) of
