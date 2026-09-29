@@ -332,6 +332,163 @@ a_declared_fact_is_recorded_at_its_declared_level_test() ->
         end
     ).
 
+%%% %%%%% Diagnostic frames %%%%% %%%%
+
+%% The one claim that makes the fold safe, and the only negative case in the module.
+%%
+%% The SSU2 transport records a frame per thing on the wire. At `notice` -- the
+%% shipped default, and what an operator gets with no configuration at all -- none of
+%% them may appear. If this one fails, a router someone installed and never
+%% configured floods their terminal, and the level they were supposed to be able to
+%% govern does not govern it.
+%%
+%% **Absence is established by a barrier.** A marker logged at `notice` after the
+%% frames is ordered behind them by the handler's mailbox, so once it arrives every
+%% frame that was going to arrive has arrived. Waiting with a timeout instead would
+%% be the pattern the level case above documents: a flood that is correctly absent
+%% would sit on the guard until eunit cancelled the run, reporting nothing.
+a_frame_is_silent_at_the_notice_default_test() ->
+    Frames = [{recv, ab, 7, new, [i2np, relay_intro]}, {send, 9, new, []}, oos_decode_error],
+    with_level(
+        fun() ->
+            ok = logger:update_primary_config(#{level => notice}),
+            Captured = i2p_ct_helpers:log_events_from(
+                fun() ->
+                    lists:foreach(fun(Ctx) -> ok = i2p_log:debug({recv, ab, 7}, Ctx) end, Frames)
+                end
+            ),
+            ?assertEqual([], Captured)
+        end
+    ).
+
+%% The same frames, with the one config key an operator would reach for. This is what
+%% ADR 0002 means by folding `m:i2p_ssu2_trace` in: the per-packet detail becomes
+%% governable from `log_level` instead of from a registered name nobody outside the
+%% test tree could set. A frame that appeared at `notice` would make the case above
+%% fail, and one that failed to appear at `debug` would make this fail -- so the
+%% pair brackets the default rather than testing either end alone.
+a_frame_appears_when_the_log_level_is_debug_test() ->
+    with_level(
+        fun() ->
+            ok = logger:update_primary_config(#{level => debug}),
+            Captured = i2p_ct_helpers:log_events_from(
+                fun() -> ok = i2p_log:debug({recv, ab, 7}, {new, 3}) end
+            ),
+            ?assertEqual([debug], [maps:get(level, E) || E <- Captured])
+        end
+    ).
+
+%% The label reaches the shipped formatter, and it is the label rather than the
+%% context that identifies the frame.
+%%
+%% **This is the case that would have caught the metadata-only design.** The shipped
+%% `config/sys.config` template is `[time, level, mfa, msg]` and names no `metadata`
+%% placeholder, and `logger_formatter` renders an unnamed key as nothing. A frame
+%% carrying its label as metadata alone renders as a line ending in the colon -- the
+%% frame is there, and says nothing. So this renders through the *shipped* formatter
+%% rather than asserting on the collected event, because the collected event carries
+%% the metadata either way and would pass on the broken version.
+a_frame_renders_its_label_through_the_shipped_formatter_test() ->
+    {logger_formatter, Formatter} = shipped_default_formatter(),
+    with_level(
+        fun() ->
+            ok = logger:update_primary_config(#{level => debug}),
+            %% The event `f:debug/2` actually produced, rendered by the shipped
+            %% formatter. Not a hand-built map: the first version of this case
+            %% constructed its own `#{msg => ..., meta => ...}` and therefore
+            %% asserted only that the formatter can render *a* frame, which held
+            %% even when `f:debug/2` put the label nowhere a formatter would print.
+            %% The label is in the message because that is the claim, and a claim
+            %% about a function has to read the function's own output.
+            [Event] = i2p_ct_helpers:log_events_from(
+                fun() -> ok = i2p_log:debug({recv, ab, 7}, {new, [i2np, relay_intro]}) end
+            ),
+            Rendered = lists:flatten(
+                logger_formatter:format(Event, complete_formatter_config(Formatter))
+            ),
+            %% The label, rendered. Three separate checks because `~0p` of a tuple
+            %% is what puts the direction and the packet number there, and one
+            %% check on the whole tuple would be satisfied by a rendering that
+            %% printed only part of it.
+            ?assertNotEqual(nomatch, string:find(Rendered, "recv")),
+            ?assertNotEqual(nomatch, string:find(Rendered, "ab")),
+            ?assertNotEqual(nomatch, string:find(Rendered, "7")),
+            %% The level, so the line is identifiable as a frame in a log an
+            %% operator is reading. `level` is resolved by the formatter itself and
+            %% is one of the template's own placeholders.
+            ?assertNotEqual(nomatch, string:find(Rendered, "debug"))
+        end
+    ).
+
+%% The same label arrives as structured metadata, so a handler can select frames by
+%% shape rather than by parsing rendered text.
+%%
+%% Paired with the case above on purpose. That one says the frame is legible; this
+%% one says it is addressable, and the two are the two reasons `f:debug/2` carries
+%% the value in both places rather than choosing one.
+a_frame_carries_its_label_as_metadata_test() ->
+    with_level(
+        fun() ->
+            ok = logger:update_primary_config(#{level => debug}),
+            Captured = i2p_ct_helpers:log_events_from(
+                fun() -> ok = i2p_log:debug({relay, rejected, code, 42}, alice) end
+            ),
+            [Event] = Captured,
+            #{label := Label, context := Context} = maps:get(meta, Event),
+            ?assertEqual({relay, rejected, code, 42}, Label),
+            ?assertEqual(alice, Context)
+        end
+    ).
+
+%% A frame is not a fact, and the two entries do not blur.
+%%
+%% The gate is deliberately on one and not the other -- the module doc says why -- so
+%% this pins the asymmetry rather than leaving it to be inferred: `debug/2` accepts a
+%% label no checklist declares, because a frame is a shape at a call site and not an
+%% operator symptom, while `emit/3` still refuses both an undeclared name and a
+%% bus-carried one. If `f:debug/2` ever started consulting `f:checklist/0`, the 65
+%% SSU2 call sites would need a row each.
+a_frame_needs_no_checklist_row_but_a_fact_still_does_test() ->
+    ?assertNot(
+        maps:is_key({recv, ab, 7}, i2p_log:checklist()),
+        "a frame label must not become a checklist fact"
+    ),
+    ?assertError(
+        {undeclared_fact, {recv, ab, 7}}, i2p_log:emit({recv, ab, 7}, "~p", [1])
+    ),
+    %% And a declared fact still records at its declared level, unaffected by the
+    %% existence of the ungated path beside it.
+    ?assertMatch(
+        #{level := notice, instrument := log}, maps:get(online, i2p_log:checklist())
+    ).
+
+%% Both of the shapes the emitters use, asserted by value rather than left to a scan.
+%%
+%% The scan that reads the real call sites is
+%% `every_frame_call_site_passes_a_label_the_signature_accepts_test`, which asserts
+%% the sites exist and is the reason this pair is not the only coverage: this one
+%% pins the two shapes by value, so it keeps working whatever the tree does, and the
+%% one that moved with the emitters catches a site the reader cannot recognise.
+the_canonical_frame_shapes_are_accepted_test() ->
+    with_level(
+        fun() ->
+            ok = logger:update_primary_config(#{level => debug}),
+            Captured = i2p_ct_helpers:log_events_from(fun() ->
+                ok = i2p_log:debug({recv, ab, 7, new, []}, alice),
+                ok = i2p_log:debug(oos_decode_error, []),
+                ok = i2p_log:debug({relay, rejected, code, 42}, [])
+            end),
+            ?assertEqual(
+                [
+                    {recv, ab, 7, new, []},
+                    oos_decode_error,
+                    {relay, rejected, code, 42}
+                ],
+                [maps:get(label, maps:get(meta, E)) || E <- Captured]
+            )
+        end
+    ).
+
 %% Both branches of the online line.
 %%
 %% Every boot takes the `bus=up` / `read_api=answering` path, and

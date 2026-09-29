@@ -78,6 +78,26 @@ than a denylist because the environment carries material that must never be
 printed: the distribution cookie lives in `kernel`, but the explicit-mode
 `i2p_peer` key holds the identity's static private key and signing seed, and a
 denylist is only ever as good as the list of secrets somebody remembered to name.
+
+## Two entry points, and why a frame is not a fact
+
+`f:emit/3` and `f:debug/2` both reach `logger`, and they are not
+interchangeable.
+
+`f:emit/3` records a **checklist fact**: something an operator would actually
+report, at a level `f:checklist/0` declares, refusing anything it does not. It
+is gated because a fact nobody listed is a fact nobody will go looking for at 3am.
+
+`f:debug/2` records a **diagnostic frame**: the shape of a thing that just
+happened, for whoever is reading with the level turned up. It is not gated,
+because the checklist is a table of symptoms and no operator has ever come to a
+log asking to see one SSU2 datagram. The SSU2 transport is the caller that needs
+this -- 65 sites, one per event on the wire -- and a checklist row per frame
+would be a list nobody could read.
+
+The gate is on the *instrument*, not on the module. A checklist fact is held to
+the discipline; a frame is off by default because `debug` is off by default,
+which is the same reason the bus is not a checklist row per event.
 """.
 
 -export([
@@ -90,10 +110,11 @@ denylist is only ever as good as the list of secrets somebody remembered to name
     checklist/0,
     fact_names/0,
     emit/3,
+    debug/2,
     loggable_config_keys/0
 ]).
 
--export_type([level/0, fact/0, instrument/0, entry/0]).
+-export_type([level/0, fact/0, instrument/0, entry/0, label/0]).
 
 %% The app-env key. Named once here and read by `m:i2p_config`'s whitelist and
 %% `m:i2p_config_srv`'s validator, so the key name is not spelled three times.
@@ -410,6 +431,41 @@ loggable_config_keys() ->
         transit_max_tunnels,
         tunnel_build_rate
     ].
+
+%%% %%%%% Diagnostic frames %%%%% %%%%
+
+%% `f:label/0` is a free-form tag rather than `t:fact/0`, and the looseness is
+%% deliberate. A fact is drawn from a closed set the checklist declares, so a
+%% typo is a compile-time-adjacent mistake worth typing tightly. A frame is a
+%% shape at the call site -- `{recv, RecvDir, Num, new, Blocks}`, `{relay, rejected, code, Code}`
+%% -- and pinning that to a union would mean a type edit at every one of the 65
+%% sites for no gain: an unexpected shape here is a diagnostic line nobody reads
+%% until they are already reading debug output.
+-type label() :: atom() | tuple().
+
+-doc """
+Record a diagnostic frame at `debug`.
+
+Input: a `t:label/0` naming what happened and a `Context` term carrying whatever
+else the site knows -- the role, the peer, the nonce. Output: `ok`.
+
+**Not gated by the checklist, on purpose.** See the module doc: a frame is not a
+symptom, and the SSU2 transport emits one per thing on the wire. What keeps that
+from being a flood is the level, not the gate: `debug` is off at the `notice`
+default, and the `log_level` key is what turns it on.
+
+**The label goes in the message *and* in the metadata.** Both, from the one
+argument, rather than a choice between them. The message is what the shipped
+`config/sys.config` template renders -- and that template names no `metadata`
+placeholder, so a label carried only as metadata would print as a line ending in
+the colon. The metadata is what makes the frame filterable by a handler that
+wants `{recv, _, _, new, _}` without parsing text. The two are the same value
+formatted twice inside one call, not two hand-maintained copies: the duplication
+this project refuses is a second declaration that can disagree, and these cannot.
+""".
+-spec debug(label(), term()) -> ok.
+debug(Label, Context) ->
+    logger:debug("~0p ~0p", [Label, Context], #{label => Label, context => Context}).
 
 %% %%%%% Internal %%%%%
 
