@@ -31,6 +31,7 @@
     floodfill_router_info/2,
     db_store_block/3,
     dead_pid/0,
+    silent_ntcp2_peer/1,
     start_ssu2_trace/0,
     stop_ssu2_trace/0,
     dump_ssu2_trace/0,
@@ -187,6 +188,75 @@ dead_pid() ->
     receive
         {'DOWN', MRef, process, Pid, _} -> Pid
     end.
+
+%% A TCP listener that speaks the NTCP2 handshake and then stops reading.
+%%
+%% This is the "peer that has stopped reading" fault, built rather than
+%% simulated, because every way of simulating it from outside a live connection
+%% is worse: the only handle on a running responder is
+%% `f:erlang:suspend_process/1`, which deadlocks the node's code server as soon
+%% as the suspended process is anywhere near a module load, and
+%% `f:sys:suspend/1` does not work at all, because a connection process is a
+%% plain receive loop and answers no system messages. Doing the responder half of
+%% the handshake here is about thirty lines, suspends nothing, and leaves nothing
+%% behind for a later case to trip over.
+%%
+%% Input: the responder's `m:i2p_ntcp2_conn:local_keys/0`.
+%% Output: `{LSock, Port, Pid}` — the listening socket (the caller closes it),
+%% the bound port to publish in a RouterInfo, and the peer process. The peer
+%% announces `{silent_ntcp2_peer, self()}` to the calling process once the
+%% handshake is complete, and from then on never reads its socket.
+-spec silent_ntcp2_peer(map()) -> {gen_tcp:socket(), inet:port_number(), pid()}.
+silent_ntcp2_peer(Keys) ->
+    {ok, LSock} = gen_tcp:listen(0, [binary, {packet, raw}, {active, false}, {reuseaddr, true}]),
+    {ok, Port} = inet:port(LSock),
+    Parent = self(),
+    Pid = spawn(fun() -> silent_ntcp2_accept(LSock, Keys, Parent) end),
+    {LSock, Port, Pid}.
+
+silent_ntcp2_accept(LSock, Keys, Parent) ->
+    {ok, Sock} = gen_tcp:accept(LSock, 10000),
+    ok = silent_ntcp2_handshake(Sock, Keys),
+    Parent ! {silent_ntcp2_peer, self()},
+    %% Parked, not blocked: the process holds the socket and never touches it
+    %% again. A zero-length read would answer immediately and is therefore not a
+    %% way to "wait" here -- the whole point is that this process does nothing.
+    silent_ntcp2_idle(Sock).
+
+%% The responder's half of the XK handshake, using the library's own stream
+%% readers so the fixture cannot drift from what a real responder does.
+silent_ntcp2_handshake(Sock, #{static_priv := Priv, static_pub := Pub, hash := Hash, iv := IV}) ->
+    S0 = i2p_ntcp2:bob_init(Priv, Pub, Hash, IV),
+    Recv = fun
+        (0) -> {ok, <<>>};
+        (N) -> gen_tcp:recv(Sock, N, 10000)
+    end,
+    {ok, _Opts1, S1} = i2p_ntcp2:receive_msg1_stream(S0, Recv),
+    {ok, Msg2, S2} = i2p_ntcp2:create_msg2(
+        S1, silent_ntcp2_eph(), crypto:strong_rand_bytes(8), now_s()
+    ),
+    ok = gen_tcp:send(Sock, Msg2),
+    {ok, _Payload, _S3} = i2p_ntcp2:receive_msg3_stream(S2, Recv),
+    ok.
+
+silent_ntcp2_eph() ->
+    {Priv, _} = i2p_crypto:x25519_keygen(),
+    Priv.
+
+now_s() ->
+    erlang:system_time(second).
+
+%% The socket stays open on purpose: closing it would be a different fault (a peer
+%% that went away, which the connection already handles as `{tcp_closed, _}`), and
+%% this fixture exists to produce the one where the peer is present and silent.
+silent_ntcp2_idle(Sock) ->
+    receive
+        {read, From} ->
+            {ok, Data} = gen_tcp:recv(Sock, 0, 1000),
+            From ! {read, Data},
+            silent_ntcp2_idle(Sock)
+    end.
+
 db_store_block(0, Key, RI) when is_map(RI) ->
     db_store_block(0, Key, i2p_i2np:router_info_data(i2p_router_info:to_binary(RI)));
 db_store_block(Type, Key, Data) when is_binary(Data) ->

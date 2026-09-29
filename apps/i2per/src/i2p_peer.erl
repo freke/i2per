@@ -1516,6 +1516,16 @@ enqueue_lookup(PeerHash, LookupType, State) ->
 %% pre-encoded `i2p_framing` block; SSU2 takes the message split into its
 %% type/msg-id/body components (the SSU2 session re-adds the 9-byte short
 %% header inside its own I2NP block).
+%%
+%% Neither transport's send makes this process wait, and that is the property
+%% this function is shaped around rather than a detail of it. This is a single
+%% `gen_server` through which every inbound message from every connection
+%% passes, so a send that blocked on one connection stopped I2NP for all of
+%% them. Both entries are casts now (`f:i2p_ntcp2_conn:send/2`,
+%% `f:i2p_ssu2_conn:send_i2np/4`), and a send to a connection that cannot take
+%% it is lost rather than waited on — which the monitor on every connection
+%% already turns into a disconnect and a backoff, the same recovery a failed
+%% connect gets. Nothing here branches on the result, because there is none.
 send_i2np(ConnPid, Transport, I2NPMsg) ->
     %% Stays a case: is_process_alive/1 is a BIF but not guard-legal.
     case is_process_alive(ConnPid) of

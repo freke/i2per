@@ -41,6 +41,7 @@ bus_event_shapes() ->
         {peer_connected, crypto:strong_rand_bytes(32)},
         {peer_disconnected, crypto:strong_rand_bytes(32)},
         {peer_connect_failed, crypto:strong_rand_bytes(32), {handshake, timeout}, 8},
+        {peer_send_stalled, crypto:strong_rand_bytes(32), socket_blocked},
         {tunnel_built, outbound, 3},
         {tunnel_failed, inbound, invalid},
         {tunnel_expired, inbound},

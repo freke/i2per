@@ -1084,11 +1084,14 @@ dead_pid() ->
         {'DOWN', MRef, process, Pid, _} -> Pid
     end.
 
+%% Stands in for a transport connection: takes frames and hands them to the test.
+%% The shape is `{send, Payload}` with no reply and no sender, because that is
+%% what `m:i2p_ntcp2_conn:send/2` sends now — a cast. A fake that answered would
+%% be testing the old protocol, and the point of the cast is that no caller waits.
 capture_loop(Test) ->
     receive
-        {send, From, Ref, Payload} ->
+        {send, Payload} ->
             Test ! {captured, Payload},
-            From ! {send_done, Ref},
             capture_loop(Test)
     end.
 

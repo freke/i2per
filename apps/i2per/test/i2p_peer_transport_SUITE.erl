@@ -21,11 +21,22 @@
     transport_ntcp2_when_ssu2_disabled/1,
     transport_ssu2_when_available/1,
     transport_falls_back_to_ntcp2/1,
+    one_stalled_connection_does_not_stop_the_others/1,
     dead_peer_backs_off_then_recovers/1
 ]).
 
 -define(APP, i2per).
 -define(TIMEOUT, 10000).
+
+%% How many frames the wedged-connection case pushes at the silent peer, and how
+%% long it then waits for that connection to be sitting in the socket write. The
+%% frames are the largest legal NTCP2 payload, so a few hundred of them are
+%% megabytes — comfortably past what a socket absorbs before it refuses, which
+%% was measured on this tree at 45 frames of 60 kB. Both numbers are hang guards
+%% on kernel and driver behaviour rather than claims about the router; reaching
+%% either fails the case rather than passing it.
+-define(FILL_FRAMES, 400).
+-define(BLOCKED_WINDOW_MS, 15000).
 
 suite() ->
     [].
@@ -36,6 +47,7 @@ all() ->
         transport_ntcp2_when_ssu2_disabled,
         transport_ssu2_when_available,
         transport_falls_back_to_ntcp2,
+        one_stalled_connection_does_not_stop_the_others,
         dead_peer_backs_off_then_recovers
     ].
 
@@ -49,8 +61,19 @@ all() ->
 
 init_per_testcase(Case, Config) ->
     ok = arm_ssu2(Case),
+    ok = arm_sndbuf(Case),
     {ok, _} = application:ensure_all_started(?APP),
     [{timetrap, timetrap_for(Case)} | Config].
+
+%% A small per-connection send buffer, so the silent peer's socket fills in a few
+%% frames rather than however many the kernel's autotuning would allow. This is
+%% the same option an operator sets to bound what one non-reading peer costs, so
+%% the case reaches the stall through a production lever rather than a private
+%% mechanism. Read when a connection enters the data phase, which is after this.
+arm_sndbuf(one_stalled_connection_does_not_stop_the_others) ->
+    application:set_env(?APP, ntcp2_sndbuf, 4096);
+arm_sndbuf(_Case) ->
+    ok.
 
 arm_ssu2(transport_ntcp2_when_remote_is_ntcp2_only) ->
     application:set_env(?APP, ssu2_enabled, true);
@@ -69,6 +92,7 @@ timetrap_for(_Case) ->
 end_per_testcase(_Case, _Config) ->
     application:stop(?APP),
     ok = application:unset_env(?APP, ssu2_enabled),
+    ok = application:unset_env(?APP, ntcp2_sndbuf),
     ok.
 
 %% ---------------------------------------------------------------------------
@@ -182,6 +206,163 @@ transport_falls_back_to_ntcp2(_Config) ->
     after
         i2p_ntcp2_listener:stop(LB),
         i2p_ssu2_listener:stop(AL)
+    end.
+
+%% --------------------------------------------------------------------------
+%% One wedged connection does not stop the router
+%% --------------------------------------------------------------------------
+
+%% The whole point of the case, and the reason the send path was rebuilt.
+%%
+%% The manager is one `gen_server` that every inbound message from every
+%% connection passes through, so a send that blocked on one connection stopped
+%% I2NP for all of them. Two peers are connected here: one healthy, and one whose
+%% far end completed a real NTCP2 handshake and then went silent
+%% (`f:i2p_ct_helpers:silent_ntcp2_peer/1`), so its window shuts and the manager's
+%% connection to it ends up blocked in a socket write. While that is true, a
+%% message for the *healthy* peer still has to arrive.
+%%
+%% The conclusion the case draws is a barrier: the healthy peer's connection
+%% delivers a real DatabaseLookup, which is an event the runtime ordered and not
+%% a duration the case slept through. Under the old send the manager would be
+%% inside `f:i2p_ntcp2_conn:send/2` waiting for a reply from the wedged
+%% connection, and that frame would never arrive at all.
+%%
+%% Two things make the ordering honest rather than lucky. The wedged connection is
+%% the manager's own, so "it is blocked in a socket write" is read off the live
+%% process before the healthy send is issued; and the case then asserts that
+%% connection is *still* blocked afterwards, so the healthy frame cannot have been
+%% served before the stall rather than during it.
+one_stalled_connection_does_not_stop_the_others(_Config) ->
+    {A, B, Silent} = trio(),
+    {LSilent, SilentPort, _Peer} = i2p_ct_helpers:silent_ntcp2_peer(Silent),
+    {ok, LB} = i2p_ntcp2_listener:listen(0, B, self()),
+    try
+        %% Three distinct routers, and it has to be three: the RouterInfo hash
+        %% covers the identity rather than the published addresses, so a second
+        %% RouterInfo built from the same router would be the *same peer* with a
+        %% different port, and the manager would have held one connection where
+        %% this case needs two.
+        BRI = ri_at(listen_port(LB), B),
+        SilentRI = ri_at(SilentPort, Silent),
+        BHash = i2p_router_info:hash(BRI),
+        SilentHash = i2p_router_info:hash(SilentRI),
+        start_peer(local(A, 4668), [BRI, SilentRI]),
+        ok = i2p_peer:lookup(SilentHash, exploratory),
+        ok = await_silent_peer(),
+        await_peer_status(SilentHash, connected),
+        await_peer_status(BHash, connected),
+        Stalled = connection_of(SilentHash),
+        %% Two keys minted here, neither of them a peer's, so neither can be a key
+        %% the manager would have looked up by itself.
+        StalledKey = crypto:strong_rand_bytes(32),
+        ProbeKey = crypto:strong_rand_bytes(32),
+        %% Push the silent peer's socket past what it will absorb, from a separate
+        %% process so the feeding and the observation are not one loop. The frames
+        %% are the largest legal payload, so this is megabytes rather than
+        %% thousands of casts, and it happens fast.
+        Filler = spawn(fun() -> flood(Stalled, ?FILL_FRAMES) end),
+        try
+            ok = await_blocked(Stalled),
+            %% Everything the manager has already put on the wire is drained
+            %% first. Connecting to a peer flushes its queued lookups, so a
+            %% DatabaseLookup is sitting in this mailbox from before the stall
+            %% began, and a case that waited for "a lookup" without clearing it
+            %% would be satisfied by that stale frame whether or not the manager
+            %% could still reach anybody — the assertion would be true in exactly
+            %% the situation it exists to detect is fixed.
+            ok = drain_frames(),
+            %% Both of these are casts, so neither call can itself be what is
+            %% being waited on. That is the property, visible in the shape of the
+            %% calls that carry it: the manager reaches the second peer without
+            %% returning from the first.
+            ok = i2p_peer:send_when_ready(SilentHash, probe(StalledKey)),
+            ok = i2p_peer:send_when_ready(BHash, probe(ProbeKey)),
+            {CB, {lookup, Lookup}} = await_frame(),
+            %% The key is the proof the frame is this probe and not a leftover:
+            %% the manager never looks up a key it was not given, and this one was
+            %% minted after the drain.
+            ProbeKey = maps:get(key, Lookup),
+            true = is_pid(CB),
+            true = is_pid(Filler),
+            %% Still wedged, so the healthy frame above was served during the
+            %% stall rather than after it.
+            {current_function, {prim_inet, send, _}} =
+                erlang:process_info(Stalled, current_function)
+        after
+            exit(Filler, kill)
+        end,
+        i2p_peer:stop()
+    after
+        i2p_ntcp2_listener:stop(LB),
+        gen_tcp:close(LSilent)
+    end.
+
+%% A DatabaseLookup, because that is the message the manager really sends for
+%% outstanding work, and because the healthy peer's connection decodes it into a
+%% `lookup` this case can recognise: the assertion is that a real message
+%% crossed, not that bytes moved. The key is the caller's, so the frame can be
+%% told apart from any lookup the manager sent on its own.
+probe(Key) ->
+    i2p_i2np:db_lookup(Key, Key, i2p_i2np:lookup_type_routerinfo(), []).
+
+%% Discard every frame already delivered to the healthy peer's connection. Only
+%% frames from the connection under test are drained, so a message belonging to
+%% another case's connection is left alone rather than swallowed.
+drain_frames() ->
+    drain_frames(?TIMEOUT).
+
+drain_frames(Timeout) ->
+    receive
+        {ntcp2_frame, _Conn, _Payload} -> drain_frames(Timeout)
+    after Timeout ->
+        ok
+    end.
+
+%% Whether the connection has stopped draining its mailbox by sitting in the
+%% socket write — the state the whole case is about. This one is polled, because
+%% a process does not announce that it has entered a NIF, and it says only that
+%% the stall is in place before the barrier is set up; whether the manager kept
+%% working is then answered by the frame. Reaching the deadline fails the case.
+await_blocked(Conn) ->
+    await_blocked(Conn, erlang:monotonic_time(millisecond) + ?BLOCKED_WINDOW_MS).
+
+await_blocked(Conn, Deadline) ->
+    case erlang:process_info(Conn, current_function) of
+        {current_function, {prim_inet, send, _}} ->
+            ok;
+        _Other ->
+            case erlang:monotonic_time(millisecond) >= Deadline of
+                true -> erlang:error({connection_never_blocked, Conn});
+                false -> await_blocked(Conn, Deadline)
+            end
+    end.
+
+flood(_Conn, 0) ->
+    ok;
+flood(Conn, N) ->
+    ok = i2p_ntcp2_conn:send(Conn, i2p_framing:encode_block(3, crypto:strong_rand_bytes(60_000))),
+    flood(Conn, N - 1).
+
+%% The silent peer's announcement that it has stopped reading. Its own barrier,
+%% and it is needed rather than merely tidy: frames sent before the peer parks
+%% would be drained, and the socket would never fill.
+await_silent_peer() ->
+    receive
+        {silent_ntcp2_peer, _Peer} -> ok;
+        {ntcp2_ready, _Conn, _RemoteRI} -> await_silent_peer()
+    after ?TIMEOUT ->
+        error(peer_never_went_silent)
+    end.
+
+%% The manager's connection pid for one peer. `f:i2p_peer:status/0` reports
+%% status, attempts and transport, and the pid is none of those, so this reads
+%% the manager's state through the documented introspection call rather than
+%% adding an accessor to the module under test for one case's benefit.
+connection_of(Hash) ->
+    case sys:get_state(i2p_peer) of
+        #{peers := Peers} -> maps:get(conn, maps:get(Hash, Peers));
+        _Other -> erlang:error(peer_not_in_manager_state)
     end.
 
 %% --------------------------------------------------------------------------

@@ -280,11 +280,12 @@ site is not.
     | unhandled_ssu2_block_peer
     | netdb_refused_routerinfo
     | reseed_failed
-    %% ADR 0002's six bus-carried rows. Named for the event that carries them,
+    %% ADR 0002's seven bus-carried rows. Named for the event that carries them,
     %% because the fact *is* the event: an operator's symptom and the announcement
     %% that answers it are the same thing here, so a second name for it would be a
     %% second thing to keep in step.
     | peer_connect_failed
+    | peer_send_stalled
     | lookup_failed
     | reachability
     | transit_denied
@@ -329,14 +330,14 @@ Adding a row here without recording it is not something the compiler can see. A
 type is not data, so nothing at the type level can say whether `started_as` is ever
 written; only a check that reads the tree can, and that is what this row is for.
 
-**What is deliberately not here.** `m:i2p_events:event/0` admits seventeen event
-shapes and only six are checklist rows, because the checklist is not the event
+**What is deliberately not here.** `m:i2p_events:event/0` admits eighteen event
+shapes and only seven are checklist rows, because the checklist is not the event
 vocabulary. It is ADR 0002's table of *symptoms an operator would report*, and a
 `peer_disconnected` is not one -- nothing an operator would come to the log to ask
 about. Declaring the rest would make the checklist a second copy of the event type,
 and the event type is already covered from both sides by
-`i2p_events_vocabulary_tests`. Two lists of the same seventeen things is the
-duplication this project refuses; so is a third list of six of them.
+`i2p_events_vocabulary_tests`. Two lists of the same eighteen things is the
+duplication this project refuses; so is a third list of seven of them.
 """.
 -spec checklist() -> #{fact() => entry()}.
 checklist() ->
@@ -353,9 +354,10 @@ checklist() ->
         unhandled_ssu2_block_peer => #{level => warning, instrument => log},
         netdb_refused_routerinfo => #{level => warning, instrument => log},
         reseed_failed => #{level => warning, instrument => log},
-        %% ADR 0002's six bus-carried rows, one per entry, in the order the ADR's
+        %% ADR 0002's seven bus-carried rows, one per entry, in the order the ADR's
         %% table lists them. No `level` on any of them: see `t:entry/0`.
         peer_connect_failed => #{instrument => bus},
+        peer_send_stalled => #{instrument => bus},
         lookup_failed => #{instrument => bus},
         reachability => #{instrument => bus},
         transit_denied => #{instrument => bus},

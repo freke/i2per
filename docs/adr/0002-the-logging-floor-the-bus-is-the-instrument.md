@@ -78,6 +78,7 @@ available, and where they live.
 | Symptom | Facts required | Carried by |
 |---|---|---|
 | "It won't connect to any peers" | peer hash, why the connect failed, the backoff interval now in force | `peer_connect_failed` |
+| "Traffic to one peer has stopped" | the peer, and that it stopped accepting our writes rather than simply closing | `peer_send_stalled` |
 | "My client can't reach anything" | the key, and whether **anyone** answered at all | `lookup_failed` |
 | "Nobody can reach me" | the current verdict, and how often it has changed | `reachability` |
 | "I'm not carrying anyone's tunnels" | the receive tunnel ID and which of the three causes | `transit_denied` |
@@ -98,6 +99,16 @@ The first row is also where the existing levels are wrong today:
 map's own default the fact is invisible — while the same condition emits
 `db_store_not_stored` on the bus. A router with no subscriber attached currently
 cannot report that a peer sent it something it could not use.
+
+**One row added after acceptance.** `peer_send_stalled` joined the table when the
+NTCP2 send path stopped waiting on a connection ([G4TF5RT]) and a peer that had
+stopped taking writes became a nameable outcome rather than an indefinite hang.
+It is a new row and not a change to the decision: the bus was already the right
+instrument for a peer-path fault with a reason attached, and the alternative the
+table rules out — logging the same fact a subscriber would also read — is the one
+thing this ADR exists to prevent. What the row buys is the difference between
+"that peer disconnected" and "that peer stopped accepting our writes", which are
+different faults with different fixes and were the same event.
 
 ## Consequences
 

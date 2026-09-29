@@ -23,6 +23,64 @@ The process is written to let protocol/session failures die:
 Its death closes the socket and reclaims the state; the supervisor never
 restarts it and the listener and every sibling connection are unaffected.
 
+## The send path, and why no caller waits on it
+
+`f:send/2` is a cast, and the data-phase socket cannot block this process. Both
+are load-bearing together, and both exist because of who the caller is.
+
+The caller is `m:i2p_peer`, one `gen_server` for the whole router, through which
+every inbound message from every connection passes. It used to call
+`f:send/2`, which handed the payload over and then waited for a `{send_done, Ref}`
+reply with **no timeout clause** — so one peer that was slow rather than dead, a
+burst of AEAD or a socket write against a shut TCP window, stopped I2NP for
+every other peer. The wait had no bound to hit. The same call had a second,
+narrower unbounded wait: it monitored nothing, so a connection that died between
+the caller's liveness check and its own message was a caller that never came back.
+
+Serialisation is the reason the framing cannot simply move to the caller. NTCP2's
+data phase is a stateful cipher stream — the message number and the SipHash IV
+advance with every frame in a direction — so the frames have to be encrypted in
+one process, in order, by whoever owns that state. What serialisation does *not*
+require is the caller waiting for it. The caller hands the frame over and
+returns, exactly as `m:i2p_ssu2_conn:send_i2np/4` does; the two transports are
+now symmetric on the send path, so "make the busy one slower to fix" is no longer
+a reason to leave a defect in one of them.
+
+Making the caller wait-free is only half of it, because a process that never
+returns from `f:send/2` is not much better than one that blocks: the connection
+would still be stuck, and the frames would still queue. So the data-phase socket
+is set `{delay_send, true}` with a `send_timeout`, which turns the socket write
+from a wait into a question with a deadline. A peer that has stopped reading now
+produces `{error, timeout}` in a known time, which `f:send_payload/3` turns into
+a named exit and a bus announcement rather than an indefinite hang.
+
+**What a stall costs, and where it ends.** The bound is the wire's, not a tuning
+number: the driver accepts a finite queue before the send has to wait, so a peer
+that never reads runs out of room after a fixed amount of undrained data and the
+connection ends with `{send_stalled, socket_blocked}` and one
+`{peer_send_stalled, _, socket_blocked}` on the bus. The peer manager observes
+that as a disconnect and its existing backoff takes over; it does not re-announce
+the reason, because the bus already carries it and ADR 0002 says a fact is
+recorded once, on one instrument.
+
+**Head-of-line, and the bound that holds it.** A send is serviced in mailbox
+order, so it waits behind whatever is already queued. That is at most one
+inbound socket message, because the socket is driven `{active, once}` and
+re-armed only after the message in hand has been processed — an invariant of this
+loop rather than a number someone chose, and the reason a burst of inbound
+traffic cannot delay an outbound frame without bound. Inbound and outbound
+frames must share one queue: the framing state they depend on is this process's,
+and a second queue would mean two owners of one message number.
+
+**What is deliberately not here.** Nothing bounds the *caller's* send rate to one
+peer, so a connection that stays alive but stops draining its mailbox — wedged
+somewhere this module cannot see — would accumulate frames until it recovered.
+That costs this router memory on one connection and nothing else, because the
+caller no longer waits on it, which is the property this is here to buy; the
+socket bound above ends the case where the peer is the one not reading. A sweep
+over connection queue lengths in the peer manager would close the remainder, and
+is not worth a per-connection timer until a send rate makes it matter.
+
 ## Usage
 
 ```erlang
@@ -30,7 +88,8 @@ restarts it and the listener and every sibling connection are unaffected.
 Local = #{static_priv := P, static_pub := Q, hash := H, iv := I, ri := RI},
 {ok, Conn} = i2p_ntcp2_conn:connect(PeerRI, Local, #{}),
 
-%% Send a framed payload (blocks) and receive {ntcp2_frame, Conn, Payload}.
+%% Hand a framed payload (blocks) to the connection and receive
+%% {ntcp2_frame, Conn, Payload} when it comes back the other way.
 ok = i2p_ntcp2_conn:send(Conn, i2p_framing:encode_block(254, <<>>)),
 receive {ntcp2_frame, Conn, Payload} -> Payload after 5000 -> timeout end.
 ```
@@ -78,6 +137,20 @@ RouterInfo, announced by both roles) and `{ntcp2_frame, Pid, Payload}`;
 }.
 -export_type([config/0]).
 
+-doc """
+Why a connection stopped accepting sends, as carried on the `m:i2p_events` bus
+and in this process's exit reason.
+
+`socket_blocked` — the socket would not take the frame. The data phase is
+`{delay_send, true}` with a `send_timeout`, so the question has a deadline, and
+a peer that has stopped reading answers it in a known time. That is the whole
+vocabulary today; a reason not modelled here is a socket error this module does
+not expect, and it crashes the connection rather than being given a name it has
+not earned.
+""".
+-type send_stalled_reason() :: socket_blocked.
+-export_type([send_stalled_reason/0]).
+
 -define(DEFAULT_TIMEOUT, 15000).
 %% Data-phase idle reaping: a connection that receives no frames for this
 %% long is considered dead and the connection process exits with
@@ -88,6 +161,19 @@ RouterInfo, announced by both roles) and `{ntcp2_frame, Pid, Payload}`;
 %% remains as the slower safety net.
 -define(IDLE_TIMEOUT_MS, 120000).
 -define(KEEPALIVE_INTERVAL_MS, 60000).
+%% How long the data-phase socket write may hold this process when the peer has
+%% stopped reading. The data phase is `{delay_send, true}`, so without this the
+%% send is a wait with no deadline and a peer that never reads wedges the
+%% connection exactly as an unbounded caller-side wait wedged the peer manager.
+%% Generous, because a burst is not a fault: the point is that the wait ends,
+%% not that it ends quickly. Overridable per run via app env `i2per` ->
+%% `ntcp2_send_timeout_ms`.
+-define(SEND_TIMEOUT_MS, 30000).
+%% How long `f:stop/1` waits for a graceful close before killing the process.
+%% A connection that cannot answer a close request cannot be closed gracefully,
+%% and an exported function with an unbounded wait is the defect this module just
+%% removed from its send path.
+-define(STOP_TIMEOUT_MS, 1000).
 
 -doc """
 Establish a connection to a peer as the initiator.
@@ -137,25 +223,45 @@ await_connection(Pid, Timeout) ->
     end.
 
 -doc """
-Send one data-phase frame carrying `Payload` (a concatenation of encoded
+Hand one data-phase frame carrying `Payload` (a concatenation of encoded
 blocks) to the peer.
 
-Returns `ok` once the frame has been handed to the socket. The message number
-and SipHash IV advance with every frame in this direction.
+Input: `Conn` — a connection process in the data phase; `Payload` — the blocks
+to frame and write. Output: `ok`, as soon as the frame is queued to the
+connection. **This returns before the frame has been encrypted, framed or
+written**, and a connection that cannot take it never says so here.
+
+That is the whole contract, and it is what makes the caller safe. The caller is
+`m:i2p_peer` — one process for the whole router, through which every inbound
+message from every connection passes — and this function used to wait for a
+`{send_done, Ref}` reply with no timeout clause, so one wedged peer stopped I2NP
+for all of them. It is a cast now, the same shape as
+`m:i2p_ssu2_conn:send_i2np/4`; see the module doc for why the framing cannot move
+to the caller and why the caller does not have to follow it.
+
+Frames are written in the order they are handed over, which is what the cipher
+state requires. The cost of that is head-of-line within the connection, bounded
+at one inbound socket message by `{active, once}`; the module doc says what that
+bound rests on.
+
+The other consequence worth stating: a frame handed to a connection that dies
+before reading its mailbox is lost. The caller monitors the connection, so the
+loss surfaces as a disconnect and the peer's queued work is re-sent on reconnect
+— the recovery a send that failed for any other reason already gets.
 """.
 -spec send(pid(), binary()) -> ok.
 send(Conn, Payload) ->
-    Ref = make_ref(),
-    Conn ! {send, self(), Ref, Payload},
-    receive
-        {send_done, Ref} -> ok
-    end.
+    Conn ! {send, Payload},
+    ok.
 
 -doc """
 Close the connection gracefully: the process exits `normal` and the socket
 closes with it. The supervisor's `temporary` restart policy leaves it dead.
 Returns `ok` even if the connection already died on its own (e.g. the peer
-closed the socket).
+closed the socket), and also if it is alive but never answers — after
+`?STOP_TIMEOUT_MS` the process is killed, because a connection that cannot be
+closed gracefully should not be left holding a socket, and this function's wait
+is bounded for the same reason `f:send/2`'s caller no longer waits at all.
 """.
 -spec stop(pid()) -> ok.
 stop(Conn) ->
@@ -168,6 +274,10 @@ stop(Conn) ->
             ok;
         {'DOWN', MRef, process, Conn, _} ->
             ok
+    after ?STOP_TIMEOUT_MS ->
+        erlang:demonitor(MRef, [flush]),
+        _ = catch exit(Conn, shutdown),
+        ok
     end.
 
 -doc false.
@@ -231,17 +341,56 @@ enter_data_phase(Owner, Sock, Keys, SendDir, RecvDir, Timer, RemoteRI) ->
             {ba, ab} -> {KBa, SipBa, KAb, SipAb}
         end,
     Owner ! {ntcp2_ready, self(), RemoteRI},
-    ok = inet:setopts(Sock, [{active, once}]),
+    ok = inet:setopts(Sock, data_phase_opts()),
     data_loop(
         Owner,
         Sock,
         #{key => SendKey, sip => SendSip, msg => 0},
         i2p_stream:new(RecvKey, RecvSip),
+        i2p_router_info:hash(RemoteRI),
         arm_idle_timer(),
         arm_keepalive_timer()
     ).
 
-data_loop(Owner, Sock, Send, Recv, IdleRef, KeepaliveRef) ->
+%% The data-phase socket is driven by this process and nothing else, so it must
+%% not be able to stop this process.
+%%
+%% `{active, once}` is what bounds head-of-line on the send path: one inbound
+%% socket message is in hand at a time, so a queued send waits behind at most
+%% that one. The option is re-armed after the message in hand has been
+%% processed, so the bound is this loop's own structure rather than a number
+%% anyone chose.
+%%
+%% `{delay_send, true}` with a `send_timeout` is what bounds the write. Together
+%% they turn `gen_tcp:send/2` from a wait into a question with a deadline: the
+%% driver takes the frame and returns, and when the peer has stopped reading the
+%% queue fills and the send comes back `{error, timeout}` in a known time. Either
+%% option alone is not a bound — with `delay_send` and no `send_timeout` the send
+%% waits for driver room indefinitely, which is the same unbounded wait one level
+%% down from the one removed from the caller.
+%%
+%% `sndbuf` is offered and **not defaulted**: the kernel's own autotuning is left
+%% in charge unless an operator sets `i2per` -> `ntcp2_sndbuf`, because how much
+%% undrained data one peer may cost this router is a memory-budget decision for
+%% whoever runs it, and picking the number for them is not this module's call.
+%% Setting it has a second effect worth knowing: the queue the driver can fill
+%% before it refuses is a function of it, so a smaller buffer brings the stall
+%% above sooner as well as bounding what it costs.
+data_phase_opts() ->
+    [
+        {active, once},
+        {delay_send, true},
+        {send_timeout, send_timeout_ms()}
+        | sndbuf_opt()
+    ].
+
+sndbuf_opt() ->
+    case application:get_env(i2per, ntcp2_sndbuf) of
+        {ok, Bytes} when is_integer(Bytes), Bytes > 0 -> [{sndbuf, Bytes}];
+        _ -> []
+    end.
+
+data_loop(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef) ->
     receive
         {tcp, Sock, Data} ->
             %% Counted on arrival, before the framing is touched. `Data` is the
@@ -264,20 +413,24 @@ data_loop(Owner, Sock, Send, Recv, IdleRef, KeepaliveRef) ->
                         Sock,
                         Send,
                         Recv1,
+                        RemoteHash,
                         rearm_idle_timer(IdleRef),
                         KeepaliveRef
                     );
                 error ->
                     exit({protocol_error, malformed_frame})
             end;
-        {send, From, Ref, Payload} ->
-            Send1 = send_payload(Sock, Send, Payload),
-            From ! {send_done, Ref},
+        {send, Payload} ->
+            %% Serviced in mailbox order, which the framing state requires and the
+            %% socket's send timeout bounds. No reply: the sender is not waiting,
+            %% and a reply here is what made every caller a waiter.
+            Send1 = send_payload(Sock, Send, Payload, RemoteHash),
             data_loop(
                 Owner,
                 Sock,
                 Send1,
                 Recv,
+                RemoteHash,
                 rearm_idle_timer(IdleRef),
                 KeepaliveRef
             );
@@ -295,24 +448,55 @@ data_loop(Owner, Sock, Send, Recv, IdleRef, KeepaliveRef) ->
         idle_timeout ->
             exit({idle_timeout, no_activity});
         keepalive ->
-            Send1 = send_payload(Sock, Send, keepalive_payload()),
+            Send1 = send_payload(Sock, Send, keepalive_payload(), RemoteHash),
             data_loop(
                 Owner,
                 Sock,
                 Send1,
                 Recv,
+                RemoteHash,
                 rearm_idle_timer(IdleRef),
                 arm_keepalive_timer()
             )
     end.
 
-send_payload(Sock, Send, Payload) ->
+send_payload(Sock, Send, Payload, RemoteHash) ->
     #{key := Key, sip := Sip, msg := Msg} = Send,
     {Frame, Sip1} = i2p_framing:encrypt_frame(Key, Msg, Payload, Sip),
     Wire = i2p_framing:frame_bytes(Frame),
+    write_frame(Sock, Wire, RemoteHash),
+    %% Charged after the write, not before. The counter's claim is that it reports
+    %% what this router handed to the socket, and a frame the socket refused is
+    %% not that — and refusing is now an outcome the process can reach and name
+    %% rather than a crash, so counting ahead of the write would be counting bytes
+    %% this router did not send.
     ok = i2p_stats:add(ntcp2_bytes_out, byte_size(Wire)),
-    ok = gen_tcp:send(Sock, Wire),
     Send#{sip => Sip1, msg => Msg + 1}.
+
+%% The socket would not take the frame, which on a `{delay_send, true}` socket
+%% means the peer's window has been shut for longer than `send_timeout`. There
+%% is no partial send to recover and no queue worth draining: the connection is
+%% dead, and letting the peer manager rediscover that through a monitor and a
+%% backoff is the recovery that already exists for a closed socket.
+%%
+%% The announcement is the whole report (ADR 0002: a fact is recorded once, on
+%% one instrument). The peer manager deliberately does not repeat the reason when
+%% it observes the disconnect — a busy consumer would read the same fact twice,
+%% and the log line that would be the tempting second copy is exactly what the
+%% rule is about.
+%%
+%% `closed` is not a stall and is not matched here: a closed socket raises, and
+%% the loop's own `{tcp_closed, Sock}` clause names a disconnect as a disconnect.
+%% Any other send error is likewise unmodelled, so it crashes the connection
+%% rather than being given a reason `t:send_stalled_reason/0` has not earned.
+write_frame(Sock, Wire, RemoteHash) ->
+    case gen_tcp:send(Sock, Wire) of
+        ok ->
+            ok;
+        {error, timeout} ->
+            i2p_events:notify({peer_send_stalled, RemoteHash, socket_blocked}),
+            exit({send_stalled, socket_blocked})
+    end.
 
 keepalive_payload() ->
     Now = erlang:system_time(second) band 16#FFFFFFFF,
@@ -334,6 +518,15 @@ keepalive_interval_ms() ->
     case application:get_env(i2per, ntcp2_keepalive_interval_ms) of
         {ok, Ms} when is_integer(Ms), Ms > 0 -> Ms;
         _ -> ?KEEPALIVE_INTERVAL_MS
+    end.
+
+%% How long the data-phase socket write may hold this process. Read once, at the
+%% transition into the data phase, so a change mid-connection cannot leave the
+%% socket with a timeout this loop does not know about.
+send_timeout_ms() ->
+    case application:get_env(i2per, ntcp2_send_timeout_ms) of
+        {ok, Ms} when is_integer(Ms), Ms > 0 -> Ms;
+        _ -> ?SEND_TIMEOUT_MS
     end.
 
 idle_timeout_ms() ->

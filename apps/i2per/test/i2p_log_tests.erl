@@ -258,12 +258,18 @@ the_checklist_declares_a_level_and_an_instrument_for_every_fact_test() ->
     ).
 
 %% A bus-carried fact cannot be written to the log, which is ADR 0002's one-instrument
-%% rule enforced rather than described: the six bus rows exist so that a fact a counter
+%% rule enforced rather than described: the bus rows exist so that a fact a counter
 %% reads cannot also become a log line, and `f:emit/3` is where that is a fact rather
 %% than a hope.
+%%
+%% No count is asserted here. This used to pin the row total, which meant every row
+%% added to the checklist broke a test that had no opinion about rows -- and the set
+%% is already pinned, by name, in `i2p_log_checklist_tests`. A second copy of the same
+%% number is the duplication this project refuses, and it is the copy that is wrong
+%% first: the name here is about the rule, not about how many rows there are.
 a_bus_carried_fact_cannot_be_written_to_the_log_test() ->
     Bus = [F || {F, #{instrument := bus}} <- maps:to_list(i2p_log:checklist())],
-    ?assertEqual(6, length(Bus)),
+    true = Bus =/= [],
     lists:foreach(
         fun(Fact) -> ?assertError({fact_on_the_bus, Fact}, i2p_log:emit(Fact, "x ~p", [1])) end,
         Bus

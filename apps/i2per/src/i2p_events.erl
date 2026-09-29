@@ -18,6 +18,7 @@ Emitted events (`t:event/0`):
 - `{peer_connected, PeerHash}` / `{peer_disconnected, PeerHash}` /
   `{peer_connect_failed, PeerHash, Reason, BackoffSeconds}` — a connect that
   did not become a connection, with the interval the router will now wait
+- `{peer_send_stalled, PeerHash, Reason}` — a peer stopped accepting our sends
 - `{tunnel_built, Direction, Hops}` / `{tunnel_failed, Direction, Why}` /
   `{tunnel_expired, Direction}`
 - `{transit_denied, ReceiveTunnelId, Reason}` — a transit tunnel this router
@@ -73,6 +74,12 @@ lookup service not being running, where there is no key and nothing was asked fo
     %% load-bearing field: without it a peer being retried in a tight loop and a
     %% peer the router has given up on look identical.
     | {peer_connect_failed, i2p_crypto:hash(), term(), pos_integer()}
+    %% A peer that stopped accepting our sends, and why. The counterpart of
+    %% `peer_disconnected`, which says the connection is gone without saying
+    %% whether it went on its own terms. A session that merely degrades when it
+    %% is busy and one that has stopped taking writes are different faults, and
+    %% only this one says which.
+    | {peer_send_stalled, i2p_crypto:hash(), i2p_ntcp2_conn:send_stalled_reason()}
     | {tunnel_built, direction(), pos_integer()}
     | {tunnel_failed, direction(), rejected | invalid}
     | {tunnel_expired, direction()}

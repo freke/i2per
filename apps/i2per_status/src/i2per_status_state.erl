@@ -56,6 +56,7 @@ i2per_status_state:snapshot().
     peer_connected,
     peer_disconnected,
     peer_connect_failed,
+    peer_send_stalled,
     tunnel_built,
     tunnel_failed,
     tunnel_expired,

@@ -129,10 +129,13 @@ the_three_boot_facts_are_declared_log_carried_and_at_notice_test() ->
         [config_in_force, started_as, online]
     ).
 
-%% ADR 0002's table names six symptoms the bus answers. All six are asserted by name and
-%% the count is pinned, so a row quietly dropped cannot leave the case green on a
-%% shorter but still self-consistent list.
-all_six_bus_carried_rows_are_declared_test() ->
+%% ADR 0002's table names the symptoms the bus answers. Each is asserted by name
+%% in a written-out list, which is the pin: a row quietly dropped cannot leave this
+%% case green on a shorter but still self-consistent set. The count is deliberately
+%% not also written into the case name, because that would be a second number to
+%% edit at the same time as this one, and a number nobody reads is a number that
+%% stops agreeing with the list.
+all_bus_carried_rows_are_declared_test() ->
     Bus = [Fact || {Fact, #{instrument := bus}} <- maps:to_list(i2p_log:checklist())],
     ?assertEqual(
         [
@@ -140,6 +143,7 @@ all_six_bus_carried_rows_are_declared_test() ->
             leaseset_publish_failed,
             lookup_failed,
             peer_connect_failed,
+            peer_send_stalled,
             reachability,
             transit_denied
         ],
