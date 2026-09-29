@@ -152,10 +152,10 @@ route_blocks(Pid, Blocks, State = #{tagged_sess := Tagged}) ->
     State1 = maybe_issue_tag(Pid, Blocks, State),
     case Pid =:= Tagged of
         true ->
-            trace({coord_route, tagged_to_requester}),
+            i2p_log:debug({coord_route, tagged_to_requester}, []),
             relay_tagged_to_requester(Blocks, State1);
         false ->
-            trace({coord_route, requester_to_tagged}),
+            i2p_log:debug({coord_route, requester_to_tagged}, []),
             relay_requester_to_tagged(Pid, Blocks, State1)
     end.
 
@@ -190,12 +190,12 @@ issue_tag(State = #{tagged_sess := Tagged, listener := Listener}) ->
         true ->
             %% Registry at capacity: leave the request unanswered, the spec's
             %% only refusal channel for a tag request.
-            trace({tag, refused, cap_reached}),
+            i2p_log:debug({tag, refused, cap_reached}, []),
             State;
         false ->
             Tag = fresh_tag(),
             Expires = erlang:system_time(second) + ?RELAY_TAG_TTL,
-            trace({tag, issued, Tag}),
+            i2p_log:debug({tag, issued, Tag}, []),
             _ = i2p_ssu2_listener:register_relay_tag(Listener, Tag, Tagged, Expires),
             tag_answer(Tag, Tagged, State#{tag => Tag})
     end.
@@ -207,7 +207,7 @@ refresh_tag(State = #{listener := Listener}) ->
             State;
         Tag ->
             Expires = erlang:system_time(second) + ?RELAY_TAG_TTL,
-            trace({tag, refreshed, Tag}),
+            i2p_log:debug({tag, refreshed, Tag}, []),
             _ =
                 i2p_ssu2_listener:register_relay_tag(
                     Listener, Tag, maps:get(tagged_sess, State), Expires
@@ -255,13 +255,13 @@ serve_relay_request(
 ->
     %% One relay is already in flight; a concurrent request is refused with
     %% Bob's "limit exceeded" (code 3).
-    trace({relay, refused, nonce, Nonce}),
+    i2p_log:debug({relay, refused, nonce, Nonce}, []),
     reject_requester(Pid, 3, Ver, Nonce, State);
 serve_relay_request(Pid, Ver, Nonce, Tag, Ts, Port, Ip, Sig, State) ->
     case request_ri(Pid, State) of
         error ->
             %% The requester's RouterInfo never arrived with her handshake.
-            trace({relay, refused, nonce, Nonce}),
+            i2p_log:debug({relay, refused, nonce, Nonce}, []),
             reject_requester(Pid, 6, Ver, Nonce, State);
         {RIBin, AHash} ->
             case lookup_tag(Tag) of
@@ -269,7 +269,7 @@ serve_relay_request(Pid, Ver, Nonce, Tag, Ts, Port, Ip, Sig, State) ->
                     State1 = State#{requester_sess => Pid},
                     serve_tagged(Tagged, RIBin, AHash, Ver, Nonce, Tag, Ts, Port, Ip, Sig, State1);
                 error ->
-                    trace({relay, refused, nonce, Nonce}),
+                    i2p_log:debug({relay, refused, nonce, Nonce}, []),
                     reject_requester(Pid, 5, Ver, Nonce, State)
             end
     end.
@@ -277,7 +277,7 @@ serve_relay_request(Pid, Ver, Nonce, Tag, Ts, Port, Ip, Sig, State) ->
 %% Serve: the requester's RouterInfo precedes the RelayIntro (block 9) so the
 %% tagged peer can recover her signing key and verify the forwarded signature.
 serve_tagged(Tagged, RIBin, AHash, Ver, Nonce, Tag, Ts, Port, Ip, Sig, State) ->
-    trace({relay, served, tag, Tag}),
+    i2p_log:debug({relay, served, tag, Tag}, []),
     i2p_ssu2_conn:send_router_info(Tagged, 0, RIBin),
     Intro = i2p_relay:intro_block(Ver, AHash, Nonce, Tag, Ts, Port, Ip, Sig),
     i2p_ssu2_conn:send_relay(Tagged, Intro),
@@ -288,7 +288,7 @@ serve_tagged(Tagged, RIBin, AHash, Ver, Nonce, Tag, Ts, Port, Ip, Sig, State) ->
 relay_tagged_to_requester(Blocks, State = #{requester_sess := Requester}) when is_pid(Requester) ->
     case lists:keyfind(relay_response, 1, Blocks) of
         {relay_response, _, _, _, _, _, _, _, _, _} = Response ->
-            trace({relay, relayed_to, Requester}),
+            i2p_log:debug({relay, relayed_to, Requester}, []),
             i2p_ssu2_conn:send_relay(Requester, Response),
             State;
         false ->
@@ -331,6 +331,3 @@ lookup_tag(Tag) ->
     end.
 
 %%%%%%% %%% Internal %%%%%%%
-
-trace(Label) ->
-    i2p_ssu2_trace:emit(self(), Label, []).

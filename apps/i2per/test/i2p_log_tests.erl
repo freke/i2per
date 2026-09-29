@@ -378,6 +378,52 @@ a_frame_appears_when_the_log_level_is_debug_test() ->
         end
     ).
 
+%% The emitters are wired to it, and every one of them says something.
+%%
+%% The whole fold is a claim about the tree, not about a function: 65 call sites
+%% across four modules have to be recording frames, and a module that was missed
+%% would keep the old mechanism alive and pass every case above. So this reads
+%% the sources and counts what is actually there.
+%%
+%% The four names are named rather than counted to four, because "at least four"
+%% would survive an emitter being dropped from the list and re-added somewhere
+%% else, and the ticket's own text lists three when there are four.
+the_four_frame_emitters_record_through_the_log_test() ->
+    Expected = #{
+        "i2p_ssu2_conn.erl" => 30,
+        "i2p_ssu2_listener.erl" => 14,
+        "i2p_relay_coord.erl" => 10,
+        "i2p_peertest_coord.erl" => 7
+    },
+    Emitting = maps:filter(fun(_File, Count) -> Count > 0 end, frame_call_counts()),
+    %% No emitter beyond the four. A fifth module recording frames would not be a
+    %% defect on its own, but it would mean the fold is not finished, and this is
+    %% where that shows up rather than in a reviewer's head.
+    ?assertEqual(lists:sort(maps:keys(Expected)), lists:sort(maps:keys(Emitting))),
+    %% Each emitter's own count, so a module that lost most of its call sites
+    %% while another gained them is visible rather than averaging out.
+    lists:foreach(
+        fun({File, Count}) ->
+            ?assertEqual({File, Count}, {File, maps:get(File, Emitting, 0)})
+        end,
+        maps:to_list(Expected)
+    ).
+
+%% The mechanism is gone. Not "unused" -- gone: a module that exists with no
+%% caller is a second verbosity control waiting to be used, which is the thing
+%% ADR 0002 rejects.
+no_separate_ssu2_trace_mechanism_remains_test() ->
+    Root = i2p_ct_helpers:project_root(),
+    ?assertNot(filelib:is_regular(filename:join(Root, "apps/i2per/src/i2p_ssu2_trace.erl"))),
+    ?assertEqual(
+        [],
+        [
+            {File, Line}
+         || {File, Line} <- mentions_of("i2p_ssu2_trace", ["apps/i2per/src", "apps/i2per/test"]),
+            not lists:member(File, ["i2p_log_tests.erl"])
+        ]
+    ).
+
 %% The label reaches the shipped formatter, and it is the label rather than the
 %% context that identifies the frame.
 %%
@@ -882,6 +928,61 @@ config_pairs() ->
 
 log_carried_facts() ->
     [Fact || {Fact, #{instrument := log}} <- maps:to_list(i2p_log:checklist())].
+
+%%% %%%%% Reading the frame call sites %%%%% %%%%%
+
+%% Every `i2p_log:debug(` in the core tree, as a count per file.
+%%
+%% Read with `binary:matches/2` and byte offsets, for the reason
+%% `i2p_log_checklist_tests` gives and repeats: these sources carry em-dashes, so
+%% a character index and a byte offset are different numbers.
+-define(DEBUG, <<"i2p_log:debug(">>).
+
+-spec frame_call_counts() -> #{string() => non_neg_integer()}.
+frame_call_counts() ->
+    maps:from_list([{filename:basename(F), count_frames(F)} || F <- core_source_files()]).
+
+-spec count_frames(file:filename_all()) -> non_neg_integer().
+count_frames(File) ->
+    {ok, Bin} = file:read_file(File),
+    length(binary:matches(Bin, ?DEBUG)).
+
+%% `{File, Line}` for every mention of `Needle` under any of `Dirs`.
+%%
+%% Used to assert a mechanism is *absent*, so it walks the tree rather than
+%% consulting a list of places that ought to mention it -- a denylist here would
+%% be a second thing to keep in step, which is what the case is checking for.
+-spec mentions_of(string(), [string()]) -> [{string(), pos_integer()}].
+mentions_of(Needle, Dirs) ->
+    lists:flatmap(fun(Dir) -> mentions_in_dir(Needle, Dir) end, Dirs).
+
+-spec mentions_in_dir(string(), string()) -> [{string(), pos_integer()}].
+mentions_in_dir(Needle, Dir) ->
+    Root = i2p_ct_helpers:project_root(),
+    Pattern = filename:join([Root, Dir, "**", "*.erl"]),
+    NeedleBin = unicode:characters_to_binary(Needle),
+    lists:flatmap(
+        fun(File) ->
+            {ok, Bin} = file:read_file(File),
+            [
+                {filename:basename(File), line_of(Bin, Offset)}
+             || {Offset, _Length} <- binary:matches(Bin, NeedleBin)
+            ]
+        end,
+        lists:filter(fun filelib:is_regular/1, filelib:wildcard(Pattern))
+    ).
+
+-spec line_of(binary(), non_neg_integer()) -> pos_integer().
+line_of(Bin, Offset) ->
+    length(binary:matches(binary:part(Bin, 0, Offset), <<"\n">>)) + 1.
+
+%% Regular files only. A glob can return an entry that cannot be read, and
+%% `file:read_file/1` failing inside the scan would look like a broken test
+%% rather than a broken glob.
+-spec core_source_files() -> [file:filename_all()].
+core_source_files() ->
+    Glob = filename:join(i2p_ct_helpers:project_root(), "apps/i2per/src/*.erl"),
+    [F || F <- filelib:wildcard(Glob), filelib:is_regular(F)].
 
 %% Configuration the router reads straight from the application environment with
 %% nothing in front of it: not on `m:i2p_config_srv`'s key list, and not in the ini

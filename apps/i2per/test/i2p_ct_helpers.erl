@@ -7,7 +7,9 @@
 %%   and a receive wrapper skips (drains) non-matching messages, so a leftover
 %%   message from a previous case cannot poison a later assertion;
 %% - signed RouterInfo fixtures, so a suite that needs routers in the NetDb
-%%   builds them here instead of keeping its own copy of the keygen.
+%%   builds them here instead of keeping its own copy of the keygen;
+%% - the SSU2 frame capture, which is a `logger` handler rather than a
+%%   registered-name sink and is read with a barrier.
 %%
 %% Test code is not rendered by ExDoc (docs are generated from the `default`
 %% profile ebin dirs), so this module carries only header comments.
@@ -31,10 +33,35 @@
     dead_pid/0,
     start_ssu2_trace/0,
     stop_ssu2_trace/0,
-    dump_ssu2_trace/0
+    dump_ssu2_trace/0,
+    %% The bare collector, for a case that wants frames without the whole
+    %% start/stop lifecycle. Same process, no level change, no auto-restore.
+    start_frame_collector/0,
+    stop_frame_collector/1
 ]).
 
 -define(SSU2_TRACE_MAX, 512).
+
+%% The collector's registered name, and the marker it watches for.
+%%
+%% A frame is identified by the `label` `m:i2p_log:debug/2` attaches, so the
+%% collector takes every log line `logger` offers it and keeps only the ones
+%% carrying a label. That is what makes this a frame capture rather than a
+%% second copy of everything the tree logs: the boot lines and the supervisor
+%% reports go past it.
+-define(SSU2_FRAMES, i2p_ct_ssu2_frames).
+
+%% The label the dump's own barrier frame carries. Named once because three
+%% clauses have to recognise the same shape -- log it, look for it, filter it
+%% out of the answer -- and a label spelled three times is a label that can be
+%% spelled three ways.
+-define(FRAME_BARRIER, '__frame_barrier__').
+
+%% How long a dump waits for its own barrier. A hang guard, not a
+%% synchronisation, for the reason `f:log_events_from/1` gives: the barrier
+%% decides, not the clock. Crossing it does not raise here -- see
+%% `f:dump_ssu2_trace/0` for why this path reports rather than fails.
+-define(FRAME_BARRIER_TIMEOUT_MS, 2000).
 
 %% How long to wait for a barrier event to come back from the bus. A hang guard,
 %% not a synchronisation -- see `f:events_from/1`. Crossing it raises.
@@ -206,7 +233,7 @@ await_timeout(Fun) ->
         [] ->
             ok;
         Buffer ->
-            ct:pal("ssu2 trace (~p events):~n~0p", [length(Buffer), Buffer])
+            ct:pal("ssu2 frames (~p):~n~0p", [length(Buffer), Buffer])
     end,
     error(timeout).
 
@@ -269,7 +296,7 @@ wait_msg_timeout(Pred) ->
         [] ->
             ok;
         Buffer ->
-            ct:pal("ssu2 trace (~p events):~n~0p", [length(Buffer), Buffer])
+            ct:pal("ssu2 frames (~p):~n~0p", [length(Buffer), Buffer])
     end,
     error(timeout).
 
@@ -334,58 +361,208 @@ summ_block(B) ->
     {block, B}.
 
 %% ------------------------------------------------------------------
-%% SSU2 on-wire trace collector
+%% SSU2 frame capture
 %%
-%% Register a collector under `i2p_ssu2_trace_sink`; the SSU2 session,
-%% listener and PeerTest coordinator emit to it whenever it is registered.
-%% The collector keeps the last ?SSU2_TRACE_MAX events and can hand them
-%% back on demand. Used by the peertest suite's init_per_suite/end_per_suite
-%% and dumped from wait_msg_timeout so a stalled test carries its own trace.
+%% The SSU2 session, its listener, the relay coordinator and the PeerTest
+%% coordinator each record a frame per thing on the wire through
+%% `m:i2p_log:debug/2`. At the `notice` default there are none, so a suite
+%% that wants them turns the level to `debug`, attaches a `logger` handler
+%% that keeps the labelled ones, and dumps what it collected when a case
+%% fails. Used by the four SSU2 suites' per-case lifecycle, and read from
+%% `f:await/1` and `f:wait_msg/2` on a timeout so a stalled test carries its
+%% own frames.
+%%
+%% **This used to be a registered name and its own enable/disable.** It is a
+%% `logger` handler now, which is the whole point of the move: the per-packet
+%% detail obeys `log_level` like everything else, so there is no second
+%% verbosity control that cannot be governed from a config key.
 
+-spec start_ssu2_trace() -> ok.
 start_ssu2_trace() ->
-    case whereis(i2p_ssu2_trace_sink) of
-        Collector when is_pid(Collector) ->
-            Collector;
-        _NotRegistered ->
-            Collector = spawn(fun() -> ssu2_trace_collector([]) end),
-            true = register(i2p_ssu2_trace_sink, Collector),
-            Collector
-    end.
+    ok = stop_collector(),
+    ok = i2p_log:set_level(debug),
+    _Collector = start_frame_collector(),
+    ok.
 
+%% The collector on its own, with the handler attached.
+%%
+%% Split out because a case that wants to assert on frames has to arrange the
+%% level itself: `f:start_ssu2_trace/0` changes the running node's verbosity and
+%% restores it in `f:stop_ssu2_trace/0`, which is right for a suite's
+%% per-case lifecycle and wrong for a test that is about the level. The
+%% collector takes frames from whatever level is in force, so a case that sets
+%% `debug` and stops there sees the same frames.
+-spec start_frame_collector() -> pid().
+start_frame_collector() ->
+    Collector = spawn(fun() -> frame_collector({[], current_level(), undefined}) end),
+    true = register(?SSU2_FRAMES, Collector),
+    {ok, HandlerId} = i2p_log_tests_collector:start(Collector),
+    Collector ! {handler, HandlerId},
+    Collector.
+
+%% Detach the handler, put the level back, and stop the collector -- in that
+%% order, and all three synchronous.
+-spec stop_frame_collector(pid()) -> ok.
+stop_frame_collector(Collector) ->
+    stop_collector_at(Collector).
+
+%% Dump whatever the case collected, then tear down.
+%%
+%% The handler goes first because it is the only thing still delivering lines
+%% into the collector, and the level goes back last because restoring it while
+%% frames were still arriving would change what a concurrent case could see.
+%% The level is the caller's to have: the four suites call this from
+%% `end_per_testcase`, and a case left at `debug` makes every case after it log
+%% verbosely, which is the same leak the boot-line cases in `i2p_log_tests`
+%% guard against with `f:with_level/1`.
+-spec stop_ssu2_trace() -> ok.
 stop_ssu2_trace() ->
-    Buffer = dump_ssu2_trace(),
-    case Buffer of
+    Frames = dump_ssu2_trace(),
+    case Frames of
         [] ->
             ok;
         _ ->
-            ct:pal("ssu2 trace (final, ~p events):~n~0p", [length(Buffer), Buffer])
+            ct:pal("ssu2 frames (final, ~p):~n~0p", [length(Frames), Frames])
     end,
-    i2p_ssu2_trace:disable().
+    stop_collector().
 
+stop_collector() ->
+    case whereis(?SSU2_FRAMES) of
+        Collector when is_pid(Collector) -> stop_collector_at(Collector);
+        _NotRunning -> ok
+    end.
+
+%% Synchronous teardown, and the reason for the monitor: `logger:remove_handler/1`
+%% returns once the handler is gone, so after it there can be no line still in
+%% flight, and the `'DOWN'` proves the collector has finished with what it had.
+%%
+%% A collector left running would keep taking the next case's frames and answer
+%% its barrier, so a dump in a later case would report frames from a case that
+%% had already finished. `unregister` first so nothing can address it in between.
+stop_collector_at(Collector) ->
+    unregister(?SSU2_FRAMES),
+    Ref = erlang:monitor(process, Collector),
+    Collector ! teardown,
+    receive
+        {'DOWN', Ref, process, Collector, _Reason} -> ok
+    after 1000 ->
+        erlang:demonitor(Ref, [flush]),
+        ok
+    end.
+
+%% The level to put back, read from `logger` rather than from `f:i2p_log:level/0`.
+%% Asking the module would be circular: this set it, so its answer is what it
+%% decided, not what the node is running at.
+current_level() ->
+    maps:get(level, logger:get_primary_config()).
+
+%% The captured frames, oldest first, as `{Label, Context, Mfa}` triples.
+%%
+%% **A barrier, not a drain.** The collector answers a dump only once it has
+%% seen the marker logged *after* the work under inspection, and `logger` walks
+%% its handler list in order for each event -- so the marker's arrival proves
+%% every frame logged before it has already been delivered. The previous shape
+%% asked the collector for a snapshot over a message channel with a 1000ms
+%% `after`, which is a deadline: on a loaded machine the frames it had not yet
+%% processed were simply absent from a buffer that read as complete. That is
+%% the one failure mode a diagnostic cannot have, because the whole point of
+%% dumping is that someone is trying to work out what did not arrive.
+%%
+%% **It reports rather than raises when the barrier does not come.** Every
+%% caller is already on a failure path -- `f:await/1` and `f:wait_msg/2` are
+%% about to raise `timeout` -- so raising here would replace the real diagnosis
+%% with one about the diagnostic. A missing barrier is itself reported in the
+%% returned value rather than thrown.
+-spec dump_ssu2_trace() -> [tuple()].
 dump_ssu2_trace() ->
-    case i2p_ssu2_trace:sink() of
+    case whereis(?SSU2_FRAMES) of
         Collector when is_pid(Collector) ->
-            Collector ! {ssu2_trace_dump, self()},
+            Ref = make_ref(),
+            %% A frame, so it passes whatever filter the collector applies, and
+            %% distinguishable from a real one by its shape.
+            ok = i2p_log:debug({?FRAME_BARRIER, Ref}, []),
+            Collector ! {dump, self(), Ref},
             receive
-                {ssu2_trace_dump_result, Buffer} -> Buffer
-            after 1000 ->
+                {dump_result, Ref, Frames} ->
+                    Frames;
+                {dump_result, Ref, barrier_missed, Frames} ->
+                    ct:pal("ssu2 frame capture: barrier never arrived; ~p frames so far", [
+                        length(Frames)
+                    ]),
+                    Frames
+            after ?FRAME_BARRIER_TIMEOUT_MS ->
+                ct:pal("ssu2 frame capture: timed out waiting for the collector"),
                 []
             end;
-        _ ->
+        _NotRunning ->
             []
     end.
 
-ssu2_trace_collector(Events) ->
+%% Keeps the last ?SSU2_TRACE_MAX labelled events, newest first internally,
+%% plus the level to put back and the handler to detach.
+%%
+%% Two jobs, and the split is why it is not simply `f:events_from/1`: a
+%% *barrier* is a one-shot question with a one-shot answer, while this is asked
+%% on a timeout after arbitrary work, and the answer has to be whatever has
+%% accumulated since the suite started rather than since a marked instant.
+frame_collector({Frames, Before, HandlerId}) ->
     receive
-        {ssu2_trace, MonotonicMs, Pid, Label, Details} ->
-            Event = {MonotonicMs, Pid, Label, Details},
-            ssu2_trace_collector(lists:sublist([Event | Events], ?SSU2_TRACE_MAX));
-        {ssu2_trace_dump, From} ->
-            From ! {ssu2_trace_dump_result, lists:reverse(Events)},
-            ssu2_trace_collector(Events);
-        stop ->
+        {log_line, Event} ->
+            frame_collector({keep(frame(Event), Frames), Before, HandlerId});
+        {dump, From, Ref} ->
+            From ! dump_answer(Ref, Frames),
+            frame_collector({Frames, Before, HandlerId});
+        {handler, Id} ->
+            frame_collector({Frames, Before, Id});
+        teardown ->
+            %% The handler first, so no line is in flight when the level moves,
+            %% then the level, then stop. Any failure here is the caller's
+            %% `end_per_testcase` to report rather than this process's.
+            i2p_log_tests_collector:stop({ok, HandlerId}),
+            i2p_log:set_level(Before),
             ok
     end.
+
+%% The answer, and whether the barrier was seen.
+%%
+%% Two shapes because a buffer that reads as complete when it is not is the one
+%% failure a diagnostic cannot have: someone reading a dump is trying to work
+%% out what did not arrive, and a silently short answer would send them looking
+%% for a packet that was simply not collected yet. The caller reports the miss
+%% rather than raising, because it is already about to raise the real failure.
+dump_answer(Ref, Frames) ->
+    case lists:member(Ref, barrier_refs(Frames)) of
+        true -> {dump_result, Ref, lists:reverse(drop_barriers(Frames))};
+        false -> {dump_result, Ref, barrier_missed, lists:reverse(drop_barriers(Frames))}
+    end.
+
+%% The barrier is machinery, not a frame, so it does not appear in what a reader
+%% is shown. It stays in the buffer until a dump, because that is how its
+%% arrival is known.
+drop_barriers(Frames) ->
+    [F || F = {{?FRAME_BARRIER, _Ref}, _Context, _Mfa} <- Frames].
+
+%% A frame, or dropped. The `label` key is what `m:i2p_log:debug/2` attaches
+%% and nothing else in the tree does, so its presence is the whole filter.
+%%
+%% Reported rather than silently dropped when the shape is unrecognised: a
+%% `logger` event that is neither a format call nor a progress report is not
+%% something this collector can tell from a frame, and a capture that quietly
+%% loses an event shape is a capture nobody can trust when they are reading it
+%% to work out what went wrong.
+-spec keep(term(), [term()]) -> [term()].
+keep(Frame, Frames) when Frame =/= skip ->
+    lists:sublist([Frame | Frames], ?SSU2_TRACE_MAX);
+keep(skip, Frames) ->
+    Frames.
+
+frame(#{meta := #{label := Label, context := Context}, mfa := Mfa}) ->
+    {Label, Context, Mfa};
+frame(_Other) ->
+    skip.
+
+barrier_refs(Frames) ->
+    [Ref || {{?FRAME_BARRIER, Ref}, _Context, _Mfa} <- Frames].
 
 %%%%%%%%% Observing the event bus %%%%%%%%%
 

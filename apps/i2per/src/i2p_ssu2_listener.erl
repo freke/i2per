@@ -184,7 +184,7 @@ handle_call(_Other, _From, State) ->
 
 handle_cast({send, Datagram, Endpoint}, State = #{sock := Sock}) ->
     Size = byte_size(Datagram),
-    trace({listener_send, self(), Endpoint, Size}),
+    i2p_log:debug({listener_send, self(), Endpoint, Size}, []),
     %% The single funnel for every outbound datagram — data, keepalives,
     %% handshake retransmits and data-phase resends all arrive here — so this is
     %% the only place a byte can be charged once and counted once. A resend
@@ -239,7 +239,7 @@ classify(ListenerPid, Datagram, IP, PortNum, State = #{local := Local}) ->
             route_or_handshake(ListenerPid, ConnId, Datagram, IP, PortNum, State);
         error ->
             %% Shorter than ?MIN_PACKET, so not an SSU2 packet at all.
-            trace({classify, ListenerPid, drop, {IP, PortNum}}),
+            i2p_log:debug({classify, ListenerPid, drop, {IP, PortNum}}, []),
             drop
     end.
 
@@ -250,11 +250,11 @@ classify(ListenerPid, Datagram, IP, PortNum, State = #{local := Local}) ->
 route_peertest(ConnId, Datagram, IP, PortNum, State) ->
     case ets:lookup(i2p_ssu2_sessions, ConnId) of
         [{_Id, Pid}] ->
-            trace({route_peertest, session, ConnId}),
+            i2p_log:debug({route_peertest, session, ConnId}, []),
             Pid ! {ssu2_packet, Datagram},
             ok;
         [] ->
-            trace({route_peertest, charlie_responder, ConnId}),
+            i2p_log:debug({route_peertest, charlie_responder, ConnId}, []),
             charlie_peertest(Datagram, IP, PortNum, State)
     end.
 
@@ -268,7 +268,7 @@ charlie_peertest(Datagram, IP, PortNum, #{local := Local}) ->
         {ok, #{blocks := Blocks}} ->
             case lists:keyfind(peertest, 1, Blocks) of
                 {peertest, 6, _Code, _Flags, _Hash, _Ver, Nonce, Ts, Port, Ip, _Sig} ->
-                    trace({charlie_msg7_reply, {IP, PortNum}}),
+                    i2p_log:debug({charlie_msg7_reply, {IP, PortNum}}, []),
                     Reply = i2p_peertest:block(7, 0, 0, <<>>, 2, Nonce, Ts, Port, Ip, <<>>),
                     Dst = i2p_peertest:dst_conn_id(Nonce),
                     Src = i2p_peertest:src_conn_id(Nonce),
@@ -276,18 +276,13 @@ charlie_peertest(Datagram, IP, PortNum, #{local := Local}) ->
                     i2p_ssu2_listener:send(self(), Packet, {IP, PortNum}),
                     ok;
                 _Other ->
-                    trace(charlie_peertest_other),
+                    i2p_log:debug(charlie_peertest_other, []),
                     drop
             end;
         _NotPeertest ->
-            trace(charlie_peertest_decode_error),
+            i2p_log:debug(charlie_peertest_decode_error, []),
             drop
     end.
-
-%% Optional diagnostic trace emission. It is a no-op unless a collector is
-%% registered (see `m:i2p_ssu2_trace`).
-trace(Label) ->
-    i2p_ssu2_trace:emit(self(), Label, []).
 
 %% Routing order is deliberate, and it is a correctness fix rather than a
 %% preference. Bytes 8..15 of an in-session short header are masked with THAT
@@ -311,13 +306,13 @@ trace(Label) ->
 route_or_handshake(ListenerPid, ConnId, Datagram, IP, PortNum, State) ->
     case ets:lookup(i2p_ssu2_sessions, ConnId) of
         [{_Id, Pid}] ->
-            trace({route_or_handshake, session, ConnId}),
+            i2p_log:debug({route_or_handshake, session, ConnId}, []),
             Pid ! {ssu2_packet, Datagram},
             ok;
         [] ->
             case ets:lookup(i2p_ssu2_pending, {IP, PortNum}) of
                 [{_Ep, PendingPid}] ->
-                    trace({route_or_handshake, pending, {IP, PortNum}}),
+                    i2p_log:debug({route_or_handshake, pending, {IP, PortNum}}, []),
                     PendingPid ! {ssu2_packet, Datagram},
                     ok;
                 [] ->
@@ -329,10 +324,10 @@ route_unowned(ListenerPid, ConnId, Datagram, IP, PortNum, State = #{local := Loc
     Bik = maps:get(intro_key, Local),
     case i2p_ssu2:open_long(Datagram, Bik, Bik) of
         {ok, <<_:64/big-unsigned-integer, _Num:32, ?TYPE_PEER_TEST:8, _/binary>>} ->
-            trace({classify, ListenerPid, peertest, ConnId}),
+            i2p_log:debug({classify, ListenerPid, peertest, ConnId}, []),
             route_peertest(ConnId, Datagram, IP, PortNum, State);
         _ ->
-            trace({classify, ListenerPid, try_handshake, ConnId}),
+            i2p_log:debug({classify, ListenerPid, try_handshake, ConnId}, []),
             try_handshake(ConnId, Datagram, IP, PortNum, State)
     end.
 
@@ -340,17 +335,17 @@ try_handshake(ConnId, Datagram, IP, PortNum, State = #{local := Local}) ->
     Bik = maps:get(intro_key, Local),
     case i2p_ssu2:decode_token_request(Bik, Datagram) of
         {ok, _TokenReqInfo} ->
-            trace({handshake, token_request, ConnId}),
+            i2p_log:debug({handshake, token_request, ConnId}, []),
             spawn_bob(ConnId, Datagram, IP, PortNum, Local, State);
         error ->
             case i2p_ssu2:open_long(Datagram, Bik, Bik) of
                 {ok,
                     <<_:64, _Num:32, ?TYPE_SESSION_REQUEST:8, 2:8, 2:8, _:8, _:64, _Tok:64,
                         _/binary>>} ->
-                    trace({handshake, session_request, ConnId}),
+                    i2p_log:debug({handshake, session_request, ConnId}, []),
                     spawn_bob(ConnId, Datagram, IP, PortNum, Local, State);
                 _NotAHandshake ->
-                    trace({handshake, drop, ConnId}),
+                    i2p_log:debug({handshake, drop, ConnId}, []),
                     drop
             end
     end.
