@@ -725,8 +725,6 @@ ensure_min_payload(Payload) ->
     PadLen = ?MIN_PAYLOAD - byte_size(Payload),
     <<Payload/binary, (tlv(?BLOCK_PADDING, <<0:PadLen/unit:8>>))/binary>>.
 
--define(ACK_MAX, 255).
-
 %% Walk an ACK block's trailing range bytes into `{Nack, Ack}` run-length
 %% pairs. Fail-closed: a fractional range, or one where both counts are zero
 %% (the encoding forbids it), yields `error`.
@@ -737,18 +735,14 @@ decode_ack_ranges(<<Nack:8, Ack:8, Rest/binary>>, Acc) when Nack > 0; Ack > 0 ->
 decode_ack_ranges(_Malformed, _Acc) ->
     error.
 
-%% Internal shared accumulator for ack_ranges/4.
--define(ACK_MODE_NACK, nack).
--define(ACK_MODE_ACK, ack).
-
 -doc """
 Build an `{ack, AckThrough, Acnt, Ranges}` block describing the packet
-numbers that have been received.
+numbers a session has received.
 
-Input: `ReceivedNums` — the packet numbers received so far (the receiver's
-in-order ack state); `MaxRanges` — an upper bound on how many `{Nack, Ack}`
-run-length ranges to emit (older, lower-numbered packets are dropped first
-when exceeded, per the spec's bounded-ackroom rule).
+Input: `Recv` — a `m:i2p_ssu2_recv:window/0`, the session's receive window;
+`MaxRanges` — an upper bound on how many `{Nack, Ack}` run-length ranges to emit
+(older, lower-numbered packets are dropped first when exceeded, per the spec's
+bounded-ackroom rule).
 
 Output: a `t:ack_block/0` ACK block. `AckThrough` is the highest received packet;
 `Acnt` the number of consecutive received packets immediately below it; the
@@ -758,60 +752,16 @@ starts with a NACK count (the spec encodes the first gap as `nack` bits).
 Example (the spec's worked case): for received `[10,9,8,6,5,2,1,0]` with
 7,4,3 missing, produces `AckThrough=10, Acnt=2, Ranges=[{1,2},{2,3}]` — i.e.
 NACK 7, ACK 6 5, then NACK 4 3, ACK 2 1 0.
+
+The window is `m:i2p_ssu2_recv`'s, not a list of packet numbers, and the
+encoding is its `f:build/2`. This exists as the named entry point because the
+block is a wire-format concept and belongs to the codec; the walk itself lives
+with the window it walks, so there is one implementation of the format rather
+than two that must agree. See #7GP4A4K.
 """.
--spec build_ack([non_neg_integer()], non_neg_integer()) -> ack_block().
-build_ack(ReceivedNums, MaxRanges) when
-    is_list(ReceivedNums), is_integer(MaxRanges), MaxRanges >= 0
-->
-    Recv = sets:from_list(ReceivedNums),
-    case sets:size(Recv) of
-        0 ->
-            {ack, 0, 0, []};
-        _ ->
-            AckThrough = lists:max(ReceivedNums),
-            MinRecv = lists:min(ReceivedNums),
-            Acnt = top_ack_count(Recv, AckThrough - 1, 0),
-            Ranges = ack_ranges(Recv, AckThrough - Acnt - 1, MinRecv, MaxRanges, []),
-            {ack, AckThrough, Acnt, Ranges}
-    end.
-
-top_ack_count(_Recv, N, Count) when N < 0; Count >= ?ACK_MAX ->
-    Count;
-top_ack_count(Recv, N, Count) ->
-    case sets:is_element(N, Recv) of
-        true -> top_ack_count(Recv, N - 1, Count + 1);
-        false -> Count
-    end.
-
-ack_ranges(_Recv, Low, MinRecv, MaxRanges, Acc) when
-    Low < MinRecv; MaxRanges =< 0
-->
-    lists:reverse(Acc);
-ack_ranges(Recv, Low, MinRecv, MaxRanges, Acc) ->
-    Nack = count_run(Recv, Low, 0, ?ACK_MODE_NACK),
-    Ack = count_run(Recv, Low - Nack, 0, ?ACK_MODE_ACK),
-    case {Nack, Ack} of
-        {0, 0} ->
-            lists:reverse(Acc);
-        _ ->
-            NextLow = Low - Nack - Ack,
-            ack_ranges(Recv, NextLow, MinRecv, MaxRanges - 1, [{Nack, Ack} | Acc])
-    end.
-
-count_run(_Recv, _Start, Count, _Mode) when Count >= ?ACK_MAX ->
-    Count;
-count_run(_Recv, Start, Count, _Mode) when Start < 0 ->
-    Count;
-count_run(Recv, Start, Count, ?ACK_MODE_NACK) ->
-    case sets:is_element(Start, Recv) of
-        false -> count_run(Recv, Start - 1, Count + 1, ?ACK_MODE_NACK);
-        true -> Count
-    end;
-count_run(Recv, Start, Count, ?ACK_MODE_ACK) ->
-    case sets:is_element(Start, Recv) of
-        true -> count_run(Recv, Start - 1, Count + 1, ?ACK_MODE_ACK);
-        false -> Count
-    end.
+-spec build_ack(i2p_ssu2_recv:window(), non_neg_integer()) -> ack_block().
+build_ack(Recv, MaxRanges) when is_integer(MaxRanges), MaxRanges >= 0 ->
+    i2p_ssu2_recv:build(Recv, MaxRanges).
 
 -doc """
 Expand an ACK block back into the concrete acked and nacked packet numbers.

@@ -66,6 +66,14 @@ outbound datagrams through it because only the listener owns the socket.
 %% Overridable per app via `i2per` env `handshake_retry_ms` /
 %% `handshake_max_resends`.
 -define(MAX_RESENDS, 9).
+%% How many `{nack, ack}` range pairs a session's ACK blocks may carry. This is
+%% a *policy* choice — the wire format would allow more — and it is deliberately
+%% the single place the number is written down, because the receive window's
+%% bound is derived from it: an ACK block cannot name a packet number further
+%% than `?ACK_MAX + this * 2 * ?ACK_MAX` below the highest received, so this
+%% value is also how far back `m:i2p_ssu2_recv` retains. Raising it widens the
+%% window as a side effect; the two cannot be changed independently without the
+%% window becoming wrong about what an ACK can still express. See #7GP4A4K.
 -define(MAX_ACK_RANGES, 20).
 %% How long after the in-session message 4 Alice waits before judging the
 %% reachability result, so an absent but still-in-flight out-of-session
@@ -449,7 +457,7 @@ init(Config = #{role := alice}) ->
         timer_ref => Timer,
         resends => 0,
         pkt_out => 0,
-        seen_in => []
+        seen_in => i2p_ssu2_recv:new()
     }};
 %% Bob: consume the listener's first SessionRequest immediately.
 init(Config = #{role := bob}) ->
@@ -491,7 +499,7 @@ init(Config = #{role := bob}) ->
                         timer_phase => created_sent,
                         resends => 0,
                         pkt_out => 0,
-                        seen_in => []
+                        seen_in => i2p_ssu2_recv:new()
                     }}
             end;
         error ->
@@ -884,7 +892,16 @@ become_established_common(HS, Keys, State) ->
             out_pkts => #{},
             reassembly => #{},
             pending_test => undefined,
-            pt_target => undefined
+            pt_target => undefined,
+            %% The handshake's inbound reassembly buffer. It only ever holds
+            %% SessionConfirmed fragments, and by here they have all been
+            %% consumed, so leaving it resident would keep the last fragment's
+            %% payload alive for the whole session. It was also the one field
+            %% this transition forgot, which is why a session's heap depended on
+            %% what the handshake happened to leave behind rather than on its
+            %% data phase.
+            fragments => [],
+            sr_info => undefined
         },
     State2 = arm_keepalive_timer(arm_idle_timer(State1)),
     case role(State2) of
@@ -907,30 +924,45 @@ data_packet(Packet, State = #{keys := Keys}) ->
     OwnIntro = maps:get(intro_key, maps:get(local, maps:get(config, State))),
     case i2p_ssu2:decode_data(Keys, RecvDir, OwnIntro, Packet) of
         {ok, #{pkt_num := Num, immediate_ack := ImmediateAck, blocks := Blocks}} ->
-            case seen(Num, maps:get(seen_in, State)) of
-                {new, SeenIn} ->
-                    i2p_log:debug(
-                        {recv, RecvDir, Num, new, [block_kind(B) || B <- Blocks]}, role(State)
-                    ),
-                    State1 = State#{seen_in => SeenIn},
-                    State2 = handle_blocks(Blocks, State1),
-                    maybe_ack(Num, Blocks, ImmediateAck, State2);
-                duplicate ->
-                    i2p_log:debug({recv, RecvDir, Num, duplicate}, role(State)),
-                    State
-            end;
+            on_data(Num, Blocks, ImmediateAck, RecvDir, State);
         error ->
             i2p_log:debug({recv, RecvDir, decode_error}, role(State)),
             State
     end.
 
-seen(Num, SeenIn) ->
-    case lists:member(Num, SeenIn) of
-        true ->
-            duplicate;
-        false ->
-            {new, [Num | SeenIn]}
+%% Classify an inbound Data packet number against the receive window, then
+%% deliver its blocks. The three outcomes differ only in what happens to the
+%% window and to the telemetry -- the blocks are delivered either way, because
+%% an out-of-window packet is still a real, authenticated packet carrying data
+%% this router has not processed, and dropping it would lose traffic to save
+%% bookkeeping. Block handling is idempotent by message identity, so delivering
+%% a duplicate we could not recognise costs work rather than correctness.
+on_data(Num, Blocks, ImmediateAck, RecvDir, State = #{seen_in := SeenIn}) ->
+    case i2p_ssu2_recv:add(Num, SeenIn, ?MAX_ACK_RANGES) of
+        {new, SeenIn1} ->
+            i2p_log:debug(
+                {recv, RecvDir, Num, new, [block_kind(B) || B <- Blocks]}, role(State)
+            ),
+            deliver(Num, Blocks, ImmediateAck, State#{seen_in => SeenIn1});
+        duplicate ->
+            i2p_log:debug({recv, RecvDir, Num, duplicate}, role(State)),
+            State;
+        stale ->
+            %% Too old to be nameable in any ACK we could send, so it cannot be
+            %% recorded — see `m:i2p_ssu2_recv`. Counted rather than silently
+            %% treated as new, because a peer doing this routinely is
+            %% retransmitting numbers the spec says it must not reuse.
+            i2p_stats:add(ssu2_stale_packets, 1),
+            i2p_log:debug(
+                {recv, RecvDir, Num, out_of_window, [block_kind(B) || B <- Blocks]},
+                role(State)
+            ),
+            deliver(Num, Blocks, ImmediateAck, State)
     end.
+
+deliver(Num, Blocks, ImmediateAck, State) ->
+    State1 = handle_blocks(Blocks, State),
+    maybe_ack(Num, Blocks, ImmediateAck, State1).
 
 block_kind({i2np, Type, _MsgId, _Exp, _Body}) ->
     {i2np, Type};
@@ -1720,8 +1752,9 @@ send_termination(Reason, State) ->
 ack_packet_zero(_Keys, State = #{seen_in := SeenIn}) ->
     %% Alice's SessionConfirmed is her data-phase packet zero; record its
     %% receipt and ACK it with Bob's first Data packet (spec: Bob 0 = ACK).
-    State1 = State#{seen_in => [0 | SeenIn]},
-    AckBlock = i2p_ssu2:build_ack([0], ?MAX_ACK_RANGES),
+    {new, SeenIn1} = i2p_ssu2_recv:add(0, SeenIn, ?MAX_ACK_RANGES),
+    State1 = State#{seen_in => SeenIn1},
+    AckBlock = i2p_ssu2:build_ack(SeenIn1, ?MAX_ACK_RANGES),
     send_packet([AckBlock], State1, false).
 
 %% ------------------------------------------------------------------

@@ -390,7 +390,11 @@ a_frame_appears_when_the_log_level_is_debug_test() ->
 %% else, and the ticket's own text lists three when there are four.
 the_four_frame_emitters_record_through_the_log_test() ->
     Expected = #{
-        "i2p_ssu2_conn.erl" => 30,
+        %% `i2p_ssu2_conn` gained one call site at #7GP4A4K: an inbound packet
+        %% number too old for the receive window to record is now logged as
+        %% `out_of_window` rather than passing as new, which is the only way that
+        %% condition is visible at all.
+        "i2p_ssu2_conn.erl" => 31,
         "i2p_ssu2_listener.erl" => 14,
         "i2p_relay_coord.erl" => 10,
         "i2p_peertest_coord.erl" => 7

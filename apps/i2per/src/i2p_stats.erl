@@ -126,6 +126,31 @@ counters() ->
         ssu2_bytes_out,
         ssu2_bytes_in,
 
+        %% %%%%% SSU2 session %%%%%
+        %%
+        %% **Received Data packet numbers that arrived too old to record.**
+        %%
+        %% An SSU2 session keeps a window of the packet numbers it has received
+        %% so it can recognise a retransmission and build the ACK block. The
+        %% window is bounded by what an ACK block can *name*: its `acnt` field
+        %% is one byte and each `{nack, ack}` pair is two, so no ACK this router
+        %% sends can reach further than a fixed distance below the highest
+        %% number received. A packet number below that reach is therefore
+        %% unrecordable — the spec also requires retransmission to use a *fresh*
+        %% number, so nothing legitimate lands there.
+        %%
+        %% So this counter is a fault signal, not a throughput figure, and it is
+        %% the only way the condition is visible: the packet is still processed
+        %% (block handling is idempotent by message identity, so a duplicate is
+        %% harmless) but it can no longer be recognised as one. A peer that
+        %% drives this above zero is retransmitting numbers the protocol does
+        %% not permit reusing. See `m:i2p_ssu2_recv` and #7GP4A4K.
+        %%
+        %% Named for what the session calls the condition (`stale`) rather than
+        %% for the window it fell out of: the read API reserves "window" for
+        %% sliding values, and this is a plain cumulative total.
+        ssu2_stale_packets,
+
         %% %%%%% Bytes carried for other routers %%%%%
         %%
         %% **These are wire bytes, not client bytes, and the difference is not an
