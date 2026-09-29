@@ -435,9 +435,10 @@ dispatch_db_message(#{type := 1, body := Body}, NowMs) ->
             %% it should not be. The `{ignored, {unsupported_type, T}}` returned here
             %% is dropped by `m:i2p_tunnel_relay` without reaching any caller that
             %% announces, so unlike the `m:i2p_peer` store path there is no
-            %% `db_store_not_stored` on the bus for a store that arrived inside garlic.
-            %% This line is the only record that it happened.
-            logger:warning(
+            %% `db_store_not_stored` on the bus for a store that arrived inside
+            %% garlic. This line is the only record that it happened.
+            i2p_log:emit(
+                netdb_store_type_unsupported,
                 "ignoring netdb store of unimplemented type ~0p for ~s",
                 [T, base64:encode(Key)]
             ),

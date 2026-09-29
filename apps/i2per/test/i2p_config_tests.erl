@@ -368,3 +368,75 @@ bad_tunnels_conf_aborts_boot_config_test() ->
         application:unset_env(i2per, config_file),
         application:unset_env(i2per, tunnels_conf_file)
     end.
+
+%% --------------------------------------------------------------------------
+%% `f:in_force/0` -- what the boot's configuration line is built from.
+%% --------------------------------------------------------------------------
+
+%% Sorted, so two boots of one configuration produce byte-identical lines. A test
+%% comparing two boots would be comparing orderings otherwise, and a change to the
+%% allowlist's order would show up as a diff in a log nobody reads on purpose.
+in_force_is_sorted_test() ->
+    Restored = save_env([data_dir, host, log_level, allow_private_host]),
+    try
+        application:set_env(i2per, data_dir, "/tmp/d"),
+        application:set_env(i2per, host, <<"127.0.0.1">>),
+        application:set_env(i2per, log_level, info),
+        application:set_env(i2per, allow_private_host, true),
+        InForce = i2p_config:in_force(),
+        ?assertEqual(
+            [allow_private_host, data_dir, host, log_level],
+            [Key || {Key, _} <- InForce]
+        )
+    after
+        restore_env(Restored)
+    end.
+
+%% A key that is allowed but unset is absent, and one that is set but not allowed is
+%% absent. The two omissions are different decisions, so they are checked apart:
+%% "unset" must not print `undefined`, and "not on the list" must not print at all
+%% even when it holds something.
+in_force_omits_unset_and_unlisted_keys_test() ->
+    Restored = save_env([data_dir, log_level, i2p_peer]),
+    try
+        application:set_env(i2per, log_level, info),
+        application:set_env(i2per, i2p_peer, #{local => #{static_priv => <<"secret">>}, seeds => []}),
+        InForce = i2p_config:in_force(),
+        Keys = [Key || {Key, _} <- InForce],
+        ?assert(lists:member(log_level, Keys)),
+        ?assertNot(lists:member(data_dir, Keys)),
+        ?assertNot(lists:member(i2p_peer, Keys)),
+        ?assertEqual(
+            nomatch, string:find(lists:flatten(io_lib:format("~p", [InForce])), "secret")
+        )
+    after
+        restore_env(Restored)
+    end.
+
+%% The values are reported exactly as stored. A renderer that prettified them could
+%% disagree with what the router is using, and the whole value of the line is that it
+%% does not -- so a binary stays a binary here.
+in_force_reports_values_as_stored_test() ->
+    Restored = save_env([data_dir, host]),
+    try
+        application:set_env(i2per, host, <<"198.51.100.7">>),
+        application:set_env(i2per, data_dir, <<"/var/lib/i2per">>),
+        ?assertEqual(
+            [{data_dir, <<"/var/lib/i2per">>}, {host, <<"198.51.100.7">>}],
+            i2p_config:in_force()
+        )
+    after
+        restore_env(Restored)
+    end.
+
+save_env(Keys) ->
+    [{Key, application:get_env(i2per, Key)} || Key <- Keys].
+
+restore_env(Saved) ->
+    lists:foreach(
+        fun
+            ({Key, {ok, Value}}) -> application:set_env(i2per, Key, Value);
+            ({Key, undefined}) -> application:unset_env(i2per, Key)
+        end,
+        Saved
+    ).

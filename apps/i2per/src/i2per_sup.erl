@@ -48,6 +48,7 @@ start_link() ->
 
 init([]) ->
     LocalSeeds = resolve_local(),
+    report_started_as(LocalSeeds),
     Children =
         [
             events_child(),
@@ -60,6 +61,172 @@ init([]) ->
             ntcp2_sup_children(LocalSeeds) ++ ssu2_sup_children(LocalSeeds) ++
             manager_children(LocalSeeds),
     {ok, {#{strategy => one_for_one, intensity => 10, period => 10}, Children}}.
+
+%% ADR 0002's "it started and I don't know with what".
+%%
+%% Reported from here rather than from `m:i2per_app` because this is where the
+%% answers are computed: `f:resolve_local/0` is what turns a data directory into a
+%% seed count and a listening address, and asking for them again from outside
+%% would either run the identity path twice or restate its defaults here. Both are
+%% worse than reporting the values this function already has.
+%%
+%% Before the children start, for the same reason the configuration line is: a
+%% router that dies coming up has still told the operator what it was trying to be.
+-spec report_started_as(local_seeds()) -> ok.
+report_started_as({ok, Local, Seeds, Listen}) ->
+    i2p_log:emit(
+        started_as,
+        "i2per started as: ~s",
+        [render_started_as(Local, Seeds, Listen)]
+    );
+report_started_as(error) ->
+    i2p_log:emit(
+        started_as,
+        "i2per started as: ~s",
+        ["(no identity and no seed list; running without a listener)"]
+    ).
+
+%% The listen address is read off the RouterInfo rather than off the environment,
+%% because the RouterInfo is what the network will be told and the environment is
+%% only what the router was asked for. They agree today; reporting the published
+%% one means the line stays true if they ever stop agreeing.
+%%
+%% The address map is in wire shape -- binary keys, and a port carried as its
+%% decimal string -- so the values are interpolated as strings rather than decoded.
+%% That is the port as the RouterInfo writes it, which is what the operator would
+%% find in a RouterInfo dump, and decoding it would mean a second copy of the
+%% `resolve_local_from_disk/0` defaults or a fallback for a non-numeric port.
+-spec render_started_as(term(), list(), term()) -> string().
+render_started_as(Local, Seeds, Listen) ->
+    lists:flatten(
+        io_lib:format(
+            "version=~s ~s data_dir=~s live=~p seeds=~p ~s",
+            [
+                vsn(),
+                render_listen(Local, Listen),
+                render_data_dir(),
+                live_network_enabled(),
+                length(Seeds),
+                render_distribution()
+            ]
+        )
+    ).
+
+-spec render_listen(term(), term()) -> string().
+render_listen(_Local, no_listen) ->
+    %% The explicit-identity mode: no listener is bound, so there is no address to
+    %% report. `sam_port` is still reported, because it is a *configured* value and
+    %% the answer to "did the operator ask for one" is the same either way.
+    lists:flatten(
+        io_lib:format("listen=none sam_port=~s", [render_opt(application:get_env(i2per, sam_port))])
+    );
+render_listen(Local, listen) ->
+    SamPort = render_opt(application:get_env(i2per, sam_port)),
+    case published_address(Local) of
+        {ok, Host, Port} ->
+            lists:flatten(io_lib:format("listen=~s:~s sam_port=~s", [Host, Port, SamPort]));
+        none ->
+            %% A listener *is* bound; what is missing is the published address,
+            %% because the configured host is not reachable and
+            %% `m:i2p_identity:validate_host/1` therefore refuses to put one in the
+            %% RouterInfo. Reported as `unpublished` rather than `none` because the
+            %% two mean opposite things to an operator deciding whether the router is
+            %% working, and `none` here would read as "nothing is listening", which
+            %% is false and would send them looking in the wrong place.
+            lists:flatten(io_lib:format("listen=unpublished sam_port=~s", [SamPort]))
+    end.
+
+%% The NTCP2 address out of the published set, with its host and port.
+%%
+%% A RouterInfo can publish several addresses, so an `ssu2_enabled` boot carries an
+%% NTCP2 and an SSU2 one and the list is not length one. NTCP2 is named
+%% specifically: it is the transport `listen` means here, and an operator reading
+%% "listen=" wants the transport the router dials peers over, not the peer-test one.
+%%
+%% Returns `none` rather than raising when the address carries no host or port,
+%% which is what an unreachable configured host produces -- `m:i2p_identity`'s host
+%% validation leaves the address in place and omits the pair, rather than dropping
+%% the address. See `f:render_listen/2` for what the line says in that case.
+-spec published_address(i2p_peer:local_keys()) -> {ok, binary(), binary()} | none.
+published_address(Local) ->
+    Addresses = i2p_router_info:addresses(maps:get(ri, Local)),
+    Ntcp2 = [
+        Address
+     || Address <- Addresses,
+        maps:get(transport, Address, undefined) =:= <<"NTCP2">>
+    ],
+    case Ntcp2 of
+        [Address | _] -> address_host_port(Address);
+        [] -> none
+    end.
+
+-spec address_host_port(map()) -> {ok, binary(), binary()} | none.
+address_host_port(Address) ->
+    Options = maps:get(options, Address),
+    case {maps:find(<<"host">>, Options), maps:find(<<"port">>, Options)} of
+        {{ok, Host}, {ok, Port}} -> {ok, Host, Port};
+        _ -> none
+    end.
+
+%% `data_dir` is absent in the explicit-identity mode, which is the test and
+%% embedded-boot mode. Reported as `none` rather than omitted so the line keeps the
+%% same shape in both modes, and a reader is not left guessing whether the field
+%% was absent or empty.
+-spec render_data_dir() -> string().
+render_data_dir() ->
+    render_opt(application:get_env(i2per, data_dir)).
+
+-spec render_opt({ok, term()} | undefined) -> string().
+render_opt({ok, Value}) -> lists:flatten(io_lib:format("~0p", [Value]));
+render_opt(undefined) -> "none".
+
+%% The distribution posture, as the running node can actually observe it.
+%%
+%% `dist=on` with the node name is the part an operator needs: the name is what
+%% `bin/i2per rpc` is given. `dist_range` is `kernel`'s configured
+%% `inet_dist_listen_min`/`max`, which is the release's choice and the number a
+%% firewall rule is written against.
+%%
+%% **What this line deliberately does not say: whether the node is listening.**
+%% There is no reliable way to ask from inside the VM on this OTP. `net_kernel:info/0`
+%% and `net_kernel:info/1` do not exist, `net_adm:local_port/0` does not exist, and
+%% `erlang:system_info(dist_ctrl)` returns `[]` whether the node was started with
+%% `-sname` or with `-dist_listen false` -- all four checked rather than assumed,
+%% because a boot line that guesses at this would be reporting a firewall
+%% question it has no access to. `vm.args` and the operator's firewall are where
+%% that is answered; ADR 0002's release default keeps `-dist_listen false`.
+%%
+%% The cookie is never named. It is the secret, and this line is read by anybody who
+%% can read the log.
+-spec render_distribution() -> string().
+render_distribution() ->
+    case node() of
+        nonode@nohost ->
+            "dist=off";
+        Node ->
+            lists:flatten(
+                io_lib:format("node=~p dist=on dist_range=~s", [Node, dist_range()])
+            )
+    end.
+
+-spec dist_range() -> string().
+dist_range() ->
+    case
+        {
+            application:get_env(kernel, inet_dist_listen_min),
+            application:get_env(kernel, inet_dist_listen_max)
+        }
+    of
+        {{ok, Min}, {ok, Max}} -> lists:flatten(io_lib:format("~p-~p", [Min, Max]));
+        _ -> "default"
+    end.
+
+-spec vsn() -> string().
+vsn() ->
+    case application:get_key(i2per, vsn) of
+        {ok, Vsn} -> lists:flatten(io_lib:format("~s", [Vsn]));
+        undefined -> "unknown"
+    end.
 
 %% First child: the status event bus every other component announces on.
 events_child() ->
@@ -363,8 +530,17 @@ reseed_child_spec(Opts) ->
 %%    directory where `m:i2p_identity` stores the identity file; `seeds`
 %%    carries the bootstrap RouterInfos and `host` / `port` name the
 %%    listening address.
--spec resolve_local() ->
-    {ok, i2p_peer:local_keys(), [i2p_router_info:router_info()], listen | no_listen} | error.
+%% The identity we resolved, the bootstrap seeds, and whether that identity has a
+%% listener bound to it.
+%%
+%% Named rather than written out twice: `f:resolve_local/0` and the boot-line
+%% reporter both need it, and a return type restated at each use is two places to
+%% edit when the shape moves.
+-type local_seeds() ::
+    {ok, i2p_peer:local_keys(), [i2p_router_info:router_info()], listen | no_listen}
+    | error.
+
+-spec resolve_local() -> local_seeds().
 resolve_local() ->
     case application:get_env(i2per, i2p_peer) of
         {ok, #{local := Local, seeds := Seeds}} ->

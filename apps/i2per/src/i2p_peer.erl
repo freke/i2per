@@ -541,11 +541,9 @@ note_unhandled_ssu2_block(ConnPid, Block, State) ->
         true ->
             State;
         false ->
-            logger:warning(
-                "unhandled ssu2 ~0p block from ~0p", [Name, Identity]
+            i2p_log:emit(
+                unhandled_ssu2_block_peer, "unhandled ssu2 ~0p block from ~0p", [Name, Identity]
             ),
-            %% A log-only fact: nothing on the bus names the peer, so this line is
-            %% the only place that fact exists.
             State#{unhandled_ssu2_blocks => Seen#{Key => true}}
     end.
 
@@ -1575,7 +1573,8 @@ learn_ri(RI, State) ->
             %% Log-only. An out-of-band RouterInfo nobody asked for is not a
             %% DatabaseStore on a pending lookup, so there is no lookup to fail and
             %% nothing for `db_store_not_stored` to be about.
-            logger:warning(
+            i2p_log:emit(
+                netdb_refused_routerinfo,
                 "netdb refused RouterInfo ~0p: ~0p",
                 [i2p_router_info:hash(RI), Refused]
             ),

@@ -73,7 +73,15 @@ ok = i2p_config:load_default(),   %% called from i2per_app:start/2
 ```
 """.
 
--export([load_default/0, load/1, parse/1, validate/1, parse_tunnels/1, listen_ip/0]).
+-export([
+    load_default/0,
+    load/1,
+    parse/1,
+    validate/1,
+    parse_tunnels/1,
+    listen_ip/0,
+    in_force/0
+]).
 
 -export_type([config/0]).
 
@@ -233,6 +241,36 @@ apply_env([{Key, Value} | Rest]) ->
     apply_env(Rest);
 apply_env([]) ->
     ok.
+
+-doc """
+The configuration in force, as the application environment actually holds it.
+
+Output: `[{Key, Value}]` for every key `m:i2p_log:loggable_config_keys/0` allows
+to be printed and that is set, sorted by key so two boots of the same
+configuration read identically. A key that is allowed but unset is absent rather
+than reported as `undefined`, because "not configured" and "configured to
+undefined" are the same thing here and only one of them is worth a line of output.
+
+The environment is the answer, never the file. `f:apply_env/1` merges the file
+*under* whatever is already set — `sys.config` wins over `i2per.conf` — so the two
+can disagree while the router runs with the environment's value. A reporter that
+read the file would be reporting a configuration that is not in force, which is
+the one failure this function exists to make impossible.
+
+Values are reported as they are stored, with no rendering or normalisation. A
+boot line that printed a prettified version of a value could disagree with the
+value the router is using, and the whole value of the line is that it does not.
+""".
+-spec in_force() -> [{atom(), term()}].
+in_force() ->
+    lists:keysort(
+        1,
+        [
+            {Key, Value}
+         || Key <- i2p_log:loggable_config_keys(),
+            {ok, Value} <- [application:get_env(i2per, Key)]
+        ]
+    ).
 
 %% %%%%% %%% Parser %%%%% %%%
 

@@ -77,6 +77,6 @@ reseed(State) ->
         {error, Reason} ->
             %% Log-only. A reseed is out-of-band bootstrapping: there is no pending
             %% lookup and no store to be refused, so no event describes it.
-            logger:warning("reseed failed: ~p", [Reason]),
+            i2p_log:emit(reseed_failed, "reseed failed: ~0p", [Reason]),
             {stop, normal, State}
     end.

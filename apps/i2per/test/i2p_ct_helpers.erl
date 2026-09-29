@@ -22,6 +22,9 @@
     await/2,
     wait_msg/2,
     events_from/1,
+    log_events_from/1,
+    log_lines_from/1,
+    render_log_event/1,
     floodfill_router_info/2,
     db_store_block/3,
     dead_pid/0,
@@ -32,11 +35,13 @@
 
 -define(SSU2_TRACE_MAX, 512).
 
-%% How long to wait for the bus to deliver a barrier event before declaring it
-%% broken. A hang guard, not a synchronisation -- see `f:await_bus/0`.
 %% How long to wait for a barrier event to come back from the bus. A hang guard,
 %% not a synchronisation -- see `f:events_from/1`. Crossing it raises.
 -define(BUS_DELIVERY_TIMEOUT_MS, 5000).
+
+%% The same for the log-capture path. A hang guard, not a synchronisation: the
+%% barrier decides, not the clock. See `f:log_lines_from/1`.
+-define(LOG_DELIVERY_TIMEOUT_MS, 5000).
 
 %% A directory that exists and is writable for the current test case, created
 %% beneath the CT priv dir. Store it in Config as `{temp_data_dir, Dir}` and
@@ -396,6 +401,83 @@ events_from(Fun) ->
         _ = gen_event:delete_handler(i2p_events, i2p_events_tests_collector, []),
         stop_bus(Owned)
     end.
+
+%% The log-capture counterpart of `f:events_from/1`: run `Fun`, then barrier on a
+%% line logged after it, and return every line collected up to that barrier.
+%%
+%% **Why a marker line is a barrier, and a wait is not.** `logger:log/3` hands the
+%% event to the `logger` server and returns; the handler is a separate process and
+%% will see it whenever it gets round to it. A zero-timeout drain afterwards is a
+%% race that passes on an idle machine, exactly as `i2p_events:notify/1` returning
+%% is not a delivery guarantee. The marker is logged *after* the work, the handler
+%% processes its mailbox in order, so the marker's arrival is proof that every
+%% line emitted before it has already been delivered. Crossing the timeout raises
+%% rather than returning a short answer, because a partial list would read as a
+%% complete one.
+%%
+%% Output: the rendered log lines, oldest first, without the marker itself.
+-spec log_lines_from(fun(() -> term())) -> [string()].
+log_lines_from(Fun) ->
+    [render_log_event(Event) || Event <- log_events_from(Fun)].
+
+-doc """
+The log events `Fun` produced, oldest first, each still carrying its level.
+
+Same barrier as `f:log_lines_from/1` and the same guarantee; this variant keeps
+`logger`'s own `#{level := _, msg := _}` instead of rendering it, so a case can
+assert *what level* a line was recorded at rather than only what it says.
+
+ADR 0002 requires the three boot lines at `notice`, and asserting their text alone
+does not enforce it: the fact name in `f:i2p_log:emit/3` selects the level and
+nothing else, so recording the started-as line under a `warning` fact produces the
+identical text at a different level, and every text assertion still passes.
+""".
+-spec log_events_from(fun(() -> term())) -> [logger:log_event()].
+log_events_from(Fun) ->
+    {ok, Id} = i2p_log_tests_collector:start(self()),
+    try
+        _ = Fun(),
+        Barrier = lists:flatten(io_lib:format("~p", [{i2p_log_barrier, make_ref()}])),
+        logger:notice("~s", [Barrier]),
+        log_events_until(Barrier, [])
+    after
+        i2p_log_tests_collector:stop({ok, Id})
+    end.
+
+-spec log_events_until(string(), [logger:log_event()]) -> [logger:log_event()].
+log_events_until(Barrier, Acc) ->
+    receive
+        {log_line, Event} ->
+            case render_log_event(Event) of
+                Barrier ->
+                    lists:reverse(Acc);
+                _Line ->
+                    log_events_until(Barrier, [Event | Acc])
+            end
+    after ?LOG_DELIVERY_TIMEOUT_MS ->
+        erlang:error({log_barrier_never_arrived, lists:reverse(Acc)})
+    end.
+
+%% Render one captured log event the way `logger`'s own formatter would, so a test
+%% asserts on the text an operator reads rather than on the pre-format term.
+%%
+%% Two shapes arrive, not one. A log call carries `{Format, Args}`. A *progress
+%% report* -- `supervisor` reporting a started child -- carries `{report, Report}`,
+%% and reaching this at all is a real consequence of a router running at `info`,
+%% which is exactly one of the configurations a boot-line test asks about. Rendering
+%% it with `io_lib:format/2` treats the atom `report` as a format string and raises
+%% `badarg`, so it gets its own clause.
+-spec render_log_event(map()) -> string().
+render_log_event(#{msg := {report, Report}}) ->
+    lists:flatten(io_lib:format("~p", [Report]));
+render_log_event(#{msg := {Format, Args}}) when
+    (is_list(Format) orelse is_binary(Format)) andalso is_list(Args)
+->
+    lists:flatten(io_lib:format(Format, Args));
+render_log_event(Event) ->
+    %% Anything else is rendered whole rather than guessed at, so a new event shape
+    %% shows up in a failing assertion instead of raising inside the barrier.
+    lists:flatten(io_lib:format("~p", [Event])).
 
 %% Everything the bus delivered up to and including `Barrier`, and separately
 %% anything already queued behind it.
