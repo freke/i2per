@@ -518,10 +518,15 @@ is_i2np_block(_) -> false.
 %% blocks those coordinators need is how a future implementation ends up looking
 %% broken for a reason that lives in this module.
 %%
-%% The event carries the block name alone, which is the dimension a counter
-%% wants; the peer is named in the log line, where cardinality does not matter.
-%% The warning is emitted once per peer and kind, because a peer that floods us
-%% with these must not turn the log into the flood it is causing.
+%% Both lines stay, and they are not a duplicate. The event carries the block name
+%% alone, which is the dimension a counter wants; the log line adds the *peer*, which
+%% the event deliberately does not carry because its cardinality is unbounded. That
+%% is the ADR 0002 split rather than a breach of it: the fact is recorded once, and
+%% the two lines record different parts of it.
+%%
+%% The warning is emitted once per peer and kind, because a peer that floods us with
+%% these must not turn the log into the flood it is causing. The event is not
+%% deduplicated, for the same reason in reverse: a counter wants the total.
 note_unhandled_ssu2_block(ConnPid, Block, State) ->
     Name = ssu2_block_name(Block),
     i2p_events:notify({ssu2_block_unhandled, Name}),
@@ -539,6 +544,8 @@ note_unhandled_ssu2_block(ConnPid, Block, State) ->
             logger:warning(
                 "unhandled ssu2 ~0p block from ~0p", [Name, Identity]
             ),
+            %% A log-only fact: nothing on the bus names the peer, so this line is
+            %% the only place that fact exists.
             State#{unhandled_ssu2_blocks => Seen#{Key => true}}
     end.
 
@@ -1153,23 +1160,15 @@ replicate_stored(StoreType, Key, Data, {stored, State}, ConnPid) ->
     _ = maybe_replicate(StoreType, Key, Data, ConnPid, State),
     State;
 replicate_stored(_StoreType, _Key, _Data, {not_stored, Reason, State}, _ConnPid) ->
+    %% The announcement is the whole report (ADR 0002: each fact is recorded once,
+    %% on one instrument). This used to also call `f:report_not_stored/1`, which
+    %% logged the same reason at `debug` -- invisible under the shipped `notice`
+    %% default, so it bought nothing for a subscriber-less router either -- and at
+    %% `warning` for an unparseable RouterInfo, where the prominence was the only
+    %% addition and `unparseable_router_info_data` is already a distinct reason a
+    %% consumer can count apart from `{unsupported_type, T}`. Both lines are gone.
     i2p_events:notify({db_store_not_stored, Reason}),
-    report_not_stored(Reason),
     State.
-
-%% A refusal and an unimplemented type are both normal enough in the aggregate
-%% that neither is worth a `warning` per message: `f:reply_to_store/3` has
-%% already acknowledged the store, so a peer that keeps sending one is not doing
-%% anything wrong and we must not turn its traffic into our log volume. The
-%% reason is on the bus, which is where a counter will read it, and `debug`
-%% keeps a packet off the wire's worth of default-level log. An unparseable type
-%% 0 is different — it means a peer sent us a RouterInfo that is not one, which
-%% is a protocol fault rather than a version we have not caught up with — so that
-%% one is worth saying out loud.
-report_not_stored(unparseable_router_info_data) ->
-    logger:warning("peer sent a netdb store whose router info data does not parse", []);
-report_not_stored(Reason) ->
-    logger:debug("netdb store not stored: ~0p", [Reason]).
 
 %% A DatabaseStore with a nonzero (and not 0xFFFFFFFF) reply token asks for a
 %% DeliveryStatus acknowledgement. i2pd replies unconditionally, before any
@@ -1573,6 +1572,9 @@ learn_ri(RI, State) ->
         Outcome when Outcome =:= added; Outcome =:= updated; Outcome =:= older ->
             remember_ri(RI, State);
         Refused ->
+            %% Log-only. An out-of-band RouterInfo nobody asked for is not a
+            %% DatabaseStore on a pending lookup, so there is no lookup to fail and
+            %% nothing for `db_store_not_stored` to be about.
             logger:warning(
                 "netdb refused RouterInfo ~0p: ~0p",
                 [i2p_router_info:hash(RI), Refused]
