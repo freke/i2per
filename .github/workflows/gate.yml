@@ -1,0 +1,161 @@
+# The two release-gate jobs, decided in #FP2QFD7 and split on purpose.
+#
+# They are separate jobs rather than one job with a matrix because they answer
+# two different questions, and a matrix cannot answer both at once:
+#
+#   gate      -- "does this commit pass on the environment it is developed in?"
+#   compat    -- "can someone run this on another OTP?"
+#
+# A matrix of the pinned version answers the second question with the first
+# job's strictness, which is why the README warns that a different OTP produces
+# warnings this one does not: `warnings_as_errors` is the *only* thing separating
+# the two jobs, so folding them together would make "fails on an older OTP" and
+# "fails on a lint regression" the same red mark.
+
+name: gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancels a superseded run on the same ref. A gate that reports a stale result is
+# worse than one that takes longer, because the commit it names is not the commit
+# that was tested.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # %%%%% The pinned gate %%%%%
+  #
+  # The toolchain `devenv.nix` declares, not "a recent version of each tool".
+  # `warnings_as_errors` stays intact, because that strictness is the point: a
+  # warning this environment does not produce is a warning the gate cannot catch.
+  gate:
+    name: gate (pinned toolchain)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        # Not a hardcoded list of versions. The versions live in devenv.nix, so
+        # this job and a developer's shell cannot disagree about which OTP a
+        # warning was measured against -- which is the drift the README warns
+        # about. The nix cache is the cost of doing it this way.
+        uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            accept-flake-config = true
+            extra-experimental-features = nix-command flakes
+
+      - uses: cachix/cachix-action@v15
+        with:
+          name: devenv
+
+      - name: Enter the devenv shell
+        run: |
+          nix profile install nixpkgs#devenv
+          devenv shell -- ci
+          eval "$(devenv direnv --json)" || true
+          # `devenv shell -- ci` already exported the environment; this is here
+          # so the step fails loudly if it did not, rather than the next step
+          # failing with "rebar3: command not found".
+          command -v rebar3
+          command -v erlfmt
+          command -v just
+
+      - name: just check
+        # lint + doc + eunit + ct, the four gates `justfile` defines. Invoked
+        # through `just` rather than spelled out here so CI and a developer run
+        # the same list: a gate that is written twice is a gate that is checked
+        # once.
+        run: just check
+
+      - name: just dialyzer
+        run: just dialyzer
+
+  # %%%%% The compatibility job %%%%%
+  #
+  # **Warnings are not fatal here, from day one.** That is not a relaxation
+  # discovered later -- it is the only thing that makes this job a different
+  # question from `gate`. A compatibility matrix that failed on warnings would
+  # report an older OTP as broken when the code is fine, and the natural
+  # response would be to delete the matrix.
+  #
+  # **Only OTP varies.** rebar3 and erlfmt are pinned per job, because varying
+  # the tooling multiplies the matrix without answering anything about the
+  # runtime, and -- worse -- a formatting difference would arrive as a
+  # compatibility failure, which is a category error an operator cannot act on.
+  #
+  # Starts at one version, the same as devenv, because a matrix nobody has run
+  # is a matrix of guesses. Expansion is 1.0.0 material.
+  compat:
+    name: compat (OTP ${{ matrix.otp }}, warnings relaxed)
+    runs-on: ubuntu-latest
+    strategy:
+      # One version, so this job is reporting rather than surveying. `fail-fast:
+      # false` is kept because the day a second version is added, the useful
+      # report is all of them rather than only the first to fail.
+      fail-fast: false
+      matrix:
+        include:
+          - otp: "28"
+            rebar3: "3.27.0"
+            erlfmt: "1.8.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ matrix.otp }}
+
+      - uses: erlef/setup-rebar3@v1
+        with:
+          rebar3-version: ${{ matrix.rebar3 }}
+
+      - name: Install the pinned erlfmt
+        # The formatter is pinned rather than ranged, for the reason in the
+        # header: a formatting difference must never read as a compatibility
+        # failure. `-check` only; this job does not rewrite the tree.
+        run: |
+          curl -fsSL "https://github.com/erlef/erlfmt/releases/download/v${{ matrix.erlfmt }}/erlfmt-${{ matrix.otp }}.zip" -o /tmp/erlfmt.zip
+          unzip -q /tmp/erlfmt.zip -d /tmp/erlfmt-bin
+          echo "$PWD/erlfmt/bin" >> "$GITHUB_PATH"
+          chmod +x erlfmt/bin/erlfmt
+
+      - name: Compile, warnings not fatal
+        # A fresh rebar config with `warnings_as_errors` dropped, rather than a
+        # flag: there is no rebar3 flag for it, and editing rebar.config in place
+        # would make the working tree dirty in a way the later steps could trip
+        # over.
+        run: |
+          cp rebar.config /tmp/rebar.config.gate
+          python3 - <<'PY'
+          import re, pathlib
+          p = pathlib.Path("rebar.config")
+          s = p.read_text()
+          # The project sets this in `{erl_opts, [...]}`. Removing just the
+          # element, not the whole list, so every other option survives.
+          s = re.sub(r",\s*warnings_as_errors", "", s)
+          p.write_text(s)
+          PY
+          rebar3 compile
+          diff -u /tmp/rebar.config.gate rebar.config || true
+
+      - name: eunit and ct
+        run: |
+          rebar3 as test eunit
+          # `--sname` gives the CT node a fixed dist name, which
+          # `apps/i2per_status/test/i2per_status_SUITE` needs to spawn a peer
+          # router. Same reason as the justfile recipe.
+          rebar3 ct --sname i2per_ct
+
+      - name: dialyzer
+        # Still run. A compatibility job that skipped it would not answer "can
+        # someone run this on another OTP" so much as "does it compile elsewhere".
+        run: rebar3 dialyzer

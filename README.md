@@ -10,8 +10,19 @@ The project interoperates with I2P routers. It does not bundle code from
 `i2pd` or `i2p-java`; the repository's `NOTICE` file records the attribution.
 
 > **Status: proof of concept.** The 0.1.0 in this tree is a development snapshot,
-> not a published release. There is no CI and no automated test gate; the first
-> fully tested and automated release is targeted at 1.0.0.
+> not a published release.
+>
+> CI is here as of this tree's HEAD: a pinned gate on the `devenv.nix` toolchain
+> running `just check` and `just dialyzer`, plus a warnings-relaxed job asking
+> whether another OTP can build and run it. The read API is versioned and its key
+> set is checked across the core/consumer boundary, not only inside each
+> application. What 0.1.0 does **not** yet have is the external i2pd
+> interoperability suite as a required gate — that is deferred to 0.3.0, the
+> first release to make protocol claims, because a gate that cannot tell a real
+> failure from a known-broken prerequisite is worse than no gate. See
+> [ADR 0001](https://github.com/freke/i2per/blob/main/docs/adr/0001-data-only-core-with-presentation-apps.md)
+> and [ADR 0002](https://github.com/freke/i2per/blob/main/docs/adr/0002-the-logging-floor-the-bus-is-the-instrument.md)
+> for the reasoning.
 
 ## Included in 0.1.0
 
