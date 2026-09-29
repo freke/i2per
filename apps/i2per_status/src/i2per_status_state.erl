@@ -21,7 +21,14 @@ i2per_status_state:snapshot().
 
 -behaviour(gen_server).
 
--export([start_link/0, snapshot/0, fetch/0, known_event_keys/0]).
+-export([
+    start_link/0,
+    snapshot/0,
+    fetch/0,
+    known_event_keys/0,
+    known_view_keys/0,
+    own_snapshot_keys/0
+]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
@@ -152,11 +159,24 @@ the view, because a view exists only for a router that was reached.
 
 The view's shape is duplicated rather than referenced, because this app does not
 depend on `i2per` at build time: it is a standalone service an operator can run
-on a different node, and the router's modules reach it by name over erpc. That
-makes the duplication a real cost, so it is pinned by a test
+on a different node, and the router's modules reach it by name over erpc. So
+there are two declarations on this side of that boundary — the `t:snapshot/0`
+type, which the compiler checks, and `f:known_view_keys/0`, which a test can
+read — and they are two rather than one because a type is not data and a test
+cannot enumerate one. `f:own_snapshot_keys/0` is the third declaration: the keys
+this service invents rather than reads.
+
+**This module's doc used to claim a test that did not exist.** It said the
+duplication was "pinned by a test
 (`apps/i2per_status/test/i2per_status_contract_tests.erl`) which fails when the
-two disagree — a key added to `f:view/0` without being added here is caught
-there, not by a reader noticing.
+two disagree". That module has never read `m:i2p_status_data:view_keys/0`, and
+the only test that does is producer-side, comparing the view against a list
+sitting beside it in the same application. So the two applications' key sets
+were each internally consistent and mutually unverified, which is the drift
+`dist_view_keys_agree_with_the_consumers_key_set` now closes.
+
+A snapshot is the union of the two sets, and the union is what a reader of
+`t:snapshot/0` is being promised.
 """.
 -type snapshot() :: #{
     online := boolean(),
@@ -359,6 +379,63 @@ known_event_keys() ->
 %% exist". An unrecognised tag is the one key that appears only when it happens.
 empty_counters() ->
     maps:from_list([{Key, 0} || Key <- known_event_keys()]).
+
+%%% %%%%% %%% The read API's key set, as data %%%%% %%%%
+
+%% The keys `m:i2p_status_data:view/0` returns, as of this version of the contract.
+%%
+%% Exists so the key set can be compared across the erpc boundary rather than only
+%% described. `t:snapshot/0` says what a snapshot looks like to the compiler; this
+%% says what it looks like to a test, and a test is the only thing that can catch
+%% the two applications' views drifting apart.
+%%
+%% **This is a second declaration beside the type, and the duplication is
+%% deliberate** — it is a consequence of the build-time boundary, not a preference.
+%% This app cannot compile against the core's types, so the shape has to be written
+%% down here; and a type is not enumerable at runtime, so the test cannot read what
+%% is written there. The way the two are kept honest is that
+%% `i2per_status_SUITE` asks a live router for its own `view_keys/0` and demands
+%% the two agree.
+%%
+%% Ordering is the router's own — the list is compared sorted, so this is a
+%% presentation detail and not a contract. **This is the consumer's expectation of
+%% the key set at `?VIEW_VERSION` 1**, and a router reporting a different `version`
+%% is a different contract rather than a drift; the suite asserts the version
+%% matches before it compares the keys, so a mismatch is reported as a version
+%% difference and not as a list of missing keys.
+-spec known_view_keys() -> [atom()].
+known_view_keys() ->
+    [
+        boot_time,
+        counters,
+        identity,
+        netdb,
+        peers,
+        sessions,
+        tunnels,
+        uptime_ms,
+        version
+    ].
+
+%% The keys this service adds to a snapshot, which the router knows nothing about.
+%%
+%% The complement of `f:known_view_keys/0` in `t:snapshot/0`, and named separately
+%% because they are not optional for the same reason: these are present whether or
+%% not the router answered, which is what makes a snapshot readable while offline.
+-spec own_snapshot_keys() -> [atom()].
+own_snapshot_keys() ->
+    [derived, events, last_reachability, online, router_node, subscribed].
+%% `underspecs` is off on **both** key-set functions below, and for the same reason
+%% it is off on the core's `m:i2p_status_data:view_keys/0`: the spec is a
+%% **contract** -- the key set this service understands, which is allowed to grow as
+%% the router's read API does -- while dialyzer's success typing is today's literal
+%% list of it. Narrowing either spec to its literal union would make it a
+%% hand-maintained copy that has to be edited in lockstep with the body, which is
+%% the duplication this module exists to make visible rather than to add to. The
+%% case that holds the two key sets in step is
+%% `dist_view_keys_agree_with_the_consumers_key_set` in `i2per_status_SUITE`, which
+%% asks a live router for its own key set and fails when the two disagree.
+-dialyzer({no_underspecs, [known_view_keys/0, own_snapshot_keys/0]}).
 
 %% %%%%% %%% Polling %%%%% %%%
 

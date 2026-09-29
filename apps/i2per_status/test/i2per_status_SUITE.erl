@@ -12,7 +12,9 @@
 -export([init_per_suite/1, end_per_suite/1, init_per_group/2, end_per_group/2]).
 -export([
     dist_snapshot_matches_remote_identity/1,
-    dist_realtime_bus_counter_over_erpc/1
+    dist_realtime_bus_counter_over_erpc/1,
+    dist_view_keys_agree_with_the_consumers_key_set/1,
+    dist_snapshot_carries_the_union_of_both_key_sets/1
 ]).
 
 -define(SUITE_TIMEOUT, 90000).
@@ -24,7 +26,9 @@ groups() ->
     [
         {dist, [sequence], [
             dist_snapshot_matches_remote_identity,
-            dist_realtime_bus_counter_over_erpc
+            dist_realtime_bus_counter_over_erpc,
+            dist_view_keys_agree_with_the_consumers_key_set,
+            dist_snapshot_carries_the_union_of_both_key_sets
         ]}
     ].
 
@@ -99,6 +103,68 @@ dist_realtime_bus_counter_over_erpc(Config) ->
             fun() -> tunnel_built_count(i2per_status_state:snapshot()) >= Before + 1 end,
             20000
         )
+    after
+        application:stop(i2per_status)
+    end.
+
+%% The two applications' read-API key sets, compared across the erpc boundary.
+%%
+%% **This is the check the release-gate decision asked for and the tree did not
+%% have.** `view_key_set_matches_the_declared_list` in `i2p_read_api_SUITE`
+%% compares the view against a list sitting beside it in the *same* application, so
+%% the core is internally consistent and says nothing about the status service. The
+%% service declares its own expected set in `f:i2per_status_state:known_view_keys/0`
+%% because it cannot compile against the core's types, so the two declarations were
+%% free to drift with nothing to notice — and this is the case that notices.
+%%
+%% It has to be a dist case, and that is not incidental: the boundary this checks
+%% is the one the service is built not to have a compile-time link across. A test
+%% that could reference `i2p_status_data` directly would not be testing the thing
+%% that can actually go wrong, which is a router on another node serving a
+%% different key set than this build expects.
+%%
+%% Both directions, and separately named in the failure, because they are different
+%% mistakes with different fixes. A key the router returns that the service does not
+%% list is a key the service silently ignores; a key the service lists that the
+%% router stopped returning is a key it will read as absent forever.
+dist_view_keys_agree_with_the_consumers_key_set(Config) ->
+    RNode = router_node(Config),
+    RouterKeys = erpc:call(RNode, i2p_status_data, view_keys, [], 5000),
+    %% A *different version* is a different contract, not drift, and comparing key
+    %% sets across versions would report a list of "missing" keys that means
+    %% nothing. So the version is checked first and separately, and this case says
+    %% so: a mismatch here is a consumer built against a different read API, and
+    %% the honest response is a version report rather than a key diff.
+    View = erpc:call(RNode, i2p_status_data, view, [], 5000),
+    ?assertEqual(1, maps:get(version, View)),
+    %% The list the view actually returned, so a router that returns `view_keys/0`
+    %% and a view that disagrees cannot both be satisfied by one of them.
+    ?assertEqual(lists:sort(maps:keys(View)), lists:sort(RouterKeys)),
+    ConsumerKeys = i2per_status_state:known_view_keys(),
+    Unlisted = lists:sort(RouterKeys) -- lists:sort(ConsumerKeys),
+    Absent = lists:sort(ConsumerKeys) -- lists:sort(RouterKeys),
+    ?assertEqual({[], []}, {Unlisted, Absent}).
+
+%% And the snapshot this service hands out is the union of the two sets: every key
+%% the router publishes, plus every key the service invents.
+%%
+%% Separate from the case above because the two fail for different reasons. That one
+%% is about the *declarations* agreeing; this one is about a real, running snapshot
+%% carrying what they promise. A key can be in both lists and still be missing from
+%% the built snapshot — `build_snapshot/1` is a hand-written merge, and nothing else
+%% checks that it merged everything.
+dist_snapshot_carries_the_union_of_both_key_sets(Config) ->
+    RNode = router_node(Config),
+    start_status(RNode),
+    try
+        ok = i2p_ct_helpers:await(
+            fun() -> maps:get(online, i2per_status_state:snapshot()) end, 15000
+        ),
+        Snap = i2per_status_state:snapshot(),
+        Expected =
+            i2per_status_state:known_view_keys() ++
+                i2per_status_state:own_snapshot_keys(),
+        ?assertEqual(lists:sort(Expected), lists:sort(maps:keys(Snap)))
     after
         application:stop(i2per_status)
     end.
