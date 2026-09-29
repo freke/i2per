@@ -83,7 +83,7 @@ denylist is only ever as good as the list of secrets somebody remembered to name
     loggable_config_keys/0
 ]).
 
--export_type([level/0, fact/0, instrument/0]).
+-export_type([level/0, fact/0, instrument/0, entry/0]).
 
 %% The app-env key. Named once here and read by `m:i2p_config`'s whitelist and
 %% `m:i2p_config_srv`'s validator, so the key name is not spelled three times.
@@ -223,10 +223,10 @@ configured_level() ->
 %% has a standing rule against. Narrowing the spec to the literal unions would mean
 %% the duplication was introduced by the very module whose purpose is to remove it.
 %%
-%% It also keeps `f:emit/3`'s `bus` clause live. With the literal map inlined, dialyzer
-%% would see that no row is `bus` today and report the clause as unreachable; the
-%% `bus` rows arrive with the checklist-enforcement ticket, and a compile error here
-%% saying so would be the wrong place to learn it.
+%% It also keeps `f:emit/3`'s `bus` clause honest. With the literal map inlined,
+%% dialyzer would see the declared `bus` rows as an open set it can reason about and
+%% the `log` rows as the only reachable ones, which is a thinner guarantee than it
+%% looks.
 -dialyzer({no_underspecs, [checklist/0, loggable_config_keys/0]}).
 
 -doc """
@@ -243,52 +243,93 @@ site is not.
     config_in_force
     | started_as
     | online
-    %% The four log-only facts the tree already records. Each has no possible
-    %% subscriber: none of them is about a pending lookup, so no event exists to
-    %% describe it.
+    %% The four log-only faults the tree records. Each has no possible subscriber:
+    %% none of them is about a pending lookup, so no event exists to describe it.
     | netdb_store_type_unsupported
     | unhandled_ssu2_block_peer
     | netdb_refused_routerinfo
-    | reseed_failed.
+    | reseed_failed
+    %% ADR 0002's six bus-carried rows. Named for the event that carries them,
+    %% because the fact *is* the event: an operator's symptom and the announcement
+    %% that answers it are the same thing here, so a second name for it would be a
+    %% second thing to keep in step.
+    | peer_connect_failed
+    | lookup_failed
+    | reachability
+    | transit_denied
+    | leaseset_publish_failed
+    | db_store_not_stored.
 
 -doc """
 Which instrument carries a fact.
 
-`log` means this tree writes it to the log, at the level the checklist declares.
-`bus` means the event bus carries it and the log must not, because ADR 0002's
-rule is that a fact is recorded once, on one instrument.
+`log` means this tree writes it to the log, at the level the row declares.
+`bus` means the event bus carries it and the log must not, because ADR 0002's rule
+is that a fact is recorded once, on one instrument.
 
-The `bus` rows are added by the ticket that enforces the checklist end to end.
-They are absent here rather than stubbed, so this map is always the set of rows
-that are actually enforced.
+The two are not interchangeable and the distinction is the point of the whole
+checklist: a `log` row is a fact with no possible subscriber, and a `bus` row is a
+fact a counter will read. Putting either on the wrong instrument is a defect the
+build now reports.
 """.
 -type instrument() :: log | bus.
 
 -doc """
-The facts the router is required to record, and how.
+One row of the checklist: which instrument carries the fact, and at what level.
 
-Output: a map from `t:fact/0` to `{t:level/0, t:instrument/0}`. This is the single
-copy: `f:emit/3` reads the level out of it, and the test whose whole job is to
-fail when a declared fact is never emitted reads the fact set out of it too.
-
-Adding a row here without emitting it is not something the compiler can see,
-which is why the enforcement test exists rather than a type.
+`level` is present exactly when `instrument` is `log`, and that is not a shorthand.
+A `bus` row has no level because there is no log record to have one, and giving it
+one anyway would be a decorative field: it would invite a future caller to log a
+bus-carried fact at a level nobody chose, which is the mistake
+`f:emit/3` exists to refuse. An optional key states the truth; a required one
+would have to be filled in with a lie.
 """.
--spec checklist() -> #{fact() => {level(), instrument()}}.
+-type entry() :: #{level => level(), instrument => instrument()}.
+
+-doc """
+The facts the router is required to record, and on which instrument.
+
+Output: a map from `t:fact/0` to a `t:entry/0`. This is the single copy. `f:emit/3`
+reads the level out of it, and `i2p_log_checklist_tests` reads the fact set, the
+instrument and the level out of it -- so a declared fact that nothing in the tree
+records, on either instrument, fails the build.
+
+Adding a row here without recording it is not something the compiler can see. A
+type is not data, so nothing at the type level can say whether `started_as` is ever
+written; only a check that reads the tree can, and that is what this row is for.
+
+**What is deliberately not here.** `m:i2p_events:event/0` admits seventeen event
+shapes and only six are checklist rows, because the checklist is not the event
+vocabulary. It is ADR 0002's table of *symptoms an operator would report*, and a
+`peer_disconnected` is not one -- nothing an operator would come to the log to ask
+about. Declaring the rest would make the checklist a second copy of the event type,
+and the event type is already covered from both sides by
+`i2p_events_vocabulary_tests`. Two lists of the same seventeen things is the
+duplication this project refuses; so is a third list of six of them.
+""".
+-spec checklist() -> #{fact() => entry()}.
 checklist() ->
     #{
         %% The boot gaps. `notice` and not `info`: an operator who has never seen
         %% the router come up should not have to turn the level up to find out
         %% that it did.
-        config_in_force => {notice, log},
-        started_as => {notice, log},
-        online => {notice, log},
+        config_in_force => #{level => notice, instrument => log},
+        started_as => #{level => notice, instrument => log},
+        online => #{level => notice, instrument => log},
         %% Log-only faults. All four `warning`, because each is a peer or a
         %% source behaving in a way the operator may want to act on.
-        netdb_store_type_unsupported => {warning, log},
-        unhandled_ssu2_block_peer => {warning, log},
-        netdb_refused_routerinfo => {warning, log},
-        reseed_failed => {warning, log}
+        netdb_store_type_unsupported => #{level => warning, instrument => log},
+        unhandled_ssu2_block_peer => #{level => warning, instrument => log},
+        netdb_refused_routerinfo => #{level => warning, instrument => log},
+        reseed_failed => #{level => warning, instrument => log},
+        %% ADR 0002's six bus-carried rows, one per entry, in the order the ADR's
+        %% table lists them. No `level` on any of them: see `t:entry/0`.
+        peer_connect_failed => #{instrument => bus},
+        lookup_failed => #{instrument => bus},
+        reachability => #{instrument => bus},
+        transit_denied => #{instrument => bus},
+        leaseset_publish_failed => #{instrument => bus},
+        db_store_not_stored => #{instrument => bus}
     }.
 
 -doc """
@@ -320,8 +361,8 @@ at a level nobody chose for it.
 emit(Fact, Format, Args) ->
     Checklist = checklist(),
     case maps:find(Fact, Checklist) of
-        {ok, {_Level, log}} -> emit_at(Fact, Checklist, Format, Args);
-        {ok, {_Level, bus}} -> erlang:error({fact_on_the_bus, Fact});
+        {ok, #{level := _, instrument := log}} -> emit_at(Fact, Checklist, Format, Args);
+        {ok, #{instrument := bus}} -> erlang:error({fact_on_the_bus, Fact});
         error -> erlang:error({undeclared_fact, Fact})
     end.
 
@@ -381,7 +422,7 @@ apply(Level) ->
 %% `f:emit/3` with the level already resolved. Separate so the caller has one
 %% branch to take per outcome, and so the level can only arrive from the
 %% checklist and nowhere else.
--spec emit_at(fact(), #{fact() => {level(), instrument()}}, io:format(), list()) -> ok.
+-spec emit_at(fact(), #{fact() => entry()}, io:format(), list()) -> ok.
 emit_at(Fact, Checklist, Format, Args) ->
-    {Level, log} = maps:get(Fact, Checklist),
+    #{level := Level, instrument := log} = maps:get(Fact, Checklist),
     logger:log(Level, Format, Args).

@@ -228,21 +228,45 @@ the_checklist_declares_a_level_and_an_instrument_for_every_fact_test() ->
     ?assertEqual(lists:sort(maps:keys(Checklist)), i2p_log:fact_names()),
     lists:foreach(
         fun(Fact) ->
-            {Level, Instrument} = maps:get(Fact, Checklist),
-            ?assert(lists:member(Level, i2p_log:levels())),
-            ?assert(lists:member(Instrument, [log, bus]))
+            Entry = maps:get(Fact, Checklist),
+            case Entry of
+                #{instrument := log, level := Level} ->
+                    ?assert(lists:member(Level, i2p_log:levels()));
+                #{instrument := log} ->
+                    erlang:error({log_row_without_a_level, Fact, Entry});
+                #{instrument := bus, level := _} ->
+                    erlang:error({bus_row_carrying_a_level, Fact, Entry});
+                #{instrument := bus} ->
+                    ok;
+                Other ->
+                    erlang:error({unreadable_checklist_row, Fact, Other})
+            end
         end,
         i2p_log:fact_names()
     ),
-    %% The three boot gaps are the rows ADR 0002 marks as gaps, and they are the
-    %% ones nothing else in the tree can answer. A row silently dropped from here
-    %% is a whole symptom with no instrument at all, so they are named explicitly
-    %% rather than inferred from the length of the list.
+    %% The three boot gaps are the rows ADR 0002 marks as gaps, and they are the ones
+    %% nothing else in the tree can answer. A row silently dropped from here is a whole
+    %% symptom with no instrument at all, so they are named explicitly rather than
+    %% inferred from the length of the list.
     lists:foreach(
         fun(Fact) ->
-            ?assertEqual({notice, log}, maps:get(Fact, Checklist))
+            ?assertEqual(
+                #{level => notice, instrument => log}, maps:get(Fact, Checklist)
+            )
         end,
         [config_in_force, started_as, online]
+    ).
+
+%% A bus-carried fact cannot be written to the log, which is ADR 0002's one-instrument
+%% rule enforced rather than described: the six bus rows exist so that a fact a counter
+%% reads cannot also become a log line, and `f:emit/3` is where that is a fact rather
+%% than a hope.
+a_bus_carried_fact_cannot_be_written_to_the_log_test() ->
+    Bus = [F || {F, #{instrument := bus}} <- maps:to_list(i2p_log:checklist())],
+    ?assertEqual(6, length(Bus)),
+    lists:foreach(
+        fun(Fact) -> ?assertError({fact_on_the_bus, Fact}, i2p_log:emit(Fact, "x ~p", [1])) end,
+        Bus
     ).
 
 %% A fact that is not declared cannot be recorded through the module. Without this
@@ -284,7 +308,8 @@ a_declared_fact_is_recorded_at_its_declared_level_test() ->
             try
                 lists:foreach(
                     fun(Fact) ->
-                        {Level, log} = maps:get(Fact, i2p_log:checklist()),
+                        #{level := Level, instrument := log} =
+                            maps:get(Fact, i2p_log:checklist()),
                         ok = logger:update_primary_config(#{level => Level}),
                         Marker = lists:flatten(
                             io_lib:format("level probe barrier ~p", [make_ref()])
@@ -495,7 +520,7 @@ config_pairs() ->
     [io_lib:format("~p=~p", [Key, Value]) || {Key, Value} <- i2p_config:in_force()].
 
 log_carried_facts() ->
-    [Fact || {Fact, {_Level, log}} <- maps:to_list(i2p_log:checklist())].
+    [Fact || {Fact, #{instrument := log}} <- maps:to_list(i2p_log:checklist())].
 
 %% Configuration the router reads straight from the application environment with
 %% nothing in front of it: not on `m:i2p_config_srv`'s key list, and not in the ini

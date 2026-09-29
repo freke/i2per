@@ -27,6 +27,13 @@ counted and flagged rather than dropped.
 
 -include_lib("eunit/include/eunit.hrl").
 
+%% Exported for `i2p_log_checklist_tests`, which needs to know whether the event type
+%% still admits the shapes ADR 0002's checklist declares as bus-carried. It calls this
+%% rather than writing a second reader for the type: this parser is deliberately fussy
+%% about the details that break silently (comment stripping, the `}.` terminator, wire
+%% vs character offsets), and a copy of it would be a copy of exactly that fussiness.
+-export([declared_tags/0]).
+
 %% The one call shape the scan below can read. Named so the offset past it is derived
 %% from the needle rather than counted out by hand: a literal count here would
 %% silently truncate every tag by two characters if the needle ever changed, and a
