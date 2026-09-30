@@ -612,6 +612,63 @@ peertest_message_wrong_key_rejected_test() ->
     Flipped = <<Head/binary, (LastByte bxor 1):8>>,
     ?assertEqual(error, i2p_ssu2:decode_peertest(Bik, Flipped)).
 
+%% A symmetric long-header datagram that stops inside its own Poly1305 tag is
+%% short, not malformed, and the answer is `error` (#YNBT5ZD).
+%%
+%% The 32-byte long header leaves `Size - 32` bytes for ciphertext-plus-tag, so
+%% every length from ?MIN_PACKET (40) up to 47 arrives with fewer than the 16
+%% tag bytes. That used to reach `finish_symmetric/7`, where the split is a hard
+%% match: `Sz` goes negative and the whole process died. On the listener this was
+%% remote and unauthenticated, because the only thing standing between a
+%% stranger's datagram and this code is the introduction key, which every
+%% RouterInfo publishes.
+%%
+%% So it is asserted on all three symmetric decoders, at every short length, and
+%% not merely that they answer: an assert that only catches `error` would still
+%% pass if the function raised, since eunit reports a raise as a badmatch in the
+%% test rather than a mismatch between two values.
+truncated_symmetric_datagram_is_error_not_raise_test() ->
+    {_Bpk, Bik} = bob_keys(),
+    Decoders = [
+        {"token_request", 10, fun(Dgram) -> i2p_ssu2:decode_token_request(Bik, Dgram) end},
+        {"retry", 9, fun(Dgram) -> i2p_ssu2:decode_retry(Bik, Dgram) end},
+        {"peertest", 7, fun(Dgram) -> i2p_ssu2:decode_peertest(Bik, Dgram) end},
+        {"holepunch", 11, fun(Dgram) -> i2p_ssu2:decode_holepunch(Bik, Dgram) end}
+    ],
+    %% The whole table as one value, so a failure prints every case rather than
+    %% whichever one the generator happened to reach first.
+    ?assertEqual(
+        [
+            {Name, Size, error}
+         || {Name, _Type, _Decode} <- Decoders, Size <- lists:seq(40, 47)
+        ],
+        [
+            {Name, Size, outcome(Decode, build_short_symmetric(Bik, Type, Size))}
+         || {Name, Type, Decode} <- Decoders, Size <- lists:seq(40, 47)
+        ]
+    ).
+
+%% `error`, and specifically not a raise. A raise is turned into a value that
+%% cannot be mistaken for an answer, so the assertion is about the outcome rather
+%% than about there not having been one.
+outcome(Decode, Dgram) ->
+    try
+        Decode(Dgram)
+    catch
+        Class:Reason -> {raised, Class, Reason}
+    end.
+
+%% A well-formed header carrying the decoder's own type, sealed for real and then
+%% cut short. The masks are tail-derived, so the truncated bytes still unmask
+%% correctly and the header really does present as the expected type -- which is
+%% what leaves the length as the only thing wrong with it.
+build_short_symmetric(Bik, Type, Size) ->
+    Trailing = Size - 32,
+    Plain = <<16#AABBCCDDEEFF0011:64, 1:32, Type:8, 2:8, 2:8, 0:8, 0:64, 0:64, 0:(Trailing * 8)>>,
+    Sealed = i2p_ssu2:seal_long(Plain, Bik, Bik),
+    ?assertEqual(Size, byte_size(Sealed)),
+    Sealed.
+
 %% Out-of-session HolePunch message (type 11): Charlie answers Alice with a
 %% DateTime + Address + RelayResponse payload under her intro key. The
 %% connection IDs are the relay-nonce pair (see relay_*_conn_id helpers).

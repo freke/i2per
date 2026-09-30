@@ -1747,6 +1747,16 @@ decode_symmetric(Bik, ExpectedType, Packet) ->
             error
     end.
 
+%% A datagram has to carry a full Poly1305 tag, and this is the one place that
+%% fact is enforced. Without the check a datagram between ?MIN_PACKET and 47 bytes
+%% leaves fewer than 16 bytes after the 32-byte long header, `Sz` goes negative,
+%% and the match raises -- which killed the SSU2 socket owner outright, because
+%% this runs on attacker-reachable input with only the public introduction key in
+%% the attacker's way. See #YNBT5ZD. A library decides no process's fate: it
+%% answers `error`, and the caller decides what that means.
+finish_symmetric(_Bik, _Header, _PktNum, _Tok, _SrcConnId, _DstConnId, CTWithMac)
+    when byte_size(CTWithMac) < 16 ->
+    error;
 finish_symmetric(Bik, Header, PktNum, Tok, SrcConnId, DstConnId, CTWithMac) ->
     Sz = byte_size(CTWithMac) - 16,
     <<CT:Sz/binary, MAC:16/binary>> = CTWithMac,

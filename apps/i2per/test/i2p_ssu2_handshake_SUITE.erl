@@ -23,7 +23,8 @@
     dial_survives_created_delay/1,
     dial_survives_created_loss/1,
     data_survives_dropped_packet/1,
-    created_with_peertest_type_byte_is_delivered/1
+    created_with_peertest_type_byte_is_delivered/1,
+    a_truncated_datagram_does_not_kill_the_socket_owner/1
 ]).
 
 -define(APP, i2per).
@@ -37,7 +38,8 @@ all() ->
         dial_survives_created_delay,
         dial_survives_created_loss,
         data_survives_dropped_packet,
-        created_with_peertest_type_byte_is_delivered
+        created_with_peertest_type_byte_is_delivered,
+        a_truncated_datagram_does_not_kill_the_socket_owner
     ].
 
 init_per_testcase(_Case, Config) ->
@@ -58,6 +60,73 @@ session_limit_rejects_new_child(_Config) ->
     after
         application:unset_env(?APP, max_ssu2_sessions)
     end.
+
+%% A datagram that stops inside its own Poly1305 tag must not take the socket
+%% owner with it.
+%%
+%% This is the consequence the library-level case in `i2p_ssu2_tests` cannot
+%% show: the listener is the only process holding the UDP socket, its child spec
+%% is `restart => temporary`, so when it died it did not come back and every SSU2
+%% session lost its send path for good. The trigger is remote and needs no
+%% credential a stranger lacks -- the introduction key is in our own RouterInfo --
+%% and the length that works depends on the key, so for any key roughly one
+%% datagram in 256 of each length from ?MIN_PACKET to 47 is enough.
+%%
+%% The assertion is the listener's own liveness after each length, checked from
+%% outside, because that is the property that matters and a codec returning
+%% `error` could still be followed by a crash somewhere on the way out.
+a_truncated_datagram_does_not_kill_the_socket_owner(_Config) ->
+    Local = peer_local(),
+    IntroKey = maps:get(intro_key, Local),
+    {ok, Listener} = i2p_ssu2_listener:listen(<<"127.0.0.1">>, 0, Local, self()),
+    {ok, Sock} = gen_udp:open(0, [binary, {active, false}]),
+    try
+        LPort = i2p_ssu2_listener:port(Listener),
+        %% Both header types the listener hands to a symmetric decoder: the
+        %% out-of-session PeerTest on the unowned path, and the TokenRequest the
+        %% handshake fallback tries first. Either alone was enough.
+        Types = [{peertest, 7}, {token_request, 10}],
+        Killed = [
+            {Name, Size}
+         || {Name, Type} <- Types,
+            Size <- lists:seq(40, 47),
+            begin
+                ok = gen_udp:send(
+                    Sock,
+                    {127, 0, 0, 1},
+                    LPort,
+                    truncated_datagram(IntroKey, Type, Size)
+                ),
+                %% Long enough for the datagram to have been classified, handled
+                %% and answered-or-dropped, and short enough not to be a race
+                %% against the assertion itself.
+                timer:sleep(50),
+                not is_process_alive(Listener)
+            end
+        ],
+        [] = Killed,
+        true = is_process_alive(Listener),
+        %% And the socket still works: a real handshake through it, which is what
+        %% a dead socket owner costs. Without this the case would pass on a
+        %% listener that survived the probes but could no longer bind.
+        {ok, Dialed, _Keys} = dial_through_proxy({delay, 0}),
+        gen_server:cast(Dialed, {terminate, 0}),
+        ok
+    after
+        gen_udp:close(Sock),
+        i2p_ssu2_listener:stop(Listener)
+    end.
+
+%% Sealed for real and then cut short, so the masks are the ones the listener
+%% will actually derive and the header really does present as `Type`. Match
+%% rather than an EUnit macro, since this is a CT suite: a size that drifted away
+%% from the datagram would otherwise make the case test nothing.
+truncated_datagram(IntroKey, Type, Size) ->
+    Trailing = Size - 32,
+    Plain = <<16#AABBCCDDEEFF0011:64, 1:32, Type:8, 2:8, 2:8, 0:8, 0:64, 0:64, 0:(Trailing * 8)>>,
+    Sealed = i2p_ssu2:seal_long(Plain, IntroKey, IntroKey),
+    Size = byte_size(Sealed),
+    Sealed.
 
 %% ---------------------------------------------------------------------------
 %% Fault-injected bare dials
