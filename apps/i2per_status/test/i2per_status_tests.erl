@@ -8,6 +8,12 @@ the same node, realtime bus counters, and the two HTTP endpoints.
 
 -include_lib("eunit/include/eunit.hrl").
 
+%% The poll interval for the one case that waits on two readings. Short enough
+%% that the wait is the assertion's own synchronisation rather than the shipped
+%% five-second default, which is a property of the page's resolution and not of
+%% what this case checks.
+-define(TEST_POLL_MS, 20).
+
 %% Start the status service bound to a dead router node.
 start_status(Port) ->
     application:set_env(i2per_status, port, Port),
@@ -101,11 +107,17 @@ live_router_online_body() ->
 %% forever and every figure on the page would read "n/a". So this drives a real
 %% router through a real status service and waits for the block to appear.
 %%
-%% The wait is a *condition*, not a sleep: the poll interval is five seconds, so
-%% two readings take about five. `await/2` returns the moment the second arrives
-%% and the case proceeds, so the common path costs one poll and not two. It is not
-%% a fixed sleep in disguise, because the assertion is about reaching a state
+%% The wait is a *condition*, not a sleep: two readings are needed, so the case
+%% waits for the second and `await/2` returns the moment it arrives. It is not a
+%% fixed sleep in disguise, because the assertion is about reaching a state
 %% rather than about elapsed time.
+%%
+%% The poll interval is shortened to 20 ms so that "two readings" is 20 ms of
+%% waiting rather than a full five-second interval. The assertion is unchanged
+%% and does not depend on the interval being a particular value -- only the cost
+%% of waiting for it is under this case's control. The shipped default is 5000
+%% and is exercised by `m:i2per_status_state`; this case is about the derivation
+%% needing two readings, not about how long a poll takes.
 derived_figures_appear_after_two_readings_test_() ->
     {timeout, 60, fun derived_figures_appear_after_two_readings_body/0}.
 
@@ -113,6 +125,7 @@ derived_figures_appear_after_two_readings_body() ->
     boot_live_router(),
     Port = free_port(),
     application:unset_env(i2per_status, router_node),
+    ok = application:set_env(i2per_status, poll_ms, ?TEST_POLL_MS),
     start_status(Port),
     try
         wait_online(),
@@ -141,6 +154,9 @@ derived_figures_appear_after_two_readings_body() ->
         ?assert(maps:is_key(<<"tunnel_success_ratio">>, OnWire))
     after
         application:stop(i2per_status),
+        %% `application:stop/1` does not clear app env, so the next case would
+        %% inherit a 20 ms poll window.
+        application:unset_env(i2per_status, poll_ms),
         teardown_live_router()
     end.
 

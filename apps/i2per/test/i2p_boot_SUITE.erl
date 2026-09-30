@@ -1189,17 +1189,10 @@ remote_ri(Port) ->
     Opts = #{<<"netId">> => <<"2">>, <<"router.version">> => <<"0.9.74">>},
     i2p_router_info:build(Identity, erlang:system_time(millisecond), [Addr], Opts, Seed).
 
+%% Shared with the other reseed-shaped suites and generated once per run. See
+%% `i2p_ct_helpers:su3_keypair/0` for why the key is 4096 bits.
 test_keypair() ->
-    case persistent_term:get({?MODULE, test_keypair}, undefined) of
-        undefined ->
-            Priv = public_key:generate_key({rsa, 4096, 65537}),
-            #{cert := Cert} = public_key:pkix_test_root_cert("i2per-boot", [{key, Priv}]),
-            Pair = {Priv, Cert},
-            persistent_term:put({?MODULE, test_keypair}, Pair),
-            Pair;
-        Pair ->
-            Pair
-    end.
+    i2p_ct_helpers:su3_keypair().
 
 sign_ris(Ris) ->
     {Priv, _Cert} = test_keypair(),

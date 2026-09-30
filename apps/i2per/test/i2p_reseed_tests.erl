@@ -106,17 +106,10 @@ real_live_su3_bundle_test() ->
 %% Fixtures
 %% --------------------------------------------------------------------------
 
+%% Shared with the other reseed-shaped suites and generated once per run. See
+%% `i2p_ct_helpers:su3_keypair/0` for why the key is 4096 bits.
 keypair() ->
-    case persistent_term:get({?MODULE, keypair}, undefined) of
-        undefined ->
-            Priv = public_key:generate_key({rsa, 4096, 65537}),
-            #{cert := Cert} = public_key:pkix_test_root_cert("reseed-test", [{key, Priv}]),
-            Pair = {Priv, Cert},
-            persistent_term:put({?MODULE, keypair}, Pair),
-            Pair;
-        Pair ->
-            Pair
-    end.
+    i2p_ct_helpers:su3_keypair().
 
 trust() ->
     #{<<"test-signer">> => element(2, keypair())}.

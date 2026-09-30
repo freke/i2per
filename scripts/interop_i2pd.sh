@@ -3,7 +3,7 @@
 #
 # Boots a throwaway i2pd 2.61.0 (nixpkgs) with NTCP2 and SSU2 enabled on
 # 127.0.0.1, waits for its RouterInfo / keys / listeners, then runs the
-# interop suite (apps/i2per/test/i2p_i2pd_interop_SUITE.erl) against it and
+# interop suite (apps/i2per/interop/i2p_i2pd_interop_SUITE.erl) against it and
 # cleans up.
 #
 # It also boots a *second*, isolated i2pd on NTCP2 only (I2P_RESPONDER_PORT,
@@ -31,8 +31,9 @@
 # instance remains published because it must accept our loopback floodfill
 # RouterInfo and dial us back.
 #
-# This suite is excluded from `just check` (see rebar.config ct_opts); the
-# `--suite` here overrides that list, and missing env vars fail the cases
+# This suite is excluded from `just check` because it does not live in an app's
+# test/ directory, which is the only place rebar3 auto-discovers suites from;
+# the `--suite` here names it explicitly, and missing env vars fail the cases
 # loudly instead of passing trivially.
 
 set -euo pipefail
@@ -192,4 +193,4 @@ fi
 
 I2P_INTEROP="${DATA}" I2P_INTEROP_PORT="${PORT}" I2P_INTEROP_SSU2_PORT="${SSU2_PORT}" \
     I2P_INTEROP_RESPONDER="${RESP_DATA}" I2P_RESPONDER_PORT="${RESP_PORT}" \
-    rebar3 ct --suite apps/i2per/test/i2p_i2pd_interop_SUITE.erl
+    rebar3 ct --suite apps/i2per/interop/i2p_i2pd_interop_SUITE.erl

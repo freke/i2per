@@ -8,6 +8,9 @@
 %%   message from a previous case cannot poison a later assertion;
 %% - signed RouterInfo fixtures, so a suite that needs routers in the NetDb
 %%   builds them here instead of keeping its own copy of the keygen;
+%% - the SU3 signing keypair, generated once per run and shared, because RSA
+%%   keygen at the size `m:i2p_su3` requires is the single most expensive thing
+%%   a unit run does;
 %% - the SSU2 frame capture, which is a `logger` handler rather than a
 %%   registered-name sink and is read with a barrier.
 %%
@@ -30,6 +33,11 @@
     render_log_event/1,
     floodfill_router_info/2,
     db_store_block/3,
+    %% One SU3 signing identity for the whole run. See `su3_keypair/0`.
+    su3_keypair/0,
+    %% A second, distinct identity, for the tests that assert a container is
+    %% rejected because it was signed by the wrong key.
+    su3_other_keypair/0,
     dead_pid/0,
     silent_ntcp2_peer/1,
     start_ssu2_trace/0,
@@ -40,6 +48,9 @@
     start_frame_collector/0,
     stop_frame_collector/1
 ]).
+
+-define(SU3_KEYPAIR, su3_keypair).
+-define(SU3_OTHER_KEYPAIR, su3_other_keypair).
 
 -define(SSU2_TRACE_MAX, 512).
 
@@ -176,6 +187,47 @@ floodfill_router_info(TimestampMs, Host) ->
 %% rather than re-encode what it was handed.
 -spec db_store_block(byte(), i2p_crypto:hash(), i2p_router_info:router_info() | binary()) ->
     {i2np, byte(), non_neg_integer(), non_neg_integer(), binary()}.
+
+%% The SU3 signing keypair every reseed-shaped test signs with, generated once
+%% per run.
+%%
+%% **The key is RSA-4096 because `m:i2p_su3` accepts nothing else.** The decoder
+%% rejects any signature type other than `16#0006` and any signature length other
+%% than 512 bytes, and 512 bytes is a 4096-bit modulus, so a smaller key produces a
+%% container this router itself declares malformed. Do not shrink it to save the
+%% time: the cost is real and the fix is the sharing below, not a smaller key.
+%%
+%% Shared rather than memoised per module, because four suites and unit modules
+%% each carried their own copy of the same four lines of `persistent_term`
+%% bookkeeping. They agreed on one identity by coincidence, and they paid for one
+%% RSA-4096 keygen each. EUnit and Common Test are separate OS processes, so this
+%% removes the duplicate within a run and never across the two.
+-spec su3_keypair() -> {tuple(), map()}.
+su3_keypair() ->
+    memorise(?SU3_KEYPAIR).
+
+%% A second identity, distinct from `su3_keypair/0`, for the cases that assert a
+%% container is refused because it was signed by a key the trust store does not
+%% hold. Memoised for the same reason and with the same cost, which is why it
+%% exists rather than being generated per call.
+-spec su3_other_keypair() -> {tuple(), map()}.
+su3_other_keypair() ->
+    memorise(?SU3_OTHER_KEYPAIR).
+
+memorise(Key) ->
+    case persistent_term:get({?MODULE, Key}, undefined) of
+        undefined ->
+            Value = make_su3_keypair(),
+            persistent_term:put({?MODULE, Key}, Value),
+            Value;
+        Value ->
+            Value
+    end.
+
+make_su3_keypair() ->
+    Priv = public_key:generate_key({rsa, 4096, 65537}),
+    #{cert := Cert} = public_key:pkix_test_root_cert("i2per-su3-test", [{key, Priv}]),
+    {Priv, Cert}.
 
 %% A pid that has already exited, for exercising a teardown path without
 %% taking the test process down with it. A store the peer manager cannot parse

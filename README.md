@@ -263,6 +263,15 @@ realtime updates and polls the router when the event connection is unavailable.
 The listener defaults to loopback; set `listen_host` explicitly before exposing
 it beyond the local machine.
 
+`i2per_status` settings:
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `router_node` | this node | the router's node, reached over Erlang distribution |
+| `port` | `7662` | the HTTP listen port |
+| `listen_host` | loopback | the HTTP listen address; set it before exposing the page beyond this machine |
+| `poll_ms` | `5000` | how often the router is polled when the event connection is unavailable. It is the window the derived rates and ratios are differenced over, so it sets their resolution. Shorten it for hermetic tests or a denser soak series. |
+
 ## Interoperability and live checks
 
 The normal `just check` gate is hermetic. To run the explicit interop suite

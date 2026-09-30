@@ -9,6 +9,13 @@ Erlang distribution. The router may be on this node or any connected node
 (`router_node` app env of `i2per_status`, default: this node); it may also be
 absent entirely, which is expected state, not an error.
 
+The poll interval is the `poll_ms` app env of `i2per_status`, five seconds by
+default. It is the window the derived figures are differenced over, so it is
+what bounds the resolution of every rate on the page; shorten it with
+`poll_ms` for hermetic tests, where a case that waits for two readings would
+otherwise wait a full interval, and for soak diagnostics that need a denser
+series.
+
 ## Usage
 
 ```erlang
@@ -32,7 +39,7 @@ i2per_status_state:snapshot().
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
--define(POLL_MS, 5000).
+-define(DEFAULT_POLL_MS, 5000).
 
 %% Every tag the router's event type admits, as of this version. Kept beside the
 %% folding code because it *documents* the set, not because the folding depends on
@@ -262,10 +269,20 @@ handle_info({nodedown, Node}, #{router_node := Node} = State) ->
     {noreply, State#{online := false, view := offline_view()}};
 handle_info(poll, State) ->
     State1 = poll_once(State),
-    erlang:send_after(?POLL_MS, self(), poll),
+    erlang:send_after(poll_interval(), self(), poll),
     {noreply, State1};
 handle_info(_Info, State) ->
     {noreply, State}.
+
+%% The window the derived figures are differenced over. Read on every reschedule
+%% rather than captured once in `init/1`, so that shortening it in a test takes
+%% effect without restarting the service -- which is what lets a case set the
+%% app env, start the service, and still get a short window.
+poll_interval() ->
+    case application:get_env(i2per_status, poll_ms) of
+        {ok, Value} when is_integer(Value), Value > 0 -> Value;
+        _ -> ?DEFAULT_POLL_MS
+    end.
 
 terminate(_Reason, _State) ->
     ok.
