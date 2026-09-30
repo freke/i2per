@@ -24,7 +24,8 @@
     isolation/1,
     send_does_not_wait_on_the_connection/1,
     a_peer_that_stops_reading_ends_the_connection/1,
-    an_inbound_burst_does_not_delay_a_send/1
+    an_inbound_burst_does_not_delay_a_send/1,
+    a_batch_of_inbound_connections_is_not_accepted_one_per_second/1
 ]).
 
 -define(APP, i2per).
@@ -40,6 +41,15 @@
 %% larger buffers. Reaching either bound fails the case rather than passing it.
 -define(MAX_FILL_FRAMES, 500).
 -define(STALL_BUDGET_MS, 20000).
+
+%% How many inbound connections the accept case opens at once, and the budget the
+%% whole batch has to land inside. Six is the number the defect was measured with
+%% (6.06 s to drain, one per second); the bound is a *batch* bound, so the floor
+%% the defect sets is (6 - 1) = 5 s against a 2 s budget, and the case still
+%% fails on the last of the six rather than passing on the five that were fast.
+%% Reaching the budget fails the case rather than passing it.
+-define(ACCEPT_BATCH, 6).
+-define(ACCEPT_BUDGET_MS, 2000).
 
 suite() ->
     [{timetrap, 30000}].
@@ -58,7 +68,8 @@ all() ->
         isolation,
         send_does_not_wait_on_the_connection,
         a_peer_that_stops_reading_ends_the_connection,
-        an_inbound_burst_does_not_delay_a_send
+        an_inbound_burst_does_not_delay_a_send,
+        a_batch_of_inbound_connections_is_not_accepted_one_per_second
     ].
 
 init_per_testcase(transport_bytes_are_counted, Config) ->
@@ -607,6 +618,176 @@ assert_ordered(Seen, Want) ->
             [Head | _] = Seen,
             assert_ordered(tl(Seen), Rest)
     end.
+
+%% --------------------------------------------------------------------------
+%% The accept path
+%% --------------------------------------------------------------------------
+
+%% A batch of inbound connections is accepted as a batch
+%%
+%% The defect: the accept loop polled its control messages on a **one-second**
+%% receive timeout and only called `f:gen_tcp:accept/2` when that timeout expired,
+%% so it took at most one inbound connection per second no matter how many were
+%% waiting. Six simultaneous connections took 6.06 s to drain, read from the
+%% kernel's accept queue — the rate was exactly the timeout, not a load effect.
+%% That is the rate a router's peer set grows at, and the rate it rebuilds one
+%% after a restart.
+%%
+%% The bound is a batch, asserted as one. Six dials are fired at the same instant
+%% and all six announcements have to arrive inside ?ACCEPT_BUDGET_MS, so a
+%% regression that admitted five immediately and the sixth a second later fails on
+%% the sixth rather than passing on the five. Against the defect the floor is
+%% (N-1) seconds — the last of N cannot be accepted before the Nth tick — so with
+%% N = 6 that is 5 s against a 2 s bound, and the bound is not a tolerance that
+%% happens to sit above the real behaviour: it is a third of what the defect
+%% needed.
+%%
+%% What the batch is made of, and why: six **real** NTCP2 dials rather than six
+%% raw TCP connects. A raw connect would prove the kernel completed a handshake,
+%% which is not the claim; the claim is that a Bob connection process was spawned
+%% per accepted socket, so each dial goes through the real handshake and its
+%% responder's `{ntcp2_ready, ...}` announcement is the evidence that an accept
+%% happened and the handover survived. Both sides of the same accept are counted:
+%% `dialed` is `f:i2p_ntcp2_conn:connect/3` returning (the accept let the dialer
+%% through), `accepted` is the responder announcing to this process as the
+%% listener's owner (a Bob process exists only because the socket was accepted).
+%%
+%% The control-message assertion is the part of the ticket that is easy to lose
+%% while fixing the throttle, so it is here rather than in a case of its own. The
+%% asker is a separate process that asks while the batch is in flight, which is
+%% the only moment the question means anything: a fix that moved the accept back
+%% into the process that answers control messages would leave it blocked. It
+%% cannot pass slowly — `f:port/1` answers or raises after its own bound, so a
+%% control path stuck behind the accept surfaces here as a wrong answer rather
+%% than as a late one.
+a_batch_of_inbound_connections_is_not_accepted_one_per_second(_Config) ->
+    {Bob, Alice} = pair(),
+    {ok, Listener} = i2p_ntcp2_listener:listen(0, Bob, self()),
+    try
+        Port = listen_port(Listener),
+        BobRI = ri_at(Port, Bob),
+        Deadline = erlang:monotonic_time(millisecond) + ?ACCEPT_BUDGET_MS,
+        Asker = ask_port(self(), Listener),
+        Dialers = [dial_inbound(BobRI, Alice, self()) || _ <- lists:seq(1, ?ACCEPT_BATCH)],
+        ?ACCEPT_BATCH = length(Dialers),
+        {Dialed, Accepted} = collect_batch(?ACCEPT_BATCH, Deadline, [], []),
+        ?ACCEPT_BATCH = length(Dialed),
+        ?ACCEPT_BATCH = length(Accepted),
+        %% Six *distinct* connections, from both sides. A count alone would be
+        %% satisfied by one connection counted twice, which is what a bug in the
+        %% responder's announcement would look like.
+        ?ACCEPT_BATCH = length(lists:usort(Dialed)),
+        ?ACCEPT_BATCH = length(lists:usort(Accepted)),
+        {asked, Port} = take_asked(Asker, Deadline),
+        [true = is_process_alive(Conn) || Conn <- Dialed ++ Accepted],
+        [ok = i2p_ntcp2_conn:stop(Conn) || Conn <- Dialed ++ Accepted]
+    after
+        i2p_ntcp2_listener:stop(Listener)
+    end,
+    %% A control question asked of a listener that is gone has a defined answer
+    %% instead of an open wait. What is asserted here is the shape; that the wait
+    %% is *bounded* is the function's own `after`, and a regression to an
+    %% unbounded one is caught by this case's timetrap rather than by this
+    %% assertion — which is also why there is no timing claim here to be wrong
+    %% about.
+    Answer = answered(fun() -> i2p_ntcp2_listener:port(Listener) end),
+    {'EXIT', {{listener_unanswered, Listener, port}, _}} = Answer,
+    %% `ok` last, and not as tidiness: Common Test reads a case that *returns*
+    %% `{'EXIT', Reason}` as a case that failed with `Reason`, so ending on the
+    %% assertion above reports the very failure the assertion is about. This cost
+    %% an hour and a half to find.
+    ok.
+
+%% The answer to a question nobody will answer, as a value rather than a raise.
+%% Kept as a function so the case reads as an assertion about a term; an inline
+%% `catch` in a match is the same thing spelled less legibly.
+answered(Fun) ->
+    try Fun() of
+        Answer -> {answered, Answer}
+    catch
+        _Class:Reason:Stack -> {'EXIT', {Reason, Stack}}
+    end.
+
+%% One dial, in its own process, so all ?ACCEPT_BATCH of them reach the listen
+%% socket at the same moment rather than as a queue of sequential handshakes. A
+%% sequential loop would measure the accept rate with a peer already established
+%% between each pair, which is not the condition the defect was measured under.
+%%
+%% The dialer owns its own connection — `f:i2p_ntcp2_conn:connect/3` defaults the
+%% owner to the caller — which is what puts the dialer's own announcement where
+%% `connect/3` consumes it and leaves the *responder's* announcement arriving
+%% here, as the listener's owner. `f:await_ready/0` relies on the same fact for a
+%% single connection. `Parent` is only where the dialer reports its own result.
+dial_inbound(BobRI, Alice, Parent) ->
+    spawn(fun() ->
+        case i2p_ntcp2_conn:connect(BobRI, Alice, #{}) of
+            {ok, Conn} -> Parent ! {dialed, Conn};
+            {error, Reason} -> Parent ! {dial_failed, Reason}
+        end
+    end).
+
+%% The asker, with the parent captured by the caller rather than read inside the
+%% spawned fun — `self()` there is the asker, and an answer sent to the asker is
+%% an answer nobody is waiting for.
+ask_port(Parent, Listener) ->
+    spawn(fun() ->
+        Port =
+            try
+                i2p_ntcp2_listener:port(Listener)
+            catch
+                error:Reason -> {raised, Reason}
+            end,
+        Parent ! {asked, Port}
+    end).
+
+%% Both halves of the batch against one deadline, so the bound is on the batch
+%% rather than per connection — a bound per connection would let the sixth wait
+%% five seconds behind five fast ones and still pass.
+%%
+%% The two counts share the budget and each has to reach ?ACCEPT_BATCH, so a run
+%% where the responder announcements all arrive first still waits for the dials'
+%% own answers rather than declaring itself finished on one side.
+%%
+%% A failed dial is reported rather than left to run out the deadline, because
+%% "the sixth never arrived" and "the sixth was refused" are different faults and
+%% only one of them is a throttle.
+collect_batch(N, Deadline, Dialed, Accepted) ->
+    case {length(Dialed), length(Accepted)} of
+        {N, N} ->
+            {Dialed, Accepted};
+        _ ->
+            collect_batch_next(N, Deadline, Dialed, Accepted)
+    end.
+
+collect_batch_next(N, Deadline, Dialed, Accepted) ->
+    receive
+        {dialed, Conn} ->
+            collect_batch(N, Deadline, [Conn | Dialed], Accepted);
+        {ntcp2_ready, Conn, _RemoteRI} ->
+            collect_batch(N, Deadline, Dialed, [Conn | Accepted]);
+        {dial_failed, Reason} ->
+            erlang:error({dial_failed, Reason})
+    after remaining_ms(Deadline) ->
+        erlang:error(
+            {accept_batch_incomplete, [
+                {dialed, Dialed},
+                {accepted, Accepted}
+            ]}
+        )
+    end.
+
+%% The asked answer, or the same failure as the batch: a control message that has
+%% not come back by the time the batch did is part of the same defect.
+take_asked(Asker, Deadline) ->
+    receive
+        {asked, Answer} ->
+            {asked, Answer}
+    after remaining_ms(Deadline) ->
+        erlang:error({control_message_unanswered, Asker})
+    end.
+
+remaining_ms(Deadline) ->
+    erlang:max(0, Deadline - erlang:monotonic_time(millisecond)).
 
 %% --------------------------------------------------------------------------
 %% Connection-suite helpers
