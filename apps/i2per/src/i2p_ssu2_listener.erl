@@ -14,21 +14,60 @@ does not hold, so a short header's type at offset 12 decodes to noise here.
 2. Otherwise look up `i2p_ssu2_pending` by source endpoint. That is how a
    `SessionCreated` or `Retry` reaches the dialer waiting for it, and it needs
    no header interpretation at all, so it is exact too.
-3. Only for a datagram from an endpoint nothing is waiting on can it be an
-   out-of-session `PeerTest`. There, and only there, unmasking the whole header
-   with the introduction key reflects what an out-of-session peer actually did,
-   so the type byte is finally trustworthy: route it to a live session when the
-   connection ID matches, otherwise answer it as Charlie.
-4. Otherwise try a long-header handshake message (`TokenRequest` or
-   `SessionRequest`); valid ones spawn a fresh Bob-side session via
-   `m:i2p_ssu2_sup` and hand it the datagram plus the peer endpoint.
-5. Anything else — corrupt, unknown type, or unclassifiable — is dropped
+3. Only for a datagram from an endpoint nothing is waiting on is the type byte
+   trustworthy: there, and only there, unmasking header bytes 8..15 with the
+   introduction key reflects what an out-of-session peer actually did. That one
+   open answers all three of the remaining cases at once, since the types are
+   disjoint — an out-of-session `PeerTest`, which routes to a live session when
+   the connection ID matches and is otherwise answered as Charlie; a
+   `SessionRequest` or a `TokenRequest`, either of which spawns a fresh Bob-side
+   session via `m:i2p_ssu2_sup` and hands it the datagram plus the peer endpoint;
+   and anything else.
+4. Anything else — corrupt, unknown type, or unclassifiable — is dropped
    without response; a bad datagram can never kill the listener.
 
 Steps 1 and 2 precede any type inspection deliberately. Reading the type first
 diverts a `SessionCreated` whose masked byte happens to read `PeerTest` into
 the Charlie responder, which drops it, and the peer then dies with
 `{handshake_timeout, session_request}` roughly one time in 256.
+
+## Crypto per datagram: one pass, and where the others go
+
+Unmasking a long header is one raw ChaCha20 pass per tail-derived mask, plus one
+that decrypts header bytes 16..31 -- three for a full `f:i2p_ssu2:open_long/3`.
+The receiving session then spends one AEAD decrypt on the datagram body, which is
+the work the session exists to do. Measured here, on a 1472-byte datagram:
+
+| | passes | µs |
+| --- | --- | --- |
+| `f:open_conn_id/3` -- step 1, routing | **1** | 0.76 |
+| `f:open_header16/3` -- step 3, the type byte | 2 | 1.55 |
+| `f:open_long/3` -- what routing used to cost | 3 | 2.30 |
+| the AEAD decrypt the session then runs | (1) | 1.40 |
+| answering one out-of-session probe, Charlie role | 8 | 6.80 |
+
+So the socket owner spends, per datagram:
+
+| the datagram is... | passes | µs |
+| --- | --- | --- |
+| claimed by a session or a pending dialer | **1** | 0.76 |
+| from an unknown endpoint, and a probe, a SessionRequest or junk | 3 | 1.55 |
+| from an unknown endpoint, and a TokenRequest | 5 | 4.80 |
+
+One pass for a claimed datagram, because bytes 0..7 are the destination
+connection id and that is what both lookups key on, so nothing else is worth
+opening until a lookup has failed. It used to open the whole 32-byte header up
+front -- three passes, two of them discarded on every datagram that had a session
+-- and then open it again, twice more, in the handshake fallback. A claimed
+datagram cost 2.30 µs, more than the 1.40 µs AEAD decrypt it existed to enable,
+and is now 0.76. See #YNBT5ZD.
+
+## What runs here, and what does not
+
+Only routing happens on the socket owner. The Charlie responder
+(`m:i2p_ssu2_charlie`) is a separate process reached by a cast, because answering
+a probe is 6.80 µs -- nine times routing -- and this process is the only one that
+can send, so its time is also every other session's send latency.
 
 The socket is driven `{active, once}` so a flood can only starve itself;
 each datagram re-arms the socket. Sessions send through this process
@@ -171,6 +210,13 @@ open_socket(IPAddress, Port, LocalKeys, Owner, Coordinator) ->
                 port => BoundPort,
                 local => LocalKeys,
                 owner => Owner,
+                %% `undefined` until the first probe needs answering. A listener
+                %% cannot ask its own supervisor for a child from `init/1` -- that
+                %% re-enters the supervisor that is in the middle of starting this
+                %% very listener, and deadlocks -- so the responder is started on
+                %% first use instead. That is also the cheaper shape: a router that
+                %% is never tested as Charlie never starts one.
+                charlie => undefined,
                 peer_test_coordinator => Coordinator
             }};
         {error, Reason} ->
@@ -204,6 +250,20 @@ handle_cast({register_relay_tag, Tag, Pid, Expires}, State) ->
     _ = ets:insert(i2p_ssu2_relay_tags, {Tag, Pid, Expires}),
     erlang:monitor(process, Pid),
     {noreply, State};
+%% A finished Charlie reply, sealed by `m:i2p_ssu2_charlie`. Bytes and endpoint,
+%% nothing decoded: this process's part is the send, and the byte count is charged
+%% here for the same reason every other outbound datagram is -- the socket funnel
+%% is the one place a byte can be counted exactly once. Kept as its own clause and
+%% not folded into the `{send, ...}` one above because a reply is not session
+%% traffic, and a reader of the counter should be able to see that.
+handle_cast({charlie_reply, {Datagram, Endpoint}}, State = #{sock := Sock}) ->
+    Size = byte_size(Datagram),
+    i2p_log:debug({charlie_msg7_reply, Endpoint, Size}, []),
+    ok = i2p_stats:add(ssu2_bytes_out, Size),
+    ok = gen_udp:send(Sock, Endpoint, Datagram),
+    {noreply, State};
+handle_cast({charlie_reply, _Malformed}, State) ->
+    {noreply, State};
 handle_cast(_Other, State) ->
     {noreply, State}.
 
@@ -212,9 +272,21 @@ handle_info({udp, Sock, IP, PortNum, Datagram}, State = #{sock := Sock}) ->
     %% boundaries, so this is the exact datagram size with no framing guesswork
     %% in it.
     ok = i2p_stats:add(ssu2_bytes_in, byte_size(Datagram)),
-    classify(self(), Datagram, IP, PortNum, State),
+    %% Re-armed before classification, not after. It matters only while the
+    %% responder is being started on a probe, which is a supervisor call from
+    %% inside this process -- but re-arming first means the socket is already
+    %% listening again by the time we go looking for it, so a datagram arriving in
+    %% that window waits in the driver's buffer rather than being missed.
     _ = inet:setopts(Sock, [{active, once}]),
-    {noreply, State};
+    {noreply, classify(self(), Datagram, IP, PortNum, State)};
+handle_info({'DOWN', _MRef, process, Pid, _Info}, State = #{charlie := Pid}) ->
+    %% The responder died on unauthenticated input, which is what it is for. The
+    %% socket owner does not die with it, and does not lose its send path: replace
+    %% the responder and carry on. Its work is optional by construction, so unlike a
+    %% session there is nothing here worth failing the listener over -- and a
+    %% replacement that cannot start is not worth losing the socket for either.
+    i2p_log:debug({charlie_responder_died, Pid}, []),
+    restart_charlie(State);
 handle_info({'DOWN', _MRef, process, Pid, _Info}, State) ->
     %% Remove any session entries owned by the dead pid; the tables die
     %% with the supervisor during shutdown, so tolerate that too.
@@ -229,60 +301,97 @@ terminate(_Reason, #{sock := Sock}) ->
     catch gen_udp:close(Sock),
     ok.
 
+%% Replace a dead responder. A `temporary` child is never restarted by the
+%% supervisor, so this has to ask for a new one explicitly; there is no bound on
+%% how often, because a responder dying on hostile input is not a condition the
+%% listener can fix by waiting.
+restart_charlie(State = #{local := Local}) ->
+    case i2p_ssu2_sup:start_charlie(maps:get(intro_key, Local)) of
+        {ok, Charlie} ->
+            erlang:monitor(process, Charlie),
+            {noreply, State#{charlie := Charlie}};
+        {error, _Reason} ->
+            %% Back to `undefined`, and that is not a tidiness point: a dead pid
+            %% left in the state would be found by the next probe's
+            %% `f:ensure_charlie/1` and cast to, and a cast to a dead process is
+            %% silently dropped -- so one failed replacement would cost the role for
+            %% the life of the listener, with nothing left to try again. As
+            %% `undefined` the next probe asks for a responder, which is the one
+            %% thing that can fix it.
+            i2p_log:debug(charlie_responder_restart_failed, []),
+            {noreply, State#{charlie => undefined}}
+    end.
+
 %% ------------------------------------------------------------------
 %% Classification
 
+%% Every branch returns the listener's state, not `ok`/`drop`. That is not tidiness:
+%% the one branch that changes state is the Charlie responder's lazy start, and a
+%% classifier that returned `drop` would throw away the pid it just created and
+%% start a second responder on the next probe.
 classify(ListenerPid, Datagram, IP, PortNum, State = #{local := Local}) ->
     Bik = maps:get(intro_key, Local),
-    case i2p_ssu2:open_long(Datagram, Bik, Bik) of
-        {ok, <<ConnId:64/big-unsigned-integer, _/binary>>} ->
+    case i2p_ssu2:open_conn_id(Datagram, Bik, Bik) of
+        {ok, ConnId} ->
             route_or_handshake(ListenerPid, ConnId, Datagram, IP, PortNum, State);
         error ->
             %% Shorter than ?MIN_PACKET, so not an SSU2 packet at all.
             i2p_log:debug({classify, ListenerPid, drop, {IP, PortNum}}, []),
-            drop
+            State
     end.
 
 %% Out-of-session PeerTest (type 7). Route to a live session by nonce-derived
 %% connection id when one matches (Alice-role: the datagram is for one of our
-%% initiated tests); otherwise handle it directly as the tested peer
-%% (Charlie-role responder).
+%% initiated tests); otherwise hand it to the tested-peer responder
+%% (Charlie-role).
 route_peertest(ConnId, Datagram, IP, PortNum, State) ->
     case ets:lookup(i2p_ssu2_sessions, ConnId) of
         [{_Id, Pid}] ->
             i2p_log:debug({route_peertest, session, ConnId}, []),
             Pid ! {ssu2_packet, Datagram},
-            ok;
+            State;
         [] ->
-            i2p_log:debug({route_peertest, charlie_responder, ConnId}, []),
             charlie_peertest(Datagram, IP, PortNum, State)
     end.
 
-%% Charlie-role responder: this router is the tested peer. On an inbound
-%% Alice->Charlie message 6, replay a Charlie->Alice message 7 to the source
-%% endpoint, carrying no hash/signature and echoing Alice's nonce/timestamp/
-%% port/IP. Signature and hash are optional out-of-session (see docs).
-charlie_peertest(Datagram, IP, PortNum, #{local := Local}) ->
-    Bik = maps:get(intro_key, Local),
-    case i2p_ssu2:decode_peertest(Bik, Datagram) of
-        {ok, #{blocks := Blocks}} ->
-            case lists:keyfind(peertest, 1, Blocks) of
-                {peertest, 6, _Code, _Flags, _Hash, _Ver, Nonce, Ts, Port, Ip, _Sig} ->
-                    i2p_log:debug({charlie_msg7_reply, {IP, PortNum}}, []),
-                    Reply = i2p_peertest:block(7, 0, 0, <<>>, 2, Nonce, Ts, Port, Ip, <<>>),
-                    Dst = i2p_peertest:dst_conn_id(Nonce),
-                    Src = i2p_peertest:src_conn_id(Nonce),
-                    {ok, Packet} = i2p_ssu2:encode_peertest(Bik, 0, Dst, Src, [Reply]),
-                    i2p_ssu2_listener:send(self(), Packet, {IP, PortNum}),
-                    ok;
-                _Other ->
-                    i2p_log:debug(charlie_peertest_other, []),
-                    drop
-            end;
-        _NotPeertest ->
-            i2p_log:debug(charlie_peertest_decode_error, []),
-            drop
-    end.
+%% Charlie-role responder: this router is the tested peer, and an inbound
+%% Alice->Charlie message 6 gets a Charlie->Alice message 7 back to the source
+%% endpoint.
+%%
+%% Handed to `m:i2p_ssu2_charlie` rather than done here, because answering a probe
+%% is 6.7 us against 0.73 us to route -- and this process is the only one that can
+%% send, so its time is also every session's send latency. There is no session to
+%% attach the role to (the probe arrives out-of-session, addressed to the intro
+%% key), which is why it became its own process rather than a session child.
+%%
+%% `answer/4` is a cast, so a responder that is busy, dead or wedged cannot delay
+%% classification of the next datagram.
+charlie_peertest(Datagram, IP, PortNum, State) ->
+    {Charlie, State1} = ensure_charlie(State),
+    i2p_log:debug({route_peertest, charlie_responder, Charlie}, []),
+    ok = i2p_ssu2_charlie:answer(Charlie, self(), Datagram, {IP, PortNum}),
+    State1.
+
+%% Start the responder on first use. It cannot be started in `init/1` -- that
+%% re-enters the supervisor that is in the middle of starting this listener -- so
+%% this is where it happens, and it happens once because the pid lands in the
+%% state and the next probe finds it there.
+%%
+%% A failure is not the listener's problem: without a responder this router does
+%% not answer peer tests as Charlie, which costs the role and nothing else.
+%% Classification and every session carry on. That asymmetry is the point of having
+%% moved the work off this process at all.
+ensure_charlie(State = #{charlie := undefined, local := Local}) ->
+    case i2p_ssu2_sup:start_charlie(maps:get(intro_key, Local)) of
+        {ok, Charlie} ->
+            erlang:monitor(process, Charlie),
+            {Charlie, State#{charlie := Charlie}};
+        {error, _Reason} ->
+            i2p_log:debug(charlie_responder_start_failed, []),
+            {undefined, State}
+    end;
+ensure_charlie(State = #{charlie := Charlie}) ->
+    {Charlie, State}.
 
 %% Routing order is deliberate, and it is a correctness fix rather than a
 %% preference. Bytes 8..15 of an in-session short header are masked with THAT
@@ -303,51 +412,85 @@ charlie_peertest(Datagram, IP, PortNum, #{local := Local}) ->
 %% PeerTest possible, and only there does unmasking the whole header with the
 %% intro key reflect what the out-of-session sender actually did, so only there
 %% is the type byte trustworthy.
+%%
+%% **One unmask per datagram, at the point the answer needs it.** `f:classify/5`
+%% recovers the connection id with a single ChaCha20 pass (`f:open_conn_id/3`) and
+%% the two lookups above need nothing more, so a datagram either of them claims
+%% stops there. Only a datagram that matches neither pays for the type byte. It
+%% used to ask for the whole header up front -- three passes, of which two were
+%% discarded on every datagram that had a session -- and then re-derive the whole
+%% header twice more in the handshake fallback. Measured on a 1472-byte datagram:
+%% routing was 2.30 us and is now 0.76, against 1.40 us for the AEAD decrypt the
+%% receiving session then does. See #YNBT5ZD.
 route_or_handshake(ListenerPid, ConnId, Datagram, IP, PortNum, State) ->
     case ets:lookup(i2p_ssu2_sessions, ConnId) of
         [{_Id, Pid}] ->
             i2p_log:debug({route_or_handshake, session, ConnId}, []),
             Pid ! {ssu2_packet, Datagram},
-            ok;
+            State;
         [] ->
             case ets:lookup(i2p_ssu2_pending, {IP, PortNum}) of
                 [{_Ep, PendingPid}] ->
                     i2p_log:debug({route_or_handshake, pending, {IP, PortNum}}, []),
                     PendingPid ! {ssu2_packet, Datagram},
-                    ok;
+                    State;
                 [] ->
                     route_unowned(ListenerPid, ConnId, Datagram, IP, PortNum, State)
             end
     end.
 
+%% The only datagram that needs a second look, because it is the only one whose
+%% type byte may be believed -- a datagram no session and no pending dialer
+%% claimed. The type byte lives in header bytes 8..15, under the *second* mask,
+%% so this cannot reuse the connection id from `f:classify/5`, and it stops at
+%% byte 15 rather than opening all 32: bytes 16..31 are a source connection id and
+%% a token that nothing here reads, and the Bob session that ends up owning the
+%% datagram opens them under the keys its own handshake derives.
+%%
+%% **One open, three answers.** The three types are disjoint, so which one is
+%% tested first is immaterial and the header is opened once for all of them. It
+%% used to be opened three times for a datagram that was none of them: once here
+%% to look for a PeerTest, once inside `f:decode_token_request/2` on the way to
+%% the SessionRequest test, and once more for that test -- nine ChaCha20 passes to
+%% decide to drop a datagram. It is now three.
 route_unowned(ListenerPid, ConnId, Datagram, IP, PortNum, State = #{local := Local}) ->
     Bik = maps:get(intro_key, Local),
-    case i2p_ssu2:open_long(Datagram, Bik, Bik) of
+    case i2p_ssu2:open_header16(Datagram, Bik, Bik) of
         {ok, <<_:64/big-unsigned-integer, _Num:32, ?TYPE_PEER_TEST:8, _/binary>>} ->
             i2p_log:debug({classify, ListenerPid, peertest, ConnId}, []),
             route_peertest(ConnId, Datagram, IP, PortNum, State);
-        _ ->
-            i2p_log:debug({classify, ListenerPid, try_handshake, ConnId}, []),
-            try_handshake(ConnId, Datagram, IP, PortNum, State)
+        {ok, <<_:64/big-unsigned-integer, _Num:32, ?TYPE_SESSION_REQUEST:8, 2:8, 2:8, _:8>>} ->
+            %% Type, version and net ID, all inside the 16 bytes already opened.
+            %% The spawned session reads the source connection id and the token
+            %% itself, under keys this process does not have.
+            i2p_log:debug({handshake, session_request, ConnId}, []),
+            spawn_bob(ConnId, Datagram, IP, PortNum, Local, State);
+        {ok, <<_:64/big-unsigned-integer, _Num:32, ?TYPE_TOKEN_REQUEST:8, _/binary>>} ->
+            i2p_log:debug({handshake, token_request, ConnId}, []),
+            try_token_request(ConnId, Datagram, IP, PortNum, Local, State);
+        _NotAHandshake ->
+            i2p_log:debug({handshake, drop, ConnId}, []),
+            State
     end.
 
-try_handshake(ConnId, Datagram, IP, PortNum, State = #{local := Local}) ->
+%% The one type that needs the payload read here, and so the one type allowed to
+%% pay for it: `f:decode_token_request/2` opens the header again, and has to,
+%% because a TokenRequest carries blocks this process must read to decide whether
+%% it is one -- the Bob session is handed the datagram and re-opens it under the
+%% keys the handshake derives.
+%%
+%% A type byte that says TokenRequest and does not decode as one is a drop, and
+%% that is what it gets, by the same door as every other unreadable datagram: it
+%% frames as `drop` there, one line for every reason the socket owner stays
+%% silent, rather than two lines that differ only in a clause nobody reading them
+%% can tell apart.
+try_token_request(ConnId, Datagram, IP, PortNum, Local, State) ->
     Bik = maps:get(intro_key, Local),
     case i2p_ssu2:decode_token_request(Bik, Datagram) of
         {ok, _TokenReqInfo} ->
-            i2p_log:debug({handshake, token_request, ConnId}, []),
             spawn_bob(ConnId, Datagram, IP, PortNum, Local, State);
         error ->
-            case i2p_ssu2:open_long(Datagram, Bik, Bik) of
-                {ok,
-                    <<_:64, _Num:32, ?TYPE_SESSION_REQUEST:8, 2:8, 2:8, _:8, _:64, _Tok:64,
-                        _/binary>>} ->
-                    i2p_log:debug({handshake, session_request, ConnId}, []),
-                    spawn_bob(ConnId, Datagram, IP, PortNum, Local, State);
-                _NotAHandshake ->
-                    i2p_log:debug({handshake, drop, ConnId}, []),
-                    drop
-            end
+            State
     end.
 
 spawn_bob(
@@ -356,7 +499,7 @@ spawn_bob(
     IP,
     PortNum,
     Local,
-    #{owner := Owner, peer_test_coordinator := Coordinator} = _State
+    State = #{owner := Owner, peer_test_coordinator := Coordinator}
 ) ->
     Args0 =
         #{
@@ -370,10 +513,13 @@ spawn_bob(
     Args = maybe_coordinator(Args0, Coordinator),
     case i2p_ssu2_sup:start_session(i2p_ssu2_sup:session_child(Args)) of
         {ok, _Pid} ->
-            ok;
+            State;
         _StartFailed ->
+            %% At the session limit, most likely. The datagram is simply not
+            %% answered, exactly as a dropped datagram is not answered; the peer
+            %% retransmits and someone else answers.
             ets:delete(i2p_ssu2_sessions, ConnId),
-            drop
+            State
     end.
 
 maybe_coordinator(Args, undefined) ->

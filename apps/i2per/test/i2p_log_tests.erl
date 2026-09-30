@@ -386,7 +386,7 @@ a_frame_appears_when_the_log_level_is_debug_test() ->
 
 %% The emitters are wired to it, and every one of them says something.
 %%
-%% The whole fold is a claim about the tree, not about a function: 65 call sites
+%% The whole fold is a claim about the tree, not about a function: 63 call sites
 %% across four modules have to be recording frames, and a module that was missed
 %% would keep the old mechanism alive and pass every case above. So this reads
 %% the sources and counts what is actually there.
@@ -401,6 +401,20 @@ the_four_frame_emitters_record_through_the_log_test() ->
         %% `out_of_window` rather than passing as new, which is the only way that
         %% condition is visible at all.
         "i2p_ssu2_conn.erl" => 31,
+        %% `i2p_ssu2_listener` net zero at #YNBT5ZD, and not by accident: three
+        %% call sites left with the Charlie role (its decode-failure and
+        %% not-a-probe branches, and the reply frame it used to record itself) and
+        %% three arrived with the things that took the role's place -- the
+        %% responder's lazy start, the responder dying, and the reply leaving.
+        %% What replaced the two sites the handshake fallback lost is one line for
+        %% both its drops: a type byte that opens no door and a TokenRequest that
+        %% will not decode are the same event, so they frame alike. The role
+        %% records nothing from its new home: `i2p_ssu2_charlie` has no
+        %% frame-emitting call site at all, deliberately, because its input is
+        %% unauthenticated and a frame per hostile probe would be a logging
+        %% amplification for whoever wanted one. The listener can see a reply
+        %% leave and a responder die; the responder says nothing about what it was
+        %% fed.
         "i2p_ssu2_listener.erl" => 14,
         "i2p_relay_coord.erl" => 10,
         "i2p_peertest_coord.erl" => 7

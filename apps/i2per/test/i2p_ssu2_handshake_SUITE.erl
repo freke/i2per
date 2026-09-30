@@ -24,7 +24,8 @@
     dial_survives_created_loss/1,
     data_survives_dropped_packet/1,
     created_with_peertest_type_byte_is_delivered/1,
-    a_truncated_datagram_does_not_kill_the_socket_owner/1
+    a_truncated_datagram_does_not_kill_the_socket_owner/1,
+    classification_spends_one_pass_per_claimed_datagram/1
 ]).
 
 -define(APP, i2per).
@@ -39,7 +40,8 @@ all() ->
         dial_survives_created_loss,
         data_survives_dropped_packet,
         created_with_peertest_type_byte_is_delivered,
-        a_truncated_datagram_does_not_kill_the_socket_owner
+        a_truncated_datagram_does_not_kill_the_socket_owner,
+        classification_spends_one_pass_per_claimed_datagram
     ].
 
 init_per_testcase(_Case, Config) ->
@@ -127,6 +129,109 @@ truncated_datagram(IntroKey, Type, Size) ->
     Sealed = i2p_ssu2:seal_long(Plain, IntroKey, IntroKey),
     Size = byte_size(Sealed),
     Sealed.
+
+%% ---------------------------------------------------------------------------
+%% What the socket owner costs, in ChaCha20 passes
+%% ---------------------------------------------------------------------------
+
+%% A datagram a session or a pending dialer has claimed costs the socket owner
+%% **one** ChaCha20 pass; one that nothing claimed costs three. Not read off the
+%% module doc -- counted, so the figure cannot drift away from the code the way a
+%% comment can.
+%%
+%% The claim is the point of #YNBT5ZD. Routing used to open the whole 32-byte long
+%% header up front, which is three passes, and then re-open it twice more in the
+%% handshake fallback -- nine passes to decide to drop a datagram, and three on
+%% the hot path, which is what a working router spends its time on. Two of those
+%% three were spent recovering bytes nobody read.
+%%
+%% `f:i2p_crypto:chacha20_crypt/4` is the seam because it is the primitive every
+%% unmask pass ends at: each of the two tail-derived header masks, and the
+%% decryption of header bytes 16..31. So counting calls to it counts passes
+%% exactly, which is the unit the module doc quotes -- counting `f:header_mask/2`
+%% instead would miss the third-section pass and under-report the handshake path.
+%%
+%% The trace pattern is global, so it is installed and removed inside the case.
+%% CT runs suites in sequence here, so no other process is deriving masks while it
+%% is up; if that ever stops being true this case would need a narrower seam, not
+%% a bigger allowance.
+classification_spends_one_pass_per_claimed_datagram(_Config) ->
+    Local = peer_local(),
+    IntroKey = maps:get(intro_key, Local),
+    {ok, Listener} = i2p_ssu2_listener:listen(<<"127.0.0.1">>, 0, Local, self()),
+    {ok, Sock} = gen_udp:open(0, [binary, {active, false}]),
+    try
+        LPort = i2p_ssu2_listener:port(Listener),
+        %% A claimed connection id, registered in the session table exactly as a
+        %% real session registers its own, so the datagram takes the step-1 path.
+        ConnId = 16#0BADF00DDEADBEEF,
+        true = ets:insert(i2p_ssu2_sessions, {ConnId, self()}),
+        Claimed = sealed_datagram(IntroKey, ConnId, 7, 1472),
+        %% An unclaimed one from an endpoint nothing is waiting on, shaped so it is
+        %% neither a probe nor a handshake: the listener drops it, so the only crypto
+        %% spent on it is classification -- one pass to route, two more to learn the
+        %% type byte says drop.
+        Unclaimed = sealed_datagram(IntroKey, 16#1111222233334444, 99, 1472),
+        [
+            {claimed, 1, [Claimed]},
+            {unclaimed, 3, []}
+        ] =
+            [
+                {Name, Passes, Delivered}
+             || {Name, Dgram} <- [{claimed, Claimed}, {unclaimed, Unclaimed}],
+                {Passes, Delivered} <- [measure(Listener, Sock, LPort, Dgram)]
+            ],
+        ok
+    after
+        gen_udp:close(Sock),
+        i2p_ssu2_listener:stop(Listener)
+    end.
+
+%% Send one datagram and report how many ChaCha20 passes the listener spent on it,
+%% together with whatever it delivered to this process.
+%%
+%% `code:ensure_loaded/1` first because a trace pattern only matches a loaded
+%% module, and nothing has to have called `i2p_crypto` yet for this case to work.
+%% `[local]` is what makes the pattern match the same-module calls too: without
+%% it only cross-module calls are traced, and this one would silently count zero.
+measure(Listener, Sock, LPort, Dgram) ->
+    {module, i2p_crypto} = code:ensure_loaded(i2p_crypto),
+    1 = erlang:trace_pattern({i2p_crypto, chacha20_crypt, 4}, true, [local]),
+    1 = erlang:trace(Listener, true, [call]),
+    try
+        ok = gen_udp:send(Sock, {127, 0, 0, 1}, LPort, Dgram),
+        {Passes, Delivered} = collect(Listener, 0, []),
+        {Passes, Delivered}
+    after
+        1 = erlang:trace(Listener, false, [call]),
+        1 = erlang:trace_pattern({i2p_crypto, chacha20_crypt, 4}, false, [local])
+    end.
+
+%% Ends on a quiet period rather than a fixed sleep: the listener is another process
+%% and the datagram has to cross a socket, so when it is finished with it is not this
+%% process's to predict. A regression that added a pass therefore reports the wrong
+%% count and fails on the number, instead of timing out.
+collect(Listener, Passes, Delivered) ->
+    receive
+        {trace, Listener, call, {i2p_crypto, chacha20_crypt, _Args}} ->
+            collect(Listener, Passes + 1, Delivered);
+        {trace, Listener, call, _NotAPass} ->
+            collect(Listener, Passes, Delivered);
+        {ssu2_packet, Dgram} ->
+            collect(Listener, Passes, Delivered ++ [Dgram])
+    after 250 ->
+        {Passes, Delivered}
+    end.
+
+%% A sealed datagram of `Size` bytes whose opened header says connection id
+%% `ConnId` and type `Type`, padded out to `Size` -- the shape a real one has.
+sealed_datagram(IntroKey, ConnId, Type, Size) ->
+    Header = <<ConnId:64, 1:32, Type:8, 2:8, 2:8, 0:8, 0:64, 0:64>>,
+    %% Padded *before* sealing, since the masks are derived from the tail: padding
+    %% afterwards would leave the header sealed under masks computed from other bytes,
+    %% and the datagram would not present as `Type` at all.
+    Body = binary:copy(crypto:strong_rand_bytes(Size - byte_size(Header)), 1),
+    i2p_ssu2:seal_long(<<Header/binary, Body/binary>>, IntroKey, IntroKey).
 
 %% ---------------------------------------------------------------------------
 %% Fault-injected bare dials

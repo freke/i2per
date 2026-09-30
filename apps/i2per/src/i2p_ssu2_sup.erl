@@ -8,6 +8,11 @@ for any reason — is never restarted and never hot-loops, and its death cannot
 take the supervisor (or the listener, or any sibling) down. The supervisor is
 a child of `m:i2per_sup`; tests start it directly.
 
+Two kinds of child live here. Sessions (`f:start_session/1`) are long-lived and
+count against `f:session_limit/0`. Charlie responders (`f:start_charlie/1`) are
+one per listener, hold a single public key, and run unauthenticated input, so they
+sit deliberately outside that limit — see `f:start_charlie/1` for why.
+
 The public ETS table `i2p_ssu2_sessions` maps destination connection ID to
 session pid; `f:i2p_ssu2_listener/1` consults it for inbound classification
 and sessions are removed by their monitor in `m:i2p_ssu2_listener`. The public
@@ -26,6 +31,8 @@ and removed when the session dies.
     start_link/4,
     session_child/1,
     start_session/1,
+    charlie_child/1,
+    start_charlie/1,
     session_count/0,
     session_limit/0,
     session_limit_reached/0,
@@ -110,6 +117,39 @@ start_session(ChildSpec) ->
             end
         end
     ).
+
+-doc """
+A `temporary` worker child spec for one out-of-session Charlie responder
+(`m:i2p_ssu2_charlie`).
+
+`temporary` and not `permanent` for the reason every child here is: the responder
+runs unauthenticated input, so it is expected to die sometimes, and a permanent
+one would be restarted into a hot loop by whatever is killing it. Its owner -- the
+listener -- notices the death by monitor and asks for a replacement, which is the
+only restart path.
+""".
+-spec charlie_child(i2p_crypto:key()) -> supervisor:child_spec().
+charlie_child(IntroKey) ->
+    #{
+        id => {ssu2_charlie, erlang:unique_integer([positive, monotonic])},
+        start => {i2p_ssu2_charlie, start_link, [IntroKey]},
+        restart => temporary,
+        shutdown => 5000,
+        type => worker,
+        modules => [i2p_ssu2_charlie]
+    }.
+
+-doc """
+Start one Charlie responder under the same supervisor as the sessions.
+
+Deliberately *not* counted against `f:session_limit/0`: that limit exists to bound
+how much of the Noise handshake state one router holds, and a responder holds a
+single public key. Counting it would mean a router at its session limit could not
+answer a peer test, which is a role rather than a resource.
+""".
+-spec start_charlie(i2p_crypto:key()) -> {ok, pid()} | {error, term()}.
+start_charlie(IntroKey) ->
+    supervisor:start_child(?MODULE, charlie_child(IntroKey)).
 
 -doc "Return the number of active SSU2 session workers.".
 -spec session_count() -> non_neg_integer().
