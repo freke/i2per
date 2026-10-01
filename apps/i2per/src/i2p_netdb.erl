@@ -117,6 +117,78 @@ rather than `[router_key()]`. Filling the memo is a mutation, and this module's
 rule is that a mutation returns the store that describes it. A caller that drops
 it gets the old cost, not a wrong answer.
 
+## The expiry horizon is a function of how full the store is
+
+How old a RouterInfo may be before the store discards it is **not a number**. It
+is `f:expiration_ms/1`, interpolated between two bounds from the store's own size,
+following i2pd's `NetDb::SaveUpdated`:
+
+```erlang
+Horizon(Count) = Min + (Max - Min) * 90 / Count   %% Count > 90
+Horizon(Count) = Max                                %% Count =< 90
+```
+
+The fuller the store, the sooner a stale entry goes. The reasoning is that a
+store which cannot hold everything should spend its space on the routers most
+likely to still be there, and a RouterInfo is republished often enough that a
+tight horizon costs a lookup rather than an entry.
+
+| Stored routers | Horizon | |
+|---|---|---|
+| 90 or fewer | 27h 00m | the ceiling; i2pd's maximum |
+| 200 | 12h 58m 30s | |
+| 500 | 6h 05m 24s | |
+| 1000 | 3h 47m 42s | |
+| 2000 | 2h 38m 51s | |
+| 4000 | 2h 04m 25s | i2p-java's aggressive-mode threshold |
+| 5000 | 1h 57m 32s | i2per's shipped capacity |
+
+**The two ends are i2pd's, so the curve matches i2pd exactly at every size.** What
+differs is what else i2pd folds into the same branch, and none of it is adopted:
+
+- **A floodfill expires everything at a flat 1 hour.** It assumes the router is
+  receiving republication, which is a property of a working floodfill with a
+  working reseed. i2per cannot verify that from inside the store, and a router
+  *configured* as a floodfill that is not actually receiving publications would
+  have its NetDb emptied — the one failure that a tighter policy must never cause.
+- **A RouterInfo advertising SSU2 introducers expires in about an hour.** This
+  keys off an introducer flag that `m:i2p_router_info` decodes when *building* a
+  RouterInfo but not when parsing one, so it is not available here without a
+  parser change.
+- **i2p-java's aggressive mode above 4000 routers** — a 30-minute cutoff (12 for
+  routers advertising the `U` cap) dropping candidates with probability 32/128 —
+  and the three guards that come with it (no expiry below 300 entries, never drop
+  a router with an established connection, a floodfill never drops a router within
+  1/256 of its own routing key) are not adopted. The mode is the other policy
+  shape this ticket chose between, and it needs an RNG to decide which entry goes.
+  Its guards are guards on *that* mode: the connection guard exists to stop a
+  30-minute cutoff severing live sessions, and the adopted curve's floor is 90
+  minutes. The below-300 rule is a second, larger version of the ceiling that
+  already covers it.
+- **i2pd's first-hour uptime grace** is not adopted either, for a reason that is
+  about where the clock lives rather than about the policy: it is a fact about the
+  *process*, and the store is a value whose every field is a statement about its
+  contents. What it protects against — pruning a NetDb that has just been loaded
+  and has not yet had a chance to refill — is prevented here more precisely, and
+  without a guard, by the load path not consulting the horizon at all (see
+  `f:from_binary/1`). The next sweep is what compacts a loaded file to the current
+  policy.
+
+The guards are not all redundant in the same way, and the ones that are not are
+ruled out above rather than left unmentioned. i2pd's `total > 90` floor *is*
+adopted, but as the curve's saturation rather than as a separate condition: the
+interpolation is already at the ceiling for any count at or below 90, which is the
+part that matters, and the difference from i2pd is that i2per expires at 27 hours
+below that line rather than not at all.
+
+**Both callers read this one function.** The admission check in `f:store/3` and
+`f:remove_expired/3` ask the same store the same question, so the horizon is never
+two numbers that can disagree. What a sliding policy gives up is the stronger
+claim a flat one could make: an entry admitted under a 27-hour horizon is not
+guaranteed 27 hours, because a store that fills afterwards shortens the horizon
+underneath it. That is inherent to the policy rather than to this arrangement, and
+it is what i2pd does.
+
 ## Usage
 
 ```erlang
@@ -154,6 +226,7 @@ true = i2p_netdb:has_router(Store, Key).
     new/0,
     new/1,
     new/2,
+    new/3,
     store/3,
     store_binary/3,
     store_ls/3,
@@ -168,9 +241,15 @@ true = i2p_netdb:has_router(Store, Key).
     count/1,
     capacity/1,
     default_expiration_ms/0,
+    default_min_expiration_ms/0,
+    min_routers/0,
+    min_expiration_ms/1,
+    max_expiration_ms/1,
     expiration_ms/1,
+    expiration_ms_at/2,
     expiration_threshold_ms/0,
     set_expiration_ms/2,
+    set_expiration_range/3,
     routing_key/1,
     routing_key/2,
     distance/2,
@@ -196,18 +275,20 @@ true = i2p_netdb:has_router(Store, Key).
 -export_type([store/0, router_key/0, ls_key/0, snapshot/0]).
 
 -define(DEFAULT_CAPACITY, 5000).
-%% The RouterInfo expiry horizon, in ms. i2pd's \`NETDB_MAX_EXPIRATION_TIMEOUT\`.
+%% The RouterInfo expiry horizon's two ends, in ms. i2pd's
+%% \`NETDB_MAX_EXPIRATION_TIMEOUT\` and \`NETDB_MIN_EXPIRATION_TIMEOUT\`.
 %%
-%% **This is the default, not the policy.** The value a store actually uses is in
-%% the store (\`expiration_ms\`), settable per store and per configuration, because
-%% both reference implementations make the horizon a *function of how full the store
-%% is* rather than a constant. i2pd interpolates 1.5h..27h by \`routers/90\`;
-%% i2p-java switches to an aggressive drop above 4000. See \`#RA5PVR1\`.
-%%
-%% What is decided here is only that i2per's own policy is the simplest of the
-%% three: a fixed horizon at every size. If it becomes a sliding one, the change is
-%% to \`horizon_ms/1\` and nothing else, because both callers already ask it.
--define(DEFAULT_EXPIRATION_MS, 27 * 60 * 60 * 1000).
+%% **These are the bounds of the policy, not the policy.** A store holds both
+%% (\`expiration_min_ms\`, \`expiration_max_ms\`) and the horizon in force is
+%% interpolated between them from the store's own size, so it is not one number
+%% anyone reads. See \`f:expiration_ms/1\`.
+-define(MAX_EXPIRATION_MS, 27 * 60 * 60 * 1000).
+-define(MIN_EXPIRATION_MS, 90 * 60 * 1000).
+%% The store size at which the horizon reaches its ceiling. i2pd's
+%% \`NETDB_MIN_ROUTERS\`, and the numerator of the interpolation: i2pd scales by
+%% \`NETDB_MIN_ROUTERS/total\`, so a store at exactly this size is at the ceiling and
+%% a store of any size above it is proportionally further below.
+-define(MIN_ROUTERS, 90).
 %% The table is unnamed: a store's table is identified by the tid in its own
 %% state, not by a global name, so two stores in one node cannot collide. The
 %% srv reads the tid from its store and hands it to callers; see
@@ -278,7 +359,8 @@ value loses nothing that is not already lost.
 """.
 -opaque store() :: #{
     capacity := pos_integer(),
-    expiration_ms := pos_integer(),
+    expiration_min_ms := pos_integer(),
+    expiration_max_ms := pos_integer(),
     routers := ets:tid(),
     order := gb_trees:tree(non_neg_integer(), router_key()),
     order_pos := gb_trees:tree(router_key(), non_neg_integer()),
@@ -290,12 +372,12 @@ value loses nothing that is not already lost.
 }.
 
 -doc """
-A fresh store with the default capacity (5000 routers) and the default RouterInfo
-expiry horizon (27 hours).
+A fresh store with the default capacity (5000 routers) and the default expiry
+horizon: i2pd's curve, from 27 hours at 90 routers down to about 1h57m at 5000.
 """.
 -spec new() -> store().
 new() ->
-    new(?DEFAULT_CAPACITY, ?DEFAULT_EXPIRATION_MS).
+    new(?DEFAULT_CAPACITY, ?MAX_EXPIRATION_MS, ?MIN_EXPIRATION_MS).
 
 -doc """
 A fresh store with a fixed `Capacity` and the default expiry horizon.
@@ -305,21 +387,36 @@ evicted.
 """.
 -spec new(pos_integer()) -> store().
 new(Capacity) ->
-    new(Capacity, ?DEFAULT_EXPIRATION_MS).
+    new(Capacity, ?MAX_EXPIRATION_MS, ?MIN_EXPIRATION_MS).
 
 -doc """
-A fresh store with a fixed `Capacity` and a fixed `ExpirationMs`.
+A fresh store with a fixed `Capacity` and a **flat** expiry horizon of
+`ExpirationMs`.
+
+This is the same as `f:new/3` with both bounds set to `ExpirationMs`, and it is
+spelled separately because a flat horizon is a policy an operator can still ask
+for: a store that holds few routers and wants them kept regardless is better
+served by one number than by a curve that happens to sit near the ceiling.
+""".
+-spec new(pos_integer(), pos_integer()) -> store().
+new(Capacity, ExpirationMs) ->
+    new(Capacity, ExpirationMs, ExpirationMs).
+
+-doc """
+A fresh store with a fixed `Capacity` and an expiry horizon that slides between
+`MinMs` and `MaxMs` with the store's size.
 
 `Capacity` is the number of RouterInfos the store holds before evicting the least
-recently stored. `ExpirationMs` is how old a RouterInfo may be before the store
-discards it — the horizon that decides both whether `f:store/3` admits a
-RouterInfo at all and what the sweep removes. It is a plain window, **not** a
-function of how full the store is, which is simpler than either reference
-implementation and more permissive than both at size. See `#RA5PVR1`.
+recently stored. `MinMs` and `MaxMs` are the ends of the staleness policy: the
+horizon in force is `MaxMs` at `f:min_routers/0` routers or fewer, and
+interpolates down towards `MinMs` as the store fills. See
+**The expiry horizon is a function of how full the store is** in the module
+documentation, and `f:expiration_ms/1` for the function itself.
 
 The two are independent: capacity bounds memory, the horizon bounds staleness. A
 store can hold few routers for a long time, or many for a short time, and neither
-setting affects the other.
+setting affects the other. The horizon is not persisted, so a store read back from
+a file starts at the default bounds whatever the running router is configured for.
 
 The returned store owns a new `protected` ETS table, so it is only safe to use
 from the process that called this: a `protected` table rejects writes from
@@ -327,16 +424,20 @@ anyone else, which is what makes the single-writer property hold rather than
 merely be intended. The table dies with this process, so the store cannot
 outlive its owner.
 """.
--spec new(pos_integer(), pos_integer()) -> store().
-new(Capacity, ExpirationMs) when
+-spec new(pos_integer(), pos_integer(), pos_integer()) -> store().
+new(Capacity, MaxMs, MinMs) when
     is_integer(Capacity),
     Capacity > 0,
-    is_integer(ExpirationMs),
-    ExpirationMs > 0
+    is_integer(MaxMs),
+    MaxMs > 0,
+    is_integer(MinMs),
+    MinMs > 0,
+    MinMs =< MaxMs
 ->
     #{
         capacity => Capacity,
-        expiration_ms => ExpirationMs,
+        expiration_min_ms => MinMs,
+        expiration_max_ms => MaxMs,
         routers => new_table(),
         order => gb_trees:empty(),
         order_pos => gb_trees:empty(),
@@ -346,7 +447,7 @@ new(Capacity, ExpirationMs) when
         lease_sets => #{},
         ls_order => []
     };
-new(_, _) ->
+new(_, _, _) ->
     error(badarg).
 
 %% The table is `protected`, not `public`: the owning process writes, everyone
@@ -618,31 +719,104 @@ capacity(Store) ->
 %% the point of exposing the number is that a caller configures against it, and a
 %% spec of `97200000` would break the build the day someone edits the macro to tune
 %% it, which is the one thing this exists to allow.
--dialyzer({no_underspecs, [default_expiration_ms/0, expiration_threshold_ms/0]}).
+-dialyzer(
+    {no_underspecs, [
+        default_expiration_ms/0,
+        default_min_expiration_ms/0,
+        min_routers/0,
+        expiration_threshold_ms/0
+    ]}
+).
 
 -doc """
-The default RouterInfo expiry horizon in ms, 27 hours.
+The default RouterInfo expiry horizon's ceiling in ms, 27 hours.
 
-i2pd's `NETDB_MAX_EXPIRATION_TIMEOUT`, and its *maximum*: i2pd interpolates down from
-this towards 1.5 hours as its store fills. Exposed because
-`m:i2p_netdb_srv` reads operator configuration and needs the default from here
-rather than restating it, so there is one number and not two that can disagree.
+i2pd's `NETDB_MAX_EXPIRATION_TIMEOUT`, and the horizon a store of 90 routers or
+fewer runs at. Exposed because `m:i2p_netdb_srv` reads operator configuration and
+needs the default from here rather than restating it, so there is one number and
+not two that can disagree.
 """.
 -spec default_expiration_ms() -> pos_integer().
 default_expiration_ms() ->
-    ?DEFAULT_EXPIRATION_MS.
+    ?MAX_EXPIRATION_MS.
+
+-doc """
+The default RouterInfo expiry horizon's floor in ms, 90 minutes.
+
+i2pd's `NETDB_MIN_EXPIRATION_TIMEOUT`, and the horizon a full store converges on:
+at the shipped capacity of 5000 routers the curve sits at about 1h57m, so this is
+a floor the shipped configuration never quite reaches rather than one it sits on.
+""".
+-spec default_min_expiration_ms() -> pos_integer().
+default_min_expiration_ms() ->
+    ?MIN_EXPIRATION_MS.
+
+-doc """
+The store size at which the expiry horizon reaches its ceiling: 90 routers.
+
+i2pd's `NETDB_MIN_ROUTERS`, and the numerator of the interpolation, so it is both
+the size at which `f:expiration_ms/1` returns the ceiling exactly and the constant
+that scales the rest of the curve. Exported so a caller reporting the policy can
+name the pivot rather than infer it from two sampled values.
+""".
+-spec min_routers() -> pos_integer().
+min_routers() ->
+    ?MIN_ROUTERS.
+
+-doc "The lower bound of a store's expiry horizon, in ms.".
+-spec min_expiration_ms(store()) -> pos_integer().
+min_expiration_ms(Store) ->
+    maps:get(expiration_min_ms, Store).
+
+-doc "The upper bound of a store's expiry horizon, in ms.".
+-spec max_expiration_ms(store()) -> pos_integer().
+max_expiration_ms(Store) ->
+    maps:get(expiration_max_ms, Store).
 
 -doc """
 The RouterInfo expiry horizon in ms: how old a RouterInfo may be before this store
-discards it.
+discards it, **at this store's current size**.
 
-Set at `f:new/2` and changeable with `f:set_expiration_ms/2`. Both the admission
-check in `f:store/3` and `f:remove_expired/3` read this one value, so a store cannot
-admit a RouterInfo it is about to expire.
+Set at `f:new/2,3` and changeable with `f:set_expiration_ms/2` and
+`f:set_expiration_range/3`. Both the admission check in `f:store/3` and
+`f:remove_expired/3` read this one value, so a store cannot admit a RouterInfo it
+is about to expire.
+
+**It is a function, not a field.** The store holds the two bounds and this
+interpolates between them from the store's own size; see
+`f:expiration_ms_at/2` for the curve and the module documentation for why. So
+there is no one number to read here, which is why `f:min_expiration_ms/1` and
+`f:max_expiration_ms/1` are exported beside it: a caller that wants to report the
+policy wants the bounds, and a caller that wants to know what is in force *now*
+wants this.
 """.
 -spec expiration_ms(store()) -> pos_integer().
 expiration_ms(Store) ->
-    maps:get(expiration_ms, Store).
+    expiration_ms_at(Store, count(Store)).
+
+-doc """
+The RouterInfo expiry horizon in ms a store of `Count` routers would apply.
+
+The curve is i2pd's, from `NetDb::SaveUpdated`:
+`Min + (Max - Min) * 90 / Count` for a store above 90 routers, and the ceiling for
+one at or below it. Integer arithmetic throughout — a float would make the horizon
+depend on rounding, and two routers reporting a store's policy would then be able
+to disagree about the last millisecond of it.
+
+Exposed with an explicit `Count` so the mapping is measurable rather than something
+a reader has to compute: a status display can report what the horizon *will* be
+once the store has grown, and a test can assert the shape at sizes no store in the
+tree actually reaches.
+""".
+-spec expiration_ms_at(store(), non_neg_integer()) -> pos_integer().
+expiration_ms_at(Store, Count) when is_integer(Count), Count >= 0, Count =< ?MIN_ROUTERS ->
+    max_expiration_ms(Store);
+expiration_ms_at(Store, Count) when is_integer(Count), Count > ?MIN_ROUTERS ->
+    Min = min_expiration_ms(Store),
+    Max = max_expiration_ms(Store),
+    Min + (Max - Min) * min_routers() div Count;
+expiration_ms_at(_Store, _Count) ->
+    error(badarg).
 
 -doc """
 How far ahead of the local clock a RouterInfo may claim to be published, in ms.
@@ -656,13 +830,19 @@ expiration_threshold_ms() ->
     ?EXPIRATION_THRESHOLD_MS.
 
 -doc """
-Set a store's RouterInfo expiry horizon, returning a new store.
+Set a store's RouterInfo expiry horizon to a flat `ExpirationMs`, returning a new
+store.
 
 Input: `Store` — the current store; `ExpirationMs` — the new horizon, which must be
 a positive integer.
 Output: `Store2`, identical to `Store` apart from the horizon. The table is not
 touched, so this is a change of policy and not a mutation: no generation is claimed
 and nothing is read or written.
+
+**This sets both bounds to the same value**, so the store stops sliding and runs
+at one number. That is deliberate: a flat horizon is a real policy (see
+`f:new/2`), and an operator who wants one should not have to name a range that
+produces it. `f:set_expiration_range/3` is the one that slides.
 
 **The horizon is read at both the admission check and the sweep**, so changing it
 takes effect on the next store and the next sweep without either having to be told.
@@ -671,8 +851,30 @@ two call sites.
 """.
 -spec set_expiration_ms(store(), pos_integer()) -> store().
 set_expiration_ms(Store, Ms) when is_integer(Ms), Ms > 0 ->
-    Store#{expiration_ms => Ms};
+    Store#{expiration_min_ms => Ms, expiration_max_ms => Ms};
 set_expiration_ms(_Store, _Ms) ->
+    error(badarg).
+
+-doc """
+Set a store's RouterInfo expiry horizon to slide between `MinMs` and `MaxMs`,
+returning a new store.
+
+Input: `Store` — the current store; `MinMs`, `MaxMs` — the new bounds, which must
+be positive integers with `MinMs =< MaxMs`.
+Output: `Store2`, identical to `Store` apart from the two bounds. As with
+`f:set_expiration_ms/2` this touches nothing else and claims no generation.
+
+`MinMs > MaxMs` is refused rather than tolerated. The interpolation would then
+return a horizon *above* the ceiling for every store large enough to be
+interpolated at all, so the store's most permissive setting would be the one
+neither bound names — a configuration error that reads as working.
+""".
+-spec set_expiration_range(store(), pos_integer(), pos_integer()) -> store().
+set_expiration_range(Store, MinMs, MaxMs) when
+    is_integer(MinMs), MinMs > 0, is_integer(MaxMs), MaxMs >= MinMs
+->
+    Store#{expiration_min_ms => MinMs, expiration_max_ms => MaxMs};
+set_expiration_range(_Store, _MinMs, _MaxMs) ->
     error(badarg).
 
 -doc """
@@ -1110,7 +1312,7 @@ interval. A router restarted with a shorter horizon must honour the shorter one
 against the routers it just loaded, so persisting the old value would be a way to
 make configuration silently not apply. `f:from_binary/1` therefore loads at the
 default and the caller applies whatever policy it is configured for with
-`f:set_expiration_ms/2`.
+`f:set_expiration_range/3`.
 """.
 -spec to_binary(store()) -> binary().
 to_binary(Store) ->
@@ -1135,8 +1337,18 @@ LeaseSet signature verifies (`m:i2p_router_info:decode/1`,
 signatures or truncated bytes are silently dropped.
 
 **Capacity is restored from the file; the expiry horizon is not.** The horizon
-arrives at the default, and the caller sets the policy it is configured for with
-`f:set_expiration_ms/2` — see `f:to_binary/1` for why it is not persisted.
+arrives at the default bounds, and the caller sets the policy it is configured for
+with `f:set_expiration_range/3` — see `f:to_binary/1` for why it is not persisted.
+
+**A load does not apply the horizon to what it loads.** Entries are seeded straight
+into the recency order rather than through `f:store/3`, so a file written by a
+router running a longer horizon is restored in full and the *next sweep* is what
+compacts it to the current policy. That is deliberate, and it is also the whole of
+the protection against a policy change emptying the store on the next boot: a
+router that upgrades from a flat 27 hours to the sliding curve starts with a full
+store and gives up its stalest entries at the sweep interval rather than all at
+once. It is also why i2pd's first-hour uptime grace is not needed here — see the
+module documentation.
 """.
 -spec from_binary(binary()) -> {ok, store()} | {error, term()}.
 from_binary(<<"I2PNETDB", ?VERSION:8, Rest/binary>>) ->
@@ -1187,8 +1399,10 @@ Input: `Store` — the store; `NowMs` — wall-clock ms since epoch; `NowSec` �
 wall-clock seconds since epoch.
 Output: `{Store2, {RoutersRemoved, LSRemoved}}` where the counts reflect how
 many entries were evicted. A RouterInfo is expired when its published timestamp
-plus the 27-hour i2pd expiration threshold has fully passed. A LeaseSet is
-expired when `m:i2p_leaset:valid/2` returns `{error, expired}`.
+plus the horizon at the store's current size has fully passed — the same
+`f:expiration_ms/1` the admission check reads, and read once for the whole walk
+because the walk does not change the size. A LeaseSet is expired when
+`m:i2p_leaset:valid/2` returns `{error, expired}`.
 """.
 -spec remove_expired(store(), non_neg_integer(), non_neg_integer()) ->
     {store(), {non_neg_integer(), non_neg_integer()}}.
@@ -1321,11 +1535,11 @@ drop_from_order(#{order := Order, order_pos := Pos} = Store, Key) ->
 %% (now > timestamp + the store's horizon).
 %%
 %% **Both bounds come from one place.** The future bound is
-%% `?EXPIRATION_THRESHOLD_MS`, the clock-skew tolerance. The past bound is the
-%% store's own horizon, which is the same value `expired_hashes/2` compares against.
-%% They were written as two comparisons in two places, so they could drift and admit
-%% a RouterInfo the sweep would immediately remove; now a store cannot do that to
-%% itself.
+%% `?EXPIRATION_THRESHOLD_MS`, the clock-skew tolerance. The past bound is
+%% `f:expiration_ms/1`, which is the same value `expired_hashes/2` compares
+%% against. They were written as two comparisons in two places, so they could drift
+%% and admit a RouterInfo the sweep would immediately remove; now a store cannot do
+%% that to itself.
 valid_window(Timestamp, NowMs, Store) ->
     Timestamp =< NowMs + ?EXPIRATION_THRESHOLD_MS andalso
         NowMs =< Timestamp + expiration_ms(Store).
@@ -1819,8 +2033,15 @@ expired_hashes(Store, NowMs) ->
     Order = gb_trees:to_list(maps:get(order, Store)),
     %% **One comparison, one source.** The horizon is read once and hoisted out of
     %% the fold, which is both what the 5000-entry walk wants and the thing that
-    %% keeps this in step with `valid_window/3`: a store that admits a RouterInfo
-    %% cannot then expire it, because both sides read the same field.
+    %% keeps this in step with `valid_window/3`: both sides ask the same store the
+    %% same question, so a store that admits a RouterInfo cannot then expire it.
+    %%
+    %% **The hoist is still sound now that the horizon slides.** It is a function of
+    %% the store's size, and this walk does not change the size -- the count comes
+    %% from the order, and nothing is dropped until `drop_each/2` runs over the list
+    %% this returns. So the value read here is the value every comparison in the
+    %% fold would compute, and reading it per entry would be 5000 identical
+    %% `gb_trees:size/1` calls to learn nothing.
     Horizon = expiration_ms(Store),
     lists:foldl(
         fun({_Position, Hash}, Gone) ->
