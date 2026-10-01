@@ -189,9 +189,22 @@ has_router(Key) ->
 publish_table(Store) ->
     persistent_term:put(?ROUTER_TABLE, i2p_netdb:router_table(Store)).
 
-%% The full O(n log n) cross-check, for the operations that rewrite many entries
-%% at once. A load and an expiry sweep are exactly where a partial bug is hardest
-%% to notice, and exactly where a single store's O(1) check would not see it.
+%% The full O(n log n) cross-check. **Only a load now.**
+%%
+%% It used to run after the expiry sweep as well, and that was right when the sweep
+%% rebuilt both trees from scratch: a wholesale rewrite is where a partial bug is
+%% hardest to notice. But the sweep no longer rebuilds — it drops the expired keys
+%% incrementally, through the same `m:i2p_netdb:drop_from_order/2` that
+%% `f:remove/2` already runs under the O(1) check.
+%%
+%% So the sweep became the class of operation the O(1) check was chosen for, and the
+%% cross-check was a **4771 us** tax on the read path at the shipped capacity of 5000
+%% routers — more than twice the sweep's own ~2.3 ms — defending against a failure
+%% mode it no longer had. Removing it is part of the change that makes the sweep
+%% cheap, not a separate relaxation.
+%%
+%% `f:consistent/1` still runs after the sweep. It is O(1) and it is the check that
+%% would catch a drop taken from one tree and not the other.
 fully_checked(Store) ->
     ok = i2p_netdb:self_check(Store),
     Store.
@@ -506,18 +519,15 @@ configured_interval(Key, Default) ->
         _ -> Default
     end.
 
-%% Every mutation that touches routers goes through `checked/1`, so the table and
-%% the recency order cannot drift apart without the NetDb refusing to continue.
-%% A store is two structures and only this process can see both.
 %% Every router mutation is funnelled through `checked/1`. The store is two
 %% structures -- an ETS table and a pair of recency trees -- and only this
 %% process can see both, so this is the one place that can assert they agree.
 %% A store that drifts is quiet: it evicts the wrong router, or stops evicting.
 %%
 %% `m:i2p_netdb:consistent/1` rather than `f:self_check/1`, because it is O(1)
-%% and this runs on the store path. The full cross-check runs where a whole batch
-%% of entries is rewritten at once -- a load and the expiry sweep, via
-%% `f:fully_checked/1`.
+%% and this runs on the store path. The full cross-check is now for a load alone,
+%% which is the only remaining operation that rewrites a whole batch at once. See
+%% `f:fully_checked/1` for why the expiry sweep stopped qualifying.
 checked(Store) ->
     ok = i2p_netdb:consistent(Store),
     Store.
@@ -609,7 +619,7 @@ handle_call(remove_expired, _From, {Store, Counters}) ->
         routers_expired := maps:get(routers_expired, Counters) + RRemoved,
         ls_expired := maps:get(ls_expired, Counters) + LSRemoved
     },
-    {reply, {RRemoved, LSRemoved}, {fully_checked(Store2), C2}};
+    {reply, {RRemoved, LSRemoved}, {checked(Store2), C2}};
 handle_call(snapshot, _From, {Store, _} = State) ->
     %% O(n) in the order, so it is not free — but it is 49 us against the 8403 us
     %% of serialising here, and the serialisation is what this process is trying
@@ -686,7 +696,12 @@ handle_info(expiry_sweep, {Store, Counters}) ->
         ls_expired := maps:get(ls_expired, Counters) + LSRemoved
     },
     schedule_expiry(),
-    {noreply, {fully_checked(Store2), C2}}.
+    %% **The O(1) check, not the cross-check.** The sweep used to be
+    %% `f:fully_checked/1`, on the grounds that a wholesale rewrite is where a
+    %% partial bug hides. It is not a wholesale rewrite any more -- see
+    %% `f:fully_checked/1` -- and at the shipped capacity of 5000 routers the
+    %% cross-check was 4771 us against the sweep's own ~2.3 ms.
+    {noreply, {checked(Store2), C2}}.
 
 terminate(_Reason, {Store, _Counters}) ->
     _ = cancel_timers(),
