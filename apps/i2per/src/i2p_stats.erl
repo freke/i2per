@@ -188,6 +188,38 @@ counters() ->
         %% frame counted here is not recoverable and not retried.
         transit_frames_dropped_no_route,
 
+        %% %%%%% Client messages with nowhere to go %%%%%
+        %%
+        %% The other half of the section above, and the pair is the point:
+        %% `transit_frames_dropped_no_route` is a frame this router could not
+        %% route, this is a message it routed and could not deliver. An operator
+        %% needs both to tell a routing fault from a delivery fault, and they
+        %% belong next to each other so the read API presents them as one
+        %% question rather than two counters to correlate by hand.
+        %%
+        %% **Messages, not frames, and the distinction is not cosmetic.** This is
+        %% counted at the injection point, where `m:i2p_client:send_wire/2` is
+        %% about to hand a whole I2NP message to `m:i2p_tunnel_srv`. No frame
+        %% exists yet -- `outbound_frames/4` runs *after* the tunnel is found, so
+        %% a message that fails here was never fragmented at all. Calling it a
+        %% frame would name a unit that does not exist and would tie this
+        %% counter to the transit one it exists to be told apart from.
+        %%
+        %% **`no_tunnel`, not `no_route`, because a route was resolved.** The
+        %% route pinned an outbound tunnel that has since gone. The two causes
+        %% are the ones an operator acts on differently, and collapsing them
+        %% into one `no_route` would lose exactly the distinction the section
+        %% above was written to keep.
+        %%
+        %% A counter rather than an event, for the reason above it: a route whose
+        %% tunnel has gone fails **every** subsequent send until the route is
+        %% re-resolved, so this is a per-message rate on a live path rather than
+        %% an incident. It is a steady state the connection's resend machinery
+        %% recovers from, which is why `m:i2p_client:send_wire/2` still returns
+        %% `ok` and does not propagate -- and why the count, not the caller's
+        %% error, is what makes it visible.
+        client_messages_dropped_no_tunnel,
+
         %% %%%%% Peer manager: bounded structures %%%%%
         %%
         %% The peer manager holds three structures that would grow without bound

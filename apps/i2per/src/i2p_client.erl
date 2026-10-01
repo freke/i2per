@@ -178,8 +178,15 @@ route_to_dest(DestBin) ->
 -doc """
 Transport for streaming connections: garlic-wrap ONE encoded streaming packet
 for the route's destination and inject it into the pinned outbound tunnel
-toward the lease. A vanished tunnel drops the packet silently; the
-connection's resend machinery recovers.
+toward the lease. A vanished tunnel drops the packet; the connection's resend
+machinery recovers it, so this returns `ok` either way and does not propagate.
+
+**The drop is counted, not silent.** `m:i2p_stats` records it as
+`client_messages_dropped_no_tunnel`, which is the companion to
+`transit_frames_dropped_no_route`: that one is a frame this router could not
+route, this is a message it routed and could not deliver. Not propagating is a
+deliberate consequence of the resend guarantee above, not an absence of
+reporting -- and the two are different, which is why the count exists.
 
 Input: `Route` — a route from `f:route_to_dest/1`; `Wire` — one encoded
 streaming packet.
@@ -197,7 +204,7 @@ send_wire(#{out_tid := OutTid, gw := Gw, tid := Tid, dest_pub := DestPub}, Wire)
         }),
     case i2p_tunnel_srv:send_via_outbound(OutTid, {tunnel, Gw, Tid}, StdMsg) of
         ok -> ok;
-        error -> ok
+        error -> i2p_stats:add(client_messages_dropped_no_tunnel, 1)
     end.
 
 %% lease_route/2 — finish route resolution once the identity parses.
