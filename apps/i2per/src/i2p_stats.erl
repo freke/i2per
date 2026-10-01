@@ -188,6 +188,35 @@ counters() ->
         %% frame counted here is not recoverable and not retried.
         transit_frames_dropped_no_route,
 
+        %% %%%%% Peer manager: bounded structures %%%%%
+        %%
+        %% The peer manager holds three structures that would grow without bound
+        %% if nothing reclaimed them. Each has a bound now, and each of these
+        %% counts a *different* reason an entry went away, because "the peer
+        %% manager shed something" is not an operator fact on its own.
+        %%
+        %% A frame dropped for want of queue space is a different fact from one
+        %% dropped for want of a route above. This router routed the frame and
+        %% could not deliver it; `transit_frames_dropped_no_route` says the
+        %% opposite. A queue that is silently truncating is the thing this
+        %% board has twice had to find after the fact.
+        pending_sends_dropped_depth,
+        %% A queued frame that aged past `?PENDING_SEND_MAX_AGE_MS` and was
+        %% dropped unsent. **Distinct from the depth drop above**: a frame lost
+        %% to age is a peer that was never going to be reachable in time, so
+        %% this counter is the evidence that a bound, rather than congestion,
+        %% is what the peer set is running into.
+        pending_sends_expired,
+        %% A RouterInfo evicted from the dialable set by `?MAX_KNOWN`. Non-zero
+        %% on a busy router is normal; a count climbing without bound while the
+        %% peer count stays low means RouterInfos are arriving faster than they
+        %% are being used, which is the NetDb's story rather than this one's.
+        known_evicted,
+        %% A peer entry evicted by `?MAX_PEERS`. Should be rare: the cap sits well
+        %% above the connection limits, so a router that evicts here is holding
+        %% more peers than it can use.
+        peers_evicted,
+
         %% %%%%% Tunnel lifecycle %%%%%
         %%
         %% Cumulative since router start, and **not** a ratio: the ratio is the

@@ -23,7 +23,7 @@ init_test() ->
         RI = mk_ri(),
         Hash = i2p_router_info:hash(RI),
         {ok, State} = i2p_peer:init([Local, [RI]]),
-        ?assertEqual([#{ri => RI, hash => Hash}], maps:get(known, State)),
+        ?assertEqual(#{Hash => #{ri => RI, hash => Hash}}, maps:get(known, State)),
         ?assertEqual(#{}, maps:get(peers, State)),
         ?assertEqual(#{}, maps:get(inbound, State)),
         ?assertEqual(#{}, maps:get(pending, State)),
@@ -172,7 +172,7 @@ send_when_ready_no_inbound_test() ->
     Msg = msg(),
     S = base_state(),
     {noreply, S1} = i2p_peer:handle_cast({send_when_ready, H, Msg}, S),
-    ?assertEqual([Msg], maps:get(H, maps:get(pending_sends, S1))),
+    ?assertMatch([{at, _, Msg}], maps:get(H, maps:get(pending_sends, S1))),
     ?assertEqual(#{}, maps:get(peers, S1)).
 
 %% A state that never initialised pending_sends creates it on first enqueue.
@@ -181,7 +181,7 @@ send_when_ready_no_pending_sends_test() ->
     Msg = msg(),
     S0 = maps:remove(pending_sends, base_state()),
     {noreply, S1} = i2p_peer:handle_cast({send_when_ready, H, Msg}, S0),
-    ?assertEqual([Msg], maps:get(H, maps:get(pending_sends, S1))).
+    ?assertMatch([{at, _, Msg}], maps:get(H, maps:get(pending_sends, S1))).
 
 stop_test() ->
     H1 = mk_hash(),
@@ -357,7 +357,7 @@ ntcp2_ready_test() ->
     Dead = dead_pid(),
     S0 = with_peer(H, peer(H, #{conn => Dead, status => connecting, attempts => 1}), base_state()),
     S1 = S0#{pending := #{H => [exploratory]}},
-    S2 = S1#{pending_sends := #{H => [msg()]}},
+    S2 = S1#{pending_sends := #{H => [{at, erlang:system_time(millisecond), msg()}]}},
     {noreply, S3} = i2p_peer:handle_info({ntcp2_ready, Dead, mk_ri()}, S2),
     Peer = maps:get(H, maps:get(peers, S3)),
     ?assertEqual(connected, maps:get(status, Peer)),
@@ -414,7 +414,7 @@ ssu2_ready_with_remote_ri_test() ->
         Hash = i2p_router_info:hash(RI),
         {noreply, S1} = i2p_peer:handle_info({ssu2_ready, self(), #{}, RI}, base_state()),
         ?assertMatch({Hash, _, ssu2}, maps:get(self(), maps:get(inbound, S1))),
-        ?assertEqual([#{ri => RI, hash => Hash}], maps:get(known, S1))
+        ?assertEqual(#{Hash => #{ri => RI, hash => Hash}}, maps:get(known, S1))
     after
         case Owner of
             started -> gen_server:stop(whereis(i2p_netdb_srv));
@@ -603,10 +603,14 @@ kick_floodfill_discovery_test() ->
     try
         H1 = mk_hash(),
         H2 = mk_hash(),
-        Known = [#{hash => H1, ri => mk_ri()}, #{hash => H2, ri => mk_ri()}],
+        Known = #{H1 => #{hash => H1, ri => mk_ri()}, H2 => #{hash => H2, ri => mk_ri()}},
         Base = base_state(),
         S = Base#{
-            known := Known,
+            known => Known,
+            %% The operator's ranking, which is what `discovery_candidates/1`
+            %% walks. H1 first and dialing, H2 second and already connecting, so
+            %% only H1 produces a lookup.
+            seed_order => [H1, H2],
             peers := #{H2 => peer(H2, #{status => connecting})}
         },
         ?assertEqual({noreply, S}, i2p_peer:handle_info(kick_floodfill_discovery, S))
@@ -622,7 +626,7 @@ kick_ignores_nonpublished_seed_test() ->
     try
         Hash = mk_hash(),
         RI = nonpublished_ri(),
-        S = (base_state())#{known => [#{hash => Hash, ri => RI}]},
+        S = (base_state())#{known => #{Hash => #{hash => Hash, ri => RI}}},
         ?assertEqual({noreply, S}, i2p_peer:handle_info(kick_floodfill_discovery, S))
     after
         case Owner of
@@ -639,7 +643,7 @@ learn_ri_test() ->
         Hash = i2p_router_info:hash(RI),
         S = base_state(),
         {noreply, S1} = i2p_peer:handle_cast({learn_ri, RI}, S),
-        ?assertEqual([#{ri => RI, hash => Hash}], maps:get(known, S1)),
+        ?assertEqual(#{Hash => #{ri => RI, hash => Hash}}, maps:get(known, S1)),
         {noreply, S2} = i2p_peer:handle_cast({learn_ri, RI}, S1),
         ?assertEqual(maps:get(known, S1), maps:get(known, S2))
     after
@@ -763,7 +767,7 @@ db_store_ri_remembered_without_dial_test() ->
         Msg = i2p_i2np:db_store(Hash, 0, 0, undefined, Data),
         S = base_state(),
         {noreply, S1} = i2p_peer:handle_info({ntcp2_frame, Dead, framed(Msg)}, S),
-        ?assertEqual([#{ri => RI, hash => Hash}], maps:get(known, S1)),
+        ?assertEqual(#{Hash => #{ri => RI, hash => Hash}}, maps:get(known, S1)),
         ?assertEqual(#{}, maps:get(peers, S1))
     after
         case Owner of
@@ -1012,14 +1016,19 @@ base_state() ->
     Local = local(),
     #{
         local => Local,
-        known => [],
+        %% `known` is keyed by hash; `seed_order` is the operator's ranking of
+        %% them, kept apart because `f:discovery_candidates/1` dials the first
+        %% three and a map cannot carry that.
+        known => #{},
+        seed_order => [],
         peers => #{},
         inbound => #{},
         pending => #{},
         pending_sends => #{},
         our_hash => maps:get(hash, Local),
         refresh_ref => make_ref(),
-        discovery_kick_ref => make_ref()
+        discovery_kick_ref => make_ref(),
+        sweep_ref => make_ref()
     }.
 
 with_peer(Hash, PeerState, State) ->
