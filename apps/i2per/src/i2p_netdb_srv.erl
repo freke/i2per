@@ -15,6 +15,28 @@ store. Network-facing work (sending DatabaseLookup messages, storing replies)
 belongs to the peer manager (`m:i2p_peer`), which reads and writes through
 this API.
 
+## What runs here, and what does not
+
+This process serves reads and applies stores, and it does the cheap half of a
+store. Two classes of expensive work are kept out of it, because this is the one
+process every NetDb read queues behind.
+
+Signature verification happens in the calling process, reached from
+`f:store_binary/2` and `f:store_ls_binary/2` before the call is made. A
+verification measures 100.4 us against 1-3 us for the store itself. That is a
+relocation and not a removal, since the peer manager and the transit relay each
+pay it now. It is the right relocation because this is the process every read
+queues behind. Whether a second verifier would help was measured, and the answer
+is no: Ed25519 throughput falls as processes are added on this OTP, so the
+100 us is something #VXRH456 has to attack rather than something more processes
+can hide.
+
+The disk save and the expiry sweep are still here, and are what #PPW41Y4 is
+about. A save measures ~16.8 ms and a sweep ~12.9 ms at the shipped capacity, so
+they are the remaining reason a read can queue behind a write. Moving them off
+depends on the store becoming something that can be handed over rather than a
+handle to live state, which is #QDA7A0X.
+
 ## Persistence
 
 When app env `i2per` → `data_dir` names a directory, the store is saved to
@@ -101,11 +123,27 @@ Input: `Bin` — full signed RouterInfo bytes; `NowMs` — wall-clock ms since
 epoch.
 Output: `{ok, Outcome}` as in `m:i2p_netdb:store/3`, or `{error, Reason}` when
 the bytes do not decode to a signature-verifying RouterInfo.
+
+The signature is verified here, in the calling process, rather than in the NetDb.
+An Ed25519 verification measures 100.4 us against 1-3 us for the store itself,
+so verifying inside the call put a floodfill replication burst or a reseed
+bundle in front of every NetDb read. The call below carries a parsed
+RouterInfo, so this process pays the store and nothing else.
+
+A pool of verifier processes was the first design and measurement killed it.
+Total Ed25519 throughput on this OTP falls as processes are added, 0.45x at 8
+processes against 4.24x for a no-crypto control on the same harness, so extra
+verifiers would queue behind the same serialising work rather than overlap it.
+OTP 28 also ships no worker \`pool\` module to build on. Decoding in the caller
+is what remains.
 """.
 -spec store_binary(binary(), non_neg_integer()) ->
     {ok, added | updated | older | from_future | too_old} | {error, term()}.
 store_binary(Bin, NowMs) ->
-    gen_server:call(?MODULE, {store_binary, Bin, NowMs}).
+    case i2p_router_info:decode(Bin) of
+        {ok, RI} -> {ok, store(RI, NowMs)};
+        {error, Reason} -> {error, Reason}
+    end.
 
 -doc """
 Look up a router by hash.
@@ -175,11 +213,16 @@ Input: `Bin` — the content bytes (without the store-type byte); `NowSec` —
 wall-clock seconds since epoch.
 Output: `{ok, Outcome}` as in `f:store_ls/2`, or `{error, Reason}` when the
 bytes do not decode to a signature-verifying LeaseSet2.
+
+Verified in the calling process, for the same reason as `f:store_binary/2`.
 """.
 -spec store_ls_binary(binary(), non_neg_integer()) ->
     {ok, added | updated | older | from_future | expired} | {error, term()}.
 store_ls_binary(Bin, NowSec) ->
-    gen_server:call(?MODULE, {store_ls_binary, Bin, NowSec}).
+    case i2p_leaset:decode(Bin) of
+        {ok, LS} -> {ok, store_ls(LS, NowSec)};
+        {error, Reason} -> {error, Reason}
+    end.
 
 -doc """
 Look up a LeaseSet2 by destination hash.
@@ -439,19 +482,9 @@ checked(Store) ->
 handle_call({store, RI, NowMs}, _From, {Store, Counters}) ->
     {Store2, Outcome} = i2p_netdb:store(Store, RI, NowMs),
     {reply, Outcome, {checked(Store2), Counters}};
-handle_call({store_binary, Bin, NowMs}, _From, {Store, Counters}) ->
-    case i2p_netdb:store_binary(Store, Bin, NowMs) of
-        {ok, Store2, Outcome} -> {reply, {ok, Outcome}, {checked(Store2), Counters}};
-        {error, Reason} -> {reply, {error, Reason}, {Store, Counters}}
-    end;
 handle_call({store_ls, LS, NowSec}, _From, {Store, Counters}) ->
     {Store2, Outcome} = i2p_netdb:store_ls(Store, LS, NowSec),
     {reply, Outcome, {Store2, Counters}};
-handle_call({store_ls_binary, Bin, NowSec}, _From, {Store, Counters}) ->
-    case i2p_netdb:store_ls_binary(Store, Bin, NowSec) of
-        {ok, Store2, Outcome} -> {reply, {ok, Outcome}, {Store2, Counters}};
-        {error, Reason} -> {reply, {error, Reason}, {Store, Counters}}
-    end;
 handle_call({find, Key}, _From, {Store, _} = State) ->
     case i2p_netdb:find(Store, Key) of
         {ok, RI} -> {reply, {ok, RI}, State};
