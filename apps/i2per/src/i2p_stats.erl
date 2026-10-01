@@ -188,37 +188,51 @@ counters() ->
         %% frame counted here is not recoverable and not retried.
         transit_frames_dropped_no_route,
 
-        %% %%%%% Client messages with nowhere to go %%%%%
+        %% %%%%% Our own outbound, undeliverable %%%%%
         %%
-        %% The other half of the section above, and the pair is the point:
-        %% `transit_frames_dropped_no_route` is a frame this router could not
-        %% route, this is a message it routed and could not deliver. An operator
-        %% needs both to tell a routing fault from a delivery fault, and they
-        %% belong next to each other so the read API presents them as one
-        %% question rather than two counters to correlate by hand.
+        %% One operator question with two causes, so one section: what did *we*
+        %% fail to deliver after successfully routing it. The section above is the
+        %% opposite -- frames that had nowhere to go at all. An operator needs
+        %% both to tell a routing fault from a delivery fault, and they belong
+        %% next to each other so the read API presents them as one question
+        %% rather than three counters to correlate by hand.
         %%
-        %% **Messages, not frames, and the distinction is not cosmetic.** This is
-        %% counted at the injection point, where `m:i2p_client:send_wire/2` is
-        %% about to hand a whole I2NP message to `m:i2p_tunnel_srv`. No frame
-        %% exists yet -- `outbound_frames/4` runs *after* the tunnel is found, so
-        %% a message that fails here was never fragmented at all. Calling it a
-        %% frame would name a unit that does not exist and would tie this
-        %% counter to the transit one it exists to be told apart from.
+        %% **Messages, not frames, and the distinction is not cosmetic.** Both are
+        %% counted at the injection point, where a whole I2NP message is about to
+        %% be handed to `m:i2p_tunnel_srv`. No frame exists yet --
+        %% `f:outbound_frames/4` runs *after* the tunnel is found, so a message
+        %% that fails here was never fragmented at all. Calling either a frame
+        %% would name a unit that does not exist, and would tie these to the
+        %% transit one they exist to be told apart from.
         %%
-        %% **`no_tunnel`, not `no_route`, because a route was resolved.** The
-        %% route pinned an outbound tunnel that has since gone. The two causes
-        %% are the ones an operator acts on differently, and collapsing them
-        %% into one `no_route` would lose exactly the distinction the section
-        %% above was written to keep.
+        %% `no_tunnel` and **not** `no_route`, because a route *was* resolved in
+        %% both cases: a pinned outbound tunnel has since gone. That is a
+        %% different cause from "no route" and collapsing them would lose
+        %% exactly the distinction this section was written to keep.
         %%
-        %% A counter rather than an event, for the reason above it: a route whose
-        %% tunnel has gone fails **every** subsequent send until the route is
-        %% re-resolved, so this is a per-message rate on a live path rather than
-        %% an incident. It is a steady state the connection's resend machinery
-        %% recovers from, which is why `m:i2p_client:send_wire/2` still returns
-        %% `ok` and does not propagate -- and why the count, not the caller's
-        %% error, is what makes it visible.
+        %% Counters rather than events, for the reason the section above gives: a
+        %% route whose tunnel has gone fails **every** subsequent send until the
+        %% route is re-resolved, so these are per-message rates on live paths
+        %% rather than incidents.
         client_messages_dropped_no_tunnel,
+        %% The same loss on the other side of the router: a reply we owed another
+        %% router, injected into a lookup outbound tunnel that went away between
+        %% picking it and sending on it. **Its own counter, not a shared one.**
+        %% A lost client send is our user waiting on their own traffic; a lost
+        %% lookup reply is *another router* waiting on an answer we had. One is
+        %% our user's experience, the other is our usefulness to the network, and
+        %% an operator cannot act on the sum. Sharing would also make
+        %% `client_messages_dropped_no_tunnel` a lie by name, which is the same
+        %% category of error as calling it `frames`.
+        %%
+        %% Expected to stay at zero, and that is a claim about the code rather
+        %% than about traffic: both lookups resolve through the same pool map, so
+        %% the id a pick returns is still present when the send re-resolves it
+        %% unless a tick retires the tunnel in between. See #MCVQ6D6 -- and note
+        %% that the path is **not deterministically constructible in a test**,
+        %% which is why this is a counter reached through an exported helper
+        %% rather than a case that races the window.
+        lookup_replies_dropped_no_tunnel,
 
         %% %%%%% Peer manager: bounded structures %%%%%
         %%

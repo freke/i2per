@@ -11,7 +11,8 @@
     ls_lookup_via_tunnels/1,
     chase_after_search_reply/1,
     responder_answers_into_reply_tunnel/1,
-    exploratory_pool_used_for_lookup/1
+    exploratory_pool_used_for_lookup/1,
+    reply_with_no_outbound_tunnel_is_dropped_not_raised/1
 ]).
 
 -define(APP, i2per).
@@ -22,7 +23,8 @@ all() ->
         ls_lookup_via_tunnels,
         chase_after_search_reply,
         responder_answers_into_reply_tunnel,
-        exploratory_pool_used_for_lookup
+        exploratory_pool_used_for_lookup,
+        reply_with_no_outbound_tunnel_is_dropped_not_raised
     ].
 
 init_per_testcase(Case, Config) ->
@@ -116,6 +118,55 @@ responder_answers_into_reply_tunnel(_Config) ->
         }} = i2p_i2np:decode_db_store(maps:get(body, StoreMsg)),
         DHash = Key,
         LsBin = i2p_leaset:to_binary(LS)
+    after
+        teardown()
+    end.
+
+%% --------------------------------------------------------------------------
+%% `f:tunnel_lookup_reply/2` is total. It answers `ok` whether or not the reply
+%% can be injected, and never raises -- it runs on the I2NP dispatch path of
+%% the peer manager, so anything else here is a process death rather than a
+%% failed lookup.
+%%
+%% There are two ways to drop, and both are handled: no outbound tunnel at all
+%% (this case), and a tunnel retired between the pick and the send (#MCVQ6D6).
+%% The counter stays at zero because the *first* drop happened, and pinning that
+%% is what keeps the two distinguishable in the read API rather than one
+%% undifferentiated "reply lost" figure.
+%%
+%% **The second half is deliberately not tested, and not faked.**
+%% `f:pick_lookup_outbound/0` returns a map *key* and `f:find_outbound/2` searches
+%% both pools, so after a successful pick the id always resolves; only a
+%% concurrent removal makes the send answer `error`. Reaching it needs a timing
+%% assumption, and a case built on one would be a flake wearing a name -- so that
+%% half is documented as untested and carries a counter instead. The case below
+%% would also pass against the old `ok = `, and it is kept for the totality
+%% contract rather than as evidence about the assert.
+%% --------------------------------------------------------------------------
+reply_with_no_outbound_tunnel_is_dropped_not_raised(_Config) ->
+    setup(),
+    try
+        %% Someone else's destination, stored locally: we have an answer to give
+        %% and no way to give it.
+        DHash = dest_hash(),
+        LS = lease_for_dest(),
+        added = i2p_netdb_srv:store_ls(LS, erlang:system_time(second)),
+
+        RequesterHash = crypto:strong_rand_bytes(32),
+        Parsed = #{
+            key => DHash,
+            from => RequesterHash,
+            flags => i2p_i2np:lookup_type_leaseset() bor 16#01,
+            type => leaseset,
+            encrypted => false,
+            delivery => #{tunnel_id => 4242},
+            excluded => [],
+            reply_encryption => <<>>
+        },
+        ok = i2p_peer:tunnel_lookup_reply(Parsed, a_hash()),
+        0 = maps:get(
+            lookup_replies_dropped_no_tunnel, i2p_stats:snapshot(), not_reported
+        )
     after
         teardown()
     end.
