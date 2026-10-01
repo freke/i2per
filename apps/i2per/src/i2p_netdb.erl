@@ -182,6 +182,10 @@ true = i2p_netdb:has_router(Store, Key).
 %% a 32-byte binary, so it cannot collide with one and no caller can name it by
 %% accident. Its value is the generation counter; see `f:claim_generation/1`.
 -define(GEN_KEY, '$generation').
+%% Bits of the derived-flag byte stored alongside each RouterInfo. See
+%% `f:floodfill_flags/1`.
+-define(FF_DECLARED, 1).
+-define(FF_ELIGIBLE, 2).
 %% i2pd NetDb.hpp: NETDB_MIN_FLOODFILL_VERSION = MAKE_VERSION_NUMBER(0, 9, 62).
 -define(NETDB_MIN_FLOODFILL_VERSION, 962).
 %% i2pd NetDb.cpp: reject RouterInfos stamped more than this into the future.
@@ -423,7 +427,7 @@ find(Store, Key) ->
 %% answer to "do we hold this router?" rather than one per call site.
 router(Key, Store) ->
     case ets:lookup(maps:get(routers, Store), Key) of
-        [{_, RI}] -> {ok, RI};
+        [{_, RI, _Flags}] -> {ok, RI};
         [] -> error
     end.
 
@@ -703,7 +707,12 @@ self_check(Store) ->
                                     )
                             of
                                 true ->
-                                    ok;
+                                    case stale_flags(Tab) of
+                                        [] ->
+                                            ok;
+                                        Stale ->
+                                            {error, {flags_disagree_with_routerinfo, Stale}}
+                                    end;
                                 false ->
                                     {error, order_pos_not_inverse_of_order}
                             end;
@@ -731,6 +740,45 @@ missing_from_order(Tab, Pos) ->
 
 missing_from_table(Tab, Order) ->
     [Hash || {{_Seq, Hash}, _Value} <- gb_trees:to_list(Order), not ets:member(Tab, Hash)].
+
+%% Routers whose stored flags disagree with the RouterInfo beside them.
+%%
+%% The flags are derived, so this is the check that they still are. It recomputes
+%% them from the RouterInfo and compares, which is the whole point: a check that
+%% could only pass because nothing could drift would not be a check.
+stale_flags(Tab) ->
+    ets:foldl(
+        fun
+            %% **Arity 2, one clause per row shape.** `ets:foldl/3` hands the whole
+            %% row over as a single term, so the generation row arrives as the
+            %% 2-tuple it is rather than spread across three arguments. Writing it
+            %% spread is a compile-time arity mismatch, not a runtime one.
+            %%
+            %% No guard on the RouterInfo. An `is_map/1` guard discriminates the row
+            %% shapes just as well, and dialyzer then narrows the term to `map()` and
+            %% rejects the call to `floodfill_flags/1`, whose argument is the opaque
+            %% `m:i2p_router_info:router_info()`. Arity alone is the cleaner
+            %% discriminator: the two shapes differ in size, not in what they hold.
+            ({?GEN_KEY, _Generation}, Acc) ->
+                Acc;
+            ({Key, RI, Flags}, Acc) ->
+                case Flags =:= floodfill_flags(RI) of
+                    true -> Acc;
+                    false -> [Key | Acc]
+                end;
+            (_OtherRow, Acc) ->
+                Acc
+        end,
+        [],
+        Tab
+    ).
+
+%% Why `ets:foldl/3` and not `ets:select/2`. The generation row is a 2-tuple and
+%% every router row is a 3-tuple, so a single match spec has to admit both arities,
+%% and the one that did was refused by the match-spec compiler with a bare `badarg`
+%% and no hint. A fold handles the mixed shapes in one clause list and cannot be
+%% malformed, and `self_check/1` already walks the whole table so the cost is
+%% already being paid.
 
 -doc "The day-scoped routing key for the current UTC date: `SHA-256(Key ‖ yyyymmdd)`.".
 -spec routing_key(router_key()) -> router_key().
@@ -820,7 +868,7 @@ closest_non_floodfills(Store, Target, N, Excluded) when
         Key
      || Key <- router_keys(Store),
         not lists:member(Key, Excluded),
-        not declared_floodfill(router_value(Key, Store))
+        not declares_floodfill(Store, Key)
     ],
     closest_keys(NonFloodfills, Target, N);
 closest_non_floodfills(_Store, _Target, _N, _Excluded) ->
@@ -965,7 +1013,7 @@ snapshot_entries(_Tab, [], Acc) ->
     {ok, lists:reverse(Acc)};
 snapshot_entries(Tab, [Key | Rest], Acc) ->
     case ets:lookup(Tab, Key) of
-        [{_, RI}] ->
+        [{_, RI, _Flags}] ->
             Bin = i2p_router_info:to_binary(RI),
             snapshot_entries(
                 Tab, Rest, [<<Key/binary, (byte_size(Bin)):16/big, Bin/binary>> | Acc]
@@ -1124,7 +1172,7 @@ insert_newer(Store, Key, RI, NowMs, Outcome) ->
             %% stale store, and a store that has already been written is already
             %% corrupt. On the raise path nothing is written at all.
             Store1 = claim_generation(Store),
-            true = ets:insert(maps:get(routers, Store1), {Key, RI}),
+            true = ets:insert(maps:get(routers, Store1), {Key, RI, floodfill_flags(RI)}),
             {trim(promote(Store1, Key)), Outcome};
         false ->
             {Store, outcome_for_window(Timestamp, NowMs)}
@@ -1316,8 +1364,48 @@ closest_keys(Keys, Target, N) ->
     [Key || {_Distance, Key} <- lists:sublist(Sorted, N)].
 
 is_eligible_floodfill(Store, Key) ->
-    RI = router_value(Key, Store),
-    declared_floodfill(RI) andalso eligible_floodfill(RI).
+    (router_flags(Key, Store) band ?FF_ELIGIBLE) =/= 0.
+
+declares_floodfill(Store, Key) ->
+    (router_flags(Key, Store) band ?FF_DECLARED) =/= 0.
+
+%% The derived flags for one RouterInfo, as a byte.
+%%
+%% **Both floodfill predicates are computed once, when the RouterInfo is stored,
+%% and read from the table afterwards.** They used to be recomputed per candidate
+%% on every closest-floodfill lookup, and each computation needed the RouterInfo --
+%% so `f:router_value/2` copied a whole parsed RouterInfo map out of ETS to answer
+%% a question about two fields of it. At the shipped capacity that was ~5000 full
+%% copies per lookup, and it was most of what `f:closest_floodfills/4` cost: 48 ms,
+%% of which the sort was under 4.
+%%
+%% Reading one element of the row instead of the whole row is what makes it cheap.
+%% `ets:lookup_element/3` copies that element and nothing else, so the flags cost a
+%% few words per candidate rather than a RouterInfo each.
+%%
+%% Derived data can go stale, which is the risk this introduces. It cannot here, and
+%% the reason is the shape rather than the code: **the flags and the RouterInfo are
+%% written in the same `ets:insert`**, and the only two places either is written are
+%% `insert_newer/5` and `seed_order/3`, both of which write the whole row. There is
+%% no path that updates a RouterInfo without replacing its flags.
+%%
+%% `f:self_check/1` recomputes them and compares, so the invariant is asserted
+%% rather than argued. That is what earns the optimisation its keep: a check that
+%% could only ever pass because nothing could drift is not a check.
+floodfill_flags(RI) ->
+    %% **`?FF_ELIGIBLE` means declared *and* eligible, not eligible.** The two were
+    %% separate halves joined by `andalso` in `is_eligible_floodfill/2`, and
+    %% `f:eligible_floodfill/1` on its own checks only version, reachability and
+    %% addresses -- so a plain router with a published address satisfies it. Reading
+    %% that bit as "eligible" made every ordinary router look like a floodfill, and
+    %% `closest_floodfills_filters_by_eligibility_test` caught it on the first run.
+    case declared_floodfill(RI) andalso eligible_floodfill(RI) of
+        true -> ?FF_DECLARED bor ?FF_ELIGIBLE;
+        false -> 0
+    end.
+
+router_flags(Key, Store) ->
+    ets:lookup_element(maps:get(routers, Store), Key, 3).
 
 %% The order tree already holds every key we store, so the key set is read from
 %% there rather than by sweeping the table. One less place that has to agree
@@ -1444,7 +1532,7 @@ seed_order(Store, Entries) ->
     Store1 = claim_generation(Store),
     {Order, Pos, NextSeq} = lists:foldl(
         fun({Key, RI}, {OrderAcc, PosAcc, Seq}) ->
-            true = ets:insert(maps:get(routers, Store1), {Key, RI}),
+            true = ets:insert(maps:get(routers, Store1), {Key, RI, floodfill_flags(RI)}),
             {
                 gb_trees:enter({Seq, Key}, Key, OrderAcc),
                 gb_trees:enter(Key, Seq, PosAcc),
@@ -1534,7 +1622,7 @@ expired_hashes(Store, NowMs) ->
     lists:foldl(
         fun({_Position, Hash}, Gone) ->
             case ets:lookup(Tab, Hash) of
-                [{_, RI}] ->
+                [{_, RI, _Flags}] ->
                     case i2p_router_info:published(RI) + Horizon < NowMs of
                         true -> [Hash | Gone];
                         false -> Gone

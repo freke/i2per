@@ -77,6 +77,94 @@ lookup_cost_is_linear_in_the_store_not_in_its_logarithm_test() ->
     ?assert(LargeHashes < 6 * SmallHashes).
 
 %%% --------------------------------------------------------------------------
+%%% The floodfill filter reads flags, not whole RouterInfos
+%%% --------------------------------------------------------------------------
+
+%% The stored flags must mean exactly what the two predicates mean.
+%%
+%% They are derived data, so the risk is that a derivation drifts from what it
+%% derived. This is the case that found the drift: `f:eligible_floodfill/1` on its
+%% own checks only version, reachability and addresses, and never the floodfill
+%% capability. The old `is_eligible_floodfill/2` joined the two with `andalso`;
+%% storing "eligible" alone made every ordinary router with a published address
+%% look like a floodfill.
+flags_mean_declared_and_eligible_not_eligible_alone_test() ->
+    Now = erlang:system_time(millisecond),
+    Store0 = i2p_netdb:new(20),
+    FF = floodfill(Now, "a"),
+    Bare = declared_but_not_eligible(Now, "b"),
+    Plain = plain(Now, "c"),
+    Store = stored([FF, Bare, Plain], Store0, Now),
+    Target = crypto:strong_rand_bytes(32),
+
+    FFs = i2p_netdb:closest_floodfills(Store, Target, 10, []),
+    %% Only the one that is both declared and eligible.
+    ?assertEqual([i2p_router_info:hash(FF)], FFs),
+    ?assertNot(lists:member(i2p_router_info:hash(Bare), FFs)),
+    ?assertNot(lists:member(i2p_router_info:hash(Plain), FFs)),
+
+    %% And the complement: `closest_non_floodfills/4` excludes declared ones
+    %% whatever their eligibility, which is a different question and was a
+    %% different predicate.
+    NonFFs = i2p_netdb:closest_non_floodfills(Store, Target, 10, []),
+    ?assertEqual(
+        lists:sort([i2p_router_info:hash(Bare), i2p_router_info:hash(Plain)]),
+        lists:sort(NonFFs)
+    ).
+
+%% `f:self_check/1` recomputes the flags from the RouterInfo and compares, so a
+%% derived row cannot drift without the store refusing it.
+%%
+%% Demonstrated red by corrupting a stored flag, which is the failure the check
+%% exists for and the only way to see that it is doing anything.
+self_check_catches_a_stored_flag_that_disagrees_with_its_routerinfo_test() ->
+    Now = erlang:system_time(millisecond),
+    Store0 = i2p_netdb:new(20),
+    FF = floodfill(Now, "d"),
+    Store = stored([FF], Store0, Now),
+    ok = i2p_netdb:self_check(Store),
+
+    Tab = i2p_netdb:router_table(Store),
+    Key = i2p_router_info:hash(FF),
+    [{_, RI, Flags}] = ets:lookup(Tab, Key),
+    %% `?FF_DECLARED` is bit 0 and `?FF_ELIGIBLE` is bit 1, so this fixture -- which
+    %% is both -- carries the full byte.
+    3 = Flags,
+
+    %% Demote it to "declared but not eligible" and the store should refuse to
+    %% vouch for itself.
+    true = ets:insert(Tab, {Key, RI, 1}),
+    ?assertEqual(
+        {error, {flags_disagree_with_routerinfo, [Key]}},
+        i2p_netdb:self_check(Store)
+    ),
+
+    %% And restoring the row restores the store, so the check is about the data
+    %% rather than about having been armed.
+    true = ets:insert(Tab, {Key, RI, Flags}),
+    ?assertEqual(ok, i2p_netdb:self_check(Store)).
+
+%% Loading a store must compute the flags too. `seed_order/3` writes the table
+%% directly, bypassing the mutators, so it is the one write path that could
+%% plausibly have been missed -- and a load that stored rows without flags would
+%% make every loaded router invisible to the floodfill lookup.
+load_computes_the_floodfill_flags_test() ->
+    Now = erlang:system_time(millisecond),
+    FF = floodfill(Now, "e"),
+    Plain = plain(Now, "f"),
+    Store0 = i2p_netdb:new(20),
+    Store = stored([FF, Plain], Store0, Now),
+    Bin = i2p_netdb:to_binary(Store),
+    {ok, Loaded} = i2p_netdb:from_binary(Bin),
+
+    ok = i2p_netdb:self_check(Loaded),
+    Target = crypto:strong_rand_bytes(32),
+    ?assertEqual(
+        [i2p_router_info:hash(FF)],
+        i2p_netdb:closest_floodfills(Loaded, Target, 10, [])
+    ).
+
+%%% --------------------------------------------------------------------------
 %%% The answers did not change
 %%% --------------------------------------------------------------------------
 
@@ -153,6 +241,55 @@ router(Now, I) ->
 
 host(N) ->
     list_to_binary("192.0.2." ++ integer_to_list(N)).
+
+stored(RIs, Store0, Now) ->
+    lists:foldl(
+        fun(RI, S) ->
+            {S1, added} = i2p_netdb:store(S, RI, Now),
+            added = added,
+            S1
+        end,
+        Store0,
+        RIs
+    ).
+
+%% A floodfill that satisfies every half of the eligibility rule.
+floodfill(Now, Tag) ->
+    with_caps(Now, Tag, <<"Of">>).
+
+%% Declares the floodfill capability but is not eligible: the unreachable flag
+%% fails it. This is the router that a "flags mean eligible" shortcut gets wrong.
+declared_but_not_eligible(Now, Tag) ->
+    with_caps(Now, Tag, <<"OUf">>).
+
+plain(Now, Tag) ->
+    with_caps(Now, Tag, <<"O">>).
+
+with_caps(Now, Tag, Caps) ->
+    {{SPub, Seed}, {CPub, _}} =
+        {i2p_crypto:ed25519_keygen(), i2p_crypto:x25519_keygen()},
+    Addr = i2p_router_info:ntcp2_address(
+        host_hash(Tag), 4668, crypto:strong_rand_bytes(32), crypto:strong_rand_bytes(16)
+    ),
+    Opts = #{
+        <<"netId">> => <<"2">>,
+        <<"router.version">> => <<"0.9.74">>,
+        <<"caps">> => Caps
+    },
+    i2p_router_info:build(i2p_keys:from_keys(CPub, SPub), Now, [Addr], Opts, Seed).
+
+%% A host derived from a tag rather than an index, so two fixtures built with the
+%% same index in different cases do not collide into one RouterInfo.
+%%
+%% **Four octets, and the last one is not padded.** The first two versions of this
+%% got it wrong in ways that failed silently: the fixture stopped being a published
+%% address, so `f:eligible_floodfill/1` was false, so `f:closest_floodfills/4`
+%% returned an empty list, and every case that was really about the stored flags
+%% failed with an empty expected-value rather than with anything about flags. Then
+%% I blamed zero padding, which was wrong -- the prefix was three octets, not four.
+%% `f:is_ipv4/1` is the thing to check a host against here.
+host_hash(Tag) ->
+    list_to_binary("198.51.100." ++ integer_to_list(erlang:phash2(Tag, 250) + 1)).
 
 %% How many times `crypto:hash/2` ran while `F` ran.
 %%
