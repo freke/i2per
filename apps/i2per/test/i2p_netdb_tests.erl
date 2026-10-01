@@ -49,7 +49,7 @@ closest_returns_distance_sorted_test() ->
     Store0 = i2p_netdb:new(),
     Target = rand_hash(),
     {Store, Keys} = store_n(Store0, 5, now_ms()),
-    Closest = i2p_netdb:closest(Store, Target, 3),
+    {_Store1, Closest} = i2p_netdb:closest(Store, Target, 3),
     Expected = lists:sublist(
         lists:sort(
             fun(A, B) -> i2p_netdb:distance(A, Target) < i2p_netdb:distance(B, Target) end, Keys
@@ -58,7 +58,7 @@ closest_returns_distance_sorted_test() ->
     ),
     ?assertEqual(Expected, Closest),
     ?assertEqual(3, length(Closest)),
-    ?assertEqual([], i2p_netdb:closest(Store, Target, 0)).
+    {_Store2, []} = i2p_netdb:closest(Store, Target, 0).
 
 %%% --------------------------------------------------------------------------
 %%% Store semantics
@@ -327,16 +327,22 @@ closest_floodfills_filters_by_eligibility_test() ->
     {Store2, added} = i2p_netdb:store(Store1, FF2, Now),
     {Store3, added} = i2p_netdb:store(Store2, Plain, Now),
     Target = i2p_router_info:hash(FF1),
-    FFs = i2p_netdb:closest_floodfills(Store3, Target, 5, []),
+    {Store4, FFs} = i2p_netdb:closest_floodfills(Store3, Target, 5, []),
     ?assertEqual(2, length(FFs)),
     ?assert(lists:member(i2p_router_info:hash(FF1), FFs)),
     ?assert(lists:member(i2p_router_info:hash(FF2), FFs)),
     ?assertNot(lists:member(i2p_router_info:hash(Plain), FFs)),
-    %% excluded floodfills are skipped
+    %% **A lookup that resolved nothing returns the store exactly as it was.**
+    %% `Store4` already carries a memo tagged with today, so naming every candidate
+    %% as excluded leaves `f:memorize/3` with nothing to record and nothing to
+    %% re-tag, and it must not rewrite the store to say "I memoised nothing".
+    %% Asserting the store rather than only the answer is the point: the answer is
+    %% `[]` either way, so it cannot tell this from a store that was needlessly
+    %% rewritten.
     ?assertEqual(
-        [],
+        {Store4, []},
         i2p_netdb:closest_floodfills(
-            Store3, Target, 5, [i2p_router_info:hash(FF1), i2p_router_info:hash(FF2)]
+            Store4, Target, 5, [i2p_router_info:hash(FF1), i2p_router_info:hash(FF2)]
         )
     ).
 
@@ -350,7 +356,7 @@ closest_non_floodfills_excludes_declared_test() ->
     {Store2, added} = i2p_netdb:store(Store1, P1, Now),
     {Store3, added} = i2p_netdb:store(Store2, P2, Now),
     Target = i2p_router_info:hash(FF),
-    NonFF = i2p_netdb:closest_non_floodfills(Store3, Target, 5, []),
+    {_Store4, NonFF} = i2p_netdb:closest_non_floodfills(Store3, Target, 5, []),
     ?assertEqual(2, length(NonFF)),
     ?assertNot(lists:member(i2p_router_info:hash(FF), NonFF)),
     ?assert(lists:member(i2p_router_info:hash(P1), NonFF)),

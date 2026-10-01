@@ -16,6 +16,15 @@
 %% implementations, which is the honest result and worth stating rather than
 %% hiding: the only thing that distinguishes them is how much work they do.
 
+%% ## The routing-key memo
+%%
+%% The second half of the cost was the crypto itself: with the sort fixed, a lookup
+%% still spent n SHA-256s resolving n keys, and the key is `SHA256(Hash ‖ Day)` —
+%% neither input changes, so it is computed once per router per day and reused.
+%% Those cases are in the **The memo** section below, and they assert the *hash
+%% count* of a second lookup, which is the exact and non-flaky version of "the
+%% second lookup is faster".
+
 -module(i2p_netdb_closest_tests).
 
 -moduledoc """
@@ -45,6 +54,9 @@ lookup_hashes_each_router_once_not_once_per_comparison_test() ->
     Store = fixture_store(),
     Target = crypto:strong_rand_bytes(32),
 
+    %% **The store is threaded out of the call**, because the memo is filled there
+    %% and the count this case asserts is the count of the *first* lookup. A second
+    %% `closest/3` on the returned store is the case that proves the memo works.
     Hashes = count_hashes(fun() -> i2p_netdb:closest(Store, Target, 3) end),
     Count = i2p_netdb:count(Store),
     Count = ?N,
@@ -97,7 +109,7 @@ flags_mean_declared_and_eligible_not_eligible_alone_test() ->
     Store = stored([FF, Bare, Plain], Store0, Now),
     Target = crypto:strong_rand_bytes(32),
 
-    FFs = i2p_netdb:closest_floodfills(Store, Target, 10, []),
+    {_Store1, FFs} = i2p_netdb:closest_floodfills(Store, Target, 10, []),
     %% Only the one that is both declared and eligible.
     ?assertEqual([i2p_router_info:hash(FF)], FFs),
     ?assertNot(lists:member(i2p_router_info:hash(Bare), FFs)),
@@ -106,7 +118,7 @@ flags_mean_declared_and_eligible_not_eligible_alone_test() ->
     %% And the complement: `closest_non_floodfills/4` excludes declared ones
     %% whatever their eligibility, which is a different question and was a
     %% different predicate.
-    NonFFs = i2p_netdb:closest_non_floodfills(Store, Target, 10, []),
+    {_Store2, NonFFs} = i2p_netdb:closest_non_floodfills(Store, Target, 10, []),
     ?assertEqual(
         lists:sort([i2p_router_info:hash(Bare), i2p_router_info:hash(Plain)]),
         lists:sort(NonFFs)
@@ -161,8 +173,233 @@ load_computes_the_floodfill_flags_test() ->
     Target = crypto:strong_rand_bytes(32),
     ?assertEqual(
         [i2p_router_info:hash(FF)],
-        i2p_netdb:closest_floodfills(Loaded, Target, 10, [])
+        hashes_of(i2p_netdb:closest_floodfills(Loaded, Target, 10, []))
     ).
+
+%%% --------------------------------------------------------------------------
+%%% The memo
+%%% --------------------------------------------------------------------------
+
+%% **The case the memo exists for.** A second lookup over the same store does no
+%% per-router crypto at all.
+%%
+%% The count is exact, which is the whole reason this is a test and not a
+%% benchmark: one hash for the target, and nothing else. The first lookup pays one
+%% per candidate, so the pair of counts is the assertion — 24 keys in, 24 hashes,
+%% then 1 hash.
+%%
+%% Reverting the memo (reading `f:routing_key/2` directly in `rank_keys/4` and
+%% returning the store untouched) fails exactly this case. It also fails the
+%% day-change case below, which is what stops it being passed by a memo that is
+%% never invalidated.
+memo_makes_the_second_lookup_do_no_per_router_crypto_test() ->
+    Store = fixture_store(),
+    Target = crypto:strong_rand_bytes(32),
+    N = i2p_netdb:count(Store),
+
+    {Store1, _First} = i2p_netdb:closest(Store, Target, 3),
+    Second = count_hashes(fun() -> i2p_netdb:closest(Store1, Target, 3) end),
+
+    %% The target's own key, and nothing else. Asserting the cold count too is
+    %% what makes the warm one mean something: `?assertEqual(1, Second)` on its own
+    %% would also pass against a lookup that resolved no keys at all.
+    ?assertEqual(N + 1, count_hashes(fun() -> i2p_netdb:closest(Store, Target, 3) end)),
+    ?assertEqual(1, Second),
+    ?assertEqual(N, 24).
+
+%% The memo survives a router being added, and the new router is not in it.
+%%
+%% This is the case that makes the day tag sufficient. A memo is only correct for
+%% the day it was built for and for the keys it holds, so it has two ways to go
+%% stale: midnight, and a store that changed. **Neither invalidates anything** —
+%% `memo_routing_key/3` falls back to computing, so a miss costs exactly what the
+%% code cost before the memo existed and can never be worse than having no memo.
+%%
+%% So the assertion is that a lookup after a store still returns the right answer
+%% *and* still adds the new router to the memo, rather than that the memo was
+%% invalidated. The second lookup afterwards resolves the new router with no
+%% crypto, which is what "it was added" means.
+memo_picks_up_a_router_added_after_it_was_filled_test() ->
+    Now = erlang:system_time(millisecond),
+    Store0 = i2p_netdb:new(20),
+    Store = stored([floodfill(Now, "g"), floodfill(Now, "h")], Store0, Now),
+    Target = crypto:strong_rand_bytes(32),
+
+    {Filled, _} = i2p_netdb:closest(Store, Target, 3),
+
+    %% A third router arrives. Nothing about the memo is told.
+    Late = floodfill(Now, "i"),
+    {Grown, added} = i2p_netdb:store(Filled, Late, Now),
+    ?assertEqual(added, added),
+
+    %% The lookup is still correct — the new router is eligible and reachable, so
+    %% it can appear — and it costs one hash more than a warm lookup, which is the
+    %% single miss.
+    {Grown1, Closest} = i2p_netdb:closest(Grown, Target, 3),
+    ?assert(lists:all(fun(K) -> i2p_netdb:has_router(Grown1, K) end, Closest)),
+
+    %% And now the memo has it: the following lookup is back to one hash.
+    ?assertEqual(1, count_hashes(fun() -> i2p_netdb:closest(Grown1, Target, 3) end)).
+
+%% A memo built for yesterday is discarded rather than used.
+%%
+%% The routing key is `SHA256(Hash ‖ Day)`, so every value in it is wrong the
+%% moment the day rolls over, and the store holds the day in the same field. This
+%% case cannot move the clock, so it moves the tag instead — reaching into the
+%% store for the one field whose value is a day, which is the only way to observe
+%% the invalidation from outside.
+%%
+%% **And it asserts the answer, not just the rebuild.** A memo that were used
+%% stale would rank by yesterday's distances and could return a different nearest
+%% set. The store is rebuilt and the result is compared against a fresh store
+%% built on the same routers, which is the only honest comparison available
+%% without moving the clock.
+memo_for_another_day_is_discarded_not_used_test() ->
+    Now = erlang:system_time(millisecond),
+    Store0 = i2p_netdb:new(40),
+    RIs = [floodfill(Now, [io_lib:format("d~2..0B", [I])]) || I <- lists:seq(1, 8)],
+    Store = stored(RIs, Store0, Now),
+    Target = crypto:strong_rand_bytes(32),
+
+    {Filled, _} = i2p_netdb:closest(Store, Target, 3),
+
+    %% **Two things have to be true before the tag is moved, or this case proves
+    %% nothing.** The memo must be populated — a retag of an empty memo is
+    %% indistinguishable from having no memo — and a lookup with a *matching* tag
+    %% must not rebuild. The second is what makes the case falsifiable: an
+    %% implementation that never reuses its memo still populates one, still passes a
+    %% size check, and still rebuilds on a retag. Only the contrast between these
+    %% two numbers says the tag is what decided.
+    ?assertEqual(length(RIs), memo_size(Filled)),
+    Warm = count_hashes(fun() -> i2p_netdb:closest(Filled, Target, 3) end),
+    ?assertEqual(1, Warm),
+
+    %% Keep the store the lookup handed back: that is the one carrying the memo,
+    %% and this is the shape a day boundary actually leaves behind.
+    Stale = retag_routing(Filled, <<"19700101">>),
+    ok = i2p_netdb:self_check(Stale),
+
+    %% The lookup on the stale store does a full pass's worth of crypto, against
+    %% the single hash the same lookup cost a moment ago.
+    Rebuilt = count_hashes(fun() -> i2p_netdb:closest(Stale, Target, 3) end),
+    ?assert(Rebuilt > Warm),
+    %% ...and returns what a store that had never memoised anything returns.
+    ?assertEqual(
+        hashes_of(i2p_netdb:closest(Store, Target, 3)),
+        hashes_of(i2p_netdb:closest(Stale, Target, 3))
+    ).
+
+%% A dropped router leaves nothing behind in the memo.
+%%
+%% `f:forget_routing/2` is hygiene rather than correctness — a memo entry for a
+%% departed router can never be returned, because a lookup only asks about keys
+%% the order still holds. It is still worth doing, and worth a test, because the
+%% alternative is a map that grows with the day's churn and nothing that notices.
+%%
+%% `f:self_check/1` is what notices. Demonstrated red by removing one of the three
+%% `forget_routing/2` call sites, which is the failure the check exists for and the
+%% only way to see that it is doing anything.
+removing_a_router_drops_its_memoised_key_test() ->
+    Now = erlang:system_time(millisecond),
+    Store0 = i2p_netdb:new(20),
+    RIs = [floodfill(Now, [io_lib:format("r~2..0B", [I])]) || I <- lists:seq(1, 4)],
+    Store = stored(RIs, Store0, Now),
+    Target = crypto:strong_rand_bytes(32),
+
+    {Filled, _} = i2p_netdb:closest(Store, Target, 3),
+    ok = i2p_netdb:self_check(Filled),
+
+    Dropped = i2p_router_info:hash(lists:nth(2, RIs)),
+    {Emptied, removed} = i2p_netdb:remove(Filled, Dropped),
+    ?assertEqual(removed, removed),
+    ?assertNot(i2p_netdb:has_router(Emptied, Dropped)),
+    %% The store can vouch for itself, which is the assertion: a leftover memo
+    %% entry is what makes it refuse.
+    ?assertEqual(ok, i2p_netdb:self_check(Emptied)),
+
+    %% And a lookup on the reduced store still works and still resolves.
+    {Emptied1, Closest} = i2p_netdb:closest(Emptied, Target, 3),
+    ?assertNot(lists:member(Dropped, Closest)),
+    ?assertEqual(1, count_hashes(fun() -> i2p_netdb:closest(Emptied1, Target, 3) end)).
+
+%% The same, for the other two ways a router leaves: capacity eviction and the
+%% expiry sweep.
+%%
+%% Eviction is `f:trim/1` and the sweep is `f:drop_each/2`, and both are separate
+%% call sites from `f:remove/2` — `f:trim/1` in particular does not go through
+%% `f:drop_from_order/2`, so the memo has to be told separately there too.
+%%
+%% **The order of the lookup and the removal is the whole test.** Filling the memo
+%% first is what makes the removal observable: evicting or sweeping a key the memo
+%% has never heard of leaves nothing behind to be caught, and both cases pass
+%% against code with no `forget_routing/2` call at all. That is why the memo size
+%% is asserted after each lookup — without it, a regression that stopped filling
+%% the memo would look exactly like a regression that forgot to clean it up.
+eviction_and_the_sweep_also_drop_the_memo_key_test() ->
+    Now = erlang:system_time(millisecond),
+    Target = crypto:strong_rand_bytes(32),
+
+    %% Capacity 2, four routers stored: the memo is filled while both are held,
+    %% then two more stores each evict one.
+    Two = stored(
+        [floodfill(Now, [io_lib:format("e~2..0B", [I])]) || I <- lists:seq(1, 2)],
+        i2p_netdb:new(2),
+        Now
+    ),
+    {Two1, _} = i2p_netdb:closest(Two, Target, 3),
+    ?assertEqual(2, memo_size(Two1)),
+
+    Four = stored(
+        [floodfill(Now, [io_lib:format("e~2..0B", [I])]) || I <- lists:seq(3, 4)],
+        Two1,
+        Now
+    ),
+    ?assertEqual(2, i2p_netdb:count(Four)),
+    ok = i2p_netdb:self_check(Four),
+
+    %% Three routers all past the horizon. The memo is filled first, by a lookup
+    %% that does not care they are stale — routing has nothing to say about expiry —
+    %% and the sweep then has something to drop.
+    Old = i2p_netdb:set_expiration_ms(i2p_netdb:new(10), 1),
+    Aged = lists:foldl(
+        fun(I, S) ->
+            {S1, _} = i2p_netdb:store(
+                S, floodfill(Now - 60000, [io_lib:format("s~2..0B", [I])]), Now - 60000
+            ),
+            S1
+        end,
+        Old,
+        lists:seq(1, 3)
+    ),
+    {Aged1, _} = i2p_netdb:closest(Aged, Target, 3),
+    ?assertEqual(3, memo_size(Aged1)),
+
+    {Swept, {Removed, 0}} = i2p_netdb:remove_expired(Aged1, Now, erlang:system_time(second)),
+    ?assertEqual(3, Removed),
+    ?assertEqual(0, i2p_netdb:count(Swept)),
+    %% The assertion: the store can vouch for itself with an empty table and a
+    %% memo that used to hold three keys.
+    ?assertEqual(ok, i2p_netdb:self_check(Swept)),
+    ?assertEqual(0, memo_size(Swept)).
+
+%% The memo is a cache, so it must not become load-bearing: a lookup has to be
+%% right whether or not anything was ever memoised.
+%%
+%% The store the assertions compare against is the same store with the memo
+%% stripped between the two lookups, which is the closest a test can get to "no
+%% memo exists" without a second implementation. It passes on the answers whether
+%% or not `memo_routing_key/3` falls back to computing, and it is here to fail if
+%% a future change makes the memo something a lookup depends on being complete.
+the_memo_is_not_load_bearing_for_the_answer_test() ->
+    Store = fixture_store(),
+    Target = crypto:strong_rand_bytes(32),
+
+    {Filled, Warm} = i2p_netdb:closest(Store, Target, 3),
+    Cold = hashes_of(i2p_netdb:closest(strip_routing(Filled), Target, 3)),
+    Again = hashes_of(i2p_netdb:closest(Filled, Target, 3)),
+
+    ?assertEqual(Warm, Cold),
+    ?assertEqual(Warm, Again).
 
 %%% --------------------------------------------------------------------------
 %%% The answers did not change
@@ -173,7 +410,7 @@ load_computes_the_floodfill_flags_test() ->
 closest_returns_hashes_not_pairs_test() ->
     Store = fixture_store(),
     Target = crypto:strong_rand_bytes(32),
-    Closest = i2p_netdb:closest(Store, Target, 3),
+    {_Store1, Closest} = i2p_netdb:closest(Store, Target, 3),
     ?assertEqual(3, length(Closest)),
     lists:foreach(fun(K) -> ?assertEqual(32, byte_size(K)) end, Closest),
     %% And every one is a key the store actually holds.
@@ -184,7 +421,7 @@ closest_returns_hashes_not_pairs_test() ->
 closest_is_ordered_by_distance_test() ->
     Store = fixture_store(),
     Target = crypto:strong_rand_bytes(32),
-    Closest = i2p_netdb:closest(Store, Target, ?N),
+    {_Store1, Closest} = i2p_netdb:closest(Store, Target, ?N),
     Distances = [i2p_netdb:distance(K, Target) || K <- Closest],
     ?assertEqual(lists:sort(Distances), Distances),
     ?assertEqual(?N, length(Closest)).
@@ -194,7 +431,7 @@ closest_is_ordered_by_distance_test() ->
 closest_does_not_depend_on_input_order_test() ->
     Store = fixture_store(),
     Target = crypto:strong_rand_bytes(32),
-    Forward = i2p_netdb:closest(Store, Target, 5),
+    {_Store1, Forward} = i2p_netdb:closest(Store, Target, 5),
     %% The store's own order is recency order; asking for the whole store and
     %% taking the nearest five by hand must agree with the lookup.
     All = i2p_netdb:keys(Store),
@@ -211,8 +448,8 @@ closest_does_not_depend_on_input_order_test() ->
 closest_handles_degenerate_n_test() ->
     Store = fixture_store(3),
     Target = crypto:strong_rand_bytes(32),
-    ?assertEqual([], i2p_netdb:closest(Store, Target, 0)),
-    ?assertEqual(3, length(i2p_netdb:closest(Store, Target, 99))).
+    ?assertEqual([], hashes_of(i2p_netdb:closest(Store, Target, 0))),
+    ?assertEqual(3, length(hashes_of(i2p_netdb:closest(Store, Target, 99)))).
 
 %%% --------------------------------------------------------------------------
 %%% Fixtures and tracing
@@ -290,6 +527,43 @@ with_caps(Now, Tag, Caps) ->
 %% `f:is_ipv4/1` is the thing to check a host against here.
 host_hash(Tag) ->
     list_to_binary("198.51.100." ++ integer_to_list(erlang:phash2(Tag, 250) + 1)).
+
+%% The list half of a `{Store2, Hashes}` result from a closest lookup.
+%%
+%% The store half is memo state, and asserting on it from a test about answers
+%% would pin the optimisation rather than the behaviour. Where the store itself
+%% matters — that a memo is filled, evicted, or rebuilt — the case says so
+%% explicitly.
+hashes_of({_Store, Hashes}) ->
+    Hashes.
+
+%% Replace the store's memo tag, leaving its contents alone.
+%%
+%% **This reaches into a field the type is `opaque` for, and that is the point.**
+%% The alternative is to wait for midnight, which no test may do: the store's
+%% `f:current_day/0` is not injectable and the whole module's discipline is that a
+%% test asserts structurally rather than against a clock. Retagging is the honest
+%% way to *construct* the state a day boundary leaves behind — a populated memo,
+%% every value stale — rather than to simulate one.
+%%
+%% `f:self_check/1` is asserted over the result in the case that uses this, so
+%% what is being described is a state the store itself considers well-formed.
+retag_routing(#{routing := {_Day, Memo}} = Store, Day) ->
+    Store#{routing := {Day, Memo}}.
+
+%% How many routing keys the store has memoised.
+%%
+%% Reading the memo's size is the one thing a test can say about it that is not
+%% either "the answer was right" or "the hash count was low". It is what makes the
+%% day-change case falsifiable: a memo that is never filled has a size of zero, and
+%% a case that retags without checking the size first passes just as happily
+%% against no memo at all.
+memo_size(#{routing := {_Day, Memo}}) ->
+    map_size(Memo).
+
+%% Drop the memo entirely, as though it had never been built.
+strip_routing(#{routing := {_Day, Memo}} = Store) ->
+    Store#{routing := {<<>>, Memo}}.
 
 %% How many times `crypto:hash/2` ran while `F` ran.
 %%

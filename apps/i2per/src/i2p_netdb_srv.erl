@@ -295,6 +295,11 @@ The `N` stored router hashes closest to `Target`.
 Input: `Target` — the router hash to measure against; `N` — how many to
 return.
 Output: up to `N` hashes sorted by routing-key XOR distance, closest first.
+
+**The caller sees no difference from this not memoising anything.** The routing-key
+memo is filled inside the NetDb process, which owns the store, and this API is a
+`gen_server:call`, so there was never a caller-side half to thread. See the
+`handle_call` clauses for why the store is written back rather than dropped.
 """.
 -spec closest(i2p_netdb:router_key(), non_neg_integer()) -> [i2p_netdb:router_key()].
 closest(Target, N) ->
@@ -600,12 +605,32 @@ handle_call(count, _From, {Store, _} = State) ->
     {reply, i2p_netdb:count(Store), State};
 handle_call(capacity, _From, {Store, _} = State) ->
     {reply, i2p_netdb:capacity(Store), State};
-handle_call({closest, Target, N}, _From, {Store, _} = State) ->
-    {reply, i2p_netdb:closest(Store, Target, N), State};
-handle_call({closest_floodfills, Target, N, Excluded}, _From, {Store, _} = State) ->
-    {reply, i2p_netdb:closest_floodfills(Store, Target, N, Excluded), State};
-handle_call({closest_non_floodfills, Target, N, Excluded}, _From, {Store, _} = State) ->
-    {reply, i2p_netdb:closest_non_floodfills(Store, Target, N, Excluded), State};
+%% **The store is threaded back through all three, and that is the whole cost of
+%% the routing-key memo.** `m:i2p_netdb:closest/3` and its two siblings return
+%% `{Store2, Closest}` because filling the memo is a mutation, and this module is
+%% the store's owner — so it is the one place that can keep the result. Before
+%% this, each of these was `{reply, Result, State}`, one line with no state in it.
+%%
+%% A caller that dropped the returned store would not get a wrong answer, only
+%% the old cost: every lookup would recompute 5000 hashes and the memo would never
+%% be used. That asymmetry is the reason the memo is worth threading at all, and
+%% also the reason it is not worth a second ETS table — a table would have been
+%% written from here anyway, by a process that does hold the store, but it would
+%% have had to be `public` to be readable by the tests that call `m:i2p_netdb`
+%% directly.
+%% **The store is the first element of the pair, not the second.** Every one of
+%% these destructures the store out and threads it back; getting the two the wrong
+%% way round is silent until the next call, because a `closest/3` reply is a list
+%% and a list is a perfectly good thing to hand back as a reply.
+handle_call({closest, Target, N}, _From, {Store, Rest}) ->
+    {Store1, Closest} = i2p_netdb:closest(Store, Target, N),
+    {reply, Closest, {Store1, Rest}};
+handle_call({closest_floodfills, Target, N, Excluded}, _From, {Store, Rest}) ->
+    {Store1, Floodfills} = i2p_netdb:closest_floodfills(Store, Target, N, Excluded),
+    {reply, Floodfills, {Store1, Rest}};
+handle_call({closest_non_floodfills, Target, N, Excluded}, _From, {Store, Rest}) ->
+    {Store1, NonFloodfills} = i2p_netdb:closest_non_floodfills(Store, Target, N, Excluded),
+    {reply, NonFloodfills, {Store1, Rest}};
 %% **The gate is here, in the NetDb, and must stay here.**
 %%
 %% `?LOAD_ERROR` is process state set in `f:init/1`, so it is only readable from this
