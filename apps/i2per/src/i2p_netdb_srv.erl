@@ -435,7 +435,13 @@ init([]) ->
         routers_expired => 0,
         ls_expired => 0
     },
-    Store0 = i2p_netdb:new(),
+    %% The horizon is a policy the operator sets, so it is read here and applied to
+    %% the store rather than defaulted inside the store. **Set before the load**, for
+    %% the same reason the table is published before the load: `from_binary/1`
+    %% restores capacity from the file but leaves the horizon at its default, and a
+    %% load that seeded under the wrong policy would admit or discard entries by a
+    %% rule the operator did not ask for.
+    Store0 = i2p_netdb:set_expiration_ms(i2p_netdb:new(), expiration_ms()),
     %% Published before the load, so a reader that arrives while a large netdb
     %% file is being read sees a table that is already safe to ask. The load
     %% inserts into this same table.
@@ -458,7 +464,16 @@ maybe_load(Store, Counters) ->
             case file:read_file(Path) of
                 {ok, Bin} ->
                     case i2p_netdb:from_binary(Bin) of
-                        {ok, Loaded} ->
+                        {ok, Loaded0} ->
+                            %% `from_binary/1` restores capacity from the file but
+                            %% leaves the horizon at its default, so the loaded store
+                            %% inherits the running policy rather than the default.
+                            %% `Store` already carries it; taking it from there rather
+                            %% than calling `expiration_ms/0` twice keeps the two paths
+                            %% (a load and no load) agreeing by construction.
+                            Loaded = i2p_netdb:set_expiration_ms(
+                                Loaded0, i2p_netdb:expiration_ms(Store)
+                            ),
                             C2 = Counters#{loads := maps:get(loads, Counters) + 1},
                             {{Loaded, C2}, ok};
                         {error, _} ->
@@ -513,6 +528,28 @@ autosave_interval() ->
 expiry_interval() ->
     configured_interval(netdb_expiry_ms, ?DEFAULT_EXPIRY_MS).
 
+%% How old a RouterInfo may be before this router discards it.
+%%
+%% **How often the sweep runs and how stale an entry may get are separate knobs.**
+%% They were not separate until now: the horizon was a compile-time constant inside
+%% `m:i2p_netdb` and the interval was the only thing an operator could reach.
+%%
+%% Set this lower and the store drops stale RouterInfos sooner, which is the knob
+%% i2pd reaches for by shrinking its own horizon as the store fills. The shipped
+%% default is i2pd's 27 hours, which is its *maximum* -- a large i2pd shortens it
+%% rather than keeping it, so the default is the most permissive point in the range
+%% rather than a considered choice. See `#RA5PVR1`.
+-spec expiration_ms() -> pos_integer().
+expiration_ms() ->
+    configured_interval(netdb_expiration_ms, i2p_netdb:default_expiration_ms()).
+
+%% Read an operator setting, falling back to `Default`.
+%%
+%% A value that is not a positive integer is ignored rather than clamped or
+%% rejected. The alternative is refusing to start on a typo, which turns a
+%% recoverable configuration mistake into a router that will not boot; the cost of
+%% ignoring it is a log line saying the default is in force, which this does not
+%% currently emit and should.
 configured_interval(Key, Default) ->
     case application:get_env(i2per, Key) of
         {ok, Value} when is_integer(Value), Value > 0 -> Value;
@@ -635,7 +672,15 @@ handle_call(stats, _From, {Store, Counters}) ->
     Reply = Counters#{
         routers => i2p_netdb:count(Store),
         lease_sets => i2p_netdb:ls_count(Store),
-        capacity => i2p_netdb:capacity(Store)
+        capacity => i2p_netdb:capacity(Store),
+        %% **The policy the store is actually enforcing**, not the one shipped.
+        %% An operator who set `netdb_expiration_ms` has no other way to see that it
+        %% took effect, and a value that silently failed to apply would look
+        %% identical to one that did from the outside. Read from the store rather
+        %% than from `expiration_ms/0` for the reason `maybe_load/2` does: the
+        %% running store is the thing that was configured, so the report cannot
+        %% disagree with the behaviour.
+        expiration_ms => i2p_netdb:expiration_ms(Store)
     },
     {reply, Reply, {Store, Counters}}.
 
