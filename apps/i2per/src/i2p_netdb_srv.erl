@@ -45,8 +45,14 @@ Floodfills = i2p_netdb_srv:closest_floodfills(Target, 3, []).
 
 -behaviour(gen_server).
 
+%% Where the RouterInfo table's tid is published, so a reader can reach the table
+%% without a call into this process. See `f:has_router/1` and `f:publish_table/1`.
+%% Declared up here because `f:has_router/1` is near the top of the file.
+-define(ROUTER_TABLE, i2per_netdb_router_table).
+
 -export([
     start_link/0,
+    has_router/1,
     store/2,
     store_binary/2,
     store_ls/2,
@@ -110,6 +116,45 @@ Output: `{ok, RouterInfo}` when present, `not_found` otherwise.
 -spec find(i2p_netdb:router_key()) -> {ok, i2p_router_info:router_info()} | not_found.
 find(Key) ->
     gen_server:call(?MODULE, {find, Key}).
+
+-doc """
+Whether the NetDb holds a RouterInfo for `Key`.
+
+Input: `Key` — the router hash. Output: `true` or `false`.
+
+**This is a table read, not a call into this process.** The tunnel relay asks
+it once per 1028-byte frame and discards everything but the answer, so as a
+`gen_server:call/2` it cost a process round trip and a copy of a whole
+RouterInfo to learn a boolean. The table the NetDb keeps is `protected`, which
+is exactly the shape this needs: this process writes it, anyone may read it.
+
+`not_found` is reported as `false`, so the two ways of not holding a router are
+one answer rather than two.
+""".
+-spec has_router(i2p_netdb:router_key()) -> boolean().
+has_router(Key) ->
+    ets:member(persistent_term:get(?ROUTER_TABLE), Key).
+
+%% **The table tid is published once, at init.**
+%%
+%% The store map is replaced on every mutation and so cannot be published, but
+%% the table it owns never is: `m:i2p_netdb:new/1` creates it once and the
+%% mutations only insert and delete entries. So the tid is fixed for the life of
+%% this process, which is what `persistent_term` is for.
+%%
+%% The table dies with this process, so a tid left in `persistent_term` after a
+%% crash cannot name a live table that something else owns -- the next NetDb to
+%% start publishes its own, and a stale tid is an `badarg` rather than a wrong
+%% answer.
+publish_table(Store) ->
+    persistent_term:put(?ROUTER_TABLE, i2p_netdb:router_table(Store)).
+
+%% The full O(n log n) cross-check, for the operations that rewrite many entries
+%% at once. A load and an expiry sweep are exactly where a partial bug is hardest
+%% to notice, and exactly where a single store's O(1) check would not see it.
+fully_checked(Store) ->
+    ok = i2p_netdb:self_check(Store),
+    Store.
 
 -doc """
 Store a verified LeaseSet2.
@@ -292,6 +337,10 @@ init([]) ->
         ls_expired => 0
     },
     Store0 = i2p_netdb:new(),
+    %% Published before the load, so a reader that arrives while a large netdb
+    %% file is being read sees a table that is already safe to ask. The load
+    %% inserts into this same table.
+    publish_table(Store0),
     put(?LOAD_ERROR, false),
     case maybe_load(Store0, Counters) of
         {{Store1, Counters1}, ok} ->
@@ -371,12 +420,28 @@ configured_interval(Key, Default) ->
         _ -> Default
     end.
 
+%% Every mutation that touches routers goes through `checked/1`, so the table and
+%% the recency order cannot drift apart without the NetDb refusing to continue.
+%% A store is two structures and only this process can see both.
+%% Every router mutation is funnelled through `checked/1`. The store is two
+%% structures -- an ETS table and a pair of recency trees -- and only this
+%% process can see both, so this is the one place that can assert they agree.
+%% A store that drifts is quiet: it evicts the wrong router, or stops evicting.
+%%
+%% `m:i2p_netdb:consistent/1` rather than `f:self_check/1`, because it is O(1)
+%% and this runs on the store path. The full cross-check runs where a whole batch
+%% of entries is rewritten at once -- a load and the expiry sweep, via
+%% `f:fully_checked/1`.
+checked(Store) ->
+    ok = i2p_netdb:consistent(Store),
+    Store.
+
 handle_call({store, RI, NowMs}, _From, {Store, Counters}) ->
     {Store2, Outcome} = i2p_netdb:store(Store, RI, NowMs),
-    {reply, Outcome, {Store2, Counters}};
+    {reply, Outcome, {checked(Store2), Counters}};
 handle_call({store_binary, Bin, NowMs}, _From, {Store, Counters}) ->
     case i2p_netdb:store_binary(Store, Bin, NowMs) of
-        {ok, Store2, Outcome} -> {reply, {ok, Outcome}, {Store2, Counters}};
+        {ok, Store2, Outcome} -> {reply, {ok, Outcome}, {checked(Store2), Counters}};
         {error, Reason} -> {reply, {error, Reason}, {Store, Counters}}
     end;
 handle_call({store_ls, LS, NowSec}, _From, {Store, Counters}) ->
@@ -399,7 +464,7 @@ handle_call({find_ls, Key}, _From, {Store, _} = State) ->
     end;
 handle_call({remove, Key}, _From, {Store, Counters}) ->
     {Store2, Outcome} = i2p_netdb:remove(Store, Key),
-    {reply, Outcome, {Store2, Counters}};
+    {reply, Outcome, {checked(Store2), Counters}};
 handle_call(routers, _From, {Store, _} = State) ->
     {reply, i2p_netdb:routers(Store), State};
 handle_call(keys, _From, {Store, _} = State) ->
@@ -428,7 +493,16 @@ handle_call(save, _From, {Store, Counters}) ->
             {reply, Result, {Store, C2}}
     end;
 handle_call(load, _From, {Store, Counters}) ->
-    {NewState, Result} = maybe_load(Store, Counters),
+    {{Loaded, Counters1}, Result} = maybe_load(Store, Counters),
+    %% A load rewrites every entry at once, so this is where the full
+    %% cross-check earns its cost: a store built from a file is the one place a
+    %% partial seeding bug would otherwise sit unnoticed until an eviction
+    %% removed the wrong router days later.
+    NewState =
+        case Result of
+            ok -> {fully_checked(Loaded), Counters1};
+            {error, _} -> {Loaded, Counters1}
+        end,
     case Result of
         ok -> put(?LOAD_ERROR, false);
         {error, _} -> put(?LOAD_ERROR, true)
@@ -443,7 +517,7 @@ handle_call(remove_expired, _From, {Store, Counters}) ->
         routers_expired := maps:get(routers_expired, Counters) + RRemoved,
         ls_expired := maps:get(ls_expired, Counters) + LSRemoved
     },
-    {reply, {RRemoved, LSRemoved}, {Store2, C2}};
+    {reply, {RRemoved, LSRemoved}, {fully_checked(Store2), C2}};
 handle_call(timer_counts, _From, State) ->
     {reply, current_timer_counts(), State};
 handle_call(stats, _From, {Store, Counters}) ->
@@ -480,7 +554,7 @@ handle_info(expiry_sweep, {Store, Counters}) ->
         ls_expired := maps:get(ls_expired, Counters) + LSRemoved
     },
     schedule_expiry(),
-    {noreply, {Store2, C2}}.
+    {noreply, {fully_checked(Store2), C2}}.
 
 terminate(_Reason, {Store, _Counters}) ->
     _ = cancel_timers(),

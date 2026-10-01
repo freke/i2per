@@ -385,10 +385,18 @@ binary_roundtrip_lease_sets_test() ->
     ?assertEqual(1, i2p_netdb:ls_count(Restored)),
     ?assertEqual({ok, LS}, i2p_netdb:find_ls(Restored, i2p_leaset:hash(LS))).
 
+%% Compared by content, not by `=:=`. The store carries the tid of its own ETS
+%% table, and a round trip builds a fresh store with a fresh table, so the two
+%% values can never be the same term. What must survive a round trip is what the
+%% store *holds* -- which is what these two assertions say.
 binary_roundtrip_empty_store_test() ->
     Store = i2p_netdb:new(),
     Bin = i2p_netdb:to_binary(Store),
-    ?assertEqual({ok, Store}, i2p_netdb:from_binary(Bin)).
+    {ok, Restored} = i2p_netdb:from_binary(Bin),
+    ?assertEqual(0, i2p_netdb:count(Restored)),
+    ?assertEqual([], i2p_netdb:keys(Restored)),
+    ?assertEqual(i2p_netdb:capacity(Store), i2p_netdb:capacity(Restored)),
+    ?assertEqual(ok, i2p_netdb:self_check(Restored)).
 
 binary_from_bad_magic_test() ->
     ?assertMatch({error, bad_magic}, i2p_netdb:from_binary(<<"BADMGIC">>)).

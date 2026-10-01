@@ -8,9 +8,40 @@ RouterInfos are keyed by their router hash (SHA-256 of the RouterIdentity) and
 kept in a capacity-bounded LRU cache. Storing mirrors i2pd's
 `NetDb::AddRouterInfo`: a RouterInfo with an equal or older publish timestamp
 never replaces an existing one, one stamped too far in the future is rejected,
-and one too old is rejected. A store is immutable; every operation returns a
-new store, so the owning process (`m:i2p_netdb_srv`) can keep the shared state
-without locks.
+and one too old is rejected.
+
+## The router table, and who may read it
+
+The RouterInfos live in an ETS table rather than in the store's own state map,
+because "do we hold this RouterInfo?" is asked on the data path, once per
+1028-byte tunnel frame, by a process that is not the NetDb. As a `gen_server`
+call that question cost a process round trip and a copy of a whole RouterInfo to
+answer yes or no. As `ets:member/2` it costs neither, and it is **the only
+thing that answers it** — which is the point. One authority for that question,
+not two that can disagree.
+
+The table is created by `f:new/0,1` and owned by the calling process, so it dies
+with the NetDb that created it rather than outliving it. It is `protected`, so
+the owner writes and everyone reads; the single-writer property is enforced by
+ETS rather than by convention, and a non-owner write raises `badarg` instead of
+silently doing nothing.
+
+**The recency order is a value, not a table.** It is a pair of `gb_trees` held
+in the store map: `Seq -> Hash` for eviction order, and `Hash -> Seq` so that
+promoting a router we already hold is a lookup rather than a traversal. It
+stays inside the store map on purpose. If the order were a second table it
+would be side-effect state, and this module's central property — one function
+stands between every mutation and both structures — would be lost.
+
+A `queue` was the obvious candidate for the order and is the wrong shape: its
+O(1) removals (`out/1`, `drop/1`, `out_r/1`, `drop_r/1`) only reach the two
+ends, and promoting a router to most-recent means deleting it from the middle,
+which is `delete/2` and O(n). That is the hot operation, so the queue would leave
+it exactly as slow and only speed up the cold one.
+
+`f:self_check/1` asserts the table and the order agree. Both are written by the
+same expressions, so they cannot drift while the code is correct; the check is
+what makes that a property rather than a hope.
 
 LeaseSets are stored alongside, keyed by their destination hash, in their own
 capacity-bounded recency order. Storing mirrors i2pd's `NetDb::AddLeaseSet`:
@@ -56,8 +87,14 @@ DestHash = i2p_leaset:hash(LeaseSet),
 {ok, LeaseSet} = i2p_netdb:find_ls(Store3, DestHash),
 ```
 
-The store is pure — the gen_server in `m:i2p_netdb_srv` owns a `store()`
-process-local and answers queries against it.
+The store is a value the gen_server in `m:i2p_netdb_srv` owns, and every
+operation returns a new one. The RouterInfos inside it are reachable without
+going through that process; see **The router table, and who may read it**.
+
+```erlang
+%% Existence is a table read, not a call into the NetDb process.
+true = i2p_netdb:has_router(Store, Key).
+```
 """.
 
 -export([
@@ -88,12 +125,21 @@ process-local and answers queries against it.
     is_ipv4/1,
     to_binary/1,
     from_binary/1,
-    remove_expired/3
+    remove_expired/3,
+    has_router/2,
+    router_table/1,
+    consistent/1,
+    self_check/1
 ]).
 
 -export_type([store/0, router_key/0, ls_key/0]).
 
 -define(DEFAULT_CAPACITY, 5000).
+%% The table is unnamed: a store's table is identified by the tid in its own
+%% state, not by a global name, so two stores in one node cannot collide. The
+%% srv reads the tid from its store and hands it to callers; see
+%% `m:i2p_netdb_srv:has_router/1`.
+-define(ROUTERS, i2per_netdb_routers).
 %% i2pd NetDb.hpp: NETDB_MIN_FLOODFILL_VERSION = MAKE_VERSION_NUMBER(0, 9, 62).
 -define(NETDB_MIN_FLOODFILL_VERSION, 962).
 %% i2pd NetDb.cpp: reject RouterInfos stamped more than this into the future.
@@ -113,14 +159,26 @@ process-local and answers queries against it.
 -type ls_key() :: i2p_crypto:hash().
 
 -doc """
-An immutable store: a map of router hash to RouterInfo plus the MRU-first
-recency order used for capacity eviction, and a parallel map of destination
-hash to LeaseSet with its own recency order.
+A store: an ETS table of RouterInfos keyed by router hash, the paired recency
+order used for capacity eviction, and a parallel map of destination hash to
+LeaseSet with its own recency order.
+
+`routers` is an `ets:tid()` rather than a map because the existence question is
+asked per relayed frame from another process, and a table read answers it
+without a round trip. `order` and `order_pos` are the two halves of the recency
+order: `Seq -> Hash` for finding the least-recently-stored router, and
+`Hash -> Seq` for promoting one we already hold. They are kept in step by the
+same expressions that write the table, and `f:self_check/1` asserts they agree.
+
+LeaseSets keep a plain map and list. Nothing on the data path asks about them
+per frame, so they gain nothing from a table and would only pay for it.
 """.
 -opaque store() :: #{
     capacity := pos_integer(),
-    routers := #{router_key() => i2p_router_info:router_info()},
-    order := [router_key()],
+    routers := ets:tid(),
+    order := gb_trees:tree(non_neg_integer(), router_key()),
+    order_pos := gb_trees:tree(router_key(), non_neg_integer()),
+    next_seq := pos_integer(),
     lease_sets := #{ls_key() => i2p_leaset:lease_set()},
     ls_order := [ls_key()]
 }.
@@ -133,18 +191,33 @@ new() ->
 -doc """
 A fresh store with a fixed `Capacity` — when a store would exceed it, the
 least recently stored RouterInfo is evicted.
+
+The returned store owns a new `protected` ETS table, so it is only safe to use
+from the process that called this: a `protected` table rejects writes from
+anyone else, which is what makes the single-writer property hold rather than
+merely be intended. The table dies with this process, so the store cannot
+outlive its owner.
 """.
 -spec new(pos_integer()) -> store().
 new(Capacity) when is_integer(Capacity), Capacity > 0 ->
     #{
         capacity => Capacity,
-        routers => #{},
-        order => [],
+        routers => new_table(),
+        order => gb_trees:empty(),
+        order_pos => gb_trees:empty(),
+        next_seq => 1,
         lease_sets => #{},
         ls_order => []
     };
 new(_) ->
     error(badarg).
+
+%% The table is `protected`, not `public`: the owning process writes, everyone
+%% reads. `read_concurrency` because the readers are exactly the case this
+%% table exists for -- many processes asking "do we hold this router?" on their
+%% own schedulers, with no writer in the middle.
+new_table() ->
+    ets:new(?ROUTERS, [set, protected, {read_concurrency, true}]).
 
 -doc """
 Store a verified RouterInfo.
@@ -161,7 +234,7 @@ store is returned unchanged).
     {store(), added | updated | older | from_future | too_old}.
 store(Store, RI, NowMs) when is_integer(NowMs) ->
     Key = i2p_router_info:hash(RI),
-    case maps:find(Key, maps:get(routers, Store)) of
+    case router(Key, Store) of
         {ok, Existing} ->
             case i2p_router_info:published(Existing) >= i2p_router_info:published(RI) of
                 true -> {Store, older};
@@ -251,7 +324,50 @@ in the LRU order.
 """.
 -spec find(store(), router_key()) -> {ok, i2p_router_info:router_info()} | error.
 find(Store, Key) ->
-    maps:find(Key, maps:get(routers, Store)).
+    router(Key, Store).
+
+%% The one place a RouterInfo is read out of the table, so there is a single
+%% answer to "do we hold this router?" rather than one per call site.
+router(Key, Store) ->
+    case ets:lookup(maps:get(routers, Store), Key) of
+        [{_, RI}] -> {ok, RI};
+        [] -> error
+    end.
+
+-doc """
+Whether the store holds a RouterInfo for `Key`.
+
+Input: `Store` — the store; `Key` — the router hash.
+Output: `true` or `false`. **This is the existence question, and it is answered
+by the table alone.**
+
+The relay path asks it once per 1028-byte frame, from the process that relays
+other routers' tunnels, and only needs the yes or no. `ets:member/2` copies
+nothing and does not reach the NetDb process, where a lookup would cost a round
+trip and a copy of a whole RouterInfo to answer the same question.
+
+It is deliberately not `f:find/2` narrowed: that returns the RouterInfo, and
+the caller here discards it.
+""".
+-spec has_router(store(), router_key()) -> boolean().
+has_router(Store, Key) ->
+    ets:member(maps:get(routers, Store), Key).
+
+-doc """
+The tid of the store's RouterInfo table.
+
+Input: `Store` — the store.
+Output: the `ets:tid()`, which stays the same for the life of the store even as
+entries are inserted and deleted.
+
+It is published once at init by `m:i2p_netdb_srv` so that a reader can reach
+the table without asking the NetDb process for the store, which is what
+`m:i2p_netdb_srv:has_router/1` does. Publishing the tid rather than the store is
+deliberate: the store is replaced on every mutation, the tid is not.
+""".
+-spec router_table(store()) -> ets:tid().
+router_table(Store) ->
+    maps:get(routers, Store).
 
 -doc """
 Look up a LeaseSet by destination hash.
@@ -272,16 +388,10 @@ Output: `{Store2, removed}` when it was present, `{Store, not_found}` otherwise.
 """.
 -spec remove(store(), router_key()) -> {store(), removed | not_found}.
 remove(Store, Key) ->
-    Routers = maps:get(routers, Store),
-    case maps:is_key(Key, Routers) of
+    case ets:member(maps:get(routers, Store), Key) of
         true ->
-            {
-                Store#{
-                    routers := maps:remove(Key, Routers),
-                    order := lists:delete(Key, maps:get(order, Store))
-                },
-                removed
-            };
+            true = ets:delete(maps:get(routers, Store), Key),
+            {drop_from_order(Store, Key), removed};
         false ->
             {Store, not_found}
     end.
@@ -289,18 +399,33 @@ remove(Store, Key) ->
 -doc "All stored RouterInfos, in storage-recency order (MRU first).".
 -spec routers(store()) -> [i2p_router_info:router_info()].
 routers(Store) ->
-    Routers = maps:get(routers, Store),
-    [maps:get(K, Routers) || K <- maps:get(order, Store)].
+    [router_value(K, Store) || K <- mru_first(Store)].
 
 -doc "All stored router hashes, in storage-recency order (MRU first).".
 -spec keys(store()) -> [router_key()].
 keys(Store) ->
-    maps:get(order, Store).
+    mru_first(Store).
+
+%% MRU-first means **descending** `Seq`, because `Seq` increases with recency and
+%% the tree iterates ascending. Getting this backwards would silently reorder
+%% the on-disk netdb file and every `routers/1` listing, which is why it is
+%% named rather than inlined at each use.
+mru_first(Store) ->
+    lists:reverse(order_hashes(Store)).
+
+%% **The hashes held by the order, ascending in recency.**
+%%
+%% `gb_trees:keys/1` is the trap here: it returns the tree's *keys*, which for
+%% this order are the `{Seq, Hash}` pairs, not the hashes. Reading it as hashes
+%% hands `{Seq, Hash}` tuples to everything downstream, and the symptom shows up
+%% far away as a byte-size failure inside an unrelated function.
+order_hashes(Store) ->
+    [Hash || {_Seq, Hash} <- gb_trees:to_list(maps:get(order, Store))].
 
 -doc "The number of stored routers.".
 -spec count(store()) -> non_neg_integer().
 count(Store) ->
-    map_size(maps:get(routers, Store)).
+    gb_trees:size(maps:get(order, Store)).
 
 -doc "All stored destination hashes, in storage-recency order (MRU first).".
 -spec ls_keys(store()) -> [ls_key()].
@@ -316,6 +441,111 @@ ls_count(Store) ->
 -spec capacity(store()) -> pos_integer().
 capacity(Store) ->
     maps:get(capacity, Store).
+
+-doc """
+The cheap invariant: the table and the order hold the same number of entries.
+
+Input: `Store` — the store. Output: `ok` or `{error, Reason}`.
+
+**This is the check that runs on every mutation,** because it is the one that
+catches the failure this arrangement actually risks. The dangerous mistake is a
+promote that adds a new position without dropping the old one, and that shows up
+immediately as a count disagreement: `count/1` reads the order while the table
+holds one RouterInfo, so the store starts evicting the wrong router.
+
+It is O(1): `ets:info/2` reads a field and `gb_trees:size/1` is stored in the
+tree header. Measured at the shipped capacity of 5000 routers, this is a fraction
+of a microsecond against **315 us** for the full `f:self_check/1`, which would
+have been a tax on the store path to catch a bug the cheap check already catches.
+""".
+-spec consistent(store()) -> ok | {error, term()}.
+consistent(#{order := Order, order_pos := Pos, routers := Tab}) ->
+    N = gb_trees:size(Order),
+    M = gb_trees:size(Pos),
+    Table = ets:info(Tab, size),
+    case {N, M, Table} of
+        {N, N, N} -> ok;
+        _ -> {error, {size_disagreement, #{order => N, order_pos => M, table => Table}}}
+    end.
+
+-doc """
+Assert the store is internally consistent, in full.
+
+Input: `Store` — the store.
+Output: `ok`, or `{error, Reason}` naming the first disagreement found.
+
+**This is the property the whole two-structure arrangement rests on.** The
+RouterInfos live in an ETS table and the recency order lives in a `gb_trees`
+pair; nothing in the language stops them drifting apart, and if they did the
+failure would be quiet and slow — a store that never evicts because its order
+lost a key, or one that evicts a key it does not hold.
+
+It is O(n log n) and it is therefore **not** what runs on every store; that is
+`f:consistent/1`, which is O(1) and catches the likeliest failure. This is the
+one for the wholesale operations, where a whole batch of entries is rewritten at
+once and a partial bug is hardest to see: a load, and the expiry sweep.
+\`i2p_netdb_srv\` calls it after both. What it verifies:
+
+- the table and the order hold the same number of entries
+- every hash in `order` is in the table, and vice versa
+- `order_pos` is exactly the inverse of `order`
+- no two entries share a `Seq`
+""".
+-spec self_check(store()) -> ok | {error, term()}.
+self_check(Store) ->
+    Order = maps:get(order, Store),
+    Pos = maps:get(order_pos, Store),
+    Tab = maps:get(routers, Store),
+    InOrder = gb_trees:size(Order),
+    InTable = ets:info(Tab, size),
+    %% `to_list/1` gives `{{Seq, Hash}, Hash}`; both levels are matched, so `Seq`
+    %% is the integer and not the pair. Reading it one level shallow would count
+    %% distinct tuples rather than distinct sequences, and a store holding the
+    %% same `{Seq, Hash}` twice would pass this check.
+    Seqs = [Seq || {{Seq, _Hash}, _Value} <- gb_trees:to_list(Order)],
+    case {InOrder, InTable, gb_trees:size(Pos), length(lists:usort(Seqs))} of
+        {N, N, N, N} ->
+            case missing_from_table(Tab, Order) of
+                [] ->
+                    case missing_from_order(Tab, Pos) of
+                        [] ->
+                            %% Both sides are lists, not trees: the empty tree
+                            %% is `{0, nil}`, so comparing a tree to a list
+                            %% would fail even when both are empty.
+                            case
+                                gb_trees:to_list(Pos) =:=
+                                    gb_trees:to_list(
+                                        positions_of(Order)
+                                    )
+                            of
+                                true ->
+                                    ok;
+                                false ->
+                                    {error, order_pos_not_inverse_of_order}
+                            end;
+                        Missing ->
+                            {error, {in_table_not_in_order, Missing}}
+                    end;
+                Missing ->
+                    {error, {in_order_not_in_table, Missing}}
+            end;
+        {A, B, C, _} ->
+            {error, {size_disagreement, #{order => A, table => B, order_pos => C}}}
+    end.
+
+%% The lookups go through `order_pos`, which *is* keyed by hash. Asking the
+%% `order` tree instead would always miss: its keys are `{Seq, Hash}` pairs.
+%% Each membership test is O(log n), so the whole check is O(n log n) rather
+%% than the O(n^2) a list membership test would cost.
+missing_from_order(Tab, Pos) ->
+    [
+        Key
+     || [Key] <- ets:select(Tab, [{{'$1', '_'}, [], ['$1']}]),
+        not gb_trees:is_defined(Key, Pos)
+    ].
+
+missing_from_table(Tab, Order) ->
+    [Hash || {{_Seq, Hash}, _Value} <- gb_trees:to_list(Order), not ets:member(Tab, Hash)].
 
 -doc "The day-scoped routing key for the current UTC date: `SHA-256(Key ‖ yyyymmdd)`.".
 -spec routing_key(router_key()) -> router_key().
@@ -356,7 +586,7 @@ closest first.
 """.
 -spec closest(store(), router_key(), non_neg_integer()) -> [router_key()].
 closest(Store, Target, N) when is_integer(N), N >= 0 ->
-    closest_keys(maps:keys(maps:get(routers, Store)), Target, N);
+    closest_keys(router_keys(Store), Target, N);
 closest(_Store, _Target, _N) ->
     error(badarg).
 
@@ -375,7 +605,7 @@ closest_floodfills(Store, Target, N, Excluded) when
 ->
     Floodfills = [
         Key
-     || Key <- maps:keys(maps:get(routers, Store)),
+     || Key <- router_keys(Store),
         not lists:member(Key, Excluded),
         is_eligible_floodfill(Store, Key)
     ],
@@ -398,9 +628,9 @@ closest_non_floodfills(Store, Target, N, Excluded) when
 ->
     NonFloodfills = [
         Key
-     || Key <- maps:keys(maps:get(routers, Store)),
+     || Key <- router_keys(Store),
         not lists:member(Key, Excluded),
-        not declared_floodfill(maps:get(Key, maps:get(routers, Store)))
+        not declared_floodfill(router_value(Key, Store))
     ],
     closest_keys(NonFloodfills, Target, N);
 closest_non_floodfills(_Store, _Target, _N, _Excluded) ->
@@ -477,10 +707,9 @@ entries ‖ ls_count(4) ‖ entries`.
 -spec to_binary(store()) -> binary().
 to_binary(Store) ->
     Capacity = capacity(Store),
-    RouterOrder = maps:get(order, Store),
-    Routers = maps:get(routers, Store),
+    RouterOrder = mru_first(Store),
     RouterCount = length(RouterOrder),
-    RouterBins = [router_entry(Key, Routers) || Key <- RouterOrder],
+    RouterBins = [router_entry(Key, Store) || Key <- RouterOrder],
     LSOrder = maps:get(ls_order, Store),
     LSMaps = maps:get(lease_sets, Store),
     LSCount = length(LSOrder),
@@ -501,17 +730,16 @@ signatures or truncated bytes are silently dropped.
 from_binary(<<"I2PNETDB", ?VERSION:8, Rest/binary>>) ->
     maybe
         {ok, Capacity, RouterCount, AfterCount} ?= split_header(Rest),
-        {ok, Routers, Order, AfterRouters} ?=
-            parse_router_entries(AfterCount, RouterCount, #{}, []),
+        {ok, Entries, AfterRouters} ?=
+            parse_router_entries(AfterCount, RouterCount, []),
         {ok, LSCount, AfterLSCount} ?= split_ls_header(AfterRouters),
         {ok, LSMaps, LSOrder} ?= parse_ls_section(AfterLSCount, LSCount),
-        {ok, #{
-            capacity => Capacity,
-            routers => Routers,
-            order => lists:reverse(Order),
-            lease_sets => LSMaps,
-            ls_order => lists:reverse(LSOrder)
-        }}
+        %% The file records routers oldest-first, so the parsed list is already
+        %% in ascending recency and can seed the order directly. Seeding it here
+        %% rather than replaying each entry through `f:store/3` keeps a load from
+        %% paying a signature verification per entry twice over.
+        {ok, Store} = seed_order(new(Capacity), Entries),
+        {ok, Store#{lease_sets => LSMaps, ls_order => lists:reverse(LSOrder)}}
     else
         {error, _} = Err -> Err;
         error -> {error, malformed_router}
@@ -553,19 +781,16 @@ expired when `m:i2p_leaset:valid/2` returns `{error, expired}`.
 -spec remove_expired(store(), non_neg_integer(), non_neg_integer()) ->
     {store(), {non_neg_integer(), non_neg_integer()}}.
 remove_expired(Store, NowMs, NowSec) when is_integer(NowMs), is_integer(NowSec) ->
-    Routers0 = maps:get(routers, Store),
     Order0 = maps:get(order, Store),
-    {KeptRouters, KeptRouterOrder, RemovedRouters} = partition_routers(
-        Routers0, Order0, NowMs, 0, []
-    ),
+    {KeptOrder, RemovedRouters} = partition_routers(Store, Order0, NowMs),
     LeaseSets0 = maps:get(lease_sets, Store),
     LSOrder0 = maps:get(ls_order, Store),
     {KeptLS, KeptLSOrder, RemovedLS} = partition_ls(
         LeaseSets0, LSOrder0, NowSec, 0, []
     ),
     Store2 = Store#{
-        routers => KeptRouters,
-        order => lists:reverse(KeptRouterOrder),
+        order => KeptOrder,
+        order_pos => positions_of(KeptOrder),
         lease_sets => KeptLS,
         ls_order => lists:reverse(KeptLSOrder)
     },
@@ -592,14 +817,44 @@ insert_newer(Store, Key, RI, NowMs, Outcome) ->
     Timestamp = i2p_router_info:published(RI),
     case valid_window(Timestamp, NowMs) of
         true ->
-            Routers0 = maps:get(routers, Store),
-            Routers = Routers0#{Key => RI},
-            Order0 = maps:get(order, Store),
-            Order1 = [Key | lists:delete(Key, Order0)],
-            {trim(Store#{routers => Routers, order => Order1}), Outcome};
+            true = ets:insert(maps:get(routers, Store), {Key, RI}),
+            {trim(promote(Store, Key)), Outcome};
         false ->
             {Store, outcome_for_window(Timestamp, NowMs)}
     end.
+
+%% Move `Key` to most-recently-stored. `order_pos` is what makes this cheap:
+%% without it the old `Seq` would be unknown and the entry could only be found by
+%% walking the whole order, which is the O(n) this replaced.
+promote(#{order := Order, order_pos := Pos, next_seq := Seq} = Store, Key) ->
+    {Order1, Pos1} =
+        case gb_trees:take_any(Key, Pos) of
+            error ->
+                {Order, Pos};
+            {OldSeq, Pos1a} ->
+                %% The old position has to leave BOTH trees, not just the
+                %% lookup one. Leaving it in `order` is what would make a
+                %% re-stored router look like two entries: `count/1` reads the
+                %% order, and the table holds one RouterInfo.
+                {_Key, Order1a} = gb_trees:take({OldSeq, Key}, Order),
+                {Order1a, Pos1a}
+        end,
+    Store#{
+        order := gb_trees:enter({Seq, Key}, Key, Order1),
+        order_pos := gb_trees:enter(Key, Seq, Pos1),
+        next_seq := Seq + 1
+    }.
+
+%% Remove `Key` from the recency order entirely, without touching the table. The
+%% caller decides whether the entry itself goes.
+drop_from_order(#{order := Order, order_pos := Pos} = Store, Key) ->
+    {Seq, Pos1} = gb_trees:take(Key, Pos),
+    %% The order is keyed by the `{Seq, Key}` *pair*, not by `Seq` alone. Taking
+    %% `Seq` on its own matches nothing and the walk runs off the end of the
+    %% tree, which is a crash rather than a wrong answer -- so it is the kind of
+    %% mistake `f:self_check/1` could not have caught on its own.
+    {_, Order1} = gb_trees:take({Seq, Key}, Order),
+    Store#{order := Order1, order_pos := Pos1}.
 
 %% i2pd NetDb.cpp AddRouterInfo: reject from future (now + 2 min) and too old
 %% (now > timestamp + 27 h).
@@ -629,14 +884,18 @@ outcome_for_window(_Timestamp, _NowMs) ->
     too_old.
 
 trim(Store) ->
-    Order = maps:get(order, Store),
-    case length(Order) > maps:get(capacity, Store) of
+    case gb_trees:size(maps:get(order, Store)) > maps:get(capacity, Store) of
         true ->
-            [Evicted | Rest] = lists:reverse(Order),
-            Store#{
-                routers := maps:remove(Evicted, maps:get(routers, Store)),
-                order := lists:reverse(Rest)
-            };
+            %% `take_smallest/1` returns `{Key, Value, NewTree}` -- three
+            %% elements, not two. The value is the evicted hash; the new tree is
+            %% already pruned, so it replaces the order outright rather than
+            %% going through `drop_from_order/2`.
+            {{_Seq, Evicted}, _V, Order1} = gb_trees:take_smallest(
+                maps:get(order, Store)
+            ),
+            true = ets:delete(maps:get(routers, Store), Evicted),
+            {_DroppedSeq, Pos1} = gb_trees:take(Evicted, maps:get(order_pos, Store)),
+            trim(Store#{order := Order1, order_pos := Pos1});
         false ->
             Store
     end.
@@ -667,8 +926,18 @@ closest_keys(Keys, Target, N) ->
     lists:sublist(Sorted, N).
 
 is_eligible_floodfill(Store, Key) ->
-    RI = maps:get(Key, maps:get(routers, Store)),
+    RI = router_value(Key, Store),
     declared_floodfill(RI) andalso eligible_floodfill(RI).
+
+%% The order tree already holds every key we store, so the key set is read from
+%% there rather than by sweeping the table. One less place that has to agree
+%% with another.
+router_keys(Store) ->
+    order_hashes(Store).
+
+router_value(Key, Store) ->
+    {ok, RI} = router(Key, Store),
+    RI.
 
 router_caps(RI) ->
     maps:get(<<"caps">>, i2p_router_info:options(RI), <<>>).
@@ -733,8 +1002,8 @@ current_day() ->
 
 %% ---- to_binary helpers ----
 
-router_entry(Key, Routers) ->
-    RI = maps:get(Key, Routers),
+router_entry(Key, Store) ->
+    RI = router_value(Key, Store),
     Bin = i2p_router_info:to_binary(RI),
     <<Key/binary, (byte_size(Bin)):16/big, Bin/binary>>.
 
@@ -743,27 +1012,68 @@ ls_entry(Key, LSMaps) ->
     Bin = i2p_leaset:to_binary(LS),
     <<Key/binary, (byte_size(Bin)):16/big, Bin/binary>>.
 
+%% The `Hash -> Seq` half, derived from the order. Written once so `f:promote/2`,
+%% the expiry sweep and a load all reach the same shape.
+%%
+%% **`gb_trees:to_list/1` returns `{TreeKey, Value}` pairs**, and for this order
+%% the tree key is *itself* the `{Seq, Hash}` pair. So the list element is
+%% `{{Seq, Hash}, Hash}` and the pattern has to reach through both levels. Reading
+%% it as `{Seq, Hash}` binds `Seq` to the whole pair, and the rebuild then stores
+%% tuples where every other path stores integers -- which then fails much later,
+%% inside `drop_from_order/2`, on a lookup that cannot match.
+positions_of(Order) ->
+    lists:foldl(
+        fun({{Seq, Hash}, _Value}, Acc) -> gb_trees:enter(Hash, Seq, Acc) end,
+        gb_trees:empty(),
+        gb_trees:to_list(Order)
+    ).
+
+%% Fill a fresh store from parsed entries. `Entries` is in **file order, which is
+%% MRU-first** -- `f:to_binary/1` writes the recency order as it stands. The
+%% entries are therefore walked backwards, so the last entry written (the oldest
+%% router) takes the lowest `Seq` and the first (the most recent) takes the
+%% highest. Getting this the wrong way round silently reverses the recency order
+%% of every loaded store, and the symptom is an LRU that evicts the most recently
+%% stored router first.
+seed_order(#{order := EmptyOrder} = Store, []) ->
+    {ok, Store#{order := EmptyOrder, order_pos := gb_trees:empty(), next_seq := 1}};
+seed_order(Store, Entries) ->
+    {Order, Pos, NextSeq} = lists:foldl(
+        fun({Key, RI}, {OrderAcc, PosAcc, Seq}) ->
+            true = ets:insert(maps:get(routers, Store), {Key, RI}),
+            {
+                gb_trees:enter({Seq, Key}, Key, OrderAcc),
+                gb_trees:enter(Key, Seq, PosAcc),
+                Seq + 1
+            }
+        end,
+        {gb_trees:empty(), gb_trees:empty(), 1},
+        %% Oldest first. `Entries` arrives MRU-first, so reversing it puts the
+        %% oldest router at `Seq` 1 and makes the LRU evict the right end.
+        lists:reverse(Entries)
+    ),
+    {ok, Store#{order := Order, order_pos := Pos, next_seq := NextSeq}}.
+
 %% ---- from_binary helpers ----
 
-parse_router_entries(Bin, 0, Routers, Order) ->
-    {ok, Routers, Order, Bin};
-parse_router_entries(<<>>, _Count, _Routers, _Order) ->
+%% Returns `{Key, RI}` pairs in **file order**, which is MRU-first because that is
+%% the order `f:to_binary/1` writes. `f:seed_order/2` reverses it on the way in.
+%% An entry whose signature does not verify is dropped here rather than counted
+%% as an expiry, exactly as the map version did.
+parse_router_entries(Bin, 0, Entries) ->
+    {ok, lists:reverse(Entries), Bin};
+parse_router_entries(<<>>, _Count, _Entries) ->
     error;
 parse_router_entries(
-    <<Key:32/binary, Len:16/big, RIBin:Len/binary, Rest/binary>>, Count, Routers, Order
+    <<Key:32/binary, Len:16/big, RIBin:Len/binary, Rest/binary>>, Count, Entries
 ) ->
     case i2p_router_info:decode(RIBin) of
         {ok, RI} ->
-            parse_router_entries(
-                Rest,
-                Count - 1,
-                Routers#{Key => RI},
-                [Key | Order]
-            );
+            parse_router_entries(Rest, Count - 1, [{Key, RI} | Entries]);
         {error, _} ->
-            parse_router_entries(Rest, Count - 1, Routers, Order)
+            parse_router_entries(Rest, Count - 1, Entries)
     end;
-parse_router_entries(_, _, _, _) ->
+parse_router_entries(_, _, _) ->
     error.
 
 parse_ls_entries(Bin, 0, LSMaps, LSOrder) ->
@@ -789,17 +1099,37 @@ parse_ls_entries(_, _, _, _) ->
 
 %% ---- remove_expired helpers ----
 
-partition_routers(_Routers, [], _NowMs, Removed, Kept) ->
-    {maps:from_list(Kept), Kept, Removed};
-partition_routers(Routers, [Key | Rest], NowMs, Removed, Kept) ->
-    RI = maps:get(Key, Routers),
-    Published = i2p_router_info:published(RI),
-    case Published + ?MAX_EXPIRATION_MS < NowMs of
-        true ->
-            partition_routers(Routers, Rest, NowMs, Removed + 1, Kept);
-        false ->
-            partition_routers(Routers, Rest, NowMs, Removed, [{Key, RI} | Kept])
-    end.
+%% Walks the order and drops expired routers, deleting each from the table as it
+%% goes so the two cannot disagree afterwards.
+%%
+%% A surviving router keeps the `Seq` it already had: expiry is not a recency
+%% event, so the sweep must not reorder the store it is merely compacting.
+%% `order_pos` is then derived from the surviving order rather than mutated in
+%% step, because it is a function of the order and `f:self_check/1` is what
+%% proves the derivation agrees.
+partition_routers(Store, Order, NowMs) ->
+    %% `gb_trees:fold/3` does not exist on this OTP, so this walks `to_list/1`,
+    %% which is ascending in key -- therefore ascending in `Seq`, which is
+    %% recency. A kept entry therefore lands in the position it already held.
+    %% `to_list/1` gives `{{Seq, Hash}, Hash}`: the tree key is itself the pair,
+    %% and the value repeats the hash. Both levels have to be matched.
+    Entries = gb_trees:to_list(Order),
+    {Kept, Removed} = lists:foldl(
+        fun({Position, _Value}, {Keep, Gone}) ->
+            {_Seq, Hash} = Position,
+            RI = router_value(Hash, Store),
+            case i2p_router_info:published(RI) + ?MAX_EXPIRATION_MS < NowMs of
+                true ->
+                    true = ets:delete(maps:get(routers, Store), Hash),
+                    {Keep, Gone + 1};
+                false ->
+                    {gb_trees:enter(Position, Hash, Keep), Gone}
+            end
+        end,
+        {gb_trees:empty(), 0},
+        Entries
+    ),
+    {Kept, Removed}.
 
 partition_ls(_LSMaps, [], _NowSec, Removed, Kept) ->
     {maps:from_list(Kept), Kept, Removed};

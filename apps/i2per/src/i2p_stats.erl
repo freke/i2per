@@ -175,6 +175,19 @@ counters() ->
         transit_bytes_in,
         transit_bytes_out,
 
+        %% %%%%% Transit frames with nowhere to go %%%%%
+        %%
+        %% Frames we accepted, counted in `transit_bytes_in`, and then had no
+        %% route for because the next hop was not in the NetDb. So it answers
+        %% "why is my inbound figure not equal to my outbound figure", which is
+        %% otherwise a question the two byte counters cannot answer between them.
+        %%
+        %% Its own counter rather than an event: this is a steady state on a
+        %% transit router whose next hop has expired, and an event per 1028-byte
+        %% frame would drown the bus. The peer manager owns reconnection, so a
+        %% frame counted here is not recoverable and not retried.
+        transit_frames_dropped_no_route,
+
         %% %%%%% Tunnel lifecycle %%%%%
         %%
         %% Cumulative since router start, and **not** a ratio: the ratio is the

@@ -102,14 +102,20 @@ handle_routed_i2np(_ConnPid, _PeerHash, _Msg, State) ->
 Send one encrypted TunnelData frame to a router.
 
 Input: `NextHash` — the next hop's RouterIdentity hash; `FwdBody` — the full
-1028-byte tunnel message body (`tunnel_id ‖ iv ‖ encrypted`). Output: `ok`;
-when no RouterInfo for `NextHash` is in the NetDb the frame is dropped
-silently (the peer manager owns reconnection).
+1028-byte tunnel message body (`tunnel_id ‖ iv ‖ encrypted`). Output: `ok`.
+When no RouterInfo for `NextHash` is in the NetDb the frame is dropped and
+counted as `transit_frames_dropped_no_route`, because the peer manager owns
+reconnection and a frame it cannot route is gone for good.
 """.
 -spec send_tunnel_data(i2p_crypto:hash(), <<_:32, _:_*8>>) -> ok.
 send_tunnel_data(NextHash, FwdBody) ->
-    case i2p_netdb_srv:find(NextHash) of
-        {ok, _RI} ->
+    %% **`has_router/1`, not `find/1`.** The answer is all this needs, and this
+    %% runs once per 1028-byte frame for every tunnel this router relays and
+    %% every message it injects. As a lookup it cost a `gen_server:call/2` into
+    %% the NetDb and a copy of a whole RouterInfo to learn a boolean; as
+    %% `ets:member/2` it costs neither and cannot block behind a NetDb write.
+    case i2p_netdb_srv:has_router(NextHash) of
+        true ->
             Fwd = #{
                 type => 18,
                 msg_id => i2p_i2np:fresh_msg_id(),
@@ -117,7 +123,14 @@ send_tunnel_data(NextHash, FwdBody) ->
                 body => FwdBody
             },
             i2p_peer:send_when_ready(NextHash, Fwd);
-        not_found ->
+        false ->
+            %% Counted, so a drop is distinguishable from a send. The peer
+            %% manager owns reconnection, so this frame is gone for good and
+            %% "we could not route it" is the only thing an operator can act on.
+            %% Not an event: a frame we have no route for is a steady state on a
+            %% transit router whose next hop has expired, and an event per frame
+            %% would drown the bus.
+            ok = i2p_stats:add(transit_frames_dropped_no_route, 1),
             ok
     end.
 
@@ -231,10 +244,13 @@ forward_stb(Msg, HopInfo, Records1, State) ->
         body := <<Num:8, (iolist_to_binary(Records1))/binary>>
     },
     NextHash = maps:get(next_hash, HopInfo),
-    case i2p_netdb_srv:find(NextHash) of
-        {ok, _RI} ->
+    %% Same reasoning as `f:send_tunnel_data/2`: only the existence check is
+    %% needed. This one runs per build record rather than per frame, so it is
+    %% not hot, but there is no reason to pay for a RouterInfo nobody reads.
+    case i2p_netdb_srv:has_router(NextHash) of
+        true ->
             i2p_peer:send_when_ready(NextHash, ForwardMsg);
-        not_found ->
+        false ->
             %% Cannot route onward; the build reply dies here and the
             %% creator will time out. Nothing to clean up.
             ok
