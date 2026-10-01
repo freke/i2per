@@ -995,8 +995,77 @@ db_store_ls_updated_test() ->
     end.
 
 %% ----------------------------------------------------------------------------
+%% A lookup reply whose tunnel went away between the pick and the send.
+%% ----------------------------------------------------------------------------
+%%
+%% This is the #MCVQ6D6 fix, and the race that reaches it is not buildable
+%% through `f:tunnel_lookup_reply/2`: `f:pick_lookup_outbound/0` returns a pool
+%% *key* and `f:find_outbound/2` searches both pools, so after a successful pick
+%% the id always resolves. Only a concurrent removal makes the send answer
+%% `error`, and reaching that needs a timing assumption -- a flake, not a case.
+%%
+%% So the state is constructed rather than raced to. A stub tunnel manager that
+%% answers `error` is *exactly* what the race leaves behind, and driving
+%% `f:reply_via_outbound/3` against it puts a red case on the line that changed
+%% instead of a green one on the drop path beside it. Against the old `ok = ` it
+%% raises `badmatch`; against the fix it answers `ok` and counts.
+lookup_reply_lost_tunnel_is_counted_not_asserted_test() ->
+    with_lookup_reply_count(error, fun() ->
+        ?assertEqual(0, lookup_reply_drops()),
+        ?assertEqual(ok, i2p_peer:reply_via_outbound(4242, local, <<"wire">>)),
+        ?assertEqual(1, lookup_reply_drops())
+    end).
+
+%% The success path must not count. Otherwise the counter is measuring "a reply
+%% was attempted" rather than "a reply was lost", which is the difference
+%% between an operator fact and a heartbeat.
+lookup_reply_delivered_does_not_count_test() ->
+    with_lookup_reply_count(ok, fun() ->
+        ?assertEqual(ok, i2p_peer:reply_via_outbound(4242, local, <<"wire">>)),
+        ?assertEqual(0, lookup_reply_drops())
+    end).
+
+%% ----------------------------------------------------------------------------
 %% Helpers
 %% ----------------------------------------------------------------------------
+
+lookup_reply_drops() ->
+    maps:get(lookup_replies_dropped_no_tunnel, i2p_stats:snapshot()).
+
+with_lookup_reply_count(Answer, Fun) ->
+    HadStats = ensure_stats(),
+    Stub = spawn(fun StubLoop() ->
+        receive
+            {'$gen_call', From, {send_via_outbound, _Tid, _Delivery, _Wire}} ->
+                gen_server:reply(From, Answer),
+                StubLoop();
+            {'$gen_call', From, _Other} ->
+                gen_server:reply(From, error),
+                StubLoop()
+        end
+    end),
+    register(i2p_tunnel_srv, Stub),
+    try
+        Fun()
+    after
+        case whereis(i2p_tunnel_srv) of
+            Stub -> unregister(i2p_tunnel_srv);
+            _ -> ok
+        end,
+        case HadStats of
+            started -> ok = gen_server:stop(whereis(i2p_stats));
+            existing -> ok
+        end
+    end.
+
+ensure_stats() ->
+    case whereis(i2p_stats) of
+        undefined ->
+            {ok, _} = i2p_stats:start_link(),
+            started;
+        _Pid ->
+            existing
+    end.
 
 framed(I2NPMsg) ->
     i2p_framing:encode_block(3, i2p_i2np:encode(I2NPMsg)).

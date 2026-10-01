@@ -97,6 +97,7 @@ i2p_peer:stop().
     learn_ri/1,
     discover/0,
     tunnel_lookup_reply/2,
+    reply_via_outbound/3,
     lookup/2,
     publish/1,
     publish_floodfills/0,
@@ -1394,6 +1395,14 @@ Output: `ok` - the DatabaseStore or DatabaseSearchReply is injected into the
 requester's inbound tunnel (`{tunnel, From, ReplyTid}` delivery) through one
 of our outbound tunnels; when none is active the reply is dropped and the
 requester's retry picks another responder.
+
+**Two ways to drop, and both answer `ok`.** Having no outbound tunnel at all is
+the one the caller can see, and it is handled here. The other is the tunnel
+going away *between* choosing it and sending on it -- a second lookup, which can
+answer `error` after a successful pick -- counted as
+`lookup_replies_dropped_no_tunnel` in `m:i2p_stats`. Neither is this router's
+fault and neither is worth failing a lookup over, so this function is total by
+design rather than by luck; see #MCVQ6D6 for why that used to be an assertion.
 """.
 -spec tunnel_lookup_reply(i2p_i2np:db_lookup(), i2p_crypto:hash()) -> ok.
 tunnel_lookup_reply(
@@ -1423,9 +1432,38 @@ tunnel_lookup_reply(
                     expiration_ms => 60_000,
                     body => maps:get(body, Msg)
                 }),
-            ok = i2p_tunnel_srv:send_via_outbound(OutTid, {tunnel, FromHash, ReplyTid}, Wire);
+            reply_via_outbound(OutTid, {tunnel, FromHash, ReplyTid}, Wire);
         error ->
             ok
+    end.
+
+%% The send above answers `error` when the tunnel is gone, and the two calls it
+%% takes are separate: `pick_lookup_outbound/0` reads the pool, then
+%% `send_via_outbound/3` re-resolves the id through `find_outbound/2`. A tunnel
+%% retired by `pool_tick` in that window makes the second answer `error`, which
+%% the `ok =` turned into a `badmatch` in the process every send path goes
+%% through. The `error ->` branch one line below the assert is the same
+%% condition handled for the pick; the send needed the same answer.
+%%
+%% **Not a counter here, and the reason is that the reply is not ours.** The
+%% client-side twin of this loss is `client_messages_dropped_no_tunnel`
+%% (#G9HZK8F), and merging the two would be the same category error as calling
+%% that one `frames`: a lost client send is a client waiting on its own traffic,
+%% and a lost lookup reply is *another router* waiting on an answer we had. The
+%% operator acts on those differently -- one is our user's experience, the other
+%% is our usefulness to the network -- so they are two counters.
+%%
+%% Exported for the same reason `f:tunnel_lookup_reply/2` is: it is the named
+%% unit of the fix, and the race that reaches it cannot be built through the
+%% public surface -- a pick returns a pool *key* and the send re-resolves that
+%% same key, so only a concurrent removal separates them. Calling this directly
+%% is the only way to put a red case on the line that changed, rather than a
+%% green one on the drop path beside it.
+-spec reply_via_outbound(0..16#FFFFFFFF, i2p_tunnel_srv:send_delivery(), binary()) -> ok.
+reply_via_outbound(OutTid, Delivery, Wire) ->
+    case i2p_tunnel_srv:send_via_outbound(OutTid, Delivery, Wire) of
+        ok -> ok;
+        error -> i2p_stats:add(lookup_replies_dropped_no_tunnel, 1)
     end.
 
 handle_db_search_reply(ConnPid, Transport, Body, State) ->
