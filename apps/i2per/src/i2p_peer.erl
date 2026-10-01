@@ -114,6 +114,43 @@ i2p_peer:stop().
 -define(HANDSHAKE_TIMEOUT, 15000).
 -define(MAX_BACKOFF_SECONDS, 300).
 -define(REFRESH_INTERVAL_SECONDS, 300).
+%% How often the bounded structures are swept: `pending_sends` entries past
+%% their age, and `peers` entries with no connection and no monitor.
+%%
+%% **One timer for both, not one each.** A sweep is O(size of the structure) and
+%% neither structure grows past its cap, so two timers would buy nothing but a
+%% second thing to cancel. It rides the same cadence as the RouterInfo refresh
+%% because both are housekeeping rather than work.
+-define(SWEEP_INTERVAL_SECONDS, 300).
+%% Frames queued for one peer. At the shipped `transit_bandwidth_kbps = 64` with
+%% one token per 1028-byte frame this is roughly eight seconds of admitted
+%% traffic.
+%%
+%% **Sized against the reconnection window, not against memory.** A peer in
+%% `backoff` retries on a doubling backoff up to `?MAX_BACKOFF_SECONDS`, so a
+%% queue that survives about that long loses nothing a peer would have wanted.
+%% 64 comfortably exceeds the first few backoff steps while bounding the worst
+%% case to roughly 64 KB per peer rather than nothing at all.
+-define(MAX_PENDING_SENDS_PER_PEER, 64).
+%% How long a queued frame is worth keeping. A relay frame belongs to a tunnel,
+%% and a tunnel that has been waiting five minutes is gone, so the frame is
+%% worthless to whoever receives it. **This is what reclaims the permanent-stall
+%% case** -- a depth cap alone converts unbounded growth into a bounded amount
+%% retained for ever, once per peer the router ever learned.
+-define(PENDING_SEND_MAX_AGE_MS, 300000).
+%% RouterInfos remembered as dialable. Each entry holds a whole RouterInfo, so
+%% this is the largest of the three bounded structures per entry.
+%%
+%% **Well above the number of peers the router will ever hold.** `max_ntcp2_connections`
+%% is 64 and `max_ssu2_sessions` is 32, so 500 is several times what can be live
+%% at once, which leaves room for backoff entries and for seeds. The cap exists
+%% to stop a router that is being fed distinct RouterInfos from retaining them
+%% all for the life of the process, not to ration anything it needs.
+-define(MAX_KNOWN, 500).
+%% Peers retained in `peers`. Generous relative to the connection caps, because
+%% a peer in `backoff` is still worth keeping until it has been unreachable
+%% longer than the backoff ceiling.
+-define(MAX_PEERS, 256).
 %% Boot kick delay: after the peer manager comes up (and any reseed pass
 %% lands), fire an exploratory lookup at idle seeds so real floodfills enter
 %% the NetDb on their own instead of waiting for the first publish cycle.
@@ -301,14 +338,21 @@ init([Local, Seeds]) ->
     KickRef = erlang:send_after(discovery_kick_ms(), self(), kick_floodfill_discovery),
     {ok, #{
         local => Local,
-        known => SeedConfigs,
+        known => maps:from_list([{maps:get(hash, C), C} || C <- SeedConfigs]),
+        %% The operator's seed order, kept apart from `known` because it is
+        %% meaning, not data. `f:discovery_candidates/1` dials the *first* three
+        %% dialable seeds, so a map keyed by hash would silently discard which
+        %% seeds the operator ranked highest. This list is the ranking; it is
+        %% bounded by the seed count and never grows.
+        seed_order => [maps:get(hash, C) || C <- SeedConfigs],
         peers => #{},
         inbound => #{},
         pending => #{},
         pending_sends => #{},
         our_hash => i2p_router_info:hash(maps:get(ri, Local)),
         refresh_ref => RefreshRef,
-        discovery_kick_ref => KickRef
+        discovery_kick_ref => KickRef,
+        sweep_ref => erlang:send_after(?SWEEP_INTERVAL_SECONDS * 1000, self(), sweep)
     }}.
 
 handle_call(router_hash, _From, State) ->
@@ -375,6 +419,7 @@ handle_cast(stop, State) ->
     #{peers := Peers} = State,
     _ = cancel_timer(maps:find(refresh_ref, State)),
     _ = cancel_timer(maps:find(discovery_kick_ref, State)),
+    _ = cancel_timer(maps:find(sweep_ref, State)),
     lists:foreach(
         fun({_Hash, #{conn := Conn}}) ->
             case Conn of
@@ -438,8 +483,113 @@ handle_info(refresh_routerinfo, State) ->
     {noreply, State1#{refresh_ref := RefreshRef}};
 handle_info(kick_floodfill_discovery, State) ->
     {noreply, kick_floodfill_discovery(State)};
+handle_info(sweep, State) ->
+    State1 = sweep(State),
+    Ref = erlang:send_after(?SWEEP_INTERVAL_SECONDS * 1000, self(), sweep),
+    {noreply, State1#{sweep_ref := Ref}};
 handle_info(_Msg, State) ->
     {noreply, State}.
+
+%% Sweep the two structures that accumulate. Neither grows past its cap, so this
+%% is bounded work, and it is the only thing that reclaims either of them.
+%%
+%% **`pending_sends` is aged, `peers` is evicted.** Different questions:
+%% a queued frame is stale after `?PENDING_SEND_MAX_AGE_MS` because the tunnel
+%% it belongs to is gone, whereas a peer entry is stale when it has no
+%% connection and no monitor -- it is not being dialled, nothing is holding it,
+%% and the backoff that would have retried it has run out.
+sweep(State) ->
+    NowMs = erlang:system_time(millisecond),
+    {Pending1, Expired} = sweep_pending_sends(maps:get(pending_sends, State), NowMs, #{}, 0),
+    ok = count_expired(Expired),
+    State#{
+        pending_sends := Pending1,
+        peers => sweep_peers(maps:get(peers, State))
+    }.
+
+count_expired(0) -> ok;
+count_expired(N) -> i2p_stats:add(pending_sends_expired, N).
+
+sweep_pending_sends(Pending, NowMs, Kept, Expired) ->
+    maps:fold(
+        fun(PeerHash, Msgs, {Acc, N}) ->
+            {KeptMsgs, Stale} = fresh_sends(Msgs, NowMs, []),
+            Next =
+                case KeptMsgs of
+                    [] -> Acc;
+                    _ -> maps:put(PeerHash, KeptMsgs, Acc)
+                end,
+            {Next, N + length(Stale)}
+        end,
+        {Kept, Expired},
+        Pending
+    ).
+
+%% Split a peer's queue into the entries still worth sending and the ones past
+%% their age.
+%%
+%% Returns `{Kept, Stale}`, both in queue order.
+%%
+%% **Walks from the head, keeping the fresh prefix and discarding the rest.**
+%% `enqueue_send/3` prepends, so the head is the newest and the tail is the
+%% oldest -- which means the entries that aged out are the tail, and a walk that
+%% dropped from the head would keep precisely the frames that had waited longest.
+%% It stops at the first expired entry rather than filtering, so a queue whose
+%% timestamps are out of order is left whole instead of being half-swept on a
+%% false reading.
+fresh_sends(Msgs, NowMs, Acc) ->
+    case Msgs of
+        [{at, Ts, _} = M | Rest] when NowMs - Ts =< ?PENDING_SEND_MAX_AGE_MS ->
+            fresh_sends(Rest, NowMs, [M | Acc]);
+        [] ->
+            {lists:reverse(Acc), []};
+        _ ->
+            {lists:reverse(Acc), Msgs}
+    end.
+
+%% Drop peers nothing is holding: no live connection, no monitor, and not
+%% mid-dial. Those are the entries `put_peer/3` added and nothing has reclaimed.
+%%
+%% **`connecting` is never evicted.** A peer in `connecting` has a dial in flight
+%% from `maybe_connect_status/3`; evicting it would leave that dial to complete
+%% into a `peers` entry that is gone, and `handle_conn_started/4` answers
+%% `error` for an unknown peer by stopping the connection. So an in-flight dial
+%% would be torn down by its own successful handshake.
+%%
+%% `?MAX_PEERS` is a backstop rather than the primary mechanism: a peer in
+%% `backoff` keeps being retried, so it is only ever unreachable-but-retained,
+%% and the count is expected to sit well below the cap. It exists so a router
+%% being fed distinct peers cannot grow this map without limit either.
+sweep_peers(Peers) when map_size(Peers) =< ?MAX_PEERS ->
+    Peers;
+sweep_peers(Peers) ->
+    Idle = maps:filter(fun(_Hash, Peer) -> idle_peer(Peer) end, Peers),
+    case map_size(Idle) of
+        0 ->
+            %% Every peer is connected, monitored or mid-dial. Nothing is
+            %% reclaimable, and the cap is not a licence to drop a live
+            %% connection -- so the map is left to exceed the cap and to report
+            %% honestly in `status/0` rather than to be truncated here.
+            Peers;
+        IdleCount ->
+            %% Drop at least enough to get back under the cap, and if the idle
+            %% peers cannot cover it, all of them. Which peers go is the lowest
+            %% hash order, because there is no recency to consult: a peer entry
+            %% carries no timestamp, and adding one would mean a write on the
+            %% dial path for a bound that is not expected to bite.
+            Over = map_size(Peers) - ?MAX_PEERS,
+            Evicted = lists:sublist(lists:sort(maps:keys(Idle)), max(Over, IdleCount)),
+            ok = count_evicted(length(Evicted)),
+            maps:without(Evicted, Peers)
+    end.
+
+count_evicted(0) -> ok;
+count_evicted(N) -> i2p_stats:add(peers_evicted, N).
+
+idle_peer(Peer) ->
+    maps:get(conn, Peer, undefined) =:= undefined andalso
+        maps:get(mon, Peer, undefined) =:= undefined andalso
+        maps:get(status, Peer, none) =/= connecting.
 
 %%%%%%%%% %%% Internal %%%%%%%
 
@@ -1406,13 +1556,26 @@ kick_floodfill_discovery(State) ->
     ),
     State.
 
-discovery_candidates(#{our_hash := OurHash, known := Known}) ->
+discovery_candidates(#{our_hash := OurHash, known := Known, seed_order := Seeds}) ->
     Floodfills = i2p_netdb_srv:closest_floodfills(OurHash, 3, [OurHash]),
     case Floodfills of
         [] ->
-            lists:sublist([Hash || #{hash := Hash, ri := RI} <- Known, dialable_ri(RI)], 3);
+            %% **`seed_order`, not `known`.** This is the fallback for a router
+            %% with no eligible floodfill in its NetDb, and the operator ranked
+            %% these seeds by putting them in that order. Iterating the map
+            %% instead would pick three at random, so `seed_order` is the
+            %% ranking and `known` is only consulted for the RouterInfo.
+            lists:sublist(
+                [Hash || Hash <- Seeds, dialable_in_known(Hash, Known)], 3
+            );
         _ ->
             Floodfills
+    end.
+
+dialable_in_known(Hash, Known) ->
+    case maps:find(Hash, Known) of
+        {ok, #{ri := RI}} -> dialable_ri(RI);
+        error -> false
     end.
 
 dialable_ri(RI) ->
@@ -1591,21 +1754,79 @@ learn_ri(RI, State) ->
             State
     end.
 
+%% A RouterInfo the NetDb accepted, which also means we should be willing to
+%% dial it. `remember_ri/2` is the same structure the seed set lives in.
+%%
+%% **Bounded, and keyed by hash.** Two reasons, and the second is the one that
+%% made it a map rather than a capped list:
+%%
+%% - every distinct RouterInfo the router accepts was retained for the life of
+%%   the process, at roughly the size of a RouterInfo each. Nothing ever
+%%   removed one, so this grew without limit on a router that is being fed
+%%   distinct RouterInfos;
+%% - and because it was a *list*, `known_hash/2` was `lists:any/2` over all of
+%%   it, on the dial path, per accepted RouterInfo and per dial decision. A cap
+%%   alone would have bounded the growth and left an O(n) scan behind.
+%%
+%% An existing entry is *not* re-inserted on a repeat RouterInfo, so a peer we
+%% already know does not get its place in the cap refreshed by a duplicate.
 remember_ri(RI, State = #{known := Known}) ->
     Hash = i2p_router_info:hash(RI),
-    case known_hash(Hash, Known) of
-        true -> State;
-        false -> State#{known := [#{ri => RI, hash => Hash} | Known]}
+    case maps:is_key(Hash, Known) of
+        true ->
+            State;
+        false ->
+            Known1 = trim_known(maps:put(Hash, #{ri => RI, hash => Hash}, Known)),
+            State#{known := Known1}
     end.
 
-known_hash(Hash, Known) ->
-    lists:any(fun(#{hash := H}) -> H =:= Hash end, Known).
+%% Enforce `?MAX_KNOWN` by dropping the stalest RouterInfo.
+%%
+%% **By publish time, which is the thing the entry actually stores.** A
+%% RouterInfo is republished rather than mutated, so its `published` field is
+%% both how fresh the knowledge is and the same measure `m:i2p_netdb` expires
+%% its own entries by. Evicting the stalest here keeps the two structures
+%% answering the same question the same way, and it needs no extra field and no
+%% second order to maintain.
+%%
+%% Not least-recently-dialed. That would need an order touched on the dial path,
+%% which is the path this change exists to keep cheap.
+trim_known(Known) when map_size(Known) =< ?MAX_KNOWN ->
+    Known;
+trim_known(Known) ->
+    ok = i2p_stats:add(known_evicted, 1),
+    maps:remove(oldest_known(Known), Known).
+
+%% The hash whose RouterInfo carries the earliest publish time.
+%%
+%% **A scan, and said so rather than hidden.** O(n) at the cap, run once per
+%% insert *past* the cap, so it amortises to nothing for a router sitting at its
+%% cap. An ordered map would make it O(1) and cost a structure maintained on the
+%% dial path; at ?MAX_KNOWN = 500 the scan is not what matters here, and if it
+%% ever becomes what matters that is a change to make against a measurement.
+oldest_known(Known) ->
+    Oldest = maps:fold(
+        fun(Hash, #{ri := RI}, Acc) ->
+            case Acc of
+                undefined ->
+                    {Hash, i2p_router_info:published(RI)};
+                {_H, Ts} ->
+                    case i2p_router_info:published(RI) < Ts of
+                        true -> {Hash, i2p_router_info:published(RI)};
+                        false -> Acc
+                    end
+            end
+        end,
+        undefined,
+        Known
+    ),
+    element(1, Oldest).
 
 find_peer_config(Hash, #{known := Known, peers := Peers}) ->
-    case [Config || #{hash := H} = Config <- Known, H =:= Hash] of
-        [Config | _] ->
+    case maps:find(Hash, Known) of
+        {ok, Config} ->
             Config;
-        [] ->
+        error ->
             case maps:find(Hash, Peers) of
                 {ok, #{config := Config}} -> Config;
                 error -> undefined
@@ -1618,9 +1839,13 @@ connect_to(RI, State) ->
         none ->
             case dialable_ri(RI) of
                 true ->
-                    Config = #{ri => RI, hash => Hash},
-                    Known = maps:get(known, State),
-                    maybe_connect(Hash, State#{known := [Config | Known]});
+                    %% `remember_ri/2` rather than a bare insert, so the entry goes
+                    %% through the `?MAX_KNOWN` bound like every other one. It was
+                    %% a raw `maps:put` shape once the list became a map, and a
+                    %% second write path around the bound is how a cap stops being
+                    %% a cap.
+                    State1 = remember_ri(RI, State),
+                    maybe_connect(Hash, State1);
                 false ->
                     State
             end;
@@ -1729,9 +1954,43 @@ forward_to_tunnel(ConnPid, Msg, #{our_hash := OurHash} = _State) ->
     end.
 
 %% Queue a message to be sent once the peer connection becomes ready.
+%%
+%% **Bounded in depth, dropping the OLDEST.** Two properties, and the ordering is
+%% the one that is easy to get backwards:
+%%
+%% - `enqueue_send/3` prepends, so the head is the newest and the tail is the
+%%   oldest. A relay frame belongs to a tunnel, and a frame that has waited is
+%%   worth less than one that has not, so a full queue sheds its tail. Taking
+%%   the head instead would keep the frame that has been waiting longest and
+%%   deliver it in preference to a fresh one.
+%% - The cap is what stops a peer that never connects from accumulating; the age
+%%   in `f:sweep/1` is what stops the *capped* queue from being held for ever.
+%%   Neither alone is enough: a cap alone converts unbounded growth into a
+%%   bounded 64 KB per peer retained permanently, which is still a leak across
+%%   every dead peer the router ever learned.
+%%
+%% A refused frame is counted. A frame dropped for want of queue space is a
+%% different operator fact from one dropped for want of a route
+%% (`transit_frames_dropped_no_route` on #W46KMT8), and a queue that is silently
+%% truncating is exactly the kind of thing this board has twice found.
 enqueue_send(PeerHash, Msg, #{pending_sends := Pending} = State) ->
     Existing = maps:get(PeerHash, Pending, []),
-    State#{pending_sends := maps:put(PeerHash, [Msg | Existing], Pending)};
+    %% Stamped on the way in, because the age sweep has to distinguish a frame
+    %% queued a moment ago from one queued five minutes ago and the queue itself
+    %% carries no other time.
+    Stamped = {at, erlang:system_time(millisecond), Msg},
+    case length(Existing) >= ?MAX_PENDING_SENDS_PER_PEER of
+        true ->
+            ok = i2p_stats:add(pending_sends_dropped_depth, 1),
+            Trimmed = lists:sublist(Existing, ?MAX_PENDING_SENDS_PER_PEER - 1),
+            State#{
+                pending_sends := maps:put(
+                    PeerHash, [Stamped | Trimmed], Pending
+                )
+            };
+        false ->
+            State#{pending_sends := maps:put(PeerHash, [Stamped | Existing], Pending)}
+    end;
 enqueue_send(PeerHash, Msg, State) ->
     enqueue_send(PeerHash, Msg, State#{pending_sends => #{}}).
 
@@ -1739,8 +1998,11 @@ enqueue_send(PeerHash, Msg, State) ->
 send_pending_sends(ConnPid, Transport, PeerHash, #{pending_sends := Pending} = State) ->
     case maps:find(PeerHash, Pending) of
         {ok, Msgs} ->
+            %% Unwraps the `{at, _, _}` stamp and reverses, so a peer receives
+            %% its frames in the order they were queued rather than the order
+            %% they were enqueued.
             lists:foreach(
-                fun(Msg) -> send_i2np(ConnPid, Transport, Msg) end,
+                fun({_at, _Ts, Msg}) -> send_i2np(ConnPid, Transport, Msg) end,
                 lists:reverse(Msgs)
             ),
             State#{pending_sends := maps:remove(PeerHash, Pending)};
