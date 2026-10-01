@@ -54,10 +54,13 @@ init([]) ->
             events_child(),
             stats_child(),
             config_srv_child(),
-            netdb_child(),
             peer_rep_child(),
             reachability_child()
         ] ++
+            %% A list, because the NetDb brings two processes. A supervisor's child
+            %% list must be **flat** — a list of lists is not a valid spec, and it
+            %% fails as a `start_spec` badmatch from every test that boots the app.
+            netdb_children() ++
             ntcp2_sup_children(LocalSeeds) ++ ssu2_sup_children(LocalSeeds) ++
             manager_children(LocalSeeds),
     {ok, {#{strategy => one_for_one, intensity => 10, period => 10}, Children}}.
@@ -264,15 +267,35 @@ config_srv_child() ->
         modules => [i2p_config_srv]
     }.
 
-netdb_child() ->
-    #{
-        id => i2p_netdb_srv,
-        start => {i2p_netdb_srv, start_link, []},
-        restart => permanent,
-        shutdown => 5000,
-        type => worker,
-        modules => [i2p_netdb_srv]
-    }.
+%% The NetDb and its writer, in that order.
+%%
+%% The writer is a child of the same supervisor rather than spawned on demand
+%% because a save that needs a process to exist first is a save that can fail to
+%% happen. `permanent` because the writer is what puts the store on disk.
+%%
+%% Order matters only for shutdown, and only mildly: `one_for_one` stops children
+%% in reverse start order, so the writer stops first and the NetDb's `f:terminate/2`
+%% saves in-process. See `m:i2p_netdb_srv:f:terminate/2` for why that is the
+%% arrangement it wants anyway.
+netdb_children() ->
+    [
+        #{
+            id => i2p_netdb_srv,
+            start => {i2p_netdb_srv, start_link, []},
+            restart => permanent,
+            shutdown => 5000,
+            type => worker,
+            modules => [i2p_netdb_srv]
+        },
+        #{
+            id => i2p_netdb_writer,
+            start => {i2p_netdb_writer, start_link, []},
+            restart => permanent,
+            shutdown => 5000,
+            type => worker,
+            modules => [i2p_netdb_writer]
+        }
+    ].
 
 %% The per-peer reliability store (`m:i2p_peer_rep`). Like the NetDb process it
 %% is always up (memory-only without a data dir) so every component can query
