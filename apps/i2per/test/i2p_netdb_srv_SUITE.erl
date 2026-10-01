@@ -73,6 +73,14 @@ netdb_srv_roundtrip(_Config) ->
         [Key] = i2p_netdb_srv:closest_non_floodfills(Key, 3, []),
         added = i2p_netdb_srv:store(FF, Now),
         [FFKey] = i2p_netdb_srv:closest_floodfills(FFKey, 3, []),
+        %% **Read the store after a lookup, not only before.** All three of the
+        %% lookups above write their memoised store back into the process state, and
+        %% a case that never reads the store again cannot tell that from one where
+        %% the reply and the store were swapped — a list is a perfectly good reply
+        %% and a perfectly bad store, so the mistake stays silent until something
+        %% reads a field. The `count/0` and `keys/0` calls below are that read, and
+        %% they are the reason this case is more than a smoke test.
+        [Key] = i2p_netdb_srv:closest_non_floodfills(rand_hash(), 3, []),
         Bin = i2p_router_info:to_binary(RI),
         {ok, older} = i2p_netdb_srv:store_binary(Bin, Now),
         removed = i2p_netdb_srv:remove(Key),

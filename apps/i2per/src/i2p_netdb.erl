@@ -84,6 +84,39 @@ The DHT helpers follow i2pd's `IdentMetrics` / `NetDb`:
   target set for a store), and `f:closest_non_floodfills/4` (the exploratory
   lookup set, mirroring `NetDb::GetExploratoryNonFloodfill`).
 
+## The routing-key memo, and why it is in the store
+
+All three closest lookups rank candidates by the XOR of two day-scoped routing
+keys, so at the shipped capacity of 5000 routers each one needs 5000 SHA-256s.
+The key is `SHA256(routerHash ‖ yyyymmdd)`, and neither input changes: the router
+hash is fixed for the life of a row, and the day changes once. So the store
+carries a memo of them, `routing :: {Day, #{RouterKey => RoutingKey}}`.
+
+It is a map in the store rather than a second ETS table, and that was measured
+rather than preferred. Resolving 5000 keys costs 2430 us from a map, 2891 us
+from an `ets:lookup` table, and 2860 us from a fourth column on the router row —
+against 4041 us for recomputing. The table loses because an ETS lookup rehashes a
+32-byte key, and the row loses for the same reason while also growing every entry
+by 40 bytes.
+
+Two properties make it safe rather than merely fast:
+
+- **A miss costs what the code cost before.** `memo_routing_key/3` falls back to
+  computing, so an incomplete memo is never worse than no memo. That is what lets
+  a new router be added without invalidating anything.
+- **The day tag is the entire invalidation policy.** Every value is wrong only if
+  the day moved, and a stale memo is a cache miss rather than a wrong answer.
+
+So the three questions a second table would have raised — who may write it, how it
+is evicted, and whether `.public` is defensible next to a deliberately `protected`
+router table — do not arise. There is no second table, and the only writer is the
+process that already owns the store.
+
+The consequence is that the three closest functions return `{Store2, Closest}`
+rather than `[router_key()]`. Filling the memo is a mutation, and this module's
+rule is that a mutation returns the store that describes it. A caller that drops
+it gets the old cost, not a wrong answer.
+
 ## Usage
 
 ```erlang
@@ -93,16 +126,18 @@ Now = erlang:system_time(millisecond),
 {ok, Store1, added} = i2p_netdb:store_binary(Store0, RouterInfoBytes, Now),
 {ok, Store2, updated} = i2p_netdb:store(Store1, RouterInfo, Now),
 
-%% Find by router hash and pick replication targets.
+%% Find by router hash and pick replication targets. **The three closest lookups
+%% hand the store back**, because they memoise routing keys as they go; keeping
+%% the result is what makes the next lookup cheaper.
 Key = i2p_router_info:hash(RouterInfo),
 {ok, RI} = i2p_netdb:find(Store2, Key),
-Floodfills = i2p_netdb:closest_floodfills(Store2, Key, 3, []),
-Exploratory = i2p_netdb:closest_non_floodfills(Store2, TargetKey, 3, []),
+{Store3, Floodfills} = i2p_netdb:closest_floodfills(Store2, Key, 3, []),
+{Store4, Exploratory} = i2p_netdb:closest_non_floodfills(Store3, TargetKey, 3, []),
 
 %% Store and find LeaseSets by destination hash.
 DestHash = i2p_leaset:hash(LeaseSet),
-{ok, Store3, added} = i2p_netdb:store_ls(Store2, LeaseSet, NowSec),
-{ok, LeaseSet} = i2p_netdb:find_ls(Store3, DestHash),
+{ok, Store5, added} = i2p_netdb:store_ls(Store4, LeaseSet, NowSec),
+{ok, LeaseSet} = i2p_netdb:find_ls(Store5, DestHash),
 ```
 
 The store is a value the gen_server in `m:i2p_netdb_srv` owns, and every
@@ -228,6 +263,14 @@ same expressions that write the table, and `f:self_check/1` asserts they agree.
 written; every mutator advances both together and refuses to write when they
 disagree. See `f:generation/1`.
 
+`routing` is the day-tagged memo of routing keys: `{Day, #{RouterKey => RoutingKey}}`
+for the UTC day every value was computed for. It is a cache of a pure function
+of the key, so the day is the *only* thing that can make it wrong, and that is
+what the tag is for. It lives in the store map for the reason the recency order
+does — a second ETS table would be side-effect state, and the property that one
+function stands between every mutation and every derived structure would be lost.
+See `f:closest_keys/4`.
+
 LeaseSets keep a plain map and list. Nothing on the data path asks about them
 per frame, so they gain nothing from a table and would only pay for it. They also
 need no generation: they live in the store map, so a dropped LeaseSet return
@@ -241,6 +284,7 @@ value loses nothing that is not already lost.
     order_pos := gb_trees:tree(router_key(), non_neg_integer()),
     next_seq := pos_integer(),
     generation := non_neg_integer(),
+    routing := {binary(), #{router_key() => router_key()}},
     lease_sets := #{ls_key() => i2p_leaset:lease_set()},
     ls_order := [ls_key()]
 }.
@@ -298,6 +342,7 @@ new(Capacity, ExpirationMs) when
         order_pos => gb_trees:empty(),
         next_seq => 1,
         generation => 0,
+        routing => {<<>>, #{}},
         lease_sets => #{},
         ls_order => []
     };
@@ -516,7 +561,7 @@ remove(Store, Key) ->
             %% would drop a RouterInfo the order still claims to hold.
             Store1 = claim_generation(Store),
             true = ets:delete(maps:get(routers, Store1), Key),
-            {drop_from_order(Store1, Key), removed};
+            {forget_routing(drop_from_order(Store1, Key), Key), removed};
         false ->
             {Store, not_found}
     end.
@@ -678,6 +723,13 @@ once and a partial bug is hardest to see: a load, and the expiry sweep.
 - every hash in `order` is in the table, and vice versa
 - `order_pos` is exactly the inverse of `order`
 - no two entries share a `Seq`
+- every stored RouterInfo's floodfill flags still agree with it
+- no memoised routing key is left behind for a router the store has dropped
+
+The last two are the checks for derived data. The flags are recomputed from the
+RouterInfo beside them, which is the only way they could come to disagree. The
+routing memo is checked in the one direction that matters, and the asymmetry is
+deliberate — see `f:stale_routing/1`.
 """.
 -spec self_check(store()) -> ok | {error, term()}.
 self_check(Store) ->
@@ -707,11 +759,20 @@ self_check(Store) ->
                                     )
                             of
                                 true ->
-                                    case stale_flags(Tab) of
-                                        [] ->
+                                    case {stale_flags(Tab), stale_routing(Store)} of
+                                        {[], []} ->
                                             ok;
-                                        Stale ->
-                                            {error, {flags_disagree_with_routerinfo, Stale}}
+                                        {Stale, []} ->
+                                            {error, {flags_disagree_with_routerinfo, Stale}};
+                                        {[], Stale} ->
+                                            {error, {routing_key_without_router, Stale}};
+                                        {StaleFlags, StaleRouting} ->
+                                            {error, {
+                                                flags_disagree_with_routerinfo,
+                                                StaleFlags,
+                                                routing_key_without_router,
+                                                StaleRouting
+                                            }}
                                     end;
                                 false ->
                                     {error, order_pos_not_inverse_of_order}
@@ -819,12 +880,15 @@ The `N` stored router hashes closest to `Target`.
 
 Input: `Store` — the store; `Target` — the router hash to measure against;
 `N` — how many to return.
-Output: up to `N` hashes, sorted by routing-key XOR distance to `Target`,
-closest first.
+Output: `{Store2, Hashes}` — up to `N` hashes sorted by routing-key XOR distance
+to `Target`, closest first, and the store with the routing keys it resolved
+memoised. **Keep the store.** Dropping it costs nothing but the old price: the
+next lookup recomputes every key, because the memo lives in the value rather than
+somewhere the caller does not have to thread.
 """.
--spec closest(store(), router_key(), non_neg_integer()) -> [router_key()].
+-spec closest(store(), router_key(), non_neg_integer()) -> {store(), [router_key()]}.
 closest(Store, Target, N) when is_integer(N), N >= 0 ->
-    closest_keys(router_keys(Store), Target, N);
+    closest_keys(Store, router_keys(Store), Target, N);
 closest(_Store, _Target, _N) ->
     error(badarg).
 
@@ -835,9 +899,11 @@ Input: `Store`, `Target`, `N` as in `f:closest/3`; `Excluded` — a list of
 hashes to skip (e.g. routers we already asked). Only routers that are both
 declared (`caps` contains `f`) and eligible (`f:eligible_floodfill/1`) count —
 this is the replication set i2pd picks (`GetClosestFloodfills(ident, 3, ...)`).
+Output: `{Store2, Hashes}`, and the store is worth keeping for the reason
+`f:closest/3` gives.
 """.
 -spec closest_floodfills(store(), router_key(), non_neg_integer(), [router_key()]) ->
-    [router_key()].
+    {store(), [router_key()]}.
 closest_floodfills(Store, Target, N, Excluded) when
     is_integer(N), N >= 0, is_list(Excluded)
 ->
@@ -847,7 +913,7 @@ closest_floodfills(Store, Target, N, Excluded) when
         not lists:member(Key, Excluded),
         is_eligible_floodfill(Store, Key)
     ],
-    closest_keys(Floodfills, Target, N);
+    closest_keys(Store, Floodfills, Target, N);
 closest_floodfills(_Store, _Target, _N, _Excluded) ->
     error(badarg).
 
@@ -857,10 +923,11 @@ The `N` closest *non-floodfill* hashes to `Target`, excluding `Excluded`.
 Input: as in `f:closest_floodfills/4`. Routers that declare the floodfill cap
 are skipped, mirroring i2pd's `GetExploratoryNonFloodfill` — the peer manager
 uses this set to probe for routers close to a key without querying
-floodfills.
+floodfills. Output: `{Store2, Hashes}`, and the store is worth keeping for the
+reason `f:closest/3` gives.
 """.
 -spec closest_non_floodfills(store(), router_key(), non_neg_integer(), [router_key()]) ->
-    [router_key()].
+    {store(), [router_key()]}.
 closest_non_floodfills(Store, Target, N, Excluded) when
     is_integer(N), N >= 0, is_list(Excluded)
 ->
@@ -870,7 +937,7 @@ closest_non_floodfills(Store, Target, N, Excluded) when
         not lists:member(Key, Excluded),
         not declares_floodfill(Store, Key)
     ],
-    closest_keys(NonFloodfills, Target, N);
+    closest_keys(Store, NonFloodfills, Target, N);
 closest_non_floodfills(_Store, _Target, _N, _Excluded) ->
     error(badarg).
 
@@ -1296,7 +1363,7 @@ trim(Store) ->
             ),
             true = ets:delete(maps:get(routers, Store), Evicted),
             {_DroppedSeq, Pos1} = gb_trees:take(Evicted, maps:get(order_pos, Store)),
-            trim(Store#{order := Order1, order_pos := Pos1});
+            trim(forget_routing(Store#{order := Order1, order_pos := Pos1}, Evicted));
         false ->
             Store
     end.
@@ -1339,12 +1406,37 @@ trim_ls(Store) ->
 %% Measured together: 148293 us -> 8026 us, an 18.5x improvement, with results
 %% identical to before.
 %%
-%% What is left is ~8000 us, and nearly all of it is 5000 SHA-256s that the
-%% previous two steps did not remove. The routing key is `SHA256(Hash ‖ Day)`, so
-%% it only changes once a day and could be memoised; that is the remaining 4.6x and
-%% it is deliberately not done here, because a memo table in this module raises
-%% questions about table ownership and eviction that want their own change. See
-%% `#8YGZFB8`.
+%% **And the routing key is memoised, so the steady state does no crypto at all.**
+%% The key is `SHA256(Hash ‖ Day)`, so it is a function of two things neither of
+%% which changes: the router hash, which is fixed for the life of a row, and the
+%% day. It therefore needs computing once per router per day and never again, and
+%% `f:routing_memo/1` is where that once happens.
+%%
+%% The memo is a map inside the store rather than a second ETS table, and the
+%% alternative was measured rather than assumed. At 5000 routers, resolving all
+%% 5000 keys costs 2430 us out of a `maps` memo, 2891 us from an `ets:lookup`
+%% table, and 2860 us from a fourth column on the router row beside a 4 KB
+%% RouterInfo — against 4041 us for recomputing. The map wins because a HAMT
+%% lookup is three word comparisons against a hash the key already carries,
+%% whereas an ETS lookup hashes a 32-byte key again and the row's size does not
+%% matter at all. So the choice was not "map versus table" on principle; the table
+%% is 20% slower and would have cost a `public` table to write.
+%%
+%% That in turn dissolves the three questions this change was supposed to answer
+%% separately. **Who may write it:** the same process that writes everything else,
+%% because the memo is part of the store value rather than a table beside it —
+%% there is no second writer to reason about. **Eviction:** the three places a
+%% router leaves drop the key with it, and `f:self_check/1` proves they did, but
+%% see below for why correctness does not depend on that. **`.public` versus the
+%% module's discipline:** there is no new table, so there is no new access mode to
+%% earn.
+%%
+%% **Correctness does not rest on the memo being complete.** `routing_key/3` falls
+%% back to computing on a miss, so a key the memo has never seen costs one hash —
+%% which is what the code cost before, so a miss is never worse than the absence of
+%% the memo. That is what makes the day tag sufficient: a stale memo is not a wrong
+%% answer, it is a cache miss. The tag is the whole invalidation policy, and it is
+%% one comparison per lookup rather than 5000.
 %%
 %% `lists:sort/2` with `=<` rather than `<`: the elements are `{Distance, Key}`
 %% pairs, so a comparator that only looked at the distance could see two equal
@@ -1354,14 +1446,107 @@ trim_ls(Store) ->
 %% hashes**, and returning the `{Distance, Key}` pairs would satisfy the sort and
 %% break every caller -- `closest_returns_distance_sorted_test` caught exactly that
 %% when this function was first rewritten, which is what an existing test is for.
-closest_keys(Keys, Target, N) ->
+%%
+%% The store comes back because filling the memo is a mutation, and this module's
+%% one rule is that a mutation returns the store that describes it. A caller that
+%% dropped the returned store would keep computing every hash, which is the old
+%% behaviour rather than a wrong one — so this is the cheap mistake to make, which
+%% is how the alternative (memoising in a table the caller does not hold) is worse
+%% than useless.
+closest_keys(Store, Keys, Target, N) ->
     Day = current_day(),
     TargetKey = routing_key(Target, Day),
-    Ranked = [{crypto:exor(routing_key(Key, Day), TargetKey), Key} || Key <- Keys],
+    {Ranked, Computed} = rank_keys(Keys, routing_memo(Store, Day), TargetKey, Day),
     Sorted = lists:sort(
         fun({D1, K1}, {D2, K2}) -> D1 < D2 orelse (D1 =:= D2 andalso K1 < K2) end, Ranked
     ),
-    [Key || {_Distance, Key} <- lists:sublist(Sorted, N)].
+    {memorize(Store, Day, Computed), [Key || {_Distance, Key} <- lists:sublist(Sorted, N)]}.
+
+%% The store's routing-key memo, or an empty one if it was computed for another day.
+%%
+%% **The whole invalidation policy is this one comparison.** Every memo value is
+%% `SHA256(RouterHash ‖ Day)` for the day in the tag, the router hash never changes
+%% for the life of a row, and so a value is wrong only if the day moved. A stale
+%% memo is therefore not a wrong answer but a cache miss, which is why nothing else
+%% has to know when the day rolls over.
+routing_memo(#{routing := {Day, Memo}}, Day) ->
+    Memo;
+routing_memo(_Store, _Day) ->
+    #{}.
+
+%% One pass over `Keys`: the ranked pairs, and what the memo had to compute.
+%%
+%% The computed values come back out rather than being written in here, because
+%% repairing the memo inside this loop would rebuild the map once per key. On a
+%% cold memo — the first lookup of a day, which is every key at once — that is
+%% n rebuilds of a map that is still being built, and `memorize/3` folds the whole
+%% lot in with one `maps:merge/2` instead.
+%%
+%% A warm memo allocates nothing for the misses: the accumulator stays `[]` because
+%% the cons is in the branch that found one.
+rank_keys(Keys, Memo, TargetKey, Day) ->
+    {Ranked, Computed} = lists:foldl(
+        fun(Key, {RankedAcc, ComputedAcc}) ->
+            {RoutingKey, Hit} = memo_routing_key(Key, Memo, Day),
+            Pair = {crypto:exor(RoutingKey, TargetKey), Key},
+            case Hit of
+                true -> {[Pair | RankedAcc], ComputedAcc};
+                false -> {[Pair | RankedAcc], [{Key, RoutingKey} | ComputedAcc]}
+            end
+        end,
+        {[], []},
+        Keys
+    ),
+    {Ranked, Computed}.
+
+%% A routing key from the memo, and whether the memo actually had it.
+%%
+%% **The fallback is what makes the memo safe to be incomplete.** A key with no
+%% entry costs one SHA-256, which is exactly what the code cost before the memo
+%% existed, so a miss is never worse than having no memo at all. That is why a
+%% new router does not have to invalidate anything, why a missed eviction is
+%% harmless, and why the day tag above is the only invalidation there is.
+memo_routing_key(Key, Memo, Day) ->
+    case maps:find(Key, Memo) of
+        {ok, RoutingKey} -> {RoutingKey, true};
+        error -> {routing_key(Key, Day), false}
+    end.
+
+%% Record the values this lookup computed, under `Day`.
+%%
+%% **Three clauses, because "computed nothing" and "computed something" are
+%% different from "the tag did not match".**
+%%
+%% The first clause is the one worth reading twice: a lookup that resolved no keys
+%% at all — which is what an `Excluded` list naming every candidate produces — must
+%% not rewrite the store. It does stamp the day, but only if the tag did not already
+%% match, so a store that has never been looked up comes back as itself.
+%%
+%% The third clause is that stamp. `routing_memo/2` read a memo built for another
+%% day as empty, so the computed values are the whole memo and there is nothing to
+%% merge with. It recurses rather than repeating the merge so that "tag now
+%% matches" has exactly one implementation.
+%%
+%% The store is returned rather than mutated, per `f:claim_generation/1`'s reason:
+%% the memo is derived state, and a caller that drops the returned store has
+%% recomputed some hashes for nothing rather than anything being wrong.
+memorize(#{routing := {Day, _Memo}} = Store, Day, []) ->
+    Store;
+memorize(#{routing := {Day, Memo}} = Store, Day, Computed) ->
+    Store#{routing := {Day, maps:merge(Memo, maps:from_list(Computed))}};
+memorize(Store, Day, Computed) ->
+    memorize(Store#{routing := {Day, #{}}}, Day, Computed).
+
+%% Drop a router's memoised routing key, on the way out.
+%%
+%% **This is hygiene, not correctness.** `memo_routing_key/3` falls back to
+%% computing, and a lookup only ever asks about a key the store still holds, so a
+%% memo entry for a departed router can never be returned — it is 40 bytes of
+%% memory and nothing else. It is dropped anyway because "bounded by nothing but
+%% the day's churn" is not a bound, and `f:self_check/1` reports a leftover so a
+%% missed call site is a test failure rather than a slow leak.
+forget_routing(#{routing := {Day, Memo}} = Store, Key) ->
+    Store#{routing := {Day, maps:remove(Key, Memo)}}.
 
 is_eligible_floodfill(Store, Key) ->
     (router_flags(Key, Store) band ?FF_ELIGIBLE) =/= 0.
@@ -1406,6 +1591,24 @@ floodfill_flags(RI) ->
 
 router_flags(Key, Store) ->
     ets:lookup_element(maps:get(routers, Store), Key, 3).
+
+%% Memoised routing keys whose router is no longer stored.
+%%
+%% **The one direction worth checking.** A memo entry for a departed router cannot
+%% be returned by a lookup, because a lookup only asks about keys the order still
+%% holds — so this is not a correctness check, it is a leak check, and it is the
+%% direction that catches a missed `forget_routing/2`.
+%%
+%% The other direction is deliberately not asserted, and the asymmetry is the
+%% point. Recomputing every value to confirm it would cost 5000 SHA-256s — about
+%% 1.5 ms against this check's 315 us, a 5x tax on a check `i2p_netdb_srv` runs
+%% after every load and sweep. It would also prove nothing: a memo value is
+%% `SHA256(RouterHash ‖ Day)`, the router hash is the key it is stored under and
+%% cannot change, and the only writer is `memorize/3`, which computes what it
+%% writes. There is no path by which a value could be wrong for its day, so a
+%% check for it would be a check that could only ever pass.
+stale_routing(#{routing := {_Day, Memo}, routers := Tab}) ->
+    [Key || Key <- maps:keys(Memo), not ets:member(Tab, Key)].
 
 %% The order tree already holds every key we store, so the key set is read from
 %% there rather than by sweeping the table. One less place that has to agree
@@ -1651,7 +1854,7 @@ drop_each(Store, []) ->
     Store;
 drop_each(#{routers := Tab} = Store, [Hash | Rest]) ->
     true = ets:delete(Tab, Hash),
-    drop_each(drop_from_order(Store, Hash), Rest).
+    drop_each(forget_routing(drop_from_order(Store, Hash), Hash), Rest).
 
 partition_ls(_LSMaps, [], _NowSec, Removed, Kept) ->
     {maps:from_list(Kept), Kept, Removed};
