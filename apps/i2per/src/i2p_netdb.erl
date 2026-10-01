@@ -118,6 +118,7 @@ true = i2p_netdb:has_router(Store, Key).
 -export([
     new/0,
     new/1,
+    new/2,
     store/3,
     store_binary/3,
     store_ls/3,
@@ -131,6 +132,10 @@ true = i2p_netdb:has_router(Store, Key).
     ls_count/1,
     count/1,
     capacity/1,
+    default_expiration_ms/0,
+    expiration_ms/1,
+    expiration_threshold_ms/0,
+    set_expiration_ms/2,
     routing_key/1,
     routing_key/2,
     distance/2,
@@ -156,6 +161,18 @@ true = i2p_netdb:has_router(Store, Key).
 -export_type([store/0, router_key/0, ls_key/0, snapshot/0]).
 
 -define(DEFAULT_CAPACITY, 5000).
+%% The RouterInfo expiry horizon, in ms. i2pd's \`NETDB_MAX_EXPIRATION_TIMEOUT\`.
+%%
+%% **This is the default, not the policy.** The value a store actually uses is in
+%% the store (\`expiration_ms\`), settable per store and per configuration, because
+%% both reference implementations make the horizon a *function of how full the store
+%% is* rather than a constant. i2pd interpolates 1.5h..27h by \`routers/90\`;
+%% i2p-java switches to an aggressive drop above 4000. See \`#RA5PVR1\`.
+%%
+%% What is decided here is only that i2per's own policy is the simplest of the
+%% three: a fixed horizon at every size. If it becomes a sliding one, the change is
+%% to \`horizon_ms/1\` and nothing else, because both callers already ask it.
+-define(DEFAULT_EXPIRATION_MS, 27 * 60 * 60 * 1000).
 %% The table is unnamed: a store's table is identified by the tid in its own
 %% state, not by a global name, so two stores in one node cannot collide. The
 %% srv reads the tid from its store and hands it to callers; see
@@ -168,9 +185,16 @@ true = i2p_netdb:has_router(Store, Key).
 %% i2pd NetDb.hpp: NETDB_MIN_FLOODFILL_VERSION = MAKE_VERSION_NUMBER(0, 9, 62).
 -define(NETDB_MIN_FLOODFILL_VERSION, 962).
 %% i2pd NetDb.cpp: reject RouterInfos stamped more than this into the future.
+%%
+%% **Not configurable, and deliberately so.** This is not a policy knob. It bounds
+%% how far ahead of the local clock a RouterInfo may claim to be published, which is
+%% a tolerance for clock skew between routers, and the number to use for that is
+%% i2pd's. Making it configurable would invite an operator to set it wide enough to
+%% accept RouterInfos that are meaningfully from the future, and the expiry sweep
+%% would then have to reason about them too. See `expiration_threshold_ms/0`, which
+%% exposes it as a read so a test or a status display can report the window the
+%% store is actually enforcing.
 -define(EXPIRATION_THRESHOLD_MS, 2 * 60 * 1000).
-%% i2pd NetDb.hpp: NETDB_MAX_EXPIRATION_TIMEOUT = 27 hours.
--define(MAX_EXPIRATION_MS, 27 * 60 * 60 * 1000).
 -define(CAPS_FLOODFILL, $f).
 -define(CAPS_UNREACHABLE, $U).
 -define(CAPS_HIDDEN, $H).
@@ -207,6 +231,7 @@ value loses nothing that is not already lost.
 """.
 -opaque store() :: #{
     capacity := pos_integer(),
+    expiration_ms := pos_integer(),
     routers := ets:tid(),
     order := gb_trees:tree(non_neg_integer(), router_key()),
     order_pos := gb_trees:tree(router_key(), non_neg_integer()),
@@ -216,14 +241,37 @@ value loses nothing that is not already lost.
     ls_order := [ls_key()]
 }.
 
--doc "A fresh store with the default capacity (5000 routers).".
+-doc """
+A fresh store with the default capacity (5000 routers) and the default RouterInfo
+expiry horizon (27 hours).
+""".
 -spec new() -> store().
 new() ->
-    new(?DEFAULT_CAPACITY).
+    new(?DEFAULT_CAPACITY, ?DEFAULT_EXPIRATION_MS).
 
 -doc """
-A fresh store with a fixed `Capacity` — when a store would exceed it, the
-least recently stored RouterInfo is evicted.
+A fresh store with a fixed `Capacity` and the default expiry horizon.
+
+When a store would exceed the capacity, the least recently stored RouterInfo is
+evicted.
+""".
+-spec new(pos_integer()) -> store().
+new(Capacity) ->
+    new(Capacity, ?DEFAULT_EXPIRATION_MS).
+
+-doc """
+A fresh store with a fixed `Capacity` and a fixed `ExpirationMs`.
+
+`Capacity` is the number of RouterInfos the store holds before evicting the least
+recently stored. `ExpirationMs` is how old a RouterInfo may be before the store
+discards it — the horizon that decides both whether `f:store/3` admits a
+RouterInfo at all and what the sweep removes. It is a plain window, **not** a
+function of how full the store is, which is simpler than either reference
+implementation and more permissive than both at size. See `#RA5PVR1`.
+
+The two are independent: capacity bounds memory, the horizon bounds staleness. A
+store can hold few routers for a long time, or many for a short time, and neither
+setting affects the other.
 
 The returned store owns a new `protected` ETS table, so it is only safe to use
 from the process that called this: a `protected` table rejects writes from
@@ -231,10 +279,16 @@ anyone else, which is what makes the single-writer property hold rather than
 merely be intended. The table dies with this process, so the store cannot
 outlive its owner.
 """.
--spec new(pos_integer()) -> store().
-new(Capacity) when is_integer(Capacity), Capacity > 0 ->
+-spec new(pos_integer(), pos_integer()) -> store().
+new(Capacity, ExpirationMs) when
+    is_integer(Capacity),
+    Capacity > 0,
+    is_integer(ExpirationMs),
+    ExpirationMs > 0
+->
     #{
         capacity => Capacity,
+        expiration_ms => ExpirationMs,
         routers => new_table(),
         order => gb_trees:empty(),
         order_pos => gb_trees:empty(),
@@ -243,7 +297,7 @@ new(Capacity) when is_integer(Capacity), Capacity > 0 ->
         lease_sets => #{},
         ls_order => []
     };
-new(_) ->
+new(_, _) ->
     error(badarg).
 
 %% The table is `protected`, not `public`: the owning process writes, everyone
@@ -508,6 +562,69 @@ ls_count(Store) ->
 -spec capacity(store()) -> pos_integer().
 capacity(Store) ->
     maps:get(capacity, Store).
+
+%% Both of these return a compile-time constant, so dialyzer's success typing is the
+%% literal rather than `pos_integer()` and it reports the spec as wider than what the
+%% body can produce. Suppressed, and deliberately kept as the wider `pos_integer()`:
+%% the point of exposing the number is that a caller configures against it, and a
+%% spec of `97200000` would break the build the day someone edits the macro to tune
+%% it, which is the one thing this exists to allow.
+-dialyzer({no_underspecs, [default_expiration_ms/0, expiration_threshold_ms/0]}).
+
+-doc """
+The default RouterInfo expiry horizon in ms, 27 hours.
+
+i2pd's `NETDB_MAX_EXPIRATION_TIMEOUT`, and its *maximum*: i2pd interpolates down from
+this towards 1.5 hours as its store fills. Exposed because
+`m:i2p_netdb_srv` reads operator configuration and needs the default from here
+rather than restating it, so there is one number and not two that can disagree.
+""".
+-spec default_expiration_ms() -> pos_integer().
+default_expiration_ms() ->
+    ?DEFAULT_EXPIRATION_MS.
+
+-doc """
+The RouterInfo expiry horizon in ms: how old a RouterInfo may be before this store
+discards it.
+
+Set at `f:new/2` and changeable with `f:set_expiration_ms/2`. Both the admission
+check in `f:store/3` and `f:remove_expired/3` read this one value, so a store cannot
+admit a RouterInfo it is about to expire.
+""".
+-spec expiration_ms(store()) -> pos_integer().
+expiration_ms(Store) ->
+    maps:get(expiration_ms, Store).
+
+-doc """
+How far ahead of the local clock a RouterInfo may claim to be published, in ms.
+
+i2pd's `NETDB_EXPIRATION_TIMEOUT_THRESHOLD`, and not configurable: it is a tolerance
+for clock skew rather than a policy, and the two halves of the admission window are
+not the same decision. See `f:new/2` for the horizon that *is* a policy.
+""".
+-spec expiration_threshold_ms() -> pos_integer().
+expiration_threshold_ms() ->
+    ?EXPIRATION_THRESHOLD_MS.
+
+-doc """
+Set a store's RouterInfo expiry horizon, returning a new store.
+
+Input: `Store` — the current store; `ExpirationMs` — the new horizon, which must be
+a positive integer.
+Output: `Store2`, identical to `Store` apart from the horizon. The table is not
+touched, so this is a change of policy and not a mutation: no generation is claimed
+and nothing is read or written.
+
+**The horizon is read at both the admission check and the sweep**, so changing it
+takes effect on the next store and the next sweep without either having to be told.
+That is the point of putting it in the store rather than reading configuration at
+two call sites.
+""".
+-spec set_expiration_ms(store(), pos_integer()) -> store().
+set_expiration_ms(Store, Ms) when is_integer(Ms), Ms > 0 ->
+    Store#{expiration_ms => Ms};
+set_expiration_ms(_Store, _Ms) ->
+    error(badarg).
 
 -doc """
 The cheap invariant: the table and the order hold the same number of entries.
@@ -865,6 +982,15 @@ entries ‖ ls_count(4) ‖ entries`.
 Equivalent to `{ok, Bin} = f:serialize(f:snapshot(Store))` for a store nothing is
 mutating, and it stays defined for one that is: it reads the table through the
 store rather than through a snapshot.
+
+**The file records capacity but not the expiry horizon.** Those are not the same
+kind of value: capacity is a property of the store that was saved, while the
+horizon is a policy the running router decides now, exactly as it decides the sweep
+interval. A router restarted with a shorter horizon must honour the shorter one
+against the routers it just loaded, so persisting the old value would be a way to
+make configuration silently not apply. `f:from_binary/1` therefore loads at the
+default and the caller applies whatever policy it is configured for with
+`f:set_expiration_ms/2`.
 """.
 -spec to_binary(store()) -> binary().
 to_binary(Store) ->
@@ -887,6 +1013,10 @@ Output: `{ok, Store}` when the binary is well-formed and every RouterInfo /
 LeaseSet signature verifies (`m:i2p_router_info:decode/1`,
 `m:i2p_leaset:decode/1`); `{error, Reason}` otherwise. Entries with invalid
 signatures or truncated bytes are silently dropped.
+
+**Capacity is restored from the file; the expiry horizon is not.** The horizon
+arrives at the default, and the caller sets the policy it is configured for with
+`f:set_expiration_ms/2` — see `f:to_binary/1` for why it is not persisted.
 """.
 -spec from_binary(binary()) -> {ok, store()} | {error, term()}.
 from_binary(<<"I2PNETDB", ?VERSION:8, Rest/binary>>) ->
@@ -983,7 +1113,7 @@ is_all_digits(Bin) ->
 
 insert_newer(Store, Key, RI, NowMs, Outcome) ->
     Timestamp = i2p_router_info:published(RI),
-    case valid_window(Timestamp, NowMs) of
+    case valid_window(Timestamp, NowMs, Store) of
         true ->
             %% Claimed *before* the write, not after: the claim is what detects a
             %% stale store, and a store that has already been written is already
@@ -1068,10 +1198,17 @@ drop_from_order(#{order := Order, order_pos := Pos} = Store, Key) ->
     Store#{order := Order1, order_pos := Pos1}.
 
 %% i2pd NetDb.cpp AddRouterInfo: reject from future (now + 2 min) and too old
-%% (now > timestamp + 27 h).
-valid_window(Timestamp, NowMs) ->
+%% (now > timestamp + the store's horizon).
+%%
+%% **Both bounds come from one place.** The future bound is
+%% `?EXPIRATION_THRESHOLD_MS`, the clock-skew tolerance. The past bound is the
+%% store's own horizon, which is the same value `expired_hashes/2` compares against.
+%% They were written as two comparisons in two places, so they could drift and admit
+%% a RouterInfo the sweep would immediately remove; now a store cannot do that to
+%% itself.
+valid_window(Timestamp, NowMs, Store) ->
     Timestamp =< NowMs + ?EXPIRATION_THRESHOLD_MS andalso
-        NowMs =< Timestamp + ?MAX_EXPIRATION_MS.
+        NowMs =< Timestamp + expiration_ms(Store).
 
 %% Insert a LeaseSet after the equal-or-newer check; the i2p_leaset:valid/2
 %% window decides acceptance.
@@ -1347,11 +1484,16 @@ parse_ls_entries(_, _, _, _) ->
 expired_hashes(Store, NowMs) ->
     Tab = maps:get(routers, Store),
     Order = gb_trees:to_list(maps:get(order, Store)),
+    %% **One comparison, one source.** The horizon is read once and hoisted out of
+    %% the fold, which is both what the 5000-entry walk wants and the thing that
+    %% keeps this in step with `valid_window/3`: a store that admits a RouterInfo
+    %% cannot then expire it, because both sides read the same field.
+    Horizon = expiration_ms(Store),
     lists:foldl(
         fun({_Position, Hash}, Gone) ->
             case ets:lookup(Tab, Hash) of
                 [{_, RI}] ->
-                    case i2p_router_info:published(RI) + ?MAX_EXPIRATION_MS < NowMs of
+                    case i2p_router_info:published(RI) + Horizon < NowMs of
                         true -> [Hash | Gone];
                         false -> Gone
                     end;

@@ -16,6 +16,7 @@
     netdb_srv_corrupt_state_fails_closed/1,
     netdb_srv_load_error_blocks_rewrite/1,
     netdb_srv_remove_expired/1,
+    netdb_srv_configured_expiration_is_honoured/1,
     netdb_srv_stats/1
 ]).
 
@@ -38,6 +39,7 @@ all() ->
         netdb_srv_corrupt_state_fails_closed,
         netdb_srv_load_error_blocks_rewrite,
         netdb_srv_remove_expired,
+        netdb_srv_configured_expiration_is_honoured,
         netdb_srv_stats
     ].
 
@@ -231,6 +233,57 @@ netdb_srv_remove_expired(_Config) ->
         end
     end.
 
+%% The configured horizon reaches the store, and both the admission check and the
+%% sweep honour it.
+%%
+%% The srv is where the configuration is read, so this is the case that says the
+%% key in `sys.config` does something. `#RA5PVR1` is about making the *policy*
+%% sliding; this is the part that already landed, namely that an operator can reach
+%% the horizon at all.
+%%
+%% Structurally rather than by deadline: set a one-minute horizon, store a
+%% RouterInfo published three minutes ago (admissible at the default 27-hour horizon,
+%% and inside one minute at the configured one, so it has to be refused at the door),
+%% then sweep and confirm nothing had to be removed.
+netdb_srv_configured_expiration_is_honoured(_Config) ->
+    application:set_env(i2per, netdb_expiration_ms, 60 * 1000),
+    Pid =
+        case whereis(i2p_netdb_srv) of
+            undefined ->
+                {ok, P} = i2p_netdb_srv:start_link(),
+                P;
+            Existing ->
+                Existing
+        end,
+    try
+        %% The store carries the configured value, not the module default.
+        60000 = maps:get(expiration_ms, i2p_netdb_srv:stats()),
+
+        Now = now_ms(),
+        {RI, _} = fixture_router(Now - 3 * 60 * 1000),
+        Key = i2p_router_info:hash(RI),
+        %% Refused by the configured horizon, not admitted and then swept.
+        too_old = i2p_netdb_srv:store(RI, Now),
+        not_found = i2p_netdb_srv:find(Key),
+        0 = i2p_netdb_srv:count(),
+
+        %% And a fresh one is still accepted, so the horizon did not break the store.
+        {Fresh, _} = fixture_router(Now),
+        added = i2p_netdb_srv:store(Fresh, Now),
+        1 = i2p_netdb_srv:count(),
+        {0, _} = i2p_netdb_srv:remove_expired(),
+        1 = i2p_netdb_srv:count()
+    after
+        application:unset_env(i2per, netdb_expiration_ms),
+        case whereis(i2p_netdb_srv) of
+            Pid ->
+                unlink(Pid),
+                exit(Pid, shutdown);
+            _ ->
+                ok
+        end
+    end.
+
 netdb_srv_stats(_Config) ->
     Pid =
         case whereis(i2p_netdb_srv) of
@@ -242,6 +295,7 @@ netdb_srv_stats(_Config) ->
         end,
     try
         Stats = i2p_netdb_srv:stats(),
+        true = maps:is_key(expiration_ms, Stats),
         true = maps:is_key(routers, Stats),
         true = maps:is_key(lease_sets, Stats),
         true = maps:is_key(capacity, Stats),
