@@ -33,6 +33,24 @@ stays inside the store map on purpose. If the order were a second table it
 would be side-effect state, and this module's central property — one function
 stands between every mutation and both structures — would be lost.
 
+**The table carries a generation counter, because a store that mutates a table
+in place is only half a value.** Every mutation writes the table and then
+returns a *new* store holding the order. A caller that drops that returned store
+has mutated the table without moving the order, and nothing about the result
+says so: the mutation inserted one row and evicted one, so the two sizes still
+agree, and `f:consistent/1` cannot see it.
+
+So the table holds one reserved row, under `?GEN_KEY`, carrying a counter that
+advances on every table mutation; the store map holds the value it believes is
+current. Every mutator claims the next generation before it writes, and the claim
+fails with `stale_store` if the table's counter has already moved on. One
+reserved row is not the order becoming a table: it is a single integer whose only
+job is to notice a lost return value, and it is why `f:generation/1` exists.
+
+Catching this at the mutator rather than in `f:consistent/1` is the whole point.
+`f:consistent/1` is asked after the fact, when the wrong router has already been
+evicted; the claim fires before a single row is written.
+
 A `queue` was the obvious candidate for the order and is the wrong shape: its
 O(1) removals (`out/1`, `drop/1`, `out_r/1`, `drop_r/1`) only reach the two
 ends, and promoting a router to most-recent means deleting it from the middle,
@@ -127,6 +145,7 @@ true = i2p_netdb:has_router(Store, Key).
     from_binary/1,
     remove_expired/3,
     has_router/2,
+    generation/1,
     router_table/1,
     consistent/1,
     self_check/1
@@ -140,6 +159,10 @@ true = i2p_netdb:has_router(Store, Key).
 %% srv reads the tid from its store and hands it to callers; see
 %% `m:i2p_netdb_srv:has_router/1`.
 -define(ROUTERS, i2per_netdb_routers).
+%% The one table row that is not a RouterInfo. An atom, where every router key is
+%% a 32-byte binary, so it cannot collide with one and no caller can name it by
+%% accident. Its value is the generation counter; see `f:claim_generation/1`.
+-define(GEN_KEY, '$generation').
 %% i2pd NetDb.hpp: NETDB_MIN_FLOODFILL_VERSION = MAKE_VERSION_NUMBER(0, 9, 62).
 -define(NETDB_MIN_FLOODFILL_VERSION, 962).
 %% i2pd NetDb.cpp: reject RouterInfos stamped more than this into the future.
@@ -170,8 +193,15 @@ order: `Seq -> Hash` for finding the least-recently-stored router, and
 `Hash -> Seq` for promoting one we already hold. They are kept in step by the
 same expressions that write the table, and `f:self_check/1` asserts they agree.
 
+`generation` is the store's half of the counter the table carries under
+`?GEN_KEY`. It is the store's belief about how many times its table has been
+written; every mutator advances both together and refuses to write when they
+disagree. See `f:generation/1`.
+
 LeaseSets keep a plain map and list. Nothing on the data path asks about them
-per frame, so they gain nothing from a table and would only pay for it.
+per frame, so they gain nothing from a table and would only pay for it. They also
+need no generation: they live in the store map, so a dropped LeaseSet return
+value loses nothing that is not already lost.
 """.
 -opaque store() :: #{
     capacity := pos_integer(),
@@ -179,6 +209,7 @@ per frame, so they gain nothing from a table and would only pay for it.
     order := gb_trees:tree(non_neg_integer(), router_key()),
     order_pos := gb_trees:tree(router_key(), non_neg_integer()),
     next_seq := pos_integer(),
+    generation := non_neg_integer(),
     lease_sets := #{ls_key() => i2p_leaset:lease_set()},
     ls_order := [ls_key()]
 }.
@@ -206,6 +237,7 @@ new(Capacity) when is_integer(Capacity), Capacity > 0 ->
         order => gb_trees:empty(),
         order_pos => gb_trees:empty(),
         next_seq => 1,
+        generation => 0,
         lease_sets => #{},
         ls_order => []
     };
@@ -216,8 +248,13 @@ new(_) ->
 %% reads. `read_concurrency` because the readers are exactly the case this
 %% table exists for -- many processes asking "do we hold this router?" on their
 %% own schedulers, with no writer in the middle.
+%%
+%% It starts with the generation row and nothing else, which is why every count
+%% of stored routers in this module subtracts one: see `f:router_count/1`.
 new_table() ->
-    ets:new(?ROUTERS, [set, protected, {read_concurrency, true}]).
+    Tab = ets:new(?ROUTERS, [set, protected, {read_concurrency, true}]),
+    true = ets:insert(Tab, {?GEN_KEY, 0}),
+    Tab.
 
 -doc """
 Store a verified RouterInfo.
@@ -354,6 +391,30 @@ has_router(Store, Key) ->
     ets:member(maps:get(routers, Store), Key).
 
 -doc """
+The store's generation: how many times its table has been written.
+
+Input: `Store` — the store.
+Output: a non-negative integer, equal to the counter the table carries under
+`?GEN_KEY`.
+
+A store that mutates a table in place is only half a value, and this is the half
+that says which one you are holding. Two stores naming the same table have
+different generations, because every mutation writes the table *and* returns a
+new store, so the counter is what distinguishes "the store I just mutated" from
+"the store I still hold" when the return value is lost.
+
+The main use is a **cross-process snapshot**. Reading the order and the table
+from another process can interleave with a mutation and produce a binary that
+was never true of any store; reading `generation/1` before and after the read
+and retrying when it moved is enough to make that safe. That is what lets the
+periodic save run outside the process that serves reads, because the reader can
+tell whether the writer saw a consistent store.
+""".
+-spec generation(store()) -> non_neg_integer().
+generation(Store) ->
+    maps:get(generation, Store).
+
+-doc """
 The tid of the store's RouterInfo table.
 
 Input: `Store` — the store.
@@ -390,8 +451,12 @@ Output: `{Store2, removed}` when it was present, `{Store, not_found}` otherwise.
 remove(Store, Key) ->
     case ets:member(maps:get(routers, Store), Key) of
         true ->
-            true = ets:delete(maps:get(routers, Store), Key),
-            {drop_from_order(Store, Key), removed};
+            %% Claimed before the delete, for the reason `f:claim_generation/1`
+            %% gives. A store that deletes from a table it no longer describes
+            %% would drop a RouterInfo the order still claims to hold.
+            Store1 = claim_generation(Store),
+            true = ets:delete(maps:get(routers, Store1), Key),
+            {drop_from_order(Store1, Key), removed};
         false ->
             {Store, not_found}
     end.
@@ -462,7 +527,7 @@ have been a tax on the store path to catch a bug the cheap check already catches
 consistent(#{order := Order, order_pos := Pos, routers := Tab}) ->
     N = gb_trees:size(Order),
     M = gb_trees:size(Pos),
-    Table = ets:info(Tab, size),
+    Table = router_count(Tab),
     case {N, M, Table} of
         {N, N, N} -> ok;
         _ -> {error, {size_disagreement, #{order => N, order_pos => M, table => Table}}}
@@ -497,7 +562,7 @@ self_check(Store) ->
     Pos = maps:get(order_pos, Store),
     Tab = maps:get(routers, Store),
     InOrder = gb_trees:size(Order),
-    InTable = ets:info(Tab, size),
+    InTable = router_count(Tab),
     %% `to_list/1` gives `{{Seq, Hash}, Hash}`; both levels are matched, so `Seq`
     %% is the integer and not the pair. Reading it one level shallow would count
     %% distinct tuples rather than distinct sequences, and a store holding the
@@ -541,6 +606,7 @@ missing_from_order(Tab, Pos) ->
     [
         Key
      || [Key] <- ets:select(Tab, [{{'$1', '_'}, [], ['$1']}]),
+        Key =/= ?GEN_KEY,
         not gb_trees:is_defined(Key, Pos)
     ].
 
@@ -781,14 +847,22 @@ expired when `m:i2p_leaset:valid/2` returns `{error, expired}`.
 -spec remove_expired(store(), non_neg_integer(), non_neg_integer()) ->
     {store(), {non_neg_integer(), non_neg_integer()}}.
 remove_expired(Store, NowMs, NowSec) when is_integer(NowMs), is_integer(NowSec) ->
-    Order0 = maps:get(order, Store),
-    {KeptOrder, RemovedRouters} = partition_routers(Store, Order0, NowMs),
-    LeaseSets0 = maps:get(lease_sets, Store),
-    LSOrder0 = maps:get(ls_order, Store),
+    %% Claimed unconditionally, before the first delete rather than at the first
+    %% delete. The sweep cannot know whether it will remove anything until it has
+    %% walked the whole order, and a claim made mid-walk would be a claim made
+    %% after rows were already gone. So a sweep that removes nothing still advances
+    %% the generation by one. That costs a reader one retry of a cross-process
+    %% snapshot every 30 minutes, and it is a far better trade than a sweep that
+    %% deletes from a table it has not checked.
+    Store1 = claim_generation(Store),
+    Order0 = maps:get(order, Store1),
+    {KeptOrder, RemovedRouters} = partition_routers(Store1, Order0, NowMs),
+    LeaseSets0 = maps:get(lease_sets, Store1),
+    LSOrder0 = maps:get(ls_order, Store1),
     {KeptLS, KeptLSOrder, RemovedLS} = partition_ls(
         LeaseSets0, LSOrder0, NowSec, 0, []
     ),
-    Store2 = Store#{
+    Store2 = Store1#{
         order => KeptOrder,
         order_pos => positions_of(KeptOrder),
         lease_sets => KeptLS,
@@ -817,10 +891,53 @@ insert_newer(Store, Key, RI, NowMs, Outcome) ->
     Timestamp = i2p_router_info:published(RI),
     case valid_window(Timestamp, NowMs) of
         true ->
-            true = ets:insert(maps:get(routers, Store), {Key, RI}),
-            {trim(promote(Store, Key)), Outcome};
+            %% Claimed *before* the write, not after: the claim is what detects a
+            %% stale store, and a store that has already been written is already
+            %% corrupt. On the raise path nothing is written at all.
+            Store1 = claim_generation(Store),
+            true = ets:insert(maps:get(routers, Store1), {Key, RI}),
+            {trim(promote(Store1, Key)), Outcome};
         false ->
             {Store, outcome_for_window(Timestamp, NowMs)}
+    end.
+
+%% Take the next generation, or fail loudly if the table has moved on without us.
+%%
+%% This is the fix for a store that mutates in place while documenting itself as a
+%% value. A caller that drops the store `insert_newer/5` just returned has an
+%% ETS table one RouterInfo ahead of the recency order it still holds, and no size
+%% check can see it, because the mutation inserted a row and evicted a row. The
+%% next mutation is where that becomes damage -- `promote/2` and `trim/1` both
+%% reason about the order, so they evict against a store that no longer describes
+%% the table, and `f:to_binary/1` persists the wrong order.
+%%
+%% Failing here means the store is caught before that mutation happens, at a point
+%% where the table is still exactly as the last good store left it. Raising rather
+%% than returning an error is deliberate: this is a programming error in a caller
+%% that does not exist, `m:i2p_netdb_srv` is the only mutator and it always keeps
+%% the result, and an `error` tuple would have to be threaded through every
+%% mutator's spec for a case that should never be reachable.
+%% **The number of RouterInfos in the table, which is one less than its size.**
+%%
+%% The table carries the generation row alongside the routers (see
+%% `f:claim_generation/1`), so `ets:info(Tab, size)` counts one non-router row.
+%% Every count of stored routers in this module goes through here rather than
+%% subtracting one at each call site, because a place that forgets is a store that
+%% reports a phantom router forever -- the count never matches the order and
+%% `f:consistent/1` reports a disagreement that does not exist.
+router_count(Tab) ->
+    ets:info(Tab, size) - 1.
+
+claim_generation(#{routers := Tab, generation := Mine} = Store) ->
+    case ets:lookup(Tab, ?GEN_KEY) of
+        [{?GEN_KEY, Mine}] ->
+            Next = Mine + 1,
+            true = ets:insert(Tab, {?GEN_KEY, Next}),
+            Store#{generation := Next};
+        [{?GEN_KEY, Theirs}] ->
+            error({stale_store, #{expected => Mine, table => Theirs}});
+        [] ->
+            error({stale_store, #{expected => Mine, table => missing}})
     end.
 
 %% Move `Key` to most-recently-stored. `order_pos` is what makes this cheap:
@@ -1038,9 +1155,16 @@ positions_of(Order) ->
 seed_order(#{order := EmptyOrder} = Store, []) ->
     {ok, Store#{order := EmptyOrder, order_pos := gb_trees:empty(), next_seq := 1}};
 seed_order(Store, Entries) ->
+    %% One claim for the whole load, not one per entry: this writes the table
+    %% directly rather than through `f:store/3`, so it is the one bulk write path
+    %% that bypasses the mutators, and it needs the same staleness check. Seeding
+    %% runs once against a store `f:from_binary/1` has just built, so the claim
+    %% cannot fail here; it is claimed anyway so that a future caller cannot
+    %% introduce a path that writes the table unchecked.
+    Store1 = claim_generation(Store),
     {Order, Pos, NextSeq} = lists:foldl(
         fun({Key, RI}, {OrderAcc, PosAcc, Seq}) ->
-            true = ets:insert(maps:get(routers, Store), {Key, RI}),
+            true = ets:insert(maps:get(routers, Store1), {Key, RI}),
             {
                 gb_trees:enter({Seq, Key}, Key, OrderAcc),
                 gb_trees:enter(Key, Seq, PosAcc),
@@ -1052,7 +1176,7 @@ seed_order(Store, Entries) ->
         %% oldest router at `Seq` 1 and makes the LRU evict the right end.
         lists:reverse(Entries)
     ),
-    {ok, Store#{order := Order, order_pos := Pos, next_seq := NextSeq}}.
+    {ok, Store1#{order := Order, order_pos := Pos, next_seq := NextSeq}}.
 
 %% ---- from_binary helpers ----
 
@@ -1114,13 +1238,14 @@ partition_routers(Store, Order, NowMs) ->
     %% `to_list/1` gives `{{Seq, Hash}, Hash}`: the tree key is itself the pair,
     %% and the value repeats the hash. Both levels have to be matched.
     Entries = gb_trees:to_list(Order),
+    Tab = maps:get(routers, Store),
     {Kept, Removed} = lists:foldl(
         fun({Position, _Value}, {Keep, Gone}) ->
             {_Seq, Hash} = Position,
             RI = router_value(Hash, Store),
             case i2p_router_info:published(RI) + ?MAX_EXPIRATION_MS < NowMs of
                 true ->
-                    true = ets:delete(maps:get(routers, Store), Hash),
+                    true = ets:delete(Tab, Hash),
                     {Keep, Gone + 1};
                 false ->
                     {gb_trees:enter(Position, Hash, Keep), Gone}

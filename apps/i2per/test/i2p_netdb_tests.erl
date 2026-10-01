@@ -450,6 +450,159 @@ remove_expired_keeps_fresh_ls_test() ->
     ?assertEqual(1, i2p_netdb:ls_count(S2)).
 
 %%% --------------------------------------------------------------------------
+%%% Generation: a store that mutates its table in place is only half a value
+%%% --------------------------------------------------------------------------
+
+%% Every test below drops a mutator's return value on purpose -- the one caller
+%% mistake this store has no defence against -- and then asks whether the store
+%% notices. `m:i2p_netdb` detects it with the generation counter the table carries
+%% under `'$generation'`, so these assert both halves: that the counter is the
+%% thing that fires, and that the store is *left usable* when it does.
+
+generation_starts_at_zero_and_advances_per_mutation_test() ->
+    NowMs = now_ms(),
+    Store0 = i2p_netdb:new(),
+    ?assertEqual(0, i2p_netdb:generation(Store0)),
+    {RI, _} = fixture_router(NowMs),
+    {Store1, added} = i2p_netdb:store(Store0, RI, NowMs),
+    ?assertEqual(1, i2p_netdb:generation(Store1)),
+    %% A rejected store writes nothing, so it must not advance the counter.
+    %% Advancing it anyway would make the generation a call count rather than a
+    %% record of table writes, and a caller would be told the table moved when it
+    %% did not.
+    {Store2, older} = i2p_netdb:store(Store1, RI, NowMs),
+    ?assertEqual(1, i2p_netdb:generation(Store2)),
+    {Store3, not_found} = i2p_netdb:remove(Store2, rand_hash()),
+    ?assertEqual(1, i2p_netdb:generation(Store3)).
+
+%% The promote case the ticket names. Storing a *newer* RouterInfo for a router
+%% already held inserts a row and moves its position in the order, and the
+%% returned store is what carries the new position. Drop it and the table holds
+%% the newer RouterInfo while the caller's store still has the old position.
+dropping_a_promote_result_is_caught_before_the_next_store_test() ->
+    NowMs = now_ms(),
+    Store0 = i2p_netdb:new(),
+    {RI, Seed} = fixture_router(NowMs),
+    Key = i2p_router_info:hash(RI),
+    {Store1, added} = i2p_netdb:store(Store0, RI, NowMs),
+    ?assertEqual(1, i2p_netdb:generation(Store1)),
+
+    %% A strictly newer RouterInfo for the same identity: this is the promote
+    %% path, `f:promote/2` moving `Key` to most-recent.
+    Newer = rebuild(RI, Seed, NowMs + 1000, <<"0.9.74">>, <<"4">>),
+    ?assertEqual(Key, i2p_router_info:hash(Newer)),
+    {_, updated} = i2p_netdb:store(Store1, Newer, NowMs),
+
+    %% Both size checks pass on the stale store. `f:consistent/1` compares three
+    %% sizes, and the mutation inserted one row and evicted one, so they agree;
+    %% `f:self_check/1` agrees too because the order is internally consistent --
+    %% it is just the *old* order. A size check cannot catch this, which is why
+    %% the fix is a counter rather than a better count.
+    ?assertEqual(ok, i2p_netdb:consistent(Store1)),
+    ?assertEqual(ok, i2p_netdb:self_check(Store1)),
+
+    %% The next *accepted* mutation is where the damage would happen, so it is
+    %% where the claim fires. A fresh router rather than `Newer` again, because
+    %% re-storing `Newer` is rejected before it reaches the table (the table
+    %% already holds the newer publish time) and so claims nothing -- which is
+    %% the behaviour asserted above.
+    {Third, _Seed3} = fixture_router(NowMs),
+    ?assertEqual(
+        {stale_store, #{expected => 1, table => 2}},
+        raised_by(fun() -> i2p_netdb:store(Store1, Third, NowMs) end)
+    ),
+
+    %% The point of firing *before* the write: nothing further was written, so no
+    %% second row was inserted and no router was evicted on the way to the error.
+    %% The table still holds exactly the one router the last good store describes.
+    ?assertEqual(ok, i2p_netdb:self_check(Store1)),
+    ?assertEqual(1, i2p_netdb:count(Store1)),
+    ?assert(i2p_netdb:has_router(Store1, Key)),
+    ?assertMatch({ok, _}, i2p_netdb:find(Store1, Key)).
+
+%% At capacity the eviction makes the damage visible to a human. Storing a router
+%% we already hold, at capacity, promotes it and evicts the oldest. Drop the
+%% result and the table has evicted a router the caller's order still holds --
+%% so the next store evicts *again* against an order that is one eviction behind,
+%% and the router just stored is the one that goes.
+dropping_a_result_at_capacity_does_not_evict_the_router_just_stored_test() ->
+    NowMs = now_ms(),
+    Store0 = i2p_netdb:new(2),
+    {A, SeedA} = fixture_router(NowMs),
+    {B, _SeedB} = fixture_router(NowMs),
+    KeyA = i2p_router_info:hash(A),
+    KeyB = i2p_router_info:hash(B),
+    {S1, added} = i2p_netdb:store(Store0, A, NowMs),
+    {S2, added} = i2p_netdb:store(S1, B, NowMs),
+    ?assertEqual(2, i2p_netdb:count(S2)),
+
+    %% Re-store A with a newer timestamp. At capacity this promotes A and evicts
+    %% B, so *which* router survives is decided entirely by the returned store:
+    %% the table on its own cannot say which router is now least recent.
+    NewerA = rebuild(A, SeedA, NowMs + 1000, <<"0.9.74">>, <<"4">>),
+    {_, updated} = i2p_netdb:store(S2, NewerA, NowMs),
+
+    %% This is the failure the ticket describes. Carried on against the stale S2,
+    %% the promote cannot find A's old position -- the table moved it -- and
+    %% `trim/1` evicts whatever the order still calls oldest. Without the
+    %% generation counter A, the router just re-stored, is the eviction victim.
+    {C, _SeedC} = fixture_router(NowMs),
+    ?assertEqual(
+        {stale_store, #{expected => 2, table => 3}},
+        raised_by(fun() -> i2p_netdb:store(S2, C, NowMs) end)
+    ),
+
+    %% At the moment the claim fired, nothing had been evicted: the mutation that
+    %% would have chosen a victim never reached the table. A is still held.
+    ?assert(i2p_netdb:has_router(S2, KeyA)),
+    ?assert(i2p_netdb:has_router(S2, KeyB)).
+
+%% The sweep writes the table, so it claims too -- and it claims before it walks,
+%% not at the first delete, because it cannot know whether it will delete anything
+%% until it has read the whole order.
+remove_expired_claims_the_generation_before_deleting_test() ->
+    NowMs = now_ms(),
+    Store0 = i2p_netdb:new(),
+    {RI, _} = fixture_router(NowMs),
+    {Store1, added} = i2p_netdb:store(Store0, RI, NowMs),
+    FutureMs = NowMs + (27 * 60 * 60 * 1000 + 1),
+    %% One claim for the sweep: the store is expired, so the table is written and
+    %% the generation advances by exactly one.
+    {Store2, {1, 0}} = i2p_netdb:remove_expired(Store1, FutureMs, now_sec()),
+    ?assertEqual(2, i2p_netdb:generation(Store2)),
+    ?assertEqual(0, i2p_netdb:count(Store2)),
+    %% A sweep that removes nothing still advances it, which is the trade the
+    %% claim-before-the-walk makes. Asserted because it is a behaviour a reader
+    %% of the code might otherwise assume is a bug.
+    {Store3, {0, 0}} = i2p_netdb:remove_expired(Store2, NowMs, now_sec()),
+    ?assertEqual(3, i2p_netdb:generation(Store3)),
+    ?assertEqual(
+        {stale_store, #{expected => 1, table => 3}},
+        raised_by(fun() -> i2p_netdb:remove_expired(Store1, FutureMs, now_sec()) end)
+    ).
+
+%% The generation is not just a guard. It is what makes a snapshot taken by
+%% another process safe to take at all, which is what lets the periodic save run
+%% off the read path: read the generation, serialise, read it again, and a change
+%% means the bytes describe no store that ever existed.
+generation_identifies_an_unchanged_store_for_a_cross_process_snapshot_test() ->
+    NowMs = now_ms(),
+    Store0 = i2p_netdb:new(3),
+    {Store, _Keys} = store_n(Store0, 3, NowMs),
+    Before = i2p_netdb:generation(Store),
+    %% Nothing wrote the table, so a snapshot taken around it is stable: read the
+    %% generation, serialise, read it again, and an equal value means the bytes
+    %% describe a store that actually existed.
+    _Bin = i2p_netdb:to_binary(Store),
+    ?assertEqual(Before, i2p_netdb:generation(Store)),
+    {RI, _Seed} = fixture_router(NowMs + 1000),
+    {Store2, added} = i2p_netdb:store(Store, RI, NowMs + 1000),
+    _Bin2 = i2p_netdb:to_binary(Store2),
+    ?assertNotEqual(Before, i2p_netdb:generation(Store2)).
+
+%%% --------------------------------------------------------------------------
+%%% Fixtures
+%%% --------------------------------------------------------------------------
 %%% Fixtures
 %%% --------------------------------------------------------------------------
 
@@ -464,6 +617,21 @@ rand_hash() ->
 
 rand_hash(N) ->
     crypto:strong_rand_bytes(N).
+
+%% The term a mutation raised, so a test can assert on it.
+%%
+%% `?assertError/2` takes a *pattern*, and Erlang map patterns cannot hold
+%% literals -- `#{expected => 1, table => 2}` is a binding expression, not a
+%% match, so it can never match. A test that needs to assert the values inside
+%% the error has to catch it and compare whole terms, which is what this is for.
+raised_by(Fun) ->
+    try
+        Fun(),
+        no_error
+    catch
+        error:Reason -> Reason;
+        Class:Reason -> {Class, Reason}
+    end.
 
 %% {RouterInfo, SeedKey} where SeedKey = {{SPub, Seed}, {CPub, _}} lets tests
 %% rebuild the same identity with a different timestamp/version/caps.
