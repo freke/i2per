@@ -1,24 +1,24 @@
 %% Tests that the RouterInfo expiry horizon is a store setting rather than a
-%% compile-time constant.
+%% compile-time constant, and that it slides with the store's size.
 %%
 %% The horizon used to be `?MAX_EXPIRATION_MS`, read in two places: once by the
 %% admission check in `f:store/3` and once by the sweep. Two copies of the same
 %% constant, written as two comparisons, with nothing tying them together.
 %%
-%% It now lives in the store next to `capacity`, so both callers read one value and
-%% a store cannot admit a RouterInfo it is about to expire.
+%% It then lived in the store next to `capacity` as one number, so both callers read
+%% one value and a store could not admit a RouterInfo it was about to expire -- but
+%% it was a flat 27 hours at every size, which is more permissive than either
+%% reference implementation, at the one size where both of them expire aggressively.
 %%
-%% **What this suite does not claim:** that the policy is right. It is a flat
-%% horizon at every store size, which is more permissive than either reference
-%% implementation and is what #RA5PVR1 is about. These cases pin that the knob
-%% *works* and that both callers read it, so that ticket is a change to one function
-%% rather than a search for every place the constant was spelled.
+%% **What is settled now:** the horizon is i2pd's curve between two bounds, so the
+%% fuller the store the sooner a stale entry goes. See "The expiry horizon is a
+%% function of how full the store is" in `m:i2p_netdb`.
 
 -module(i2p_netdb_expiry_tests).
 
 -moduledoc """
-Tests that the RouterInfo expiry horizon is per-store and shared by the admission
-check and the sweep.
+Tests that the RouterInfo expiry horizon is per-store, shared by the admission check
+and the sweep, and interpolated from the store's size between two bounds.
 """.
 
 -include_lib("eunit/include/eunit.hrl").
@@ -28,6 +28,10 @@ check and the sweep.
 %% i2pd NetDb.hpp: NETDB_MAX_EXPIRATION_TIMEOUT = 27 hours. Spelled out so the
 %% default case above is checked against something rather than against itself.
 -define(MAX_EXPIRATION_MS, 27 * ?HOUR_MS).
+%% i2pd NetDb.hpp: NETDB_MIN_EXPIRATION_TIMEOUT = 1.5 hours.
+-define(MIN_EXPIRATION_MS, 90 * ?MINUTE_MS).
+%% i2pd NetDb.hpp: NETDB_MIN_ROUTERS = 90.
+-define(MIN_ROUTERS, 90).
 
 %%% --------------------------------------------------------------------------
 %%% The horizon is a store field, not a constant
@@ -296,6 +300,199 @@ horizon_does_not_change_the_serialised_form_test() ->
     ?assertEqual(i2p_netdb:to_binary(Default), i2p_netdb:to_binary(Custom)).
 
 %%% --------------------------------------------------------------------------
+%%% The horizon slides with the store's size
+%%% --------------------------------------------------------------------------
+
+%% **The mapping, at the boundaries.**
+%%
+%% The curve is `Min + (Max - Min) * 90 / Count`, and these are its values at the
+%% sizes that matter: the pivot, i2p-java's aggressive-mode threshold, and this
+%% router's shipped capacity. Asserted as numbers rather than as a formula so that
+%% a change to the interpolation has to be a deliberate edit to a value a reader can
+%% see, rather than a refactor nobody notices.
+%%
+%% Every case here is structural: it asks what horizon the store reports, and
+%% nothing sleeps or waits.
+horizon_slides_from_the_ceiling_to_near_the_floor_test() ->
+    Store = i2p_netdb:new(),
+    ?assertEqual(?MAX_EXPIRATION_MS, i2p_netdb:expiration_ms_at(Store, 0)),
+    ?assertEqual(?MAX_EXPIRATION_MS, i2p_netdb:expiration_ms_at(Store, ?MIN_ROUTERS)),
+    %% Spelled in hours, minutes and seconds rather than as a sum of `?HOUR_MS` and
+    %% `?MINUTE_MS` because the curve is integer division over a 90-router numerator.
+    %% Every value here has an exact answer, and a sum of round macros would be a
+    %% value somebody eventually tries to match with `2 * ?HOUR_MS`. The comments
+    %% carry the exact ms, which is what a reader has to change this to.
+
+    % 12h58m30s
+    ?assertEqual(46_710_000, i2p_netdb:expiration_ms_at(Store, 200)),
+    %  6h05m24s
+    ?assertEqual(21_924_000, i2p_netdb:expiration_ms_at(Store, 500)),
+    %  3h47m42s
+    ?assertEqual(13_662_000, i2p_netdb:expiration_ms_at(Store, 1000)),
+    %  2h38m51s
+    ?assertEqual(9_531_000, i2p_netdb:expiration_ms_at(Store, 2000)),
+    %  2h04m25s
+    ?assertEqual(7_465_500, i2p_netdb:expiration_ms_at(Store, 4000)),
+    %  1h57m32s
+    ?assertEqual(7_052_400, i2p_netdb:expiration_ms_at(Store, 5000)).
+
+%% The shipped default is the ceiling and the floor, and they are i2pd's numbers
+%% rather than this module's. Asserted against the accessors so the case says "the
+%% default is the documented pair" instead of restating it and drifting.
+default_bounds_are_i2pds_own_test() ->
+    ?assertEqual(?MAX_EXPIRATION_MS, i2p_netdb:default_expiration_ms()),
+    ?assertEqual(?MIN_EXPIRATION_MS, i2p_netdb:default_min_expiration_ms()),
+    ?assertEqual(?MIN_ROUTERS, i2p_netdb:min_routers()),
+    Store = i2p_netdb:new(),
+    ?assertEqual(i2p_netdb:default_expiration_ms(), i2p_netdb:max_expiration_ms(Store)),
+    ?assertEqual(i2p_netdb:default_min_expiration_ms(), i2p_netdb:min_expiration_ms(Store)).
+
+%% **A store reports the horizon for its own size, not a fixed field.**
+%%
+%% This is the case the old flat field could not express. A store holding two
+%% routers is at the ceiling; the same store holding 5000 is at about 1h57m. The
+%% count is read from the recency order, so filling a store is what moves it --
+%% there is no separate call and nothing to keep in step.
+store_reports_the_horizon_at_its_current_size_test() ->
+    Now = erlang:system_time(millisecond),
+    Small = stored([router(Now, host(N)) || N <- lists:seq(20, 21)], i2p_netdb:new(5000), Now),
+    ?assertEqual(2, i2p_netdb:count(Small)),
+    ?assertEqual(?MAX_EXPIRATION_MS, i2p_netdb:expiration_ms(Small)),
+    %% The same store's policy, asked about a size it has not reached.
+    ?assertEqual(7_052_400, i2p_netdb:expiration_ms_at(Small, 5000)).
+
+%% Filling a store tightens its horizon, monotonically. A curve that slid the other
+%% way, or one that was not monotonic, would let a store's policy depend on its
+%% history rather than its contents.
+horizon_tightens_as_the_store_fills_test() ->
+    Store = i2p_netdb:new(),
+    Sizes = [1, 50, ?MIN_ROUTERS, ?MIN_ROUTERS + 1, 500, 5000],
+    Horizons = [i2p_netdb:expiration_ms_at(Store, N) || N <- Sizes],
+    Sorted = lists:reverse(lists:sort(Horizons)),
+    ?assertEqual(Horizons, Sorted),
+    %% And it never leaves the bounds it was given.
+    ?assert(
+        lists:all(
+            fun(H) -> H >= ?MIN_EXPIRATION_MS andalso H =< ?MAX_EXPIRATION_MS end,
+            Horizons
+        )
+    ).
+
+%% A store with a flat horizon does not slide. `set_expiration_ms/2` sets both
+%% bounds to one value, so an operator who wants one number for their router gets
+%% one number at every size rather than a range they have to keep equal.
+flat_horizon_is_the_same_at_every_size_test() ->
+    Flat = i2p_netdb:set_expiration_ms(i2p_netdb:new(), 6 * ?HOUR_MS),
+    ?assertEqual(6 * ?HOUR_MS, i2p_netdb:expiration_ms_at(Flat, 0)),
+    ?assertEqual(6 * ?HOUR_MS, i2p_netdb:expiration_ms_at(Flat, 100)),
+    ?assertEqual(6 * ?HOUR_MS, i2p_netdb:expiration_ms_at(Flat, 5000)),
+    ?assertEqual(6 * ?HOUR_MS, i2p_netdb:min_expiration_ms(Flat)),
+    ?assertEqual(6 * ?HOUR_MS, i2p_netdb:max_expiration_ms(Flat)),
+    %% And `new/2` means the same thing, since a flat policy is a real one.
+    ?assertEqual(
+        6 * ?HOUR_MS,
+        i2p_netdb:expiration_ms_at(
+            i2p_netdb:new(10, 6 * ?HOUR_MS),
+            5000
+        )
+    ).
+
+%% The bounds are settings, so they are settable per store, and setting them
+%% changes the policy and nothing else -- same rule as `set_expiration_ms/2`.
+set_expiration_range_changes_policy_and_nothing_else_test() ->
+    Now = erlang:system_time(millisecond),
+    Store1 = stored([router(Now, host(30)), router(Now, host(31))], i2p_netdb:new(10), Now),
+    Store2 = i2p_netdb:set_expiration_range(Store1, ?HOUR_MS, 12 * ?HOUR_MS),
+    ?assertEqual(?HOUR_MS, i2p_netdb:min_expiration_ms(Store2)),
+    ?assertEqual(12 * ?HOUR_MS, i2p_netdb:max_expiration_ms(Store2)),
+    ?assertEqual(12 * ?HOUR_MS, i2p_netdb:expiration_ms(Store2)),
+    ?assertEqual(i2p_netdb:count(Store1), i2p_netdb:count(Store2)),
+    ?assertEqual(i2p_netdb:keys(Store1), i2p_netdb:keys(Store2)),
+    ?assertEqual(i2p_netdb:capacity(Store1), i2p_netdb:capacity(Store2)),
+    ?assertEqual(i2p_netdb:generation(Store1), i2p_netdb:generation(Store2)),
+    ok = i2p_netdb:self_check(Store2).
+
+%% A floor above the ceiling is refused rather than tolerated. The interpolation
+%% would return a horizon *above* the ceiling for every store large enough to be
+%% interpolated at all, so the store's most permissive setting would be the one
+%% neither bound names -- a configuration error that reads as working.
+inverted_expiration_range_is_rejected_test() ->
+    Store = i2p_netdb:new(10),
+    ?assertError(badarg, i2p_netdb:set_expiration_range(Store, 12 * ?HOUR_MS, ?HOUR_MS)),
+    ?assertError(badarg, i2p_netdb:set_expiration_range(Store, 0, ?HOUR_MS)),
+    ?assertError(badarg, i2p_netdb:set_expiration_range(Store, ?HOUR_MS, 0)),
+    ?assertError(badarg, i2p_netdb:set_expiration_range(Store, ?HOUR_MS, infinity)),
+    ?assertError(badarg, i2p_netdb:new(10, ?HOUR_MS, 12 * ?HOUR_MS)),
+    ?assertError(badarg, i2p_netdb:new(10, 0, ?HOUR_MS)),
+    ?assertError(badarg, i2p_netdb:new(10, ?HOUR_MS, -1)),
+    %% Equal bounds are the flat case, not the invalid one.
+    ?assertEqual(
+        ?HOUR_MS,
+        i2p_netdb:max_expiration_ms(
+            i2p_netdb:set_expiration_range(Store, ?HOUR_MS, ?HOUR_MS)
+        )
+    ).
+
+%% A count that is not a positive integer is a programming error in a caller, and
+%% raises. A caller asking "what would the horizon be for an empty or negative
+%% store" has a bug upstream, and answering it with the ceiling would hide it.
+invalid_expiration_count_is_rejected_test() ->
+    Store = i2p_netdb:new(10),
+    ?assertError(badarg, i2p_netdb:expiration_ms_at(Store, -1)),
+    ?assertError(badarg, i2p_netdb:expiration_ms_at(Store, infinity)),
+    ?assertError(badarg, i2p_netdb:expiration_ms_at(Store, big)),
+    ?assertError(badarg, i2p_netdb:expiration_ms_at(Store, undefined)).
+
+%% **Both callers read the sliding function, not a field.**
+%%
+%% This is the case a flat horizon could not distinguish. A store holding 200
+%% routers runs at about 13 hours and a store holding 5000 at about 2, so if the
+%% sweep read a field while the admission check read the curve, one of them would
+%% be comparing against 27 hours and the store would either admit everything or
+%% sweep everything. Here the same store is given the same RouterInfo at two
+%% different sizes and the admission check tracks the curve at both.
+admission_agrees_with_the_curve_at_two_sizes_test() ->
+    Now = erlang:system_time(millisecond),
+    %% Eight hours old: older than the horizon at 5000 routers, comfortably inside
+    %% it at 200.
+    RI = router(Now - 8 * ?HOUR_MS, host(40)),
+
+    Small = i2p_netdb:new(5000),
+    Small1 = fill_to(Small, 200, Now),
+    ?assertEqual(200, i2p_netdb:count(Small1)),
+    {Small2, added} = i2p_netdb:store(Small1, RI, Now),
+    ?assertEqual(added, added),
+    ?assertEqual(201, i2p_netdb:count(Small2)),
+
+    Full = i2p_netdb:new(5000),
+    Full1 = fill_to(Full, 5000, Now),
+    ?assertEqual(5000, i2p_netdb:count(Full1)),
+    {Full2, too_old} = i2p_netdb:store(Full1, RI, Now),
+    ?assertEqual(5000, i2p_netdb:count(Full2)).
+
+%% The sweep follows the curve too, at two sizes, with one horizon read for the
+%% whole walk. The walk does not change the size, so the value hoisted out of the
+%% fold is the value every comparison would have computed.
+sweep_agrees_with_the_curve_at_two_sizes_test() ->
+    Now = erlang:system_time(millisecond),
+    Aged = router(Now - 8 * ?HOUR_MS, host(41)),
+
+    %% Seeded past the window, because `store/3` would refuse it at 5000 routers.
+    Tight = seed(i2p_netdb:new(5000), Aged, Now - 8 * ?HOUR_MS),
+    Tight1 = fill_to(Tight, 5000, Now),
+    ?assertEqual(5000, i2p_netdb:count(Tight1)),
+    {Tight2, {1, 0}} = i2p_netdb:remove_expired(Tight1, Now, erlang:system_time(second)),
+    ?assertEqual(4999, i2p_netdb:count(Tight2)),
+
+    Loose = seed(i2p_netdb:new(5000), Aged, Now - 8 * ?HOUR_MS),
+    Loose1 = fill_to(Loose, 200, Now),
+    %% `fill_to/3` counts from zero, so 200 total: the seeded 8-hour-old RouterInfo
+    %% plus 199 fresh ones.
+    ?assertEqual(200, i2p_netdb:count(Loose1)),
+    {Loose2, {0, 0}} = i2p_netdb:remove_expired(Loose1, Now, erlang:system_time(second)),
+    ?assertEqual(200, i2p_netdb:count(Loose2)).
+
+%%% --------------------------------------------------------------------------
 %%% Fixtures
 %%% --------------------------------------------------------------------------
 
@@ -329,3 +526,25 @@ seed(Store, RI, StoreAt) ->
     {S, added} = i2p_netdb:store(Store, RI, StoreAt),
     ?assertEqual(added, added),
     S.
+
+%% Grow a store to at least `N` routers, so a case can ask what the *curve* reports
+%% at a size no test would otherwise build.
+%%
+%% `Host` is the next host in the 192.0.2.0/24 test range to hand out. It is a
+%% counter rather than a fixed set so two calls cannot collide: a filler that hit a
+%% host the store already holds would be an equal-timestamp update, change no
+%% count, and leave the case asserting a size it never reached.
+%%
+%% `N` is a floor rather than an exact target, so the caller does not have to know
+%% how many entries the case seeded before asking to be filled.
+fill_to(Store0, N, Now) ->
+    fill_to(Store0, N, Now, 0).
+
+fill_to(Store0, N, Now, NextHost) ->
+    case i2p_netdb:count(Store0) >= N of
+        true ->
+            Store0;
+        false ->
+            {Store1, _} = i2p_netdb:store(Store0, router(Now, host(NextHost)), Now),
+            fill_to(Store1, N, Now, NextHost + 1)
+    end.

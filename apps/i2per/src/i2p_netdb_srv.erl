@@ -446,7 +446,7 @@ init([]) ->
     %% restores capacity from the file but leaves the horizon at its default, and a
     %% load that seeded under the wrong policy would admit or discard entries by a
     %% rule the operator did not ask for.
-    Store0 = i2p_netdb:set_expiration_ms(i2p_netdb:new(), expiration_ms()),
+    Store0 = set_expiration_policy(i2p_netdb:new()),
     %% Published before the load, so a reader that arrives while a large netdb
     %% file is being read sees a table that is already safe to ask. The load
     %% inserts into this same table.
@@ -473,11 +473,16 @@ maybe_load(Store, Counters) ->
                             %% `from_binary/1` restores capacity from the file but
                             %% leaves the horizon at its default, so the loaded store
                             %% inherits the running policy rather than the default.
-                            %% `Store` already carries it; taking it from there rather
-                            %% than calling `expiration_ms/0` twice keeps the two paths
-                            %% (a load and no load) agreeing by construction.
-                            Loaded = i2p_netdb:set_expiration_ms(
-                                Loaded0, i2p_netdb:expiration_ms(Store)
+                            %% `Store` already carries it; taking the two *bounds* from
+                            %% there rather than calling the readers twice keeps the two
+                            %% paths (a load and no load) agreeing by construction —
+                            %% and the bounds, not `expiration_ms/1`, because the
+                            %% horizon in force at load time is a function of a count
+                            %% the loaded store has not got yet.
+                            Loaded = i2p_netdb:set_expiration_range(
+                                Loaded0,
+                                i2p_netdb:min_expiration_ms(Store),
+                                i2p_netdb:max_expiration_ms(Store)
                             ),
                             C2 = Counters#{loads := maps:get(loads, Counters) + 1},
                             {{Loaded, C2}, ok};
@@ -533,20 +538,69 @@ autosave_interval() ->
 expiry_interval() ->
     configured_interval(netdb_expiry_ms, ?DEFAULT_EXPIRY_MS).
 
-%% How old a RouterInfo may be before this router discards it.
+%% How old a RouterInfo may be before this router discards it, at both ends of the
+%% range the store slides between.
 %%
 %% **How often the sweep runs and how stale an entry may get are separate knobs.**
-%% They were not separate until now: the horizon was a compile-time constant inside
-%% `m:i2p_netdb` and the interval was the only thing an operator could reach.
+%% They were not separate until `#RA5PVR1`: the horizon was a compile-time constant
+%% inside `m:i2p_netdb` and the interval was the only thing an operator could reach.
 %%
-%% Set this lower and the store drops stale RouterInfos sooner, which is the knob
-%% i2pd reaches for by shrinking its own horizon as the store fills. The shipped
-%% default is i2pd's 27 hours, which is its *maximum* -- a large i2pd shortens it
-%% rather than keeping it, so the default is the most permissive point in the range
-%% rather than a considered choice. See `#RA5PVR1`.
--spec expiration_ms() -> pos_integer().
-expiration_ms() ->
+%% **Both ends are configurable, and neither is the policy.** The horizon in force is
+%% `m:i2p_netdb:expiration_ms/1`, i2pd's curve between these two, so an operator who
+%% sets the ceiling alone moves the *small-store* horizon and leaves a full store
+%% almost where it was: at 5000 routers a 12-hour ceiling lands within four minutes
+%% of the shipped 27-hour one. The two are separate settings because the useful one
+%% depends on the store -- raising the ceiling buys a router that has just booted and
+%% holds ninety routers, lowering the floor is what a router at capacity wants, and
+%% an operator who set only the one that suited neither gets a store that looks
+%% configured and has not moved.
+%%
+%% The shipped defaults are i2pd's 27 hours and 90 minutes, its own two ends. See
+%% `#RA5PVR1`.
+-spec expiration_max_ms() -> pos_integer().
+expiration_max_ms() ->
     configured_interval(netdb_expiration_ms, i2p_netdb:default_expiration_ms()).
+
+%% The floor, or `undefined` when the operator has not set one.
+%%
+%% **Not the default.** The distinction is the whole of the key's meaning: a store
+%% with no floor set runs flat at the ceiling, which is what an operator who sets
+%% only `netdb_expiration_ms` means and what that key meant before the horizon slid
+%% (see `#RA5PVR1`). Defaulting the floor to i2pd's 90 minutes instead would make
+%% that operator's setting mean something they did not ask for -- a 1-minute ceiling
+%% is a legitimate instruction to expire aggressively at every size, and reading it
+%% as a *ceiling* would leave a small store on the shipped 27-hour default.
+-spec expiration_min_ms() -> pos_integer() | undefined.
+expiration_min_ms() ->
+    configured_interval(netdb_expiration_min_ms, undefined).
+
+%% Apply the configured horizon to a store.
+%%
+%% Three shapes, in the order they are decided:
+%%
+%% 1. **Neither key set** -- i2pd's shipped curve, from its two documented ends.
+%% 2. **Ceiling only** -- a flat horizon at that value. Preserves what the key meant
+%%    before the policy slid, and is the shape an operator gets for setting one
+%%    number.
+%% 3. **Both set** -- the curve between them. The only way to slide, and so the only
+%%    way to reach the floor at capacity.
+%%
+%% **The bounds are ordered before they are applied, not after.** A floor above the
+%% ceiling is a configuration the operator can express and the store cannot use --
+%% `m:i2p_netdb:set_expiration_range/3` refuses it, and refusing to start over a
+%% horizon would turn a recoverable typo into a router that will not boot, the same
+%% reasoning `configured_interval/2` applies to a non-integer value. Swapping them
+%% keeps the router running at an interval between the two numbers they gave.
+set_expiration_policy(Store) ->
+    case {expiration_min_ms(), expiration_max_ms()} of
+        {undefined, Max} ->
+            i2p_netdb:set_expiration_ms(Store, Max);
+        {Min, Max} ->
+            case Min =< Max of
+                true -> i2p_netdb:set_expiration_range(Store, Min, Max);
+                false -> i2p_netdb:set_expiration_range(Store, Max, Min)
+            end
+    end.
 
 %% Read an operator setting, falling back to `Default`.
 %%
@@ -702,10 +756,18 @@ handle_call(stats, _From, {Store, Counters}) ->
         %% An operator who set `netdb_expiration_ms` has no other way to see that it
         %% took effect, and a value that silently failed to apply would look
         %% identical to one that did from the outside. Read from the store rather
-        %% than from `expiration_ms/0` for the reason `maybe_load/2` does: the
-        %% running store is the thing that was configured, so the report cannot
+        %% than from the readers in this module for the reason `maybe_load/2` does:
+        %% the running store is the thing that was configured, so the report cannot
         %% disagree with the behaviour.
-        expiration_ms => i2p_netdb:expiration_ms(Store)
+        %%
+        %% **All three, because no one of them answers the question alone.** The
+        %% horizon is a function of the router count, so `expiration_ms` on its own
+        %% drifts downward as a store fills and an operator watching it would see a
+        %% number they never configured. The two bounds are the settings; the third
+        %% is what they currently add up to.
+        expiration_ms => i2p_netdb:expiration_ms(Store),
+        expiration_min_ms => i2p_netdb:min_expiration_ms(Store),
+        expiration_max_ms => i2p_netdb:max_expiration_ms(Store)
     },
     {reply, Reply, {Store, Counters}}.
 
