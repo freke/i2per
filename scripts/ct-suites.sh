@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
 # Print the CT suites in one tier, comma-separated, for `rebar3 ct --suite=`.
 #
-#   fast   the PR tier: the few suites that catch what eunit cannot
+#   smoke   every push: as much of the router as fits a five-minute CI budget.
+#           Deliberately a *partition of the tree*, not a hand-picked list, so a
+#           new suite is in tomorrow's smoke run by default.
 #   rest   every suite except the slow ones. Main only.
-#   slow   the slow ones, alone. Main only.
-#   all    every suite, no partition. Main only.
+#   slow   the slow ones, alone. For working on them, not for CI.
+#   all    every suite, no partition, no time limit. Main only.
 #
 # One script rather than a list in the justfile *and* a list in the workflow,
 # because the two would drift and a drifting partition is a gate that quietly
 # stops running something.
 #
-# **Derived from the tree, not enumerated.** `rest` and `all` are whatever is in
-# a `test/` directory now, so a suite added tomorrow is in tomorrow's `rest`
-# without anyone editing this file. Only `fast` and `slow` are explicit lists,
-# because choosing what runs on every PR is a decision and should be reviewable.
+# **Derived from the tree, not enumerated.** `smoke`, `rest` and `all` are
+# whatever is in a `test/` directory now, so a suite added tomorrow is in
+# tomorrow's `smoke` without anyone editing this file. Only `slow` is an explicit
+# list, because naming what is *too slow for every push* is a decision that
+# should be reviewable.
 
 # %%%%% Nothing here may need i2pd %%%%%
 #
@@ -35,40 +38,42 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# The PR tier. Each suite earns its place by covering something eunit
-# structurally cannot: the real supervision tree, configuration, the 0.2.0 read
-# contract, the tunnel path end to end, and NTCP2 *or* SSU2, so a change breaking
-# either transport cannot pass a PR.
+# %%%%% The push tier: `smoke` %%%%%
 #
-# **What this tier does not run, so it is not mistaken for the gate.** No SAM, so
-# the client-facing path is unchecked on a PR. No streaming, addressbook, reseed,
-# netdb-srv, or peer-lifecycle suites. And not `i2p_ssu2_e2e_SUITE`. A PR that
-# breaks one of those merges green and turns main red -- which is what a
-# one-minute signal costs. Chosen deliberately, not arrived at by accident: the
-# alternative was a ten-minute PR signal, which is the same gate arriving later.
+# **Every suite except `slow`.** The reasoning is the opposite of a hand-picked
+# list: a named list has to be edited every time a suite is added, and the edit
+# is the moment someone decides the new suite does not matter yet. Deriving the
+# tier from the tree inverts that -- a new suite is *in* the smoke run unless
+# someone deliberately puts it in `slow`.
 #
-# **`i2p_ssu2_handshake_SUITE` is in both `fast` and `slow`, deliberately.** It is
-# the cheap SSU2 check -- the handshake, without the 22,000-datagram receive-window
-# case -- so it is exactly what a PR needs and exactly what must not cost a PR its
-# ten minutes. Since `fast` runs only on pull requests and `slow` only on `main`,
-# no run ever executes it twice. `fast` is therefore a subset of `all`, but *not* of
-# `rest`, and anything checking the partition should check that rather than assume
-# a tier nesting.
-read -r -d '' FAST <<'EOF' || true
-apps/i2per/test/i2p_boot
-apps/i2per/test/i2p_config_srv
-apps/i2per/test/i2p_ntcp2_conn
-apps/i2per/test/i2p_read_api
-apps/i2per/test/i2p_ssu2_handshake
-apps/i2per/test/i2p_tunnel_srv
-EOF
+# What that buys is coverage of the whole router: boot, both transports, the
+# tunnel path, SAM, streaming, the address book, reseed, the NetDb server and the
+# peer lifecycle all run on every push. Measured **~44s** of CT time here, which
+# is ~110s on a runner against the 5-minute budget -- see the note in
+# `.github/workflows/gate.yml` for the arithmetic and the margin.
+#
+# **What it does not run, stated rather than implied.** The two `slow` suites:
+# `i2p_peer_transport_SUITE` (protocol-mandated connect timeouts and backoff) and
+# `i2p_ssu2_e2e_SUITE` (22,000 real encrypted datagrams through a live session
+# pair). Together they are 50s here and ~125s on a runner -- more than the whole
+# budget, for two suites whose failures are about waiting rather than about
+# behaviour. A push that breaks one of them goes green here and red on `main`.
+# That is the price of a five-minute signal, and it is paid deliberately.
 
 # `i2p_ssu2_e2e_SUITE`'s receive-window case drives 22,000 real encrypted
-# datagrams through a live session pair. Measured **8m18s** on a runner, alone --
-# more than every other CT suite put together. Main only.
+# datagrams through a live session pair. `i2p_peer_transport_SUITE` is a cluster
+# of connection-timeout and backoff cases: protocol-mandated waits, several of
+# them over ten seconds each.
+#
+# **This is the only explicit list in the file**, and it is explicit because
+# "too slow to run on every push" is a judgement about wall-clock budget rather
+# than about what the code is, and a judgement like that belongs somewhere a
+# reader can argue with. `assert_present` below fails if a name here is not in
+# the tree, so a suite renamed or deleted cannot leave this quietly naming
+# nothing.
 read -r -d '' SLOW <<'EOF' || true
 apps/i2per/test/i2p_ssu2_e2e
-apps/i2per/test/i2p_ssu2_handshake
+apps/i2per/test/i2p_peer_transport
 EOF
 
 # Canonical form `find` yields -- `_SUITE.erl` already stripped -- so the lists
@@ -111,35 +116,38 @@ assert_present() {
 
 tree=$(suites)
 
+# Everything that is not slow. The one derived partition, so `smoke`, `rest` and
+# any future name for it cannot disagree.
+not_slow() {
+    printf '%s\n' "$tree" | grep -vxF "$SLOW" || true
+}
+
+assert_slow_present() {
+    local suite
+    while IFS= read -r suite; do
+        assert_present "$tree" "$suite"
+    done <<<"$SLOW"
+}
+
 case "${1:-all}" in
-    fast)
-        while IFS= read -r suite; do
-            assert_present "$tree" "$suite"
-        done <<<"$FAST"
-        emit $FAST
-        ;;
-    slow)
-        while IFS= read -r suite; do
-            assert_present "$tree" "$suite"
-        done <<<"$SLOW"
-        emit $SLOW
-        ;;
-    rest)
-        while IFS= read -r suite; do
-            assert_present "$tree" "$suite"
-        done <<<"$SLOW"
-        rest=$(printf '%s\n' "$tree" | grep -vxF "$SLOW" || true)
-        if [ -z "$rest" ]; then
-            echo "ct-suites.sh: 'rest' is empty -- is the whole tree the slow tier?" >&2
+    smoke|rest)
+        assert_slow_present
+        body=$(not_slow)
+        if [ -z "$body" ]; then
+            echo "ct-suites.sh: '$1' is empty -- is the whole tree the slow tier?" >&2
             exit 1
         fi
-        emit $rest
+        emit $body
+        ;;
+    slow)
+        assert_slow_present
+        emit $SLOW
         ;;
     all)
         emit $tree
         ;;
     *)
-        echo "usage: ct-suites.sh [fast|rest|slow|all]" >&2
+        echo "usage: ct-suites.sh [smoke|rest|slow|all]" >&2
         exit 2
         ;;
 esac
