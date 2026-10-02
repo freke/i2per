@@ -10,7 +10,10 @@
 %% Pipeline
 %% --------------------------------------------------------------------------
 
-fetch_and_process_test() ->
+fetch_and_process_test_() ->
+    {timeout, 60, fun fetch_and_process/0}.
+
+fetch_and_process() ->
     Ris = [router_info(4700), router_info(4701)],
     Port = serve_su3(sign(Ris)),
     {ok, Body} = i2p_reseed:fetch(url(Port)),
@@ -34,7 +37,10 @@ fetch_and_process_test() ->
 %% the live server first and only then releasing a dead port removes it at the root:
 %% a port held by a live listener cannot be allocated again, so the two are
 %% guaranteed distinct.
-run_falls_back_to_next_host_test() ->
+run_falls_back_to_next_host_test_() ->
+    {timeout, 60, fun run_falls_back_to_next_host/0}.
+
+run_falls_back_to_next_host() ->
     Ris = [router_info(4702)],
     LivePort = serve_su3(sign(Ris)),
     DeadPort = dead_port(),
@@ -49,18 +55,27 @@ all_hosts_dead_test() ->
 %% Rejections
 %% --------------------------------------------------------------------------
 
-unknown_signer_rejected_test() ->
+unknown_signer_rejected_test_() ->
+    {timeout, 60, fun unknown_signer_rejected/0}.
+
+unknown_signer_rejected() ->
     Su3 = sign([router_info(4703)]),
     ?assertEqual(
         {error, {unknown_signer, <<"test-signer">>}},
         i2p_reseed:process(Su3, #{})
     ).
 
-tampered_file_rejected_test() ->
+tampered_file_rejected_test_() ->
+    {timeout, 60, fun tampered_file_rejected/0}.
+
+tampered_file_rejected() ->
     Su3 = flip_last_byte(sign([router_info(4704)])),
     ?assertEqual({error, bad_signature}, i2p_reseed:process(Su3, trust())).
 
-signer_cert_expired_rejected_test() ->
+signer_cert_expired_rejected_test_() ->
+    {timeout, 60, fun signer_cert_expired_rejected/0}.
+
+signer_cert_expired_rejected() ->
     {_Priv, _Cert} = keypair(),
     %% A trust anchor whose validity window closed in 2021 is refused before
     %% any signature work happens.
@@ -74,13 +89,19 @@ signer_cert_expired_rejected_test() ->
         i2p_reseed:process(Su3, #{<<"test-signer">> => Expired})
     ).
 
-not_a_reseed_file_rejected_test() ->
+not_a_reseed_file_rejected_test_() ->
+    {timeout, 60, fun not_a_reseed_file_rejected/0}.
+
+not_a_reseed_file_rejected() ->
     %% Same signer and key as the happy path, but the container declares
     %% content type 1 (router update) instead of 3 (reseed).
     Bin = su3_with_content_type(1),
     ?assertEqual({error, not_a_reseed_file}, i2p_reseed:process(Bin, trust())).
 
-bundled_trust_store_loads_test() ->
+bundled_trust_store_loads_test_() ->
+    {timeout, 60, fun bundled_trust_store_loads/0}.
+
+bundled_trust_store_loads() ->
     %% The committed reseed anchors parse as RSA certificates. No time
     %% assertion here — expiry is enforced against live files at runtime.
     Store = i2p_reseed:load_trust_store(),
@@ -93,7 +114,10 @@ bundled_trust_store_loads_test() ->
         Store
     ).
 
-real_live_su3_bundle_test() ->
+real_live_su3_bundle_test_() ->
+    {timeout, 60, fun real_live_su3_bundle/0}.
+
+real_live_su3_bundle() ->
     %% Captured from the current live reseed service. This is the public
     %% process/2 seam: the complete fetch, trust lookup, signature check,
     %% archive decode, and RouterInfo decode path must work against real data.

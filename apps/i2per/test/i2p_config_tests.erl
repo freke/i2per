@@ -200,8 +200,26 @@ addressbook_section_is_app_env_only_test() ->
 
 %% %%%%% %%% Loader integration %%%%% %%%
 
+%% Temp files live in a directory this module creates, under the system temp
+%% dir. The path used to be hardcoded to `/tmp/opencode/...`, which exists on a
+%% developer's machine and not on a CI runner: `file:write_file/2` raised
+%% `enoent` there and took eight cases with it.
+%%
+%% **The path was the smaller half of the defect.** Three of these cases call
+%% `application:set_env/3` *before* their `try`, so when the write raised, the
+%% `after` that unsets those keys never ran. A leaked `net_id` then broke the
+%% two `in_force_*` cases, which have nothing to do with the loader and report
+%% an exact key set. Ten red marks, one missing directory.
+tmp_dir() ->
+    Dir = filename:join("/tmp", "i2per_config_tests"),
+    ok = filelib:ensure_dir(filename:join(Dir, "x")),
+    Dir.
+
 tmp_conf(Lines) ->
-    Path = "/tmp/opencode/i2per_conf_" ++ integer_to_list(erlang:unique_integer([positive])),
+    Path = filename:join(
+        tmp_dir(),
+        "conf_" ++ integer_to_list(erlang:unique_integer([positive]))
+    ),
     ok = file:write_file(Path, Lines),
     Path.
 
@@ -217,9 +235,14 @@ loader_applies_envs_test() ->
     end.
 
 preset_env_wins_over_file_test() ->
-    application:set_env(i2per, net_id, 42),
     Path = tmp_conf(<<"net_id = 7\n">>),
+    %% **Inside the `try`, deliberately.** Setting this key outside it meant a
+    %% failure in `tmp_conf/1` skipped the `after` below, leaked `net_id` into the
+    %% application env for the rest of the run, and broke the two `in_force_*`
+    %% cases with an unrelated key-set mismatch. The `after` is only a cleanup
+    %% guarantee for code that runs after it is installed.
     try
+        application:set_env(i2per, net_id, 42),
         ?assertEqual(ok, i2p_config:load(Path)),
         ?assertEqual({ok, 42}, application:get_env(i2per, net_id))
     after
@@ -237,9 +260,9 @@ bad_file_aborts_load_test() ->
 
 pre_section_typo_aborts_boot_config_test() ->
     Path = tmp_conf(<<"prot = typo\n[eepsite]\ntype = server\nport = 8081\n">>),
-    application:set_env(i2per, config_file, missing_conf_path()),
-    application:set_env(i2per, tunnels_conf_file, Path),
     try
+        application:set_env(i2per, config_file, missing_conf_path()),
+        application:set_env(i2per, tunnels_conf_file, Path),
         ?assertEqual(
             {error, {unknown_key, <<"prot">>}},
             i2p_config:load_default()
@@ -271,13 +294,16 @@ load_default_missing_file_ok_test() ->
     end.
 
 missing_conf_path() ->
-    "/tmp/opencode/absent_" ++ integer_to_list(erlang:unique_integer([positive])) ++ ".conf".
+    filename:join(
+        tmp_dir(),
+        "absent_" ++ integer_to_list(erlang:unique_integer([positive])) ++ ".conf"
+    ).
 
 load_default_explicit_path_test() ->
     Path = tmp_conf(<<"transit_max_tunnels = 1234\n">>),
-    application:set_env(i2per, config_file, Path),
-    application:unset_env(i2per, transit_max_tunnels),
     try
+        application:set_env(i2per, config_file, Path),
+        application:unset_env(i2per, transit_max_tunnels),
         ?assertEqual(ok, i2p_config:load_default()),
         ?assertEqual({ok, 1234}, application:get_env(i2per, transit_max_tunnels))
     after

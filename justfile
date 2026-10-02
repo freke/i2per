@@ -14,6 +14,34 @@ test: eunit ct
 eunit:
     rebar3 as test eunit --cover
 
+# %%%%% The PR tier %%%%%
+#
+# What a pull request runs. **Measured 2026-10-02 at ~55s** -- eunit 13s plus
+# 41s for 100 CT cases -- against ~221s for `just check`.
+#
+# The gate stops at its first failure, so a *red* run already reports in seconds.
+# This recipe is for the other case: a green run you would otherwise wait ten
+# minutes to learn about.
+#
+# **Lint is in it, `doc` is not.** Formatting costs ~1s and is a thing a PR gets
+# wrong; the ExDoc build is a few seconds of work nobody is waiting on, and `main`
+# builds it.
+#
+# **This is not the gate, and it is not named as if it were.** 6 of 25 CT suites,
+# so a PR touching SAM, streaming, addressbook, reseed, netdb-srv or a
+# peer-lifecycle suite can go green and break `main`. That is the price of a
+# one-minute signal, paid deliberately rather than by accident; `main` runs
+# everything. Why these six, and exactly what is given up, is argued in
+# `scripts/ct-suites.sh` next to the list itself.
+#
+# No `--cover`: this is for turnaround, and the aggregate report is
+# `just coverage`'s business. `--sname` for the same reason as `ct` below.
+#
+# The PR tier: all 940 eunit cases plus 100 CT ones, in about 55s
+check-fast: lint
+    rebar3 as test eunit
+    rebar3 ct --sname i2per_ct --suite="$(bash scripts/ct-suites.sh fast)"
+
 # Run the full suite (eunit + ct) with coverage and render the merged report
 coverage:
     rebar3 as test do eunit --cover, ct --cover --sname i2per_ct
@@ -24,6 +52,26 @@ coverage:
 # --cover so `just check` still produces the ct.coverdata half of the aggregate)
 ct:
     rebar3 ct --cover --sname i2per_ct
+
+# %%%%% The slow tier %%%%%
+#
+# `i2p_ssu2_e2e_SUITE`'s receive-window case drives 22,000 real encrypted
+# datagrams through a live session pair: 15s here, and the suite measured
+# **5m52s** alone on a GitHub runner -- about 14x slower than the rest of CT,
+# which is only ~2.5x slower. Nine testcases out of 223 were taking six of the
+# gate's 8m21s of CT, in *both* jobs, so one suite was setting the critical path
+# for the whole pipeline.
+#
+# It is here so it can be run *alone* when it is the thing being worked on. CI
+# does not: `main` runs all 223 and a pull request runs the six above.
+#
+# **No `--cover`.** Coverdata is per-`rebar3 ct`-process and this is a
+# single-suite run for development, not an aggregate. Measured at 2s of 43s --
+# worth dropping, not worth a report nobody reads.
+
+# The slow suites alone. For working on the receive window, not for CI.
+ct-slow:
+    rebar3 ct --sname i2per_ct --suite="$(bash scripts/ct-suites.sh slow)"
 
 # Run one CT suite
 ct-suite name:

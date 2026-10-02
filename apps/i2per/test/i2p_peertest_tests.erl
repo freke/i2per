@@ -47,7 +47,10 @@ ipv6_address_size_test() ->
     ?assertEqual(16 + 32 + 1 + 4 + 4 + 1 + 2 + 16, byte_size(Data)),
     ?assertEqual(Ip6, binary:part(Data, byte_size(Data) - 16, 16)).
 
-sign_verify_ok_test() ->
+sign_verify_ok_test_() ->
+    {timeout, 60, fun sign_verify_ok/0}.
+
+sign_verify_ok() ->
     {SignPub, SignSeed} = keys(),
     Bob = bob_hash(),
     Charlie = charlie_hash(),
@@ -59,7 +62,10 @@ sign_verify_ok_test() ->
         i2p_peertest:verify(Bob, Charlie, 2, 16#12345678, 1234, Port, Ip, Sig, SignPub)
     ).
 
-sign_verify_tamper_fails_test() ->
+sign_verify_tamper_fails_test_() ->
+    {timeout, 60, fun sign_verify_tamper_fails/0}.
+
+sign_verify_tamper_fails() ->
     {SignPub, SignSeed} = keys(),
     Bob = bob_hash(),
     Ip = <<10, 0, 0, 1>>,
@@ -78,7 +84,10 @@ sign_verify_tamper_fails_test() ->
         i2p_peertest:verify(Other, undefined, 2, 7, 1, 40000, Ip, Sig, SignPub)
     ).
 
-wrong_signer_fails_test() ->
+wrong_signer_fails_test_() ->
+    {timeout, 60, fun wrong_signer_fails/0}.
+
+wrong_signer_fails() ->
     {SignPub, SignSeed} = keys(),
     {_OtherPub, _} = keys(),
     Bob = bob_hash(),
