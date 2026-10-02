@@ -20,11 +20,28 @@ table `i2p_ssu2_relay_tags` maps a handed-out 32-bit relay tag to the session
 pid that holds it (plus its expiry); rows are written by the listener's
 `f:i2p_ssu2_listener:register_relay_tag/4` cast at the introducer's request
 and removed when the session dies.
+
+## The cap, and what admits a session
+
+`max_ssu2_sessions` is enforced by `m:i2p_admission`, one instance of which is
+a child of this supervisor. The limit is a count-then-start and the two halves
+have to be atomic together, because inbound accepts and outbound handshakes
+complete together in exactly the moments the cap exists for.
+
+It is not a `m:global` lock, and the reason `m:i2p_admission` gives is the
+important one: `global:trans/2` is a shared lock rather than a mutex, so every
+concurrent handshake ran the count-then-start anyway. `m:i2p_admission` is local,
+holds no state, and reads its count from this supervisor — so the count cannot
+disagree with what is alive.
 """.
 
 -behaviour(supervisor).
 
 -define(DEFAULT_MAX_SESSIONS, 32).
+
+%% The admission process `f:start_session/1` goes through. Named so the resource
+%% it guards is in the supervision tree and answerable to a `whereis/1`.
+-define(ADMISSION, i2p_ssu2_admission).
 
 -export([
     start_link/0,
@@ -35,7 +52,6 @@ and removed when the session dies.
     start_charlie/1,
     session_count/0,
     session_limit/0,
-    session_limit_reached/0,
     init/1
 ]).
 
@@ -100,23 +116,15 @@ session_child(Args) ->
 -doc """
 Admit and start one SSU2 session under the configured active-session limit.
 
-The admission check and `supervisor:start_child/2` are serialized with a node
-lock so simultaneous inbound/outbound handshakes cannot exceed the limit.
-Output is the normal `supervisor:start_child/2` result, or
+The count and the `m:supervisor:start_child/2` that follows it are one operation
+in `m:i2p_admission`, so simultaneous inbound/outbound handshakes cannot exceed
+the limit. Output is the normal `supervisor:start_child/2` result, or
 `{error, session_limit}`.
 """.
 -spec start_session(supervisor:child_spec()) ->
     {ok, pid()} | {ok, pid(), term()} | {error, term()}.
 start_session(ChildSpec) ->
-    global:trans(
-        {?MODULE, session_admission},
-        fun() ->
-            case session_limit_reached() of
-                true -> {error, session_limit};
-                false -> supervisor:start_child(?MODULE, ChildSpec)
-            end
-        end
-    ).
+    i2p_admission:admit(?ADMISSION, ChildSpec).
 
 -doc """
 A `temporary` worker child spec for one out-of-session Charlie responder
@@ -182,16 +190,25 @@ session_limit() ->
         _ -> ?DEFAULT_MAX_SESSIONS
     end.
 
--doc "Whether a new SSU2 session would exceed the configured limit.".
--spec session_limit_reached() -> boolean().
-session_limit_reached() ->
-    session_count() >= session_limit().
+%% `count` and `limit` are read per admission, not captured at boot, so an
+%% operator who changes `max_ssu2_sessions` changes it for the next handshake --
+%% and a zero, the emergency fail-closed switch, works without a restart.
+admission_child() ->
+    i2p_admission:child_spec(#{
+        name => ?ADMISSION,
+        supervisor => ?MODULE,
+        count => fun session_count/0,
+        limit => fun session_limit/0,
+        refused => session_limit,
+        refused_counter => ssu2_sessions_refused_limit
+    }).
 
 init([]) ->
-    {ok, {#{strategy => one_for_one, intensity => 10, period => 10}, []}};
+    {ok, {#{strategy => one_for_one, intensity => 10, period => 10}, [admission_child()]}};
 init([Host, Port, LocalKeys, Owner]) ->
     {ok,
         {#{strategy => one_for_one, intensity => 10, period => 10}, [
+            admission_child(),
             #{
                 id => {ssu2_listener, Port, erlang:unique_integer([positive, monotonic])},
                 start =>

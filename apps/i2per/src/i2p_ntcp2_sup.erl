@@ -10,11 +10,37 @@ connection) down. The supervisor is a child of `m:i2per_sup`.
 
 `i2p_ntcp2_conn:connect/3` and `i2p_ntcp2_listener:listen/3` build their child
 specs through `conn_child/1` and `listener_child/3`.
+
+## The cap, and what admits a connection
+
+`max_ntcp2_connections` is enforced by `m:i2p_admission`, one instance of which
+is a child of this supervisor. It is a separate process because the limit is a
+count-then-start and the two halves have to be atomic together: a peer-set
+rebuild after a restart completes many handshakes in the same instant, which is
+precisely when a count read by one admission is read again by another before
+either has started its child.
+
+What it is *not* is a `m:global` lock, which is what enforced it until this
+changed — and that is not a smaller thing than a shared process. `global:trans/2`
+is a **cooperative, shared** lock, not a mutex: a second process asking for an id
+that is already held is added to the holder list and answered `true`, so every
+concurrent dial ran the count-then-start. It only looked exclusive because the
+critical section was usually short enough that a retrying dialer came back after
+the holder had left; this one is a tree walk and a process start. `m:i2p_admission`
+has the measurement, and `m:i2p_admission` is local, holds no state, and reads its
+count from the supervisor it starts children in — so the count cannot disagree with
+what is alive, and a restart cannot leave the cap enforcing a total nobody
+checked.
 """.
 
 -behaviour(supervisor).
 
 -define(DEFAULT_MAX_CONNECTIONS, 64).
+
+%% The admission process `f:start_connection/1` goes through. Its own name
+%% rather than `?MODULE`, so the resource it guards is named in the supervision
+%% tree and in a `whereis/1` rather than being an anonymous extra child.
+-define(ADMISSION, i2p_ntcp2_admission).
 
 -export([
     start_link/0,
@@ -23,8 +49,7 @@ specs through `conn_child/1` and `listener_child/3`.
     listener_child/3,
     start_connection/1,
     connection_count/0,
-    connection_limit/0,
-    connection_limit_reached/0
+    connection_limit/0
 ]).
 -export([init/1]).
 
@@ -52,24 +77,14 @@ start_link(Port, LocalKeys, Owner) ->
 Admit and start one NTCP2 connection under the configured active-connection
 limit.
 
-The admission check and `supervisor:start_child/2` are serialized with a node
-lock so simultaneous peer dials cannot exceed the limit. Output is the normal
-`supervisor:start_child/2` result, or `{error, connection_limit}`.
+The count and the `m:supervisor:start_child/2` that follows it are one operation
+in `m:i2p_admission`, so simultaneous peer dials cannot exceed the limit. Output
+is the normal `supervisor:start_child/2` result, or `{error, connection_limit}`.
 """.
 -spec start_connection(supervisor:child_spec()) ->
     {ok, pid()} | {ok, pid(), term()} | {error, term()}.
 start_connection(ChildSpec) ->
-    global:trans(
-        {?MODULE, connection_admission},
-        fun() ->
-            case connection_limit_reached() of
-                true ->
-                    {error, connection_limit};
-                false ->
-                    supervisor:start_child(?MODULE, ChildSpec)
-            end
-        end
-    ).
+    i2p_admission:admit(?ADMISSION, ChildSpec).
 
 -doc "Return the number of active NTCP2 connection workers.".
 -spec connection_count() -> non_neg_integer().
@@ -101,11 +116,6 @@ connection_limit() ->
         {ok, Value} when is_integer(Value), Value >= 0 -> Value;
         _ -> ?DEFAULT_MAX_CONNECTIONS
     end.
-
--doc "Whether a new NTCP2 connection would exceed the configured limit.".
--spec connection_limit_reached() -> boolean().
-connection_limit_reached() ->
-    connection_count() >= connection_limit().
 
 -doc """
 A `temporary` worker child spec for one connection process.
@@ -142,10 +152,25 @@ listener_child(Port, LocalKeys, Owner) ->
 boot_listener_child(Port, LocalKeys, Owner) ->
     (listener_child(Port, LocalKeys, Owner))#{restart => permanent}.
 
+%% `count` and `limit` are read per admission, not captured at boot, so an
+%% operator who changes `max_ntcp2_connections` changes it for the next
+%% connection. That is also what keeps a zero — the emergency fail-closed switch
+%% — working without a restart, which is the entire point of having one.
+admission_child() ->
+    i2p_admission:child_spec(#{
+        name => ?ADMISSION,
+        supervisor => ?MODULE,
+        count => fun connection_count/0,
+        limit => fun connection_limit/0,
+        refused => connection_limit,
+        refused_counter => ntcp2_connections_refused_limit
+    }).
+
 init([]) ->
-    {ok, {#{strategy => one_for_one, intensity => 5, period => 10}, []}};
+    {ok, {#{strategy => one_for_one, intensity => 5, period => 10}, [admission_child()]}};
 init([Port, LocalKeys, Owner]) ->
     {ok,
         {#{strategy => one_for_one, intensity => 5, period => 10}, [
+            admission_child(),
             boot_listener_child(Port, LocalKeys, Owner)
         ]}}.
