@@ -15,6 +15,28 @@ store. Network-facing work (sending DatabaseLookup messages, storing replies)
 belongs to the peer manager (`m:i2p_peer`), which reads and writes through
 this API.
 
+## What runs here, and what does not
+
+This process serves reads and applies stores, and it does the cheap half of a
+store. Two classes of expensive work are kept out of it, because this is the one
+process every NetDb read queues behind.
+
+Signature verification happens in the calling process, reached from
+`f:store_binary/2` and `f:store_ls_binary/2` before the call is made. A
+verification measures 100.4 us against 1-3 us for the store itself. That is a
+relocation and not a removal, since the peer manager and the transit relay each
+pay it now. It is the right relocation because this is the process every read
+queues behind. Whether a second verifier would help was measured, and the answer
+is no: Ed25519 throughput falls as processes are added on this OTP, so the
+100 us is something #VXRH456 has to attack rather than something more processes
+can hide.
+
+The disk save and the expiry sweep are still here, and are what #PPW41Y4 is
+about. A save measures ~16.8 ms and a sweep ~12.9 ms at the shipped capacity, so
+they are the remaining reason a read can queue behind a write. Moving them off
+depends on the store becoming something that can be handed over rather than a
+handle to live state, which is #QDA7A0X.
+
 ## Persistence
 
 When app env `i2per` → `data_dir` names a directory, the store is saved to
@@ -45,8 +67,14 @@ Floodfills = i2p_netdb_srv:closest_floodfills(Target, 3, []).
 
 -behaviour(gen_server).
 
+%% Where the RouterInfo table's tid is published, so a reader can reach the table
+%% without a call into this process. See `f:has_router/1` and `f:publish_table/1`.
+%% Declared up here because `f:has_router/1` is near the top of the file.
+-define(ROUTER_TABLE, i2per_netdb_router_table).
+
 -export([
     start_link/0,
+    has_router/1,
     store/2,
     store_binary/2,
     store_ls/2,
@@ -66,6 +94,8 @@ Floodfills = i2p_netdb_srv:closest_floodfills(Target, 3, []).
     save/0,
     load/0,
     remove_expired/0,
+    snapshot/0,
+    generation_now/0,
     timer_counts/0,
     stats/0
 ]).
@@ -95,11 +125,27 @@ Input: `Bin` — full signed RouterInfo bytes; `NowMs` — wall-clock ms since
 epoch.
 Output: `{ok, Outcome}` as in `m:i2p_netdb:store/3`, or `{error, Reason}` when
 the bytes do not decode to a signature-verifying RouterInfo.
+
+The signature is verified here, in the calling process, rather than in the NetDb.
+An Ed25519 verification measures 100.4 us against 1-3 us for the store itself,
+so verifying inside the call put a floodfill replication burst or a reseed
+bundle in front of every NetDb read. The call below carries a parsed
+RouterInfo, so this process pays the store and nothing else.
+
+A pool of verifier processes was the first design and measurement killed it.
+Total Ed25519 throughput on this OTP falls as processes are added, 0.45x at 8
+processes against 4.24x for a no-crypto control on the same harness, so extra
+verifiers would queue behind the same serialising work rather than overlap it.
+OTP 28 also ships no worker \`pool\` module to build on. Decoding in the caller
+is what remains.
 """.
 -spec store_binary(binary(), non_neg_integer()) ->
     {ok, added | updated | older | from_future | too_old} | {error, term()}.
 store_binary(Bin, NowMs) ->
-    gen_server:call(?MODULE, {store_binary, Bin, NowMs}).
+    case i2p_router_info:decode(Bin) of
+        {ok, RI} -> {ok, store(RI, NowMs)};
+        {error, Reason} -> {error, Reason}
+    end.
 
 -doc """
 Look up a router by hash.
@@ -110,6 +156,58 @@ Output: `{ok, RouterInfo}` when present, `not_found` otherwise.
 -spec find(i2p_netdb:router_key()) -> {ok, i2p_router_info:router_info()} | not_found.
 find(Key) ->
     gen_server:call(?MODULE, {find, Key}).
+
+-doc """
+Whether the NetDb holds a RouterInfo for `Key`.
+
+Input: `Key` — the router hash. Output: `true` or `false`.
+
+**This is a table read, not a call into this process.** The tunnel relay asks
+it once per 1028-byte frame and discards everything but the answer, so as a
+`gen_server:call/2` it cost a process round trip and a copy of a whole
+RouterInfo to learn a boolean. The table the NetDb keeps is `protected`, which
+is exactly the shape this needs: this process writes it, anyone may read it.
+
+`not_found` is reported as `false`, so the two ways of not holding a router are
+one answer rather than two.
+""".
+-spec has_router(i2p_netdb:router_key()) -> boolean().
+has_router(Key) ->
+    ets:member(persistent_term:get(?ROUTER_TABLE), Key).
+
+%% **The table tid is published once, at init.**
+%%
+%% The store map is replaced on every mutation and so cannot be published, but
+%% the table it owns never is: `m:i2p_netdb:new/1` creates it once and the
+%% mutations only insert and delete entries. So the tid is fixed for the life of
+%% this process, which is what `persistent_term` is for.
+%%
+%% The table dies with this process, so a tid left in `persistent_term` after a
+%% crash cannot name a live table that something else owns -- the next NetDb to
+%% start publishes its own, and a stale tid is an `badarg` rather than a wrong
+%% answer.
+publish_table(Store) ->
+    persistent_term:put(?ROUTER_TABLE, i2p_netdb:router_table(Store)).
+
+%% The full O(n log n) cross-check. **Only a load now.**
+%%
+%% It used to run after the expiry sweep as well, and that was right when the sweep
+%% rebuilt both trees from scratch: a wholesale rewrite is where a partial bug is
+%% hardest to notice. But the sweep no longer rebuilds — it drops the expired keys
+%% incrementally, through the same `m:i2p_netdb:drop_from_order/2` that
+%% `f:remove/2` already runs under the O(1) check.
+%%
+%% So the sweep became the class of operation the O(1) check was chosen for, and the
+%% cross-check was a **4771 us** tax on the read path at the shipped capacity of 5000
+%% routers — more than twice the sweep's own ~2.3 ms — defending against a failure
+%% mode it no longer had. Removing it is part of the change that makes the sweep
+%% cheap, not a separate relaxation.
+%%
+%% `f:consistent/1` still runs after the sweep. It is O(1) and it is the check that
+%% would catch a drop taken from one tree and not the other.
+fully_checked(Store) ->
+    ok = i2p_netdb:self_check(Store),
+    Store.
 
 -doc """
 Store a verified LeaseSet2.
@@ -130,11 +228,16 @@ Input: `Bin` — the content bytes (without the store-type byte); `NowSec` —
 wall-clock seconds since epoch.
 Output: `{ok, Outcome}` as in `f:store_ls/2`, or `{error, Reason}` when the
 bytes do not decode to a signature-verifying LeaseSet2.
+
+Verified in the calling process, for the same reason as `f:store_binary/2`.
 """.
 -spec store_ls_binary(binary(), non_neg_integer()) ->
     {ok, added | updated | older | from_future | expired} | {error, term()}.
 store_ls_binary(Bin, NowSec) ->
-    gen_server:call(?MODULE, {store_ls_binary, Bin, NowSec}).
+    case i2p_leaset:decode(Bin) of
+        {ok, LS} -> {ok, store_ls(LS, NowSec)};
+        {error, Reason} -> {error, Reason}
+    end.
 
 -doc """
 Look up a LeaseSet2 by destination hash.
@@ -192,6 +295,11 @@ The `N` stored router hashes closest to `Target`.
 Input: `Target` — the router hash to measure against; `N` — how many to
 return.
 Output: up to `N` hashes sorted by routing-key XOR distance, closest first.
+
+**The caller sees no difference from this not memoising anything.** The routing-key
+memo is filled inside the NetDb process, which owns the store, and this API is a
+`gen_server:call`, so there was never a caller-side half to thread. See the
+`handle_call` clauses for why the store is written back rather than dropped.
 """.
 -spec closest(i2p_netdb:router_key(), non_neg_integer()) -> [i2p_netdb:router_key()].
 closest(Target, N) ->
@@ -229,11 +337,20 @@ closest_non_floodfills(Target, N, Excluded) ->
 -define(NETDB_FILE, "netdb.bin").
 
 -doc """
-Save the current store to disk.
+Save the current store to disk, waiting for the file to be written.
 
 Input: none (uses the current process state).
 Output: `ok` when the file was written, `{error, Reason}` on I/O failure. Does
 nothing when `data_dir` is not configured.
+
+**This one waits**, unlike the 15-minute timer, because a caller asking to save
+wants the file to exist when it returns. The serialisation still happens in
+`m:i2p_netdb_writer` when it is running — only this call blocks, and it blocks
+the caller rather than the process every NetDb read queues behind.
+
+Falls back to saving in this process when the writer is absent, which is the case
+in any test that starts the NetDb on its own. The fallback is the old
+behaviour: correct, and on the read path.
 """.
 -spec save() -> ok | {error, term()}.
 save() ->
@@ -273,6 +390,38 @@ timer_counts() ->
     gen_server:call(?MODULE, timer_counts).
 
 -doc """
+A description of the store for `m:i2p_netdb_writer` to serialise.
+
+Input: none.
+Output: an `m:i2p_netdb:snapshot()` — the capacity, the router hashes in recency
+order, the LeaseSets, and the current generation.
+
+**This is the whole cost the read path pays for a save.** It does not include the
+RouterInfos, because `m:i2p_netdb:serialize/1` reads them from the table itself,
+which is `protected` and readable from any process. At the shipped capacity of
+5000 routers this measures about **49 us**, against the **8403 us** that
+serialising in this process cost.
+""".
+-spec snapshot() -> i2p_netdb:snapshot().
+snapshot() ->
+    gen_server:call(?MODULE, snapshot).
+
+-doc """
+The store's current generation, for checking a snapshot taken earlier.
+
+Input: none.
+Output: a non-negative integer, as `m:i2p_netdb:generation/1`.
+
+This is what makes a snapshot safe to serialise in another process. Read it
+before the save and again after; equal means the table was not written while the
+snapshot was being serialised, so every key in it was present for the whole walk.
+See `m:i2p_netdb_writer` for how the retry is bounded.
+""".
+-spec generation_now() -> non_neg_integer().
+generation_now() ->
+    gen_server:call(?MODULE, generation_now).
+
+-doc """
 Return a snapshot of operational counters.
 
 Input: none.
@@ -291,7 +440,17 @@ init([]) ->
         routers_expired => 0,
         ls_expired => 0
     },
-    Store0 = i2p_netdb:new(),
+    %% The horizon is a policy the operator sets, so it is read here and applied to
+    %% the store rather than defaulted inside the store. **Set before the load**, for
+    %% the same reason the table is published before the load: `from_binary/1`
+    %% restores capacity from the file but leaves the horizon at its default, and a
+    %% load that seeded under the wrong policy would admit or discard entries by a
+    %% rule the operator did not ask for.
+    Store0 = set_expiration_policy(i2p_netdb:new()),
+    %% Published before the load, so a reader that arrives while a large netdb
+    %% file is being read sees a table that is already safe to ask. The load
+    %% inserts into this same table.
+    publish_table(Store0),
     put(?LOAD_ERROR, false),
     case maybe_load(Store0, Counters) of
         {{Store1, Counters1}, ok} ->
@@ -310,7 +469,21 @@ maybe_load(Store, Counters) ->
             case file:read_file(Path) of
                 {ok, Bin} ->
                     case i2p_netdb:from_binary(Bin) of
-                        {ok, Loaded} ->
+                        {ok, Loaded0} ->
+                            %% `from_binary/1` restores capacity from the file but
+                            %% leaves the horizon at its default, so the loaded store
+                            %% inherits the running policy rather than the default.
+                            %% `Store` already carries it; taking the two *bounds* from
+                            %% there rather than calling the readers twice keeps the two
+                            %% paths (a load and no load) agreeing by construction —
+                            %% and the bounds, not `expiration_ms/1`, because the
+                            %% horizon in force at load time is a function of a count
+                            %% the loaded store has not got yet.
+                            Loaded = i2p_netdb:set_expiration_range(
+                                Loaded0,
+                                i2p_netdb:min_expiration_ms(Store),
+                                i2p_netdb:max_expiration_ms(Store)
+                            ),
                             C2 = Counters#{loads := maps:get(loads, Counters) + 1},
                             {{Loaded, C2}, ok};
                         {error, _} ->
@@ -365,28 +538,102 @@ autosave_interval() ->
 expiry_interval() ->
     configured_interval(netdb_expiry_ms, ?DEFAULT_EXPIRY_MS).
 
+%% How old a RouterInfo may be before this router discards it, at both ends of the
+%% range the store slides between.
+%%
+%% **How often the sweep runs and how stale an entry may get are separate knobs.**
+%% They were not separate until `#RA5PVR1`: the horizon was a compile-time constant
+%% inside `m:i2p_netdb` and the interval was the only thing an operator could reach.
+%%
+%% **Both ends are configurable, and neither is the policy.** The horizon in force is
+%% `m:i2p_netdb:expiration_ms/1`, i2pd's curve between these two, so an operator who
+%% sets the ceiling alone moves the *small-store* horizon and leaves a full store
+%% almost where it was: at 5000 routers a 12-hour ceiling lands within four minutes
+%% of the shipped 27-hour one. The two are separate settings because the useful one
+%% depends on the store -- raising the ceiling buys a router that has just booted and
+%% holds ninety routers, lowering the floor is what a router at capacity wants, and
+%% an operator who set only the one that suited neither gets a store that looks
+%% configured and has not moved.
+%%
+%% The shipped defaults are i2pd's 27 hours and 90 minutes, its own two ends. See
+%% `#RA5PVR1`.
+-spec expiration_max_ms() -> pos_integer().
+expiration_max_ms() ->
+    configured_interval(netdb_expiration_ms, i2p_netdb:default_expiration_ms()).
+
+%% The floor, or `undefined` when the operator has not set one.
+%%
+%% **Not the default.** The distinction is the whole of the key's meaning: a store
+%% with no floor set runs flat at the ceiling, which is what an operator who sets
+%% only `netdb_expiration_ms` means and what that key meant before the horizon slid
+%% (see `#RA5PVR1`). Defaulting the floor to i2pd's 90 minutes instead would make
+%% that operator's setting mean something they did not ask for -- a 1-minute ceiling
+%% is a legitimate instruction to expire aggressively at every size, and reading it
+%% as a *ceiling* would leave a small store on the shipped 27-hour default.
+-spec expiration_min_ms() -> pos_integer() | undefined.
+expiration_min_ms() ->
+    configured_interval(netdb_expiration_min_ms, undefined).
+
+%% Apply the configured horizon to a store.
+%%
+%% Three shapes, in the order they are decided:
+%%
+%% 1. **Neither key set** -- i2pd's shipped curve, from its two documented ends.
+%% 2. **Ceiling only** -- a flat horizon at that value. Preserves what the key meant
+%%    before the policy slid, and is the shape an operator gets for setting one
+%%    number.
+%% 3. **Both set** -- the curve between them. The only way to slide, and so the only
+%%    way to reach the floor at capacity.
+%%
+%% **The bounds are ordered before they are applied, not after.** A floor above the
+%% ceiling is a configuration the operator can express and the store cannot use --
+%% `m:i2p_netdb:set_expiration_range/3` refuses it, and refusing to start over a
+%% horizon would turn a recoverable typo into a router that will not boot, the same
+%% reasoning `configured_interval/2` applies to a non-integer value. Swapping them
+%% keeps the router running at an interval between the two numbers they gave.
+set_expiration_policy(Store) ->
+    case {expiration_min_ms(), expiration_max_ms()} of
+        {undefined, Max} ->
+            i2p_netdb:set_expiration_ms(Store, Max);
+        {Min, Max} ->
+            case Min =< Max of
+                true -> i2p_netdb:set_expiration_range(Store, Min, Max);
+                false -> i2p_netdb:set_expiration_range(Store, Max, Min)
+            end
+    end.
+
+%% Read an operator setting, falling back to `Default`.
+%%
+%% A value that is not a positive integer is ignored rather than clamped or
+%% rejected. The alternative is refusing to start on a typo, which turns a
+%% recoverable configuration mistake into a router that will not boot; the cost of
+%% ignoring it is a log line saying the default is in force, which this does not
+%% currently emit and should.
 configured_interval(Key, Default) ->
     case application:get_env(i2per, Key) of
         {ok, Value} when is_integer(Value), Value > 0 -> Value;
         _ -> Default
     end.
 
+%% Every router mutation is funnelled through `checked/1`. The store is two
+%% structures -- an ETS table and a pair of recency trees -- and only this
+%% process can see both, so this is the one place that can assert they agree.
+%% A store that drifts is quiet: it evicts the wrong router, or stops evicting.
+%%
+%% `m:i2p_netdb:consistent/1` rather than `f:self_check/1`, because it is O(1)
+%% and this runs on the store path. The full cross-check is now for a load alone,
+%% which is the only remaining operation that rewrites a whole batch at once. See
+%% `f:fully_checked/1` for why the expiry sweep stopped qualifying.
+checked(Store) ->
+    ok = i2p_netdb:consistent(Store),
+    Store.
+
 handle_call({store, RI, NowMs}, _From, {Store, Counters}) ->
     {Store2, Outcome} = i2p_netdb:store(Store, RI, NowMs),
-    {reply, Outcome, {Store2, Counters}};
-handle_call({store_binary, Bin, NowMs}, _From, {Store, Counters}) ->
-    case i2p_netdb:store_binary(Store, Bin, NowMs) of
-        {ok, Store2, Outcome} -> {reply, {ok, Outcome}, {Store2, Counters}};
-        {error, Reason} -> {reply, {error, Reason}, {Store, Counters}}
-    end;
+    {reply, Outcome, {checked(Store2), Counters}};
 handle_call({store_ls, LS, NowSec}, _From, {Store, Counters}) ->
     {Store2, Outcome} = i2p_netdb:store_ls(Store, LS, NowSec),
     {reply, Outcome, {Store2, Counters}};
-handle_call({store_ls_binary, Bin, NowSec}, _From, {Store, Counters}) ->
-    case i2p_netdb:store_ls_binary(Store, Bin, NowSec) of
-        {ok, Store2, Outcome} -> {reply, {ok, Outcome}, {Store2, Counters}};
-        {error, Reason} -> {reply, {error, Reason}, {Store, Counters}}
-    end;
 handle_call({find, Key}, _From, {Store, _} = State) ->
     case i2p_netdb:find(Store, Key) of
         {ok, RI} -> {reply, {ok, RI}, State};
@@ -399,7 +646,7 @@ handle_call({find_ls, Key}, _From, {Store, _} = State) ->
     end;
 handle_call({remove, Key}, _From, {Store, Counters}) ->
     {Store2, Outcome} = i2p_netdb:remove(Store, Key),
-    {reply, Outcome, {Store2, Counters}};
+    {reply, Outcome, {checked(Store2), Counters}};
 handle_call(routers, _From, {Store, _} = State) ->
     {reply, i2p_netdb:routers(Store), State};
 handle_call(keys, _From, {Store, _} = State) ->
@@ -412,23 +659,68 @@ handle_call(count, _From, {Store, _} = State) ->
     {reply, i2p_netdb:count(Store), State};
 handle_call(capacity, _From, {Store, _} = State) ->
     {reply, i2p_netdb:capacity(Store), State};
-handle_call({closest, Target, N}, _From, {Store, _} = State) ->
-    {reply, i2p_netdb:closest(Store, Target, N), State};
-handle_call({closest_floodfills, Target, N, Excluded}, _From, {Store, _} = State) ->
-    {reply, i2p_netdb:closest_floodfills(Store, Target, N, Excluded), State};
-handle_call({closest_non_floodfills, Target, N, Excluded}, _From, {Store, _} = State) ->
-    {reply, i2p_netdb:closest_non_floodfills(Store, Target, N, Excluded), State};
+%% **The store is threaded back through all three, and that is the whole cost of
+%% the routing-key memo.** `m:i2p_netdb:closest/3` and its two siblings return
+%% `{Store2, Closest}` because filling the memo is a mutation, and this module is
+%% the store's owner — so it is the one place that can keep the result. Before
+%% this, each of these was `{reply, Result, State}`, one line with no state in it.
+%%
+%% A caller that dropped the returned store would not get a wrong answer, only
+%% the old cost: every lookup would recompute 5000 hashes and the memo would never
+%% be used. That asymmetry is the reason the memo is worth threading at all, and
+%% also the reason it is not worth a second ETS table — a table would have been
+%% written from here anyway, by a process that does hold the store, but it would
+%% have had to be `public` to be readable by the tests that call `m:i2p_netdb`
+%% directly.
+%% **The store is the first element of the pair, not the second.** Every one of
+%% these destructures the store out and threads it back; getting the two the wrong
+%% way round is silent until the next call, because a `closest/3` reply is a list
+%% and a list is a perfectly good thing to hand back as a reply.
+handle_call({closest, Target, N}, _From, {Store, Rest}) ->
+    {Store1, Closest} = i2p_netdb:closest(Store, Target, N),
+    {reply, Closest, {Store1, Rest}};
+handle_call({closest_floodfills, Target, N, Excluded}, _From, {Store, Rest}) ->
+    {Store1, Floodfills} = i2p_netdb:closest_floodfills(Store, Target, N, Excluded),
+    {reply, Floodfills, {Store1, Rest}};
+handle_call({closest_non_floodfills, Target, N, Excluded}, _From, {Store, Rest}) ->
+    {Store1, NonFloodfills} = i2p_netdb:closest_non_floodfills(Store, Target, N, Excluded),
+    {reply, NonFloodfills, {Store1, Rest}};
+%% **The gate is here, in the NetDb, and must stay here.**
+%%
+%% `?LOAD_ERROR` is process state set in `f:init/1`, so it is only readable from this
+%% process -- and it is the whole point of the check: a store built by refusing to
+%% load a corrupt file must not then be written over that file. Moving the decision
+%% to a caller-side `save/0` made `get/1` read the *caller's* dictionary, where the
+%% key is absent, so every save looked allowed.
 handle_call(save, _From, {Store, Counters}) ->
     case persist_allowed() of
         false ->
             {reply, {error, load_failed}, {Store, Counters}};
         true ->
-            Result = save_to_disk(Store),
-            C2 = Counters#{saves := maps:get(saves, Counters) + 1},
+            Snapshot = i2p_netdb:snapshot(Store),
+            Result =
+                case whereis(i2p_netdb_writer) of
+                    undefined -> save_here(Snapshot);
+                    _Pid -> i2p_netdb_writer:save(Snapshot, undefined)
+                end,
+            C2 =
+                case Result of
+                    ok -> Counters#{saves := maps:get(saves, Counters) + 1};
+                    _ -> Counters
+                end,
             {reply, Result, {Store, C2}}
     end;
 handle_call(load, _From, {Store, Counters}) ->
-    {NewState, Result} = maybe_load(Store, Counters),
+    {{Loaded, Counters1}, Result} = maybe_load(Store, Counters),
+    %% A load rewrites every entry at once, so this is where the full
+    %% cross-check earns its cost: a store built from a file is the one place a
+    %% partial seeding bug would otherwise sit unnoticed until an eviction
+    %% removed the wrong router days later.
+    NewState =
+        case Result of
+            ok -> {fully_checked(Loaded), Counters1};
+            {error, _} -> {Loaded, Counters1}
+        end,
     case Result of
         ok -> put(?LOAD_ERROR, false);
         {error, _} -> put(?LOAD_ERROR, true)
@@ -443,32 +735,88 @@ handle_call(remove_expired, _From, {Store, Counters}) ->
         routers_expired := maps:get(routers_expired, Counters) + RRemoved,
         ls_expired := maps:get(ls_expired, Counters) + LSRemoved
     },
-    {reply, {RRemoved, LSRemoved}, {Store2, C2}};
+    {reply, {RRemoved, LSRemoved}, {checked(Store2), C2}};
+handle_call(snapshot, _From, {Store, _} = State) ->
+    %% O(n) in the order, so it is not free — but it is 49 us against the 8403 us
+    %% of serialising here, and the serialisation is what this process is trying
+    %% to stop doing. The alternative, copying the store, measured 371 us.
+    {reply, i2p_netdb:snapshot(Store), State};
+handle_call(generation_now, _From, {Store, _} = State) ->
+    %% O(1): a map lookup. The writer calls this twice per save attempt, and the
+    %% second one is what decides whether the bytes get written at all.
+    {reply, i2p_netdb:generation(Store), State};
 handle_call(timer_counts, _From, State) ->
     {reply, current_timer_counts(), State};
 handle_call(stats, _From, {Store, Counters}) ->
     Reply = Counters#{
         routers => i2p_netdb:count(Store),
         lease_sets => i2p_netdb:ls_count(Store),
-        capacity => i2p_netdb:capacity(Store)
+        capacity => i2p_netdb:capacity(Store),
+        %% **The policy the store is actually enforcing**, not the one shipped.
+        %% An operator who set `netdb_expiration_ms` has no other way to see that it
+        %% took effect, and a value that silently failed to apply would look
+        %% identical to one that did from the outside. Read from the store rather
+        %% than from the readers in this module for the reason `maybe_load/2` does:
+        %% the running store is the thing that was configured, so the report cannot
+        %% disagree with the behaviour.
+        %%
+        %% **All three, because no one of them answers the question alone.** The
+        %% horizon is a function of the router count, so `expiration_ms` on its own
+        %% drifts downward as a store fills and an operator watching it would see a
+        %% number they never configured. The two bounds are the settings; the third
+        %% is what they currently add up to.
+        expiration_ms => i2p_netdb:expiration_ms(Store),
+        expiration_min_ms => i2p_netdb:min_expiration_ms(Store),
+        expiration_max_ms => i2p_netdb:max_expiration_ms(Store)
     },
     {reply, Reply, {Store, Counters}}.
 
+handle_cast({save_result, Result}, {Store, Counters}) ->
+    %% The writer reports the outcome back here rather than the timer branch
+    %% matching on it, so a failed save is counted in one place and the counter
+    %% means the same thing whether it came from the timer or from `f:save/0`.
+    C2 =
+        case Result of
+            ok -> Counters#{saves := maps:get(saves, Counters) + 1};
+            _ -> Counters
+        end,
+    {noreply, {Store, C2}};
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
+%% The writer reports the save outcome here rather than the timer branch matching on
+%% it, so a failure is counted in one place and `saves` means the same thing whether
+%% it came from the timer or from `f:save/0`.
+handle_info({save_result, Result}, {Store, Counters}) ->
+    C2 =
+        case Result of
+            ok -> Counters#{saves := maps:get(saves, Counters) + 1};
+            _ -> Counters
+        end,
+    {noreply, {Store, C2}};
 handle_info(autosave, {Store, Counters}) ->
     _ = take_timer(?AUTOSAVE_TIMERS),
-    C2 =
-        case persist_allowed() of
-            true ->
-                _ = save_to_disk(Store),
-                Counters#{saves := maps:get(saves, Counters) + 1};
-            false ->
-                Counters
-        end,
     schedule_autosave(),
-    {noreply, {Store, C2}};
+    %% **The save is handed to `m:i2p_netdb_writer` and this process goes straight
+    %% back to serving reads.** Serialising 5000 routers measures 8403 us, and
+    %% doing it here meant every read queued behind it -- `f:closest/3` for a
+    %% lookup round, `f:closest_floodfills/4` for a tunnel build, `f:has_router/2`
+    %% for a relayed frame.
+    %%
+    %% The hand-over costs about 49 us, because a snapshot names the routers
+    %% rather than copying them: `m:i2p_netdb:serialize/1` reads each one from the
+    %% table itself, which is `protected`. `f:save/1` is the same call, for an
+    %% operator who wants to wait for the file.
+    %%
+    %% The result is deliberately not matched on here. The writer counts a failure
+    %% in its own state and reports it through `f:stats/0`; a full disk must not
+    %% stop this process from serving reads, which would lose the store as well as
+    %% the file.
+    case persist_allowed() of
+        true -> hand_save_to_writer(Store);
+        false -> ok
+    end,
+    {noreply, {Store, Counters}};
 handle_info(expiry_sweep, {Store, Counters}) ->
     _ = take_timer(?EXPIRY_TIMERS),
     NowMs = erlang:system_time(millisecond),
@@ -480,13 +828,23 @@ handle_info(expiry_sweep, {Store, Counters}) ->
         ls_expired := maps:get(ls_expired, Counters) + LSRemoved
     },
     schedule_expiry(),
-    {noreply, {Store2, C2}}.
+    %% **The O(1) check, not the cross-check.** The sweep used to be
+    %% `f:fully_checked/1`, on the grounds that a wholesale rewrite is where a
+    %% partial bug hides. It is not a wholesale rewrite any more -- see
+    %% `f:fully_checked/1` -- and at the shipped capacity of 5000 routers the
+    %% cross-check was 4771 us against the sweep's own ~2.3 ms.
+    {noreply, {checked(Store2), C2}}.
 
 terminate(_Reason, {Store, _Counters}) ->
     _ = cancel_timers(),
+    %% **Saved here, not through the writer.** Two reasons, and they point the same
+    %% way: at shutdown nobody is waiting for a read, so the reason to move the save
+    %% off this process does not apply; and the writer is about to be stopped, so
+    %% handing it work would race that shutdown. `f:save_here/1` is the old
+    %% behaviour, kept for exactly this and for a NetDb started without a writer.
     _ =
         case persist_allowed() of
-            true -> save_to_disk(Store);
+            true -> save_here(i2p_netdb:snapshot(Store));
             false -> ok
         end,
     ok.
@@ -497,19 +855,53 @@ cancel_timers() ->
         timer_refs(?AUTOSAVE_TIMERS) ++ timer_refs(?EXPIRY_TIMERS)
     ).
 
-save_to_disk(Store) ->
-    case data_dir() of
-        {ok, Dir} ->
-            Path = filename:join(Dir, ?NETDB_FILE),
-            TmpPath =
-                Path ++ ".tmp." ++ integer_to_list(erlang:unique_integer([positive, monotonic])),
-            Bin = i2p_netdb:to_binary(Store),
-            case filelib:ensure_dir(Path) of
-                ok -> write_private_atomic(Path, TmpPath, Bin);
-                {error, _} = Err -> Err
-            end;
-        undefined ->
-            ok
+%% Take the snapshot here — the 49 us this process pays — and hand the rest to the
+%% writer. A `gen_server:call/1`, so the writer blocks rather than this process,
+%% which is the entire reason the writer exists.
+%%
+%% No timeout: the serialisation measures 8403 us at the shipped capacity, but it
+%% is not bounded by anything this project controls (a large LeaseSet map, a slow
+%% disk), and a save that gives up halfway leaves a temp file rather than a store.
+hand_save_to_writer(Store) ->
+    Snapshot = i2p_netdb:snapshot(Store),
+    Result =
+        case whereis(i2p_netdb_writer) of
+            undefined ->
+                %% No writer. Fall back to saving here rather than dropping the file:
+                %% the read path is the thing being protected, and in a test that
+                %% starts this process alone there is no read to protect.
+                save_here(Snapshot);
+            _Pid ->
+                i2p_netdb_writer:save_async(Snapshot, self()),
+                ok
+        end,
+    %% **The fallback reports too.** The writer sends `{save_result, Result}` back
+    %% and the counter is incremented when that arrives, so a save done *here* would
+    %% otherwise be invisible to `f:stats/0` -- and `saves` silently stopping
+    %% incrementing is precisely what an operator watching that counter would take
+    %% for "the autosave timer is not firing".
+    self() ! {save_result, Result},
+    ok.
+
+%% The in-process save, kept as the fallback rather than deleted.
+%%
+%% It is the old `f:save_to_disk/1`: serialise, write to a temp file, chmod 0600,
+%% rename. Slower and it runs on the read path, but it is the difference between
+%% "the save did not happen" and "the save happened somewhere inconvenient".
+save_here(Snapshot) ->
+    case {i2p_netdb:serialize(Snapshot), data_dir()} of
+        {{ok, Bin}, {ok, Dir}} -> write_here(Bin, Dir);
+        {{error, _}, _} -> {error, serialize_failed};
+        {_, undefined} -> ok
+    end.
+
+write_here(Bin, Dir) ->
+    Path = filename:join(Dir, ?NETDB_FILE),
+    TmpPath =
+        Path ++ ".tmp." ++ integer_to_list(erlang:unique_integer([positive, monotonic])),
+    case filelib:ensure_dir(Path) of
+        ok -> write_private_atomic(Path, TmpPath, Bin);
+        {error, _} = Err -> Err
     end.
 
 write_private_atomic(Path, TmpPath, Bin) ->

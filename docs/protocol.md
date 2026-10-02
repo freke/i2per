@@ -360,8 +360,13 @@ An unsolicited store, or the reply to a successful DatabaseLookup. The
 one-byte store type is part of the DatabaseStore body, not part of a
 LeaseSet's own content. The values used by the I2NP codec are `0` (RouterInfo),
 `1` (LeaseSet), `3` (LeaseSet2), `5` (EncryptedLeaseSet), and `7`
-(MetaLeaseSet). i2per's NetDb path decodes and stores types `0`, `1`, and
-`3`; the encrypted and meta variants are not decoded in 0.1.0.
+(MetaLeaseSet). i2per's NetDb path stores types `0`, `1`, and `3`. Types `5`
+and `7` **are decoded** — the codec reports every byte on the wire rather than
+only the types it understands — and are then dropped as unimplemented, with a
+warning naming the type. The distinction matters: a type i2per cannot parse and
+a type it has no parser for are different facts, and only the latter arrives
+here. Encrypted LeaseSet is live in both reference routers (off by default);
+MetaLeaseSet remains draft.
 
 ```mermaid
 packet
@@ -1678,6 +1683,24 @@ Alice (her SessionConfirmed is packet 0) and 0 for Bob. A receiver records
 the packet numbers it has successfully received and sends an ACK block
 describing that set.
 
+**The receive window is bounded, and the bound is the ACK block's own reach.**
+An ACK block can only *name* a packet number within `?ACK_MAX + MaxRanges ×
+2 × ?ACK_MAX` of `AckThrough` — 255 in the `acnt` field, then two bytes per
+range pair. Anything further below cannot appear in any ACK the receiver sends,
+so a receiver that kept it could not change a single byte on the wire. The set
+is therefore held as a descending list of disjoint, non-adjacent inclusive
+`{Lo, Hi}` ranges (`m:i2p_ssu2_recv`), which makes a contiguous receive stream a
+*single* range however long the session runs, and bounds the pathological case
+too: a peer losing every other packet leaves at most `MaxRanges + 1` ranges,
+because that is how many a block can carry. The lowest number ever received is
+kept separately, because it is where the ACK walk stops — the numbers between
+the last retained range and it were never received, and the block says so with
+a NACK the peer acts on. A packet number below the reach is reported as
+`ssu2_stale_packets` and processed rather than recorded: it is a duplicate the
+peer has already moved past, block handling is idempotent by message identity,
+and the spec requires retransmission to use a fresh number, so a peer doing
+this routinely is misbehaving.
+
 **ACK block (type 12).** Encodes which packets were received and which were
 missing:
 
@@ -1694,7 +1717,7 @@ below `AckThrough` that were received (0–255). The optional trailing ranges
 are `{nack, ack}` byte pairs encoding missing and received runs below that;
 the range list may be empty even when `acnt` is nonzero. After the last range,
 packets are considered unknown. The decoder rejects a range when either count
-is zero, including a `{0, 0}` pair. The current `build_ack/2` can nevertheless
+is zero, including a `{0, 0}` pair. `m:i2p_ssu2:build_ack/2` can nevertheless
 emit a leading `{0, ack}` pair for a sparse receive set, so an encode/decode
 round-trip is not lossless for every possible set; `ack_expand/1` still
 consumes that internal representation.

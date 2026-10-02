@@ -44,7 +44,13 @@ writes configuration files.
     floodfill,
     net_id,
     transit_bandwidth_kbps,
-    tunnel_build_rate
+    tunnel_build_rate,
+    %% Applied immediately rather than merely stored. `m:i2p_log:set_level/1` is the
+    %% only thing in the tree that can change the level, so this key routes through
+    %% it: going through `application:set_env/3` alone would record the new level
+    %% without applying it, and the router would appear to have accepted a verbosity
+    %% change it had not made.
+    log_level
 ]).
 
 %% Every key this service will acknowledge, hot or not.
@@ -127,6 +133,7 @@ set(Key, Value) ->
     | max_sam_sessions
     | max_ssu2_sessions
     | ntcp2_keepalive_interval_ms
+    | log_level
     | host
     | port
     | sam_port
@@ -179,7 +186,7 @@ apply_set(Key, Value) ->
         ok ->
             case lists:member(Key, ?RUNTIME_KEYS) of
                 true ->
-                    application:set_env(i2per, Key, Value),
+                    store_runtime(Key, Value),
                     {ok, ok};
                 false ->
                     {ok, {ok, pending_restart}}
@@ -187,6 +194,26 @@ apply_set(Key, Value) ->
         {error, _} = Err ->
             Err
     end.
+
+%% store_runtime/2 — persist a runtime key, applying the ones that need it.
+%%
+%% Only `log_level` needs more than storing. Everything else in the set is read from
+%% the app env by its consumer at use time, so writing the env *is* the whole of
+%% "apply". The log level is the exception because the thing that reads it is
+%% `logger`, and `logger` is not an application environment.
+-spec store_runtime(atom(), term()) -> ok.
+store_runtime(log_level, Value) ->
+    case i2p_log:set_level(Value) of
+        ok -> ok;
+        %% Already refused by `f:validate_value/2`, so this is unreachable rather
+        %% than handled. Left as an error rather than a silent success because a
+        %% runtime key that reports `ok` and did nothing is the exact failure the
+        %% comment on the key above describes.
+        {error, Reason} -> erlang:error({log_level_not_applied, Reason})
+    end;
+store_runtime(Key, Value) ->
+    application:set_env(i2per, Key, Value),
+    ok.
 
 %% %%%%% %%% Validation %%%%% %%%
 
@@ -214,6 +241,14 @@ validate_value(Key, Value) ->
         {live_network, V} when is_boolean(V) -> ok;
         {listen_host, V} when is_binary(V), byte_size(V) > 0 -> ok;
         {net_id, V} when is_integer(V), V >= 0 -> ok;
+        %% The vocabulary is `m:i2p_log`'s, not a list written out here. Two lists of
+        %% levels in two modules is a level the ini accepts and this service refuses,
+        %% or the reverse, and neither is discoverable without running both.
+        {log_level, V} ->
+            case i2p_log:is_level(V) of
+                true -> ok;
+                false -> {error, {bad_value, Key, V}}
+            end;
         {tunnel_pool, V} when is_map(V) ->
             case maps:find(outbound, V) of
                 {ok, O} when is_integer(O), O > 0 ->

@@ -23,7 +23,7 @@ init_test() ->
         RI = mk_ri(),
         Hash = i2p_router_info:hash(RI),
         {ok, State} = i2p_peer:init([Local, [RI]]),
-        ?assertEqual([#{ri => RI, hash => Hash}], maps:get(known, State)),
+        ?assertEqual(#{Hash => #{ri => RI, hash => Hash}}, maps:get(known, State)),
         ?assertEqual(#{}, maps:get(peers, State)),
         ?assertEqual(#{}, maps:get(inbound, State)),
         ?assertEqual(#{}, maps:get(pending, State)),
@@ -172,7 +172,7 @@ send_when_ready_no_inbound_test() ->
     Msg = msg(),
     S = base_state(),
     {noreply, S1} = i2p_peer:handle_cast({send_when_ready, H, Msg}, S),
-    ?assertEqual([Msg], maps:get(H, maps:get(pending_sends, S1))),
+    ?assertMatch([{at, _, Msg}], maps:get(H, maps:get(pending_sends, S1))),
     ?assertEqual(#{}, maps:get(peers, S1)).
 
 %% A state that never initialised pending_sends creates it on first enqueue.
@@ -181,7 +181,7 @@ send_when_ready_no_pending_sends_test() ->
     Msg = msg(),
     S0 = maps:remove(pending_sends, base_state()),
     {noreply, S1} = i2p_peer:handle_cast({send_when_ready, H, Msg}, S0),
-    ?assertEqual([Msg], maps:get(H, maps:get(pending_sends, S1))).
+    ?assertMatch([{at, _, Msg}], maps:get(H, maps:get(pending_sends, S1))).
 
 stop_test() ->
     H1 = mk_hash(),
@@ -233,13 +233,131 @@ connect_failed_connecting_test() ->
     ?assertEqual(backoff, Status),
     ?assertEqual(10, Attempts).
 
-%% Pending work and sends are flushed to a freshly connected NTCP2 peer.
+%%%%%%%%% Connect failures are announced, with the reason and the backoff %%%%%%%%%
+
+%% The reason travels with the failure. `i2p_ntcp2_conn` used to match
+%% `{error, _Reason}` and drop it, so the manager knew a connect had failed and
+%% not why — and "this peer is backing off" is the same figure for a timeout, a
+%% rejected handshake and a key mismatch.
+connect_failure_is_announced_with_its_reason_test() ->
+    H = mk_hash(),
+    S = with_peer(H, peer(H, #{attempts => 3}), base_state()),
+    ?assertEqual(
+        {peer_connect_failed, H, {handshake, timeout}, 8},
+        announced(fun() -> i2p_peer:handle_info({connect_failed, H, {handshake, timeout}}, S) end)
+    ).
+
+%% A failure with nothing more to report keeps its place rather than being
+%% dropped: `ntcp2_connect/4` can only say that the supervisor refused, and
+%% inventing a reason would be worse than admitting there is not one.
+connect_failure_without_a_reason_is_still_announced_test() ->
+    H = mk_hash(),
+    S = with_peer(H, peer(H, #{attempts => 1}), base_state()),
+    ?assertEqual(
+        {peer_connect_failed, H, unknown, 2},
+        announced(fun() -> i2p_peer:handle_info({connect_failed, H}, S) end)
+    ).
+
+%% The backoff is the load-bearing field, and the announced interval is the one
+%% actually in force. Asserted against the state the same call produced, because
+%% an event carrying a *different* number from the one the router waits would be
+%% the worst kind of duplicated figure: it would look right and be wrong.
+announced_backoff_is_the_one_in_force_test() ->
+    lists:foreach(
+        fun(Attempts) ->
+            H = mk_hash(),
+            S = with_peer(H, peer(H, #{attempts => Attempts}), base_state()),
+            Event = announced(fun() -> i2p_peer:handle_info({connect_failed, H, boom}, S) end),
+            {peer_connect_failed, H, boom, Announced} = Event,
+            {noreply, S1} = i2p_peer:handle_info({connect_failed, H, boom}, S),
+            #{backoff := InForce} = maps:get(H, maps:get(peers, S1)),
+            ?assertEqual(InForce, Announced)
+        end,
+        [0, 1, 3, 9]
+    ),
+    %% And the cap holds, so a long-failing peer announces the ceiling rather than
+    %% an ever-growing number.
+    H = mk_hash(),
+    S = with_peer(H, peer(H, #{attempts => 40}), base_state()),
+    ?assertMatch(
+        {peer_connect_failed, H, boom, 300},
+        announced(fun() -> i2p_peer:handle_info({connect_failed, H, boom}, S) end)
+    ).
+
+%% Two peers failing differently are distinguishable. Without the reason and the
+%% interval these were one counter, and "retrying in a tight loop" and "given up"
+%% were the same number.
+different_failures_are_distinguishable_test() ->
+    Event = fun(Attempts, Reason) ->
+        H = mk_hash(),
+        S = with_peer(H, peer(H, #{attempts => Attempts}), base_state()),
+        announced(fun() -> i2p_peer:handle_info({connect_failed, H, Reason}, S) end)
+    end,
+    ?assertNotEqual(Event(0, timeout), Event(9, timeout)),
+    ?assertNotEqual(Event(3, timeout), Event(3, protocol_error)).
+
+%% A connect failure for a peer that is not connecting is not a failure of
+%% anything: there is no backoff to enter, so nothing is announced. The state is
+%% returned untouched, which is what makes this a no-op rather than a spurious
+%% event.
+failure_for_a_non_connecting_peer_announces_nothing_test() ->
+    H = mk_hash(),
+    S0 = with_peer(H, peer(H, #{status => connected}), base_state()),
+    ?assertEqual(none, announced(fun() -> i2p_peer:handle_info({connect_failed, H, boom}, S0) end)),
+    {noreply, S1} = i2p_peer:handle_info({connect_failed, H, boom}, S0),
+    ?assertEqual(S0, S1).
+
+%% A *drop* is not a failed connect and must not be reported as one. The two share
+%% `enter_backoff/2`, which is exactly why this case is here: instrumenting the
+%% backoff rather than the failure would have announced every disconnect as a
+%% connect failure, and the two mean opposite things — one was never established,
+%% the other was and has gone.
+drop_is_not_reported_as_a_connect_failure_test() ->
+    H = mk_hash(),
+    Conn = i2p_ct_helpers:dead_pid(),
+    Mon = make_ref(),
+    S = with_peer(H, peer(H, #{conn => Conn, mon => Mon, attempts => 4}), base_state()),
+    ?assertEqual(
+        {peer_disconnected, H},
+        announced(fun() -> i2p_peer:handle_info({'DOWN', Mon, process, Conn, boom}, S) end)
+    ),
+    ?assertEqual(
+        [],
+        peer_connect_failures(fun() ->
+            i2p_peer:handle_info({'DOWN', Mon, process, Conn, boom}, S)
+        end)
+    ).
+
+%%%%%%%%% Event observation %%%%%%%%%
+
+%% `i2p_ct_helpers:events_from/1` waits for a *known* event to come back from the
+%% bus before draining, rather than draining on a zero timeout. `i2p_events:notify/1`
+%% returning proves nothing about delivery: `gen_event` queues the event and
+%% dispatches it to the handlers afterwards, in its own process. The first version
+%% of these helpers drained immediately and every case passed for the wrong reason.
+
+announced(Fun) ->
+    case i2p_ct_helpers:events_from(Fun) of
+        [Event] -> Event;
+        [] -> none
+    end.
+
+%% As `announced/1`, but for the case where the point is that a particular event
+%% did not fire and others may have. The barrier means the absence is a real
+%% absence: the bus was demonstrably live, and had already delivered everything
+%% the work under test announced, by the time the list came back.
+peer_connect_failures(Fun) ->
+    [E || E <- i2p_ct_helpers:events_from(Fun), is_connect_failure(E)].
+
+is_connect_failure({peer_connect_failed, _, _, _}) -> true;
+is_connect_failure(_) -> false.
+
 ntcp2_ready_test() ->
     H = mk_hash(),
     Dead = dead_pid(),
     S0 = with_peer(H, peer(H, #{conn => Dead, status => connecting, attempts => 1}), base_state()),
     S1 = S0#{pending := #{H => [exploratory]}},
-    S2 = S1#{pending_sends := #{H => [msg()]}},
+    S2 = S1#{pending_sends := #{H => [{at, erlang:system_time(millisecond), msg()}]}},
     {noreply, S3} = i2p_peer:handle_info({ntcp2_ready, Dead, mk_ri()}, S2),
     Peer = maps:get(H, maps:get(peers, S3)),
     ?assertEqual(connected, maps:get(status, Peer)),
@@ -296,7 +414,7 @@ ssu2_ready_with_remote_ri_test() ->
         Hash = i2p_router_info:hash(RI),
         {noreply, S1} = i2p_peer:handle_info({ssu2_ready, self(), #{}, RI}, base_state()),
         ?assertMatch({Hash, _, ssu2}, maps:get(self(), maps:get(inbound, S1))),
-        ?assertEqual([#{ri => RI, hash => Hash}], maps:get(known, S1))
+        ?assertEqual(#{Hash => #{ri => RI, hash => Hash}}, maps:get(known, S1))
     after
         case Owner of
             started -> gen_server:stop(whereis(i2p_netdb_srv));
@@ -485,10 +603,14 @@ kick_floodfill_discovery_test() ->
     try
         H1 = mk_hash(),
         H2 = mk_hash(),
-        Known = [#{hash => H1, ri => mk_ri()}, #{hash => H2, ri => mk_ri()}],
+        Known = #{H1 => #{hash => H1, ri => mk_ri()}, H2 => #{hash => H2, ri => mk_ri()}},
         Base = base_state(),
         S = Base#{
-            known := Known,
+            known => Known,
+            %% The operator's ranking, which is what `discovery_candidates/1`
+            %% walks. H1 first and dialing, H2 second and already connecting, so
+            %% only H1 produces a lookup.
+            seed_order => [H1, H2],
             peers := #{H2 => peer(H2, #{status => connecting})}
         },
         ?assertEqual({noreply, S}, i2p_peer:handle_info(kick_floodfill_discovery, S))
@@ -504,7 +626,7 @@ kick_ignores_nonpublished_seed_test() ->
     try
         Hash = mk_hash(),
         RI = nonpublished_ri(),
-        S = (base_state())#{known => [#{hash => Hash, ri => RI}]},
+        S = (base_state())#{known => #{Hash => #{hash => Hash, ri => RI}}},
         ?assertEqual({noreply, S}, i2p_peer:handle_info(kick_floodfill_discovery, S))
     after
         case Owner of
@@ -521,7 +643,7 @@ learn_ri_test() ->
         Hash = i2p_router_info:hash(RI),
         S = base_state(),
         {noreply, S1} = i2p_peer:handle_cast({learn_ri, RI}, S),
-        ?assertEqual([#{ri => RI, hash => Hash}], maps:get(known, S1)),
+        ?assertEqual(#{Hash => #{ri => RI, hash => Hash}}, maps:get(known, S1)),
         {noreply, S2} = i2p_peer:handle_cast({learn_ri, RI}, S1),
         ?assertEqual(maps:get(known, S1), maps:get(known, S2))
     after
@@ -645,7 +767,7 @@ db_store_ri_remembered_without_dial_test() ->
         Msg = i2p_i2np:db_store(Hash, 0, 0, undefined, Data),
         S = base_state(),
         {noreply, S1} = i2p_peer:handle_info({ntcp2_frame, Dead, framed(Msg)}, S),
-        ?assertEqual([#{ri => RI, hash => Hash}], maps:get(known, S1)),
+        ?assertEqual(#{Hash => #{ri => RI, hash => Hash}}, maps:get(known, S1)),
         ?assertEqual(#{}, maps:get(peers, S1))
     after
         case Owner of
@@ -873,8 +995,77 @@ db_store_ls_updated_test() ->
     end.
 
 %% ----------------------------------------------------------------------------
+%% A lookup reply whose tunnel went away between the pick and the send.
+%% ----------------------------------------------------------------------------
+%%
+%% This is the #MCVQ6D6 fix, and the race that reaches it is not buildable
+%% through `f:tunnel_lookup_reply/2`: `f:pick_lookup_outbound/0` returns a pool
+%% *key* and `f:find_outbound/2` searches both pools, so after a successful pick
+%% the id always resolves. Only a concurrent removal makes the send answer
+%% `error`, and reaching that needs a timing assumption -- a flake, not a case.
+%%
+%% So the state is constructed rather than raced to. A stub tunnel manager that
+%% answers `error` is *exactly* what the race leaves behind, and driving
+%% `f:reply_via_outbound/3` against it puts a red case on the line that changed
+%% instead of a green one on the drop path beside it. Against the old `ok = ` it
+%% raises `badmatch`; against the fix it answers `ok` and counts.
+lookup_reply_lost_tunnel_is_counted_not_asserted_test() ->
+    with_lookup_reply_count(error, fun() ->
+        ?assertEqual(0, lookup_reply_drops()),
+        ?assertEqual(ok, i2p_peer:reply_via_outbound(4242, local, <<"wire">>)),
+        ?assertEqual(1, lookup_reply_drops())
+    end).
+
+%% The success path must not count. Otherwise the counter is measuring "a reply
+%% was attempted" rather than "a reply was lost", which is the difference
+%% between an operator fact and a heartbeat.
+lookup_reply_delivered_does_not_count_test() ->
+    with_lookup_reply_count(ok, fun() ->
+        ?assertEqual(ok, i2p_peer:reply_via_outbound(4242, local, <<"wire">>)),
+        ?assertEqual(0, lookup_reply_drops())
+    end).
+
+%% ----------------------------------------------------------------------------
 %% Helpers
 %% ----------------------------------------------------------------------------
+
+lookup_reply_drops() ->
+    maps:get(lookup_replies_dropped_no_tunnel, i2p_stats:snapshot()).
+
+with_lookup_reply_count(Answer, Fun) ->
+    HadStats = ensure_stats(),
+    Stub = spawn(fun StubLoop() ->
+        receive
+            {'$gen_call', From, {send_via_outbound, _Tid, _Delivery, _Wire}} ->
+                gen_server:reply(From, Answer),
+                StubLoop();
+            {'$gen_call', From, _Other} ->
+                gen_server:reply(From, error),
+                StubLoop()
+        end
+    end),
+    register(i2p_tunnel_srv, Stub),
+    try
+        Fun()
+    after
+        case whereis(i2p_tunnel_srv) of
+            Stub -> unregister(i2p_tunnel_srv);
+            _ -> ok
+        end,
+        case HadStats of
+            started -> ok = gen_server:stop(whereis(i2p_stats));
+            existing -> ok
+        end
+    end.
+
+ensure_stats() ->
+    case whereis(i2p_stats) of
+        undefined ->
+            {ok, _} = i2p_stats:start_link(),
+            started;
+        _Pid ->
+            existing
+    end.
 
 framed(I2NPMsg) ->
     i2p_framing:encode_block(3, i2p_i2np:encode(I2NPMsg)).
@@ -894,14 +1085,19 @@ base_state() ->
     Local = local(),
     #{
         local => Local,
-        known => [],
+        %% `known` is keyed by hash; `seed_order` is the operator's ranking of
+        %% them, kept apart because `f:discovery_candidates/1` dials the first
+        %% three and a map cannot carry that.
+        known => #{},
+        seed_order => [],
         peers => #{},
         inbound => #{},
         pending => #{},
         pending_sends => #{},
         our_hash => maps:get(hash, Local),
         refresh_ref => make_ref(),
-        discovery_kick_ref => make_ref()
+        discovery_kick_ref => make_ref(),
+        sweep_ref => make_ref()
     }.
 
 with_peer(Hash, PeerState, State) ->
@@ -966,11 +1162,14 @@ dead_pid() ->
         {'DOWN', MRef, process, Pid, _} -> Pid
     end.
 
+%% Stands in for a transport connection: takes frames and hands them to the test.
+%% The shape is `{send, Payload}` with no reply and no sender, because that is
+%% what `m:i2p_ntcp2_conn:send/2` sends now — a cast. A fake that answered would
+%% be testing the old protocol, and the point of the cast is that no caller waits.
 capture_loop(Test) ->
     receive
-        {send, From, Ref, Payload} ->
+        {send, Payload} ->
             Test ! {captured, Payload},
-            From ! {send_done, Ref},
             capture_loop(Test)
     end.
 

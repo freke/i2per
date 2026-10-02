@@ -8,18 +8,27 @@ the same node, realtime bus counters, and the two HTTP endpoints.
 
 -include_lib("eunit/include/eunit.hrl").
 
+%% The poll interval for the one case that waits on two readings. Short enough
+%% that the wait is the assertion's own synchronisation rather than the shipped
+%% five-second default, which is a property of the page's resolution and not of
+%% what this case checks.
+-define(TEST_POLL_MS, 20).
+
 %% Start the status service bound to a dead router node.
 start_status(Port) ->
     application:set_env(i2per_status, port, Port),
     {ok, _} = application:ensure_all_started(i2per_status),
     ok.
 
+%% The status code is returned rather than asserted, because it is part of what
+%% these tests check: the endpoints answer 200 only when the router is online and
+%% 503 when it is not, so a test that only wanted a body should say so.
 http_get(Path) ->
-    {ok, {{_, 200, _}, Headers, Body}} =
+    {ok, {{_, Status, _}, Headers, Body}} =
         httpc:request(
             get, {"http://127.0.0.1:" ++ integer_to_list(cfg_port()) ++ Path, []}, [], []
         ),
-    {proplists:get_value("content-type", Headers), iolist_to_binary(Body)}.
+    {Status, proplists:get_value("content-type", Headers), iolist_to_binary(Body)}.
 
 cfg_port() ->
     {ok, P} = application:get_env(i2per_status, port),
@@ -41,7 +50,12 @@ offline_snapshot_body() ->
     try
         Snap = i2per_status_state:snapshot(),
         ?assertEqual(false, maps:get(online, Snap)),
-        {_, Body} = http_get("/status.json"),
+        %% 503, not 200: a monitoring consumer must be able to tell a
+        %% dead router from a healthy one by the status code. `online` in
+        %% the body is no substitute for a consumer that only reads the code.
+        {Status, CT, Body} = http_get("/status.json"),
+        ?assertEqual(503, Status),
+        ?assert(lists:prefix("application/json", CT)),
         #{<<"online">> := false} = json:decode(Body)
     after
         application:stop(i2per_status)
@@ -55,7 +69,8 @@ offline_page_body() ->
     application:set_env(i2per_status, router_node, 'ghost@nowhere'),
     start_status(Port),
     try
-        {CT, Body} = http_get("/"),
+        {Status, CT, Body} = http_get("/"),
+        ?assertEqual(503, Status),
         ?assert(lists:prefix("text/html", CT)),
         ?assertNotEqual(nomatch, binary:match(Body, <<"router offline">>))
     after
@@ -73,7 +88,8 @@ live_router_online_body() ->
     start_status(Port),
     try
         wait_online(),
-        {_, Body} = http_get("/status.json"),
+        {Status, _CT, Body} = http_get("/status.json"),
+        ?assertEqual(200, Status),
         Json = json:decode(Body),
         ?assertEqual(true, maps:get(<<"online">>, Json)),
         ?assert(maps:is_key(<<"identity">>, Json)),
@@ -82,6 +98,81 @@ live_router_online_body() ->
         application:stop(i2per_status),
         teardown_live_router()
     end.
+
+%% The end-to-end half of the derivation, and the only test that proves the wiring.
+%%
+%% The unit tests prove `m:i2per_status_derive` arithmetic and the page tests
+%% prove rendering, and neither of those would notice if the poll stopped feeding
+%% readings into the derivation — the derived block would simply be `undefined`
+%% forever and every figure on the page would read "n/a". So this drives a real
+%% router through a real status service and waits for the block to appear.
+%%
+%% The wait is a *condition*, not a sleep: two readings are needed, so the case
+%% waits for the second and `await/2` returns the moment it arrives. It is not a
+%% fixed sleep in disguise, because the assertion is about reaching a state
+%% rather than about elapsed time.
+%%
+%% The poll interval is shortened to 20 ms so that "two readings" is 20 ms of
+%% waiting rather than a full five-second interval. The assertion is unchanged
+%% and does not depend on the interval being a particular value -- only the cost
+%% of waiting for it is under this case's control. The shipped default is 5000
+%% and is exercised by `m:i2per_status_state`; this case is about the derivation
+%% needing two readings, not about how long a poll takes.
+derived_figures_appear_after_two_readings_test_() ->
+    {timeout, 60, fun derived_figures_appear_after_two_readings_body/0}.
+
+derived_figures_appear_after_two_readings_body() ->
+    boot_live_router(),
+    Port = free_port(),
+    application:unset_env(i2per_status, router_node),
+    ok = application:set_env(i2per_status, poll_ms, ?TEST_POLL_MS),
+    start_status(Port),
+    try
+        wait_online(),
+        %% One reading is not enough for a rate, and the first reading says so
+        %% rather than showing a zero.
+        ?assertEqual(no_previous_sample, derived_window_status()),
+        %% `await/2` returns `ok`; the block is read afterwards. Returning the
+        %% predicate's value would read better but is not what it does.
+        ok = i2p_ct_helpers:await(fun() -> derived_window_ok() end, 30000),
+        Derived = derived_block(),
+        ?assertEqual(ok, maps:get(window_status, Derived)),
+        ?assert(is_integer(maps:get(window_ms, Derived))),
+        ?assert(maps:get(window_ms, Derived) > 0),
+        %% And it reaches the wire, with the window and the provenance beside it.
+        {Status, _CT, Body} = http_get("/status.json"),
+        ?assertEqual(200, Status),
+        Json = json:decode(Body),
+        OnWire = maps:get(<<"derived">>, Json),
+        %% A string, not the atom: the JSON encoder renders atoms as strings and
+        %% only `true`/`false` stay boolean. So a consumer of the wire compares
+        %% `"ok"`, and the atom-to-string step is worth knowing about before a
+        %% consumer is written against it.
+        ?assertEqual(<<"ok">>, maps:get(<<"window_status">>, OnWire)),
+        ?assert(maps:is_key(<<"window_ms">>, OnWire)),
+        ?assert(maps:is_key(<<"transfer_bps">>, OnWire)),
+        ?assert(maps:is_key(<<"tunnel_success_ratio">>, OnWire))
+    after
+        application:stop(i2per_status),
+        %% `application:stop/1` does not clear app env, so the next case would
+        %% inherit a 20 ms poll window.
+        application:unset_env(i2per_status, poll_ms),
+        teardown_live_router()
+    end.
+
+derived_window_status() ->
+    maps:get(window_status, derived_block()).
+
+derived_block() ->
+    case maps:get(derived, i2per_status_state:snapshot(), undefined) of
+        undefined -> #{window_status => no_reading_yet};
+        Derived -> Derived
+    end.
+
+%% `await/2` wants a boolean. Returning the block would be `case_clause` inside
+%% the helper, which is a confusing place to be told the predicate is malformed.
+derived_window_ok() ->
+    maps:get(window_status, derived_block()) =:= ok.
 
 bus_event_counter_test_() ->
     {timeout, 30, fun bus_event_counter_body/0}.

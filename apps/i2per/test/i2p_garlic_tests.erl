@@ -375,7 +375,38 @@ dispatch_db_store_with_reply_token_test() ->
 
 dispatch_db_store_malformed_test() ->
     Msg = #{type => 1, msg_id => <<1, 2, 3, 4>>, expiration => 1800000000, body => <<>>},
-    ?assertEqual(ignore, i2p_garlic:dispatch_db_message(Msg, 0)).
+    ?assertEqual(
+        {ignored, undecodable_store}, i2p_garlic:dispatch_db_message(Msg, 0)
+    ).
+
+%% Store types 5 (EncryptedLeaseSet) and 7 (MetaLeaseSet) decode successfully
+%% — `f:i2p_i2np:decode_db_store/1` reports every byte on the wire — so before
+%% the catch-all clause they matched no clause here and raised `case_clause`,
+%% taking the tunnel manager down with them. Both reference routers can emit 5.
+dispatch_db_store_unimplemented_type_test_() ->
+    [
+        ?_assertEqual(
+            {ignored, {unsupported_type, Type}}, dispatch_unimplemented_db_store(Type)
+        )
+     || Type <- [5, 7]
+    ].
+
+dispatch_db_store_unknown_byte_test_() ->
+    %% Any other store type this router does not implement, not just the two
+    %% the references are known to emit.
+    [
+        ?_assertEqual(
+            {ignored, {unsupported_type, Type}}, dispatch_unimplemented_db_store(Type)
+        )
+     || Type <- [2, 4, 6, 8, 255]
+    ].
+
+dispatch_unimplemented_db_store(Type) ->
+    Key = crypto:strong_rand_bytes(32),
+    Data = crypto:strong_rand_bytes(64),
+    Body = <<Key/binary, Type:8, 0:32/big, Data/binary>>,
+    Msg = #{type => 1, msg_id => <<1, 2, 3, 4>>, expiration => 1800000000, body => Body},
+    i2p_garlic:dispatch_db_message(Msg, 0).
 
 dispatch_db_lookup_test() ->
     Key = crypto:strong_rand_bytes(32),
@@ -399,7 +430,40 @@ dispatch_db_search_reply_test() ->
 
 dispatch_unknown_type_test() ->
     Msg = #{type => 42, msg_id => <<1, 2, 3, 4>>, expiration => 1800000000, body => <<"data">>},
-    ?assertEqual(ignore, i2p_garlic:dispatch_db_message(Msg, 0)).
+    ?assertEqual(
+        {ignored, not_a_db_message}, i2p_garlic:dispatch_db_message(Msg, 0)
+    ).
+
+%% The three store-shaped ways a message can be declined are kept apart, because the
+%% ticket this came from needs the difference: a store whose *type* has no parser here
+%% means a peer answered and the record arrived intact, while `undecodable_store` means
+%% the bytes did not parse. One is a gap in this implementation, the other is a fault
+%% on the wire, and an operator cannot act on either until they know which.
+ignored_store_reasons_are_distinct_test() ->
+    Key = crypto:strong_rand_bytes(32),
+    Unimplemented = <<Key/binary, 5:8, 0:32/big, (crypto:strong_rand_bytes(64))/binary>>,
+    Undecodable = #{type => 1, body => <<>>},
+    NotAStore = #{type => 42, body => <<"data">>},
+    ?assertEqual(
+        [
+            {ignored, {unsupported_type, 5}},
+            {ignored, undecodable_store},
+            {ignored, not_a_db_message}
+        ],
+        [
+            i2p_garlic:dispatch_db_message(
+                #{
+                    type => 1,
+                    msg_id => <<1, 2, 3, 4>>,
+                    expiration => 0,
+                    body => Unimplemented
+                },
+                0
+            ),
+            i2p_garlic:dispatch_db_message(Undecodable, 0),
+            i2p_garlic:dispatch_db_message(NotAStore, 0)
+        ]
+    ).
 
 %%%%%%%%% Existing Session (RGarlic) %%%%%%%%%
 

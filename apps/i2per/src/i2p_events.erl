@@ -15,15 +15,28 @@ receive {event, Event} -> ... end.
 
 Emitted events (`t:event/0`):
 
-- `{peer_connected, PeerHash}` / `{peer_disconnected, PeerHash}`
+- `{peer_connected, PeerHash}` / `{peer_disconnected, PeerHash}` /
+  `{peer_connect_failed, PeerHash, Reason, BackoffSeconds}` — a connect that
+  did not become a connection, with the interval the router will now wait
+- `{peer_send_stalled, PeerHash, Reason}` — a peer stopped accepting our sends
 - `{tunnel_built, Direction, Hops}` / `{tunnel_failed, Direction, Why}` /
   `{tunnel_expired, Direction}`
-- `{leaseset_published, DestHash}`
+- `{transit_denied, ReceiveTunnelId, Reason}` — a transit tunnel this router
+  refused to carry, and which of the three reasons applied
+- `{leaseset_published, DestHash}` / `{leaseset_publish_failed, DestHash, Reason}`
 - `{peertest_result, AddressType, Result}` — one SSU2 peer test concluded
 - `{reachability, ssu2, Status}` — the router's inbound reachability decision,
   derived from `peertest_result` events (`firewalled` | `reachable` | `unknown`)
+- `{lookup_failed, Key, Kind, Reason}` — a lookup did not produce its record; the
+  reason separates a responder that answered with something unreadable from one
+  that never answered
 - `{sam_session_created, SessionId, Style}` / `{sam_session_closed, SessionId}`
 - `{config_changed, Key, Value}`
+
+The three failure events — `peer_connect_failed`, `transit_denied`,
+`leaseset_publish_failed` — are the answer to "this router is not working and
+nothing says why". Each is announced at the point the thing happens, once per
+failure rather than once per packet, and each names what failed and why.
 
 Delivery is best-effort: `f:notify/1` always returns `ok` even when the manager
 is not running (emitters must never crash over telemetry). The manager is the
@@ -38,23 +51,59 @@ data path instead of crashing working connections over it.
 
 -export([init/1, handle_event/2, handle_call/2, handle_info/2, terminate/2, code_change/3]).
 
--export_type([event/0, direction/0]).
+-export_type([event/0, direction/0, lookup_kind/0]).
 
 -doc "Tunnel direction.".
 -type direction() :: inbound | outbound.
+
+-doc """
+Which kind of record a `lookup_failed` event was about.
+
+`none` for a failure that is not about a particular record — currently only the
+lookup service not being running, where there is no key and nothing was asked for.
+""".
+-type lookup_kind() :: lease | router | none.
 
 -doc "One router status change, as announced on the bus.".
 -type event() ::
     {peer_connected, i2p_crypto:hash()}
     | {peer_disconnected, i2p_crypto:hash()}
+    %% A connect attempt that did not become a connection, with the reason the
+    %% connection process gave (or `unknown`, for a failure with nothing more to
+    %% report) and the backoff now in effect, in seconds. The interval is the
+    %% load-bearing field: without it a peer being retried in a tight loop and a
+    %% peer the router has given up on look identical.
+    | {peer_connect_failed, i2p_crypto:hash(), term(), pos_integer()}
+    %% A peer that stopped accepting our sends, and why. The counterpart of
+    %% `peer_disconnected`, which says the connection is gone without saying
+    %% whether it went on its own terms. A session that merely degrades when it
+    %% is busy and one that has stopped taking writes are different faults, and
+    %% only this one says which.
+    | {peer_send_stalled, i2p_crypto:hash(), i2p_ntcp2_conn:send_stalled_reason()}
     | {tunnel_built, direction(), pos_integer()}
     | {tunnel_failed, direction(), rejected | invalid}
     | {tunnel_expired, direction()}
+    %% A build record this router refused to carry, with the receive tunnel ID it
+    %% was for and which of the three refusal causes applied.
+    | {transit_denied, 0..16#FFFFFFFF, i2p_tunnel_relay:transit_denied_reason()}
     | {leaseset_published, i2p_crypto:hash()}
+    %% A client LeaseSet that did not reach the network, with the destination and
+    %% the reason. The counterpart of `leaseset_published`, which used to be
+    %% announced whether or not anything had actually been published.
+    | {leaseset_publish_failed, i2p_crypto:hash(),
+        i2p_tunnel_publish:leaset_publish_failed_reason()}
     | {sam_session_created, binary(), term()}
     | {sam_session_closed, binary()}
     | {peertest_result, i2p_peertest:address_type(), i2p_peertest:result()}
     | {reachability, ssu2, firewalled | reachable | unknown}
+    | {ssu2_block_unhandled, atom()}
+    | {db_store_not_stored, i2p_peer:store_not_stored_reason()}
+    %% A lookup that did not produce the record it was asked for. The reason is the
+    %% whole point: `no_answer` means nobody answered, while `{not_stored, _}` means
+    %% a peer *did* answer and this router could not use what it was given. Those are
+    %% opposite problems and used to be the same result.
+    | {lookup_failed, i2p_crypto:hash() | undefined, lookup_kind(),
+        i2p_lookup_srv:lookup_failed_reason()}
     | {config_changed, atom(), term()}.
 
 -doc """
@@ -75,6 +124,7 @@ discarded deliberately (see the module doc).
 """.
 -spec notify(event()) -> ok.
 notify(Event) ->
+    ok = i2p_stats:add(events_notified, 1),
     case whereis(?MODULE) of
         undefined ->
             ok;

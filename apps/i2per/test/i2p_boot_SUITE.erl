@@ -30,7 +30,10 @@
     boot_kicks_floodfill_discovery/1,
     boot_kick_noops_without_seeds/1,
     offline_boot_does_not_dial_seeded_peer/1,
-    smoke_report_carries_four_observables/1
+    smoke_report_carries_four_observables/1,
+    boot_announces_config_posture_and_online/1,
+    boot_config_line_reports_the_value_in_force/1,
+    boot_lines_carry_no_key_material/1
 ]).
 
 -define(APP, i2per).
@@ -56,7 +59,10 @@ all() ->
         boot_kicks_floodfill_discovery,
         boot_kick_noops_without_seeds,
         offline_boot_does_not_dial_seeded_peer,
-        smoke_report_carries_four_observables
+        smoke_report_carries_four_observables,
+        boot_announces_config_posture_and_online,
+        boot_config_line_reports_the_value_in_force,
+        boot_lines_carry_no_key_material
     ].
 
 init_per_testcase(_Case, Config) ->
@@ -81,7 +87,10 @@ end_per_testcase(_Case, _Config) ->
             live_network,
             listen_host,
             floodfill_discovery_delay_ms,
-            host
+            host,
+            config_file,
+            net_id,
+            log_level
         ]
     ),
     ok.
@@ -368,8 +377,12 @@ ssu2_inbound_session_round_trips(Config) ->
         %% Bob's (our own) RouterInfo is announced back as the first data-phase
         %% store over the SSU2 lane.
         ?assertEqual(OurHash, recv_ssu2_store(APid)),
-        %% The peer manager learned the dialer into the NetDb.
-        ?assertMatch({ok, _}, await_netdb(AliceHash)),
+        %% The peer manager learned the dialer into the NetDb. A call is handled
+        %% after every message already queued on the peer manager, and the store
+        %% arrived over that queue, so this answers "has the store been applied"
+        %% rather than "has it happened within ten seconds".
+        _ = gen_server:call(i2p_peer, dialed),
+        ?assertMatch({ok, _}, i2p_netdb_srv:find(AliceHash)),
         unlink(APid),
         i2p_ssu2_conn:terminate_session(APid, 0),
         i2p_ssu2_listener:stop(AliceListener)
@@ -432,10 +445,27 @@ reseed_runs_after_live_opt_in(Config) ->
         {ok, _} = application:ensure_all_started(?APP),
         %% Behavioural: the reseed worker feeds the NetDb; each reseeded
         %% RouterInfo becomes findable.
+        %%
+        %% **Barrier, not a poll.** The previous version polled the NetDb with a
+        %% ten-second deadline. That is a different thing with a different
+        %% failure mode: `m:i2p_reseed`'s HTTP client is configured with a
+        %% thirty-second timeout, so a fetch the production code is entitled to
+        %% take fifteen seconds is a test failure — and a slow machine and a
+        %% broken one produce the same report. It failed under full-suite load
+        %% while passing twelve times in a row on its own, which is what a
+        %% deadline standing in for a synchronisation looks like.
+        %%
+        %% The two steps below remove the race instead of widening the window.
+        %% The worker stops only after the fetch returned and every `learn_ri`
+        %% cast was sent, so its exit means the casts are in flight. A call to the
+        %% peer manager is then handled after every message already in its queue,
+        %% so once it answers, the RouterInfos are in the NetDb. After that there
+        %% is no deadline on the assertion at all.
+        ok = await_reseed_worker(),
+        _ = gen_server:call(i2p_peer, dialed),
         lists:foreach(
             fun(RI) ->
-                Hash = i2p_router_info:hash(RI),
-                ?assertMatch({ok, _}, await_netdb(Hash))
+                ?assertMatch({ok, _}, i2p_netdb_srv:find(i2p_router_info:hash(RI)))
             end,
             Ris
         )
@@ -593,6 +623,192 @@ boot_kick_noops_without_seeds(Config) ->
         application:unset_env(?APP, reseed),
         application:unset_env(?APP, ntcp2_published),
         application:unset_env(?APP, floodfill_discovery_delay_ms)
+    end.
+
+%% --------------------------------------------------------------------------
+%% ADR 0002's three boot gaps. Each is one `notice` line, emitted once per boot,
+%% from a place on the path every boot takes.
+%% --------------------------------------------------------------------------
+
+boot_announces_config_posture_and_online(Config) ->
+    Dir = i2p_ct_helpers:temp_data_dir(Config),
+    Port = i2p_ct_helpers:free_port(),
+    try
+        application:set_env(?APP, data_dir, Dir),
+        application:set_env(?APP, seeds, [dummy_seed(), remote_ri(4802)]),
+        application:set_env(?APP, port, Port),
+        application:set_env(?APP, allow_private_host, true),
+        application:set_env(?APP, sam_port, i2p_ct_helpers:free_port()),
+        application:set_env(?APP, live_network, false),
+        Events = i2p_ct_helpers:log_events_from(fun boot/0),
+        Lines = [i2p_ct_helpers:render_log_event(E) || E <- Events],
+        ct:pal("boot lines:~n~s", [lists:join("\n", Lines)]),
+
+        %% Each of the three, exactly once, and at `notice`.
+        %%
+        %% "Exactly once" rather than "at least": a line repeated on every
+        %% supervisor restart would turn one question -- what did this router start
+        %% as -- into three answers, two of them about a router no longer running.
+        %%
+        %% The level is checked separately from the text because they are separate
+        %% claims. `m:i2p_log:emit/3`'s fact name selects the level and nothing else,
+        %% so recording the started-as line under a `warning` fact yields the
+        %% identical text at a different level -- and every text assertion still
+        %% passes. That was a mutation this case did not catch until it asserted
+        %% the level too.
+        One = fun(Prefix) ->
+            case
+                [
+                    {maps:get(level, Event), Line}
+                 || Event <- Events,
+                    Line <- [i2p_ct_helpers:render_log_event(Event)],
+                    lists:prefix(Prefix, Line)
+                ]
+            of
+                [{notice, Only}] ->
+                    Only;
+                [{Level, Only}] ->
+                    ct:fail({expected_notice_for, Prefix, Level, Only});
+                Found ->
+                    ct:fail({expected_one_line_for, Prefix, Found})
+            end
+        end,
+        InForce = One("i2per config in force: "),
+        StartedAs = One("i2per started as: "),
+        Online = One("i2per online: "),
+
+        %% What the operator asked for. The listen address and the seed count are
+        %% the two that cannot be read back out of the configuration file at all,
+        %% so getting them right is the part actually being tested.
+        ?assertNotEqual(nomatch, string:find(StartedAs, "version=")),
+        ?assertNotEqual(
+            nomatch, string:find(StartedAs, "listen=127.0.0.1:" ++ integer_to_list(Port))
+        ),
+        %% The path is rendered as a string, so it carries its own quotes.
+        ?assertNotEqual(nomatch, string:find(StartedAs, "data_dir=\"" ++ Dir)),
+        ?assertNotEqual(nomatch, string:find(StartedAs, "live=false")),
+        ?assertNotEqual(nomatch, string:find(StartedAs, "seeds=2")),
+        ?assertNotEqual(nomatch, string:find(StartedAs, "sam_port=")),
+        %% CT runs on a named node, so the distribution posture here is the one an
+        %% operator with a firewall actually has to reason about. What the line does
+        %% *not* claim is whether the node is listening -- see
+        %% `m:i2per_sup:render_distribution/0` for why there is no way to ask.
+        ?assertNotEqual(nomatch, string:find(StartedAs, "dist=on")),
+        ?assertNotEqual(nomatch, string:find(StartedAs, "node=")),
+        ?assertNotEqual(nomatch, string:find(StartedAs, "dist_range=")),
+
+        ?assertNotEqual(nomatch, string:find(Online, "bus=up")),
+        ?assertNotEqual(nomatch, string:find(Online, "read_api=answering(")),
+        ?assertNotEqual(nomatch, string:find(Online, "identity=")),
+
+        %% The configuration line names the environment's values, including the
+        %% level -- so an operator reading a log at a verbosity they did not expect
+        %% has somewhere to find out why.
+        ?assertNotEqual(nomatch, string:find(InForce, "port=" ++ integer_to_list(Port))),
+        ?assertNotEqual(nomatch, string:find(InForce, "data_dir=")),
+        ?assertNotEqual(nomatch, string:find(InForce, "log_level=")),
+        ?assertNotEqual(nomatch, string:find(InForce, "live_network=false")),
+        %% "One line" checked as a property of the output rather than assumed from
+        %% the format strings. A `~p` over one of the read API's maps wraps at this
+        %% width and would have turned any of the three into five lines, each of
+        %% which still matched the prefix above.
+        ?assertEqual(3, length(Lines))
+    after
+        application:stop(?APP)
+    end.
+
+%% The one that can silently lie.
+%%
+%% `i2per.conf` supplies two keys and the environment supplies a third the file
+%% never mentions. `m:i2p_config:apply_env/1` is gap-filling -- anything already set
+%% in the environment wins -- so the file and the environment genuinely disagree
+%% about what this router is running with, and the line has to report the
+%% environment's answer for the key both of them set. A reporter that read the file
+%% would print the file's value, and every one of its assertions would still look
+%% entirely plausible.
+boot_config_line_reports_the_value_in_force(Config) ->
+    Dir = i2p_ct_helpers:temp_data_dir(Config),
+    Port = i2p_ct_helpers:free_port(),
+    Conf = filename:join(Dir, "i2per.conf"),
+    ok = filelib:ensure_dir(Conf),
+    ok = file:write_file(Conf, <<"log_level = info\nnet_id = 7\nfloodfill = false\n">>),
+    try
+        application:set_env(?APP, config_file, Conf),
+        %% Set only in the environment: the file says nothing about `data_dir`, so
+        %% a reporter reading the file could not mention it at all.
+        application:set_env(?APP, data_dir, Dir),
+        application:set_env(?APP, seeds, [dummy_seed()]),
+        application:set_env(?APP, port, Port),
+        application:set_env(?APP, allow_private_host, true),
+        application:set_env(?APP, net_id, 3),
+        Lines = i2p_ct_helpers:log_lines_from(fun boot/0),
+        Rendered = lists:flatten(lists:join(" ", Lines)),
+        ct:pal("boot lines:~n~s", [lists:join("\n", Lines)]),
+
+        %% The environment's answer for the key both of them set: `net_id` is 3 in
+        %% the environment and 7 in the file, and the router is running with 3.
+        ?assertEqual({ok, 3}, application:get_env(?APP, net_id)),
+        ?assertNotEqual(nomatch, string:find(Rendered, "net_id=3")),
+        ?assertEqual(nomatch, string:find(Rendered, "net_id=7")),
+
+        %% And the file's answer for the key only the file set, which is the other
+        %% half of the property: the line has to reflect what the loader put into
+        %% the environment, not only what was already there.
+        ?assertEqual({ok, info}, application:get_env(?APP, log_level)),
+        ?assertEqual(info, i2p_log:level()),
+        ?assertNotEqual(nomatch, string:find(Rendered, "log_level=info")),
+        ?assertNotEqual(nomatch, string:find(Rendered, "floodfill=false"))
+    after
+        application:stop(?APP),
+        application:unset_env(?APP, config_file)
+    end.
+
+%% Nothing the router holds that is secret reaches any of the three lines.
+%%
+%% Two real secrets rather than stand-ins: the identity this boot created on disk,
+%% whose signing seed is read back out of the data directory afterwards, and the
+%% distribution cookie this node is genuinely running with. The cookie is the
+%% better of the two to check -- a boot line that leaked it would hand over the one
+%% secret an attacker can actually use to connect at all.
+%%
+%% Worth reading next to `boot_announces_config_posture_and_online/1` and not on its
+%% own: a renderer that printed nothing would pass a "no secrets" test by itself,
+%% so what makes this meaningful is that the other case proves the lines are
+%% non-empty and carry the facts.
+boot_lines_carry_no_key_material(Config) ->
+    Dir = i2p_ct_helpers:temp_data_dir(Config),
+    Port = i2p_ct_helpers:free_port(),
+    try
+        application:set_env(?APP, data_dir, Dir),
+        application:set_env(?APP, seeds, [dummy_seed()]),
+        application:set_env(?APP, port, Port),
+        application:set_env(?APP, allow_private_host, true),
+        Lines = i2p_ct_helpers:log_lines_from(fun boot/0),
+        Rendered = lists:flatten(lists:join(" ", Lines)),
+        ct:pal("boot lines:~n~s", [lists:join("\n", Lines)]),
+
+        {ok, Id} = i2p_identity:ensure_identity(Dir),
+        Seed = maps:get(sign_seed, Id),
+        Cookie = erlang:get_cookie(),
+        ?assertNotEqual(nohost, Cookie),
+        ?assertEqual(nomatch, string:find(Rendered, binary_to_list(Seed))),
+        ?assertEqual(nomatch, string:find(Rendered, atom_to_list(Cookie)))
+    after
+        application:stop(?APP)
+    end.
+
+%% Start the router, failing the case if it did not start.
+%%
+%% Used as the work under `m:i2p_ct_helpers:log_lines_from/1`'s barrier:
+%% `ensure_all_started/1` returns only once `m:i2per_app:start/2` has emitted all
+%% three lines, so the marker logged after it cannot overtake them. No deadline and
+%% no sleep -- the ordering is the property, and it is the barrier's job to establish
+%% it rather than this function's.
+-spec boot() -> ok.
+boot() ->
+    case application:ensure_all_started(?APP) of
+        {ok, _} -> ok;
+        {error, Reason} -> ct:fail({boot_failed, Reason})
     end.
 
 %%%%%%% %%% Internal %%%%%%%
@@ -973,17 +1189,10 @@ remote_ri(Port) ->
     Opts = #{<<"netId">> => <<"2">>, <<"router.version">> => <<"0.9.74">>},
     i2p_router_info:build(Identity, erlang:system_time(millisecond), [Addr], Opts, Seed).
 
+%% Shared with the other reseed-shaped suites and generated once per run. See
+%% `i2p_ct_helpers:su3_keypair/0` for why the key is 4096 bits.
 test_keypair() ->
-    case persistent_term:get({?MODULE, test_keypair}, undefined) of
-        undefined ->
-            Priv = public_key:generate_key({rsa, 4096, 65537}),
-            #{cert := Cert} = public_key:pkix_test_root_cert("i2per-boot", [{key, Priv}]),
-            Pair = {Priv, Cert},
-            persistent_term:put({?MODULE, test_keypair}, Pair),
-            Pair;
-        Pair ->
-            Pair
-    end.
+    i2p_ct_helpers:su3_keypair().
 
 sign_ris(Ris) ->
     {Priv, _Cert} = test_keypair(),
@@ -1027,13 +1236,25 @@ serve_once(Listen, Su3) ->
 reseed_url(Port) ->
     lists:flatten(io_lib:format("http://127.0.0.1:~b/", [Port])).
 
-%% Deadline-based NetDb poll: waits for the hash to appear instead of
-%% counter+timer:sleep.
-await_netdb(Hash) ->
-    i2p_ct_helpers:await(fun() ->
-        case i2p_netdb_srv:find(Hash) of
-            {ok, _} -> true;
-            not_found -> false
-        end
-    end),
-    i2p_netdb_srv:find(Hash).
+%% Wait for the reseed worker to stop, which it does after the fetch returned
+%% and the `learn_ri` casts were sent — whether the fetch succeeded or failed.
+%% Either way the casts are in flight, so the caller's barrier on the peer manager
+%% is sound. A failed reseed therefore shows up as a RouterInfo that is not
+%% findable, which names the cause, rather than as a timeout.
+%%
+%% The process may already be gone: it is a child of the supervisor the test just
+%% started, so it was registered when `ensure_all_started` returned, and a missing
+%% name therefore means it finished rather than that it never started. The
+%% deadline below guards a genuine hang, not a slow one.
+await_reseed_worker() ->
+    case whereis(i2p_reseed_srv) of
+        undefined ->
+            ok;
+        Pid ->
+            Ref = erlang:monitor(process, Pid),
+            receive
+                {'DOWN', Ref, process, Pid, _Reason} -> ok
+            after 60_000 ->
+                erlang:error(reseed_worker_never_stopped)
+            end
+    end.

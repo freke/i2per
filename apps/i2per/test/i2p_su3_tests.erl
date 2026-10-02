@@ -146,8 +146,8 @@ cert_expired_test() ->
 %% Fixtures
 %% --------------------------------------------------------------------------
 
-%% i2psu3/0 — one valid container, memoised so only two RSA-4096 keys are ever
-%% generated per test-node run.
+%% i2psu3/0 — one valid container, memoised so the encoding is done once. The
+%% signing key is shared per run; see `i2p_ct_helpers:su3_keypair/0`.
 i2psu3() ->
     {Priv, _Cert} = keypair(),
     case persistent_term:get({?MODULE, su3}, undefined) of
@@ -159,24 +159,13 @@ i2psu3() ->
             Bin
     end.
 
-keypair() -> memoise(key, fun make_keypair/0).
+keypair() -> i2p_ct_helpers:su3_keypair().
 
-other_keypair() -> memoise(other_key, fun make_keypair/0).
+other_keypair() -> i2p_ct_helpers:su3_other_keypair().
 
-memoise(Key, Make) ->
-    case persistent_term:get({?MODULE, Key}, undefined) of
-        undefined ->
-            Value = Make(),
-            persistent_term:put({?MODULE, Key}, Value),
-            Value;
-        Value ->
-            Value
-    end.
-
-make_keypair() ->
-    Priv = public_key:generate_key({rsa, 4096, 65537}),
-    #{cert := Cert} = public_key:pkix_test_root_cert("reseed-test", [{key, Priv}]),
-    {Priv, Cert}.
+%% The signing identity is generated once per run by
+%% `i2p_ct_helpers:su3_keypair/0`, which is also why this module keeps no keygen
+%% of its own.
 
 flip_last_byte(Bin) ->
     Len = byte_size(Bin),

@@ -130,10 +130,10 @@ terminate(_Reason, #{listener := Listener}) ->
 route_blocks(Pid, Blocks, State = #{charlie_sess := Charlie}) ->
     case Pid =:= Charlie of
         true ->
-            trace({coord_route, charlie_to_alice}),
+            i2p_log:debug({coord_route, charlie_to_alice}, []),
             relay_charlie_to_alice(Blocks, State);
         false ->
-            trace({coord_route, alice_to_charlie}),
+            i2p_log:debug({coord_route, alice_to_charlie}, []),
             State1 = relay_alice_to_charlie(Blocks, State),
             case maps:get(alice_sess, State1, undefined) of
                 undefined -> State1#{alice_sess => Pid};
@@ -157,7 +157,7 @@ relay_alice_to_charlie(Blocks, State = #{charlie_sess := Charlie}) ->
 relay_msg1_or_buffer(Code, Flags, Ver, Nonce, Ts, Port, Ip, Sig, State) ->
     case alice_hash(State) of
         undefined ->
-            trace({coord_msg1, buffered}),
+            i2p_log:debug({coord_msg1, buffered}, []),
             %% Alice's hash not yet learned; hold the request until her
             %% RouterInfo arrives (SSU2 delivers blocks in order, so the
             %% RouterInfo will be handled in a later message).
@@ -165,7 +165,7 @@ relay_msg1_or_buffer(Code, Flags, Ver, Nonce, Ts, Port, Ip, Sig, State) ->
                 pending_msg1 => {peertest, 1, Code, Flags, <<0:256>>, Ver, Nonce, Ts, Port, Ip, Sig}
             };
         AliceHash ->
-            trace({coord_msg1, sent}),
+            i2p_log:debug({coord_msg1, sent}, []),
             Msg2 = {peertest, 2, Code, Flags, AliceHash, Ver, Nonce, Ts, Port, Ip, Sig},
             i2p_ssu2_conn:send_peertest(maps:get(charlie_sess, State), Msg2),
             State#{pending_msg1 => undefined}
@@ -196,7 +196,7 @@ flush_pending_msg1(State) ->
         {{peertest, 1, Code, Flags, _Hash, Ver, Nonce, Ts, Port, Ip, Sig}, AliceHash} when
             is_binary(AliceHash)
         ->
-            trace({coord_msg1, flushed_from_buffer}),
+            i2p_log:debug({coord_msg1, flushed_from_buffer}, []),
             Msg2 = {peertest, 2, Code, Flags, AliceHash, Ver, Nonce, Ts, Port, Ip, Sig},
             i2p_ssu2_conn:send_peertest(maps:get(charlie_sess, State), Msg2),
             State#{pending_msg1 => undefined};
@@ -224,14 +224,16 @@ relay_charlie_to_alice(Blocks, State = #{charlie_ri := CharlieRI}) ->
         {{peertest, 3, Code, Flags, _Hash, Ver, Nonce, Ts, Port, Ip, Sig}, APid, CRI} when
             is_pid(APid), CRI =/= undefined
         ->
-            trace({coord_msg4, sent}),
+            i2p_log:debug({coord_msg4, sent}, []),
             i2p_ssu2_conn:send_router_info(Alice, 0, i2p_router_info:to_binary(CRI)),
             Msg4 =
                 {peertest, 4, Code, Flags, i2p_router_info:hash(CRI), Ver, Nonce, Ts, Port, Ip,
                     Sig},
             i2p_ssu2_conn:send_peertest(Alice, Msg4);
         _ ->
-            trace({coord_msg4, skipped, peek_pt(Blocks), is_pid(Alice), CharlieRI =/= undefined}),
+            i2p_log:debug(
+                {coord_msg4, skipped, peek_pt(Blocks), is_pid(Alice), CharlieRI =/= undefined}, []
+            ),
             ok
     end,
     State.
@@ -241,9 +243,6 @@ peek_pt(Blocks) ->
         {peertest, N, _Code, _Flags, _Hash, _Ver, _Nonce, _Ts, _Port, _Ip, _Sig} -> N;
         _ -> none
     end.
-
-trace(Label) ->
-    i2p_ssu2_trace:emit(self(), Label, []).
 
 alice_hash(State) ->
     maps:get(alice_hash, State, undefined).

@@ -54,6 +54,8 @@ ok = i2p_tunnel_relay:send_tunnel_data(FirstHopHash, Frame).
     send_tunnel_data/2
 ]).
 
+-export_type([transit_denied_reason/0, store_result/0]).
+
 -define(DEFAULT_MAX_TRANSIT, 1000).
 -define(REPLY_RET_OFFSET, 201).
 -define(TRANSIT_FRAME_BYTES, 1028).
@@ -100,14 +102,20 @@ handle_routed_i2np(_ConnPid, _PeerHash, _Msg, State) ->
 Send one encrypted TunnelData frame to a router.
 
 Input: `NextHash` — the next hop's RouterIdentity hash; `FwdBody` — the full
-1028-byte tunnel message body (`tunnel_id ‖ iv ‖ encrypted`). Output: `ok`;
-when no RouterInfo for `NextHash` is in the NetDb the frame is dropped
-silently (the peer manager owns reconnection).
+1028-byte tunnel message body (`tunnel_id ‖ iv ‖ encrypted`). Output: `ok`.
+When no RouterInfo for `NextHash` is in the NetDb the frame is dropped and
+counted as `transit_frames_dropped_no_route`, because the peer manager owns
+reconnection and a frame it cannot route is gone for good.
 """.
 -spec send_tunnel_data(i2p_crypto:hash(), <<_:32, _:_*8>>) -> ok.
 send_tunnel_data(NextHash, FwdBody) ->
-    case i2p_netdb_srv:find(NextHash) of
-        {ok, _RI} ->
+    %% **`has_router/1`, not `find/1`.** The answer is all this needs, and this
+    %% runs once per 1028-byte frame for every tunnel this router relays and
+    %% every message it injects. As a lookup it cost a `gen_server:call/2` into
+    %% the NetDb and a copy of a whole RouterInfo to learn a boolean; as
+    %% `ets:member/2` it costs neither and cannot block behind a NetDb write.
+    case i2p_netdb_srv:has_router(NextHash) of
+        true ->
             Fwd = #{
                 type => 18,
                 msg_id => i2p_i2np:fresh_msg_id(),
@@ -115,9 +123,59 @@ send_tunnel_data(NextHash, FwdBody) ->
                 body => FwdBody
             },
             i2p_peer:send_when_ready(NextHash, Fwd);
-        not_found ->
+        false ->
+            %% Counted, so a drop is distinguishable from a send. The peer
+            %% manager owns reconnection, so this frame is gone for good and
+            %% "we could not route it" is the only thing an operator can act on.
+            %% Not an event: a frame we have no route for is a steady state on a
+            %% transit router whose next hop has expired, and an event per frame
+            %% would drown the bus.
+            ok = i2p_stats:add(transit_frames_dropped_no_route, 1),
             ok
     end.
+
+%%%%%%% %%% Types %%%%%%%
+
+-doc """
+Why the router refused to carry a tunnel.
+
+The three causes are the three branches of `f:decide_ret/2`, kept apart because
+a single "ret 30" is undiagnosable: an operator seeing denials needs to know
+whether the transit pool is full (expected at capacity, nothing to fix), the
+build-pacing budget is drained (a rate-limit decision, and raising
+`tunnel_build_rate` would help), or the receive ID is one we already serve (a
+duplicate, and the creator is retrying into a tunnel it already holds).
+
+A closed vocabulary on purpose — these are the code's own branches, so an open
+one would let a reason be invented that no path can produce.
+""".
+-type transit_denied_reason() ::
+    %% `transit_max_tunnels` reached: every receive ID we hold is a legitimate
+    %% transit tunnel and there is no room for another.
+    capacity
+    %% The receive ID is already in the transit map, so this build is a retry of
+    %% one we are already carrying rather than a new request.
+    | duplicate_receive_id
+    %% The `tunnel_build_rate` token bucket is drained, so acceptance is being
+    %% paced rather than refused on the merits.
+    | build_budget_drained.
+
+-doc """
+What became of a responder's store on its way into the NetDb, with the reason
+attached when it did not make it.
+
+Deliberately **not** named `store_outcome`, because `m:i2p_peer:store_outcome/0`
+already exists and means something slightly different: it is the two-atom verdict
+that path hands back, with the reason travelling separately in a three-tuple. This
+one is built to be *put in a message*, so the reason is inline — a wake-up that
+omits it would be indistinguishable from a wake-up that had none.
+
+The reason vocabulary itself is `m:i2p_peer:store_not_stored_reason/0`, reused rather
+than reinvented. These are the same conditions the store path already reports, and a
+parallel set of reasons for "the NetDb would not take this record" would have to be
+kept in step with the original forever.
+""".
+-type store_result() :: stored | {not_stored, i2p_peer:store_not_stored_reason()}.
 
 %%%%%%% %%% Internal %%%%%%%
 
@@ -151,7 +209,13 @@ handle_stb(Msg, #{local := Local} = State) ->
 -spec seal_and_forward(map(), i2p_tunnel:hop_info(), [binary()], i2p_tunnel_srv:tunnel_srv_state()) ->
     i2p_tunnel_srv:tunnel_srv_state().
 seal_and_forward(Msg, HopInfo, Records, State) ->
-    {Ret, State2} = decide_ret(HopInfo, State),
+    {Ret, Denied, State2} = decide_ret(HopInfo, State),
+    %% Announced at the point the decision is taken, carrying *why* it went the
+    %% other way. A bare ret 30 is the one thing an operator seeing a router that
+    %% is not carrying anyone's tunnels cannot act on, and it is the only part of
+    %% transit participation that left no trace at all. One event per denied
+    %% record, so one per build request — never per relayed frame.
+    maybe_deny(recv_tunnel_id(HopInfo), Denied),
     Records1 = i2p_tunnel:apply_build_reply(HopInfo, Ret, Records),
     State3 =
         case Ret of
@@ -180,10 +244,13 @@ forward_stb(Msg, HopInfo, Records1, State) ->
         body := <<Num:8, (iolist_to_binary(Records1))/binary>>
     },
     NextHash = maps:get(next_hash, HopInfo),
-    case i2p_netdb_srv:find(NextHash) of
-        {ok, _RI} ->
+    %% Same reasoning as `f:send_tunnel_data/2`: only the existence check is
+    %% needed. This one runs per build record rather than per frame, so it is
+    %% not hot, but there is no reason to pay for a RouterInfo nobody reads.
+    case i2p_netdb_srv:has_router(NextHash) of
+        true ->
             i2p_peer:send_when_ready(NextHash, ForwardMsg);
-        not_found ->
+        false ->
             %% Cannot route onward; the build reply dies here and the
             %% creator will time out. Nothing to clean up.
             ok
@@ -240,15 +307,44 @@ deliver_otbrm(Msg, HopInfo, Records1, State) ->
 %% endpoint); 30 rejects on capacity, duplicate receive ID, or a drained
 %% build-pacing bucket. Rejections are still sealed into the record list so
 %% the creator learns immediately.
+%% decide_ret/2 — accept or reject a build record, and say why.
+%%
+%% A denial now names its cause (`t:transit_denied_reason/0`) instead of collapsing
+%% to ret 30, so the event the caller announces can be actionable. The capacity
+%% and duplicate tests were one boolean and are now two clauses for exactly that
+%% reason: `transit_max_tunnels` being reached and a receive ID we already hold
+%% call for different responses from an operator, and were indistinguishable.
 -spec decide_ret(i2p_tunnel:hop_info(), i2p_tunnel_srv:tunnel_srv_state()) ->
-    {0 | 30, i2p_tunnel_srv:tunnel_srv_state()}.
+    {0 | 30, accept | transit_denied_reason(), i2p_tunnel_srv:tunnel_srv_state()}.
 decide_ret(#{recv_tunnel_id := RecvID}, #{transit := Transit} = State) ->
     MaxTransit = application:get_env(i2per, transit_max_tunnels, ?DEFAULT_MAX_TRANSIT),
-    Duplicate = maps:is_key(RecvID, Transit) orelse map_size(Transit) >= MaxTransit,
-    case Duplicate of
-        true -> {30, State};
-        false -> pace_build(State)
+    case maps:is_key(RecvID, Transit) of
+        true ->
+            {30, duplicate_receive_id, State};
+        false ->
+            case map_size(Transit) >= MaxTransit of
+                true -> {30, capacity, State};
+                false -> accept_and_pace(State)
+            end
     end.
+
+%% accept_and_pace/1 — the record is acceptable on the merits, so the only thing
+%% left is whether the build-pacing budget allows another acceptance.
+accept_and_pace(State) ->
+    case pace_build(State) of
+        {0, State1} -> {0, accept, State1};
+        {30, State1} -> {30, build_budget_drained, State1}
+    end.
+
+%% recv_tunnel_id/1 and maybe_deny/2 — announce a denial, if this was one. Kept
+%% apart so `seal_and_forward/4` reads as the sequence of decisions it is, and so
+%% an accepted record has no path to the bus at all.
+-spec recv_tunnel_id(i2p_tunnel:hop_info()) -> 0..16#FFFFFFFF.
+recv_tunnel_id(#{recv_tunnel_id := RecvID}) -> RecvID.
+
+-spec maybe_deny(0..16#FFFFFFFF, accept | transit_denied_reason()) -> ok.
+maybe_deny(_RecvID, accept) -> ok;
+maybe_deny(RecvID, Reason) -> ok = i2p_events:notify({transit_denied, RecvID, Reason}).
 
 %% pace_build/1 — charge one build-decision token against the build-accept
 %% bucket. When the bucket is drained the acceptance becomes ret 30; a
@@ -313,13 +409,27 @@ relay_transit_data(Body, Info, State) ->
         deny ->
             State;
         {allow, State1} ->
+            %% Charged on acceptance, not on arrival and not on forwarding. A
+            %% frame the token bucket refused was never carried, so charging it
+            %% would let a router under pressure report the traffic it turned
+            %% away as traffic it did — and the bucket is consulted before the
+            %% crypto precisely because that is the cheapest place to stop.
+            ok = i2p_stats:add(transit_bytes_in, byte_size(Body)),
             NextID = maps:get(next_tunnel_id, Info),
             NextHash = maps:get(next_hash, Info),
             case i2p_tunnel:process_tunnel_data(Body, Info, NextID, i2p_i2np:fresh_msg_id()) of
                 {ok, FwdBody} ->
+                    %% Charged here rather than inside `f:send_tunnel_data/2`,
+                    %% which is also the gateway's own path for injecting local
+                    %% client data. Counting there would report another router's
+                    %% traffic and our own as the same figure.
+                    ok = i2p_stats:add(transit_bytes_out, byte_size(FwdBody)),
                     send_tunnel_data(NextHash, FwdBody),
                     State1;
                 error ->
+                    %% Accepted and received, but not forwarded — so counted
+                    %% once, in the inbound figure, and that asymmetry is the
+                    %% honest one.
                     State1
             end
     end.
@@ -409,14 +519,16 @@ dispatch_local_message(StdMsg, State) ->
             DbMsg = #{type => maps:get(type, Msg), body => maps:get(body, Msg)},
             case i2p_garlic:dispatch_db_message(DbMsg, 0) of
                 {store, lease, Key, LsBin, _Ts} ->
-                    _ = i2p_netdb_srv:store_ls_binary(LsBin, erlang:system_time(second)),
-                    notify_lookup(Key, lease);
+                    notify_lookup(Key, lease, store_lease(LsBin));
                 {store, router, Key, RiBin, _Ts} ->
-                    _ = i2p_netdb_srv:store_binary(RiBin, erlang:system_time(millisecond)),
-                    notify_lookup(Key, router);
+                    notify_lookup(Key, router, store_router(RiBin));
                 {search_reply, #{key := Key, peers := Peers}} ->
                     notify_search_reply(Key, Peers);
-                _OtherOutcome ->
+                {ignored, _Reason} ->
+                    %% Nothing to tell a lookup about: no store arrived for any key,
+                    %% so a pending lookup stays pending and will time out on its own
+                    %% terms. Reporting an unparsed message as a failed lookup would
+                    %% be inventing a key that was never looked up.
                     ok
             end,
             State;
@@ -442,12 +554,47 @@ dispatch_inbound_garlic(GarlicBody, State) ->
             State
     end.
 
-%% notify_lookup/2 — wake pending remote lookups (m:i2p_lookup_srv). The
-%% orchestrator is an optional subscriber: standalone tunnel servers (tests,
-%% tooling) run without it.
--spec notify_lookup(i2p_crypto:hash(), router | lease) -> ok.
-notify_lookup(Key, Kind) ->
-    maybe_notify({db_stored, Key, Kind}).
+%% notify_lookup/3 — hand a store outcome to the pending remote lookups
+%% (m:i2p_lookup_srv). The orchestrator is an optional subscriber: standalone tunnel
+%% servers (tests, tooling) run without it.
+%%
+%% The outcome travels with the wake-up because it is the only thing that
+%% distinguishes a responder whose answer arrived and could not be used from one
+%% that never arrived. Both sites used to write `_ = i2p_netdb_srv:store_ls_binary(...)`
+%% and then send the same `{db_stored, Key, Kind}` either way, so a lookup could not
+%% tell them apart and both read as a timeout.
+-spec notify_lookup(i2p_crypto:hash(), router | lease, store_result()) -> ok.
+notify_lookup(Key, Kind, Outcome) ->
+    maybe_notify({db_stored, Key, Kind, Outcome}).
+
+%% What became of a store on its way into the NetDb, in the vocabulary
+%% `m:i2p_peer:store_not_stored_reason/0` already settled on — reused rather than
+%% reinvented, because these are the same conditions that path reports and a parallel
+%% set of reasons for them would have to be kept in step forever.
+-spec store_router(binary()) -> store_result().
+store_router(RiBin) ->
+    outcome(i2p_netdb_srv:store_binary(RiBin, erlang:system_time(millisecond))).
+
+-spec store_lease(binary()) -> store_result().
+store_lease(LsBin) ->
+    outcome(i2p_netdb_srv:store_ls_binary(LsBin, erlang:system_time(second))).
+
+%% Two accepted shapes and two refused ones, across two NetDb entry points that do not
+%% spell the vocabulary identically: `store_binary/2` says `too_old` where
+%% `store_ls_binary/2` says `expired`.
+%%
+%% The refused clause is deliberately *open*. Naming each refusal atom separately
+%% looks tidier and is worse: the union is only closed as far as today's two specs
+%% agree, and a catch-all on the outer match would be dead code that dialyzer
+%% correctly reports as unreachable -- so the day the NetDb gained a fourth refusal
+%% the mapping would raise `function_clause` inside a `permanent` child, which is how
+%% an unimplemented store type once took the tunnel manager down with it. An
+%% unfamiliar refusal is named here and surfaces as a lookup failure rather than as a
+%% dead router, and if it is not in the declared reason vocabulary the build says so.
+outcome({ok, added}) -> stored;
+outcome({ok, updated}) -> stored;
+outcome({ok, Refused}) -> {not_stored, {refused_with_reason, Refused}};
+outcome({error, Reason}) -> {not_stored, Reason}.
 
 %% notify_search_reply/2 — hand a search reply's closer-peer list to the
 %% pending lookup so it can chase the responders' suggestions.
@@ -456,7 +603,7 @@ notify_search_reply(Key, Peers) ->
     maybe_notify({search_reply, Key, Peers}).
 
 -spec maybe_notify(
-    {db_stored, i2p_crypto:hash(), router | lease}
+    {db_stored, i2p_crypto:hash(), router | lease, store_result()}
     | {search_reply, i2p_crypto:hash(), [i2p_crypto:hash()]}
 ) -> ok.
 maybe_notify(Msg) ->
@@ -669,14 +816,14 @@ dispatch_one_clove(_ConnPid, PeerHash, #{type := T, data := Data}, State) when
         {store, router, Key, RiBin, _Ts} ->
             %% RouterInfo clocks are milliseconds; LeaseSet clocks are
             %% seconds (matching the m:i2p_netdb store APIs).
-            _ = i2p_netdb_srv:store_binary(RiBin, erlang:system_time(millisecond)),
+            Outcome = store_router(RiBin),
             replicate_clove_store(0, Key, RiBin, PeerHash, State),
-            notify_lookup(Key, router),
+            notify_lookup(Key, router, Outcome),
             State;
         {store, lease, Key, LsBin, _Ts} ->
-            _ = i2p_netdb_srv:store_ls_binary(LsBin, erlang:system_time(second)),
+            Outcome = store_lease(LsBin),
             replicate_clove_store(1, Key, LsBin, PeerHash, State),
-            notify_lookup(Key, lease),
+            notify_lookup(Key, lease, Outcome),
             State;
         {lookup, Parsed} ->
             OurHash = maps:get(hash, maps:get(local, State)),
@@ -685,7 +832,10 @@ dispatch_one_clove(_ConnPid, PeerHash, #{type := T, data := Data}, State) when
         {search_reply, #{key := Key, peers := Peers}} ->
             notify_search_reply(Key, Peers),
             State;
-        ignore ->
+        {ignored, _Reason} ->
+            %% As at the other site: a message with no key in it says nothing about
+            %% any pending lookup, so it is dropped here. What a *store* was refused
+            %% for is a different matter and is carried by `notify_lookup/3`.
             State
     end;
 dispatch_one_clove(_ConnPid, _PeerHash, _Clove, State) ->

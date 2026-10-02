@@ -262,29 +262,52 @@ ensure_min_payload_test() ->
 % ACK block construction / expansion
 % ---------------------------------------------------------------------------
 
+%% Fold a list of received packet numbers into a receive window, the way a
+%% session does, and encode it. The numbers go in as a list because that is how
+%% the SSU2 spec states its cases, but the window is what the session actually
+%% holds and what the encoder actually walks -- so this drives the production
+%% path rather than a test-only one. See #7GP4A4K.
+ack_of(ReceivedNums, MaxRanges) ->
+    i2p_ssu2:build_ack(window(ReceivedNums, MaxRanges), MaxRanges).
+
+window(ReceivedNums, MaxRanges) ->
+    lists:foldl(
+        fun
+            (Num, _W) when Num < 0 ->
+                error;
+            (Num, W) ->
+                case i2p_ssu2_recv:add(Num, W, MaxRanges) of
+                    {new, W1} -> W1;
+                    duplicate -> W
+                end
+        end,
+        i2p_ssu2_recv:new(),
+        ReceivedNums
+    ).
+
 ack_single_packet_test() ->
     %% "we want to ACK packet 10 only"
-    {ack, 10, 0, []} = i2p_ssu2:build_ack([10], 100),
+    {ack, 10, 0, []} = ack_of([10], 100),
     ?assertEqual({[10], []}, i2p_ssu2:ack_expand({ack, 10, 0, []})).
 
 ack_contiguous_run_test() ->
     %% "we want to ACK packets 8-10 only": AckThrough 10, acnt 2, no ranges.
-    {ack, 10, 2, []} = i2p_ssu2:build_ack([8, 9, 10], 100),
+    {ack, 10, 2, []} = ack_of([8, 9, 10], 100),
     ?assertEqual({[8, 9, 10], []}, i2p_ssu2:ack_expand({ack, 10, 2, []})).
 
 ack_spec_worked_example_test() ->
     %% "we want to ACK 10 9 8 6 5 2 1 0, and NACK 7 4 3"
     Recv = [10, 9, 8, 6, 5, 2, 1, 0],
-    {ack, 10, 2, [{1, 2}, {2, 3}]} = i2p_ssu2:build_ack(Recv, 100),
+    {ack, 10, 2, [{1, 2}, {2, 3}]} = ack_of(Recv, 100),
     {Acked, Nacked} = i2p_ssu2:ack_expand({ack, 10, 2, [{1, 2}, {2, 3}]}),
     ?assertEqual([0, 1, 2, 5, 6, 8, 9, 10], Acked),
     ?assertEqual([3, 4, 7], Nacked).
 
 ack_bounded_ranges_test() ->
     %% MaxRanges=1 drops the older range (packets 2 1 0 / nack 4 3).
-    {ack, 10, 2, [{1, 2}]} = i2p_ssu2:build_ack([10, 9, 8, 6, 5, 2, 1, 0], 1),
+    {ack, 10, 2, [{1, 2}]} = ack_of([10, 9, 8, 6, 5, 2, 1, 0], 1),
     %% MaxRanges=0 emits no ranges at all.
-    {ack, 10, 2, []} = i2p_ssu2:build_ack([10, 9, 8, 6, 5, 2, 1, 0], 0).
+    {ack, 10, 2, []} = ack_of([10, 9, 8, 6, 5, 2, 1, 0], 0).
 
 ack_literal_bytes_kat_test() ->
     %% Known-answer test for the happy-path ACK block (the follow-up to the
@@ -292,7 +315,7 @@ ack_literal_bytes_kat_test() ->
     %% of an ACK. The spec's worked example [10 9 8 6 5 2 1 0] must encode as
     %% tag 12, length 9, AckThrough=10 (32-bit BE), Acnt=2 (8-bit), then the
     %% {Nack,Ack} range bytes {1,2} then {2,3} — every byte pinned by hand.
-    Ack = i2p_ssu2:build_ack([10, 9, 8, 6, 5, 2, 1, 0], 100),
+    Ack = ack_of([10, 9, 8, 6, 5, 2, 1, 0], 100),
     ?assertEqual({ack, 10, 2, [{1, 2}, {2, 3}]}, Ack),
     Wire = <<12:8, 9:16, 10:32, 2:8, 1:8, 2:8, 2:8, 3:8>>,
     ?assertEqual(Wire, i2p_ssu2:encode_blocks([Ack])),
@@ -300,17 +323,17 @@ ack_literal_bytes_kat_test() ->
     %% The empty ACK: no gaps, AckThrough 0, Acnt 0 — 5 data bytes, no ranges.
     ?assertEqual(
         <<12:8, 5:16, 0:32, 0:8>>,
-        i2p_ssu2:encode_blocks([i2p_ssu2:build_ack([], 100)])
+        i2p_ssu2:encode_blocks([ack_of([], 100)])
     ).
 
 ack_empty_test() ->
-    {ack, 0, 0, []} = i2p_ssu2:build_ack([], 100).
+    {ack, 0, 0, []} = ack_of([], 100).
 
 ack_expand_roundtrip_test() ->
     %% Random received sets must round-trip through build_ack -> ack_expand.
     lists:foreach(
         fun({Recv, Max}) ->
-            {ack, AT, Acnt, Ranges} = i2p_ssu2:build_ack(Recv, Max),
+            {ack, AT, Acnt, Ranges} = ack_of(Recv, Max),
             {Acked, _Nacked} = i2p_ssu2:ack_expand({ack, AT, Acnt, Ranges}),
             ?assertEqual(lists:usort(Recv), Acked)
         end,
@@ -588,6 +611,63 @@ peertest_message_wrong_key_rejected_test() ->
     <<Head:Sz/binary, LastByte:8>> = Msg,
     Flipped = <<Head/binary, (LastByte bxor 1):8>>,
     ?assertEqual(error, i2p_ssu2:decode_peertest(Bik, Flipped)).
+
+%% A symmetric long-header datagram that stops inside its own Poly1305 tag is
+%% short, not malformed, and the answer is `error` (#YNBT5ZD).
+%%
+%% The 32-byte long header leaves `Size - 32` bytes for ciphertext-plus-tag, so
+%% every length from ?MIN_PACKET (40) up to 47 arrives with fewer than the 16
+%% tag bytes. That used to reach `finish_symmetric/7`, where the split is a hard
+%% match: `Sz` goes negative and the whole process died. On the listener this was
+%% remote and unauthenticated, because the only thing standing between a
+%% stranger's datagram and this code is the introduction key, which every
+%% RouterInfo publishes.
+%%
+%% So it is asserted on all three symmetric decoders, at every short length, and
+%% not merely that they answer: an assert that only catches `error` would still
+%% pass if the function raised, since eunit reports a raise as a badmatch in the
+%% test rather than a mismatch between two values.
+truncated_symmetric_datagram_is_error_not_raise_test() ->
+    {_Bpk, Bik} = bob_keys(),
+    Decoders = [
+        {"token_request", 10, fun(Dgram) -> i2p_ssu2:decode_token_request(Bik, Dgram) end},
+        {"retry", 9, fun(Dgram) -> i2p_ssu2:decode_retry(Bik, Dgram) end},
+        {"peertest", 7, fun(Dgram) -> i2p_ssu2:decode_peertest(Bik, Dgram) end},
+        {"holepunch", 11, fun(Dgram) -> i2p_ssu2:decode_holepunch(Bik, Dgram) end}
+    ],
+    %% The whole table as one value, so a failure prints every case rather than
+    %% whichever one the generator happened to reach first.
+    ?assertEqual(
+        [
+            {Name, Size, error}
+         || {Name, _Type, _Decode} <- Decoders, Size <- lists:seq(40, 47)
+        ],
+        [
+            {Name, Size, outcome(Decode, build_short_symmetric(Bik, Type, Size))}
+         || {Name, Type, Decode} <- Decoders, Size <- lists:seq(40, 47)
+        ]
+    ).
+
+%% `error`, and specifically not a raise. A raise is turned into a value that
+%% cannot be mistaken for an answer, so the assertion is about the outcome rather
+%% than about there not having been one.
+outcome(Decode, Dgram) ->
+    try
+        Decode(Dgram)
+    catch
+        Class:Reason -> {raised, Class, Reason}
+    end.
+
+%% A well-formed header carrying the decoder's own type, sealed for real and then
+%% cut short. The masks are tail-derived, so the truncated bytes still unmask
+%% correctly and the header really does present as the expected type -- which is
+%% what leaves the length as the only thing wrong with it.
+build_short_symmetric(Bik, Type, Size) ->
+    Trailing = Size - 32,
+    Plain = <<16#AABBCCDDEEFF0011:64, 1:32, Type:8, 2:8, 2:8, 0:8, 0:64, 0:64, 0:(Trailing * 8)>>,
+    Sealed = i2p_ssu2:seal_long(Plain, Bik, Bik),
+    ?assertEqual(Size, byte_size(Sealed)),
+    Sealed.
 
 %% Out-of-session HolePunch message (type 11): Charlie answers Alice with a
 %% DateTime + Address + RelayResponse payload under her intro key. The

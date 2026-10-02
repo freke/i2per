@@ -55,6 +55,8 @@ State2 = i2p_tunnel_publish:do_pool_tick(State1),
     do_sweep/1
 ]).
 
+-export_type([leaset_publish_failed_reason/0]).
+
 -define(NUM_HOPS, 3).
 -define(TRANSIT_LIFETIME_S, 720).
 -define(TUNNEL_LIFETIME_S, 600).
@@ -67,6 +69,35 @@ State2 = i2p_tunnel_publish:do_pool_tick(State1),
 -define(LEASE_END_MARGIN_S, 30).
 -define(LEASE_REFRESH_MARGIN_S, 120).
 -define(LS_VALID_DAYS, 1).
+
+%%%%%%% %%% Types %%%%%%%
+
+-doc """
+Why a client LeaseSet did not reach the network.
+
+Each is a point at which a LeaseSet that was signed and stored locally still
+fails to exist anywhere the network can see it. They are kept apart because the
+operator response differs: `no_inbound_tunnel` resolves on its own once the
+router has an inbound tunnel, `no_floodfill_targets` means the router has not
+learned a floodfill and is unreachable to anyone, and `local_store_rejected`
+means our own NetDb threw away the lease we just signed and is a fault rather
+than a state.
+
+A closed vocabulary, and every clause corresponds to a branch in
+`f:build_and_publish/6` or `f:lease_or_pending/6` — so a reason cannot be
+invented that no path can produce, which is the failure mode an open `term()`
+would allow.
+""".
+-type leaset_publish_failed_reason() ::
+    %% `f:freshest_inbound_lease/2` found no active inbound tunnel, so there was
+    %% no gateway to point a lease at. Recorded and retried by the pool tick.
+    no_inbound_tunnel
+    %% The LeaseSet was signed and stored, but `closest_floodfills/3` returned an
+    %% empty list — the router knows no floodfill, so the lease is held nowhere.
+    | no_floodfill_targets
+    %% Our own NetDb refused the freshly signed LeaseSet (`older`, `from_future`
+    %% or `expired`), or was not running to receive it.
+    | local_store_rejected.
 
 %%%%%%% %%% Public API %%%%%%%
 
@@ -155,6 +186,14 @@ publish_into(Dest, Seed, DestHash, InLen, State) ->
 %% lease_or_pending/6 — clause pair on the freshest-inbound-tunnel lookup:
 %% a live tunnel publishes immediately; no tunnel records (or keeps serving)
 %% a pending entry the periodic tick retries.
+%%
+%% `leaseset_published` used to be announced on the `{ok, ...}` clause
+%% unconditionally, whatever `build_and_publish/6` had done — so a LeaseSet that
+%% was signed and then handed to zero floodfills, or refused by our own NetDb,
+%% was reported to the bus as a success. Publishing is the step that makes a
+%% router usable by the network, and a silent failure there is indistinguishable
+%% from a router nobody wants. The success event now follows the outcome, and the
+%% failure carries the reason.
 -spec lease_or_pending(
     {ok, i2p_crypto:hash(), 0..16#FFFFFFFF, non_neg_integer()} | error,
     i2p_keys:identity(),
@@ -164,16 +203,37 @@ publish_into(Dest, Seed, DestHash, InLen, State) ->
     i2p_tunnel_srv:tunnel_srv_state()
 ) -> i2p_tunnel_srv:published_lease().
 lease_or_pending({ok, Gw, Tid, UntilSec}, Dest, Seed, DestHash, InLen, State) ->
-    build_and_publish(Dest, Seed, Gw, Tid, UntilSec, State),
-    i2p_events:notify({leaseset_published, DestHash}),
-    #{dest => Dest, seed => Seed, until_sec => UntilSec, in_len => InLen};
+    case build_and_publish(Dest, Seed, Gw, Tid, UntilSec, State) of
+        ok ->
+            i2p_events:notify({leaseset_published, DestHash}),
+            #{dest => Dest, seed => Seed, until_sec => UntilSec, in_len => InLen};
+        {error, Reason} ->
+            %% The entry is recorded and will be retried by the pool tick, exactly
+            %% as a pending entry is: `refresh_published/1` filters on `until_sec`,
+            %% and 0 is always inside the refresh margin. So a failed attempt still
+            %% returns a live lease, and the failure is announced separately.
+            ok = i2p_events:notify({leaseset_publish_failed, DestHash, Reason}),
+            #{dest => Dest, seed => Seed, until_sec => 0, in_len => InLen}
+    end;
 lease_or_pending(error, Dest, Seed, DestHash, InLen, State) ->
     case maps:find(DestHash, maps:get(published, State, #{})) of
         {ok, #{until_sec := OldUntil} = Prev} when OldUntil > 0 ->
             %% Keep serving the previous lease while retrying.
             Prev;
+        {ok, #{until_sec := 0}} ->
+            %% Already known to be pending, and already reported. The pool tick
+            %% calls back every ~30s, so announcing this again each time would be a
+            %% periodic flood of a condition that is not changing.
+            maps:get(DestHash, maps:get(published, State, #{}));
         _ ->
-            #{dest => Dest, seed => Seed, until_sec => 0, in_len => InLen}
+            %% No usable inbound tunnel on a client's *first* attempt. This is the
+            %% most common way a lease never goes out, and before this it was
+            %% completely invisible: the destination sat in the published map with
+            %% `until_sec => 0` and nothing anywhere said why. Announced once, on the
+            %% first attempt, because the retries are the tick and are not news.
+            Entry = #{dest => Dest, seed => Seed, until_sec => 0, in_len => InLen},
+            ok = i2p_events:notify({leaseset_publish_failed, DestHash, no_inbound_tunnel}),
+            Entry
     end.
 
 -doc """
@@ -236,7 +296,7 @@ sweep_pool(State, Key, Direction, AliveTunnel) ->
 %% notify_expired/3 — announce each tunnel the sweep is about to drop.
 notify_expired(Direction, Tunnels, Alive) ->
     [
-        i2p_events:notify({tunnel_expired, Direction})
+        i2p_tunnel_outcome:expired(Direction)
      || {_ID, #{built_at := BuiltAt}} <- maps:to_list(Tunnels), not Alive(BuiltAt)
     ],
     ok.
@@ -298,8 +358,15 @@ freshest_from(Inbound) ->
         maps:get(built_at, Best) + ?TUNNEL_LIFETIME_S - ?LEASE_END_MARGIN_S,
     {ok, Gw, Tid, UntilSec}.
 
-%% build_and_publish/6 — sign the LeaseSet2, store it locally and push it
+%% build_and_publish/6 - sign the LeaseSet2, store it locally and push it
 %% to the closest floodfills.
+%%
+%% Returns the outcome rather than discarding it. It used to end in a bare `ok`
+%% with the store result dropped (`_ = i2p_netdb_srv:store_ls(...)`) and no check
+%% that any floodfill was found at all - so the common cold-start case, a router
+%% that has not learned a floodfill yet, built a LeaseSet, handed it to nobody,
+%% and reported success. The reasons below are the ones that make a signed
+%% LeaseSet not reach the network.
 -spec build_and_publish(
     i2p_keys:identity(),
     i2p_crypto:ed25519_seed(),
@@ -307,7 +374,7 @@ freshest_from(Inbound) ->
     0..16#FFFFFFFF,
     non_neg_integer(),
     i2p_tunnel_srv:tunnel_srv_state()
-) -> ok.
+) -> ok | {error, leaset_publish_failed_reason()}.
 build_and_publish(Dest, Seed, Gw, Tid, UntilSec, #{local := Local}) ->
     NowSec = erlang:system_time(second),
     Lease = #{
@@ -316,10 +383,52 @@ build_and_publish(Dest, Seed, Gw, Tid, UntilSec, #{local := Local}) ->
         end_date => (UntilSec * 1000) band 16#FFFFFFFF
     },
     LS = i2p_leaset:build(Dest, NowSec, ?LS_VALID_DAYS, [Lease], Seed),
-    _ = i2p_netdb_srv:store_ls(LS, NowSec),
-    LsBin = i2p_leaset:to_binary(LS),
-    OurHash = maps:get(hash, Local),
-    Targets = i2p_netdb_srv:closest_floodfills(i2p_leaset:hash(LS), 3, [OurHash]),
+    StoreOutcome = store_own_lease(LS, NowSec),
+    %% Refused by our own NetDb. `added` and `updated` are the two that mean the
+    %% local copy is live; the rest mean it was judged older than, from the future
+    %% of, or expired against what we already hold, which is not something a lease
+    %% signed a moment ago should ever trigger. Checked before the LeaseSet is
+    %% serialised and the NetDb asked who the floodfills are, so a NetDb that is
+    %% not there is not put to a second question it cannot answer.
+    case StoreOutcome of
+        added -> push_to_floodfills(i2p_leaset:to_binary(LS), LS, Local);
+        updated -> push_to_floodfills(i2p_leaset:to_binary(LS), LS, Local);
+        _ -> {error, local_store_rejected}
+    end.
+
+%% store_own_lease/2 - put the LeaseSet we just signed into our own NetDb.
+%%
+%% A NetDb that is not running makes the call exit. A publication cannot be signed
+%% and kept locally at all without it, and a crash here would take the pool tick
+%% down with it, so the absence is reported rather than propagated. Deliberately
+%% narrow: only the two ways a missing `gen_server` surfaces are caught, so a real
+%% fault inside the NetDb still propagates instead of being reported as a rejection.
+-spec store_own_lease(i2p_leaset:lease_set(), non_neg_integer()) ->
+    added | updated | older | from_future | expired | netdb_unavailable.
+store_own_lease(LS, NowSec) ->
+    try i2p_netdb_srv:store_ls(LS, NowSec) of
+        Outcome -> Outcome
+    catch
+        exit:{noproc, _} -> netdb_unavailable;
+        exit:{normal, _} -> netdb_unavailable
+    end.
+
+%% push_to_floodfills/3 - send the LeaseSet to the floodfills we know. An empty
+%% target list is the cold-start case and is a failure, not a no-op: a LeaseSet
+%% nobody holds is a destination nobody can reach, and it is the single most
+%% common reason a working router appears dead to the network.
+%% The serialised LeaseSet is a plain `binary()`: `m:i2p_leaset` has no named type
+%% for it, and `f:to_binary/1` is specified as returning one. Inventing a name here
+%% would have been a second description of something that already has one.
+-spec push_to_floodfills(binary(), i2p_leaset:lease_set(), i2p_peer:local_keys()) ->
+    ok | {error, leaset_publish_failed_reason()}.
+push_to_floodfills(LsBin, LS, #{hash := OurHash}) ->
+    case i2p_netdb_srv:closest_floodfills(i2p_leaset:hash(LS), 3, [OurHash]) of
+        [] -> {error, no_floodfill_targets};
+        Targets -> send_to(LsBin, LS, Targets)
+    end.
+
+send_to(LsBin, LS, Targets) ->
     lists:foreach(
         fun(Target) ->
             i2p_peer:send_when_ready(

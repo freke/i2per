@@ -7,10 +7,11 @@
 %%   I2P_INTEROP_PORT       i2pd's NTCP2 TCP port
 %%   I2P_INTEROP_SSU2_PORT  i2pd's SSU2 UDP port
 %%
-%% This suite is deliberately excluded from `just check`: rebar.config's
-%% `ct_opts` `suite` list runs only the deterministic suites, and the script
-%% re-invokes rebar3 with a `--suite` that overrides that list (any CLI test
-%% selector replaces all config-level selectors). If the environment is
+%% This suite is deliberately excluded from `just check` by living outside
+%% `test/` (apps/i2per/interop/, not apps/i2per/test/), because rebar3
+%% auto-discovers suites under `test/` and there is no config-level list to
+%% exclude from. The script reaches it with a CLI `--suite`, which compiles the
+%% file on demand regardless of where it lives. If the environment is
 %% missing the cases fail with a pointer to the script rather than passing
 %% trivially, so a broken gate can never go green silently. With the
 %% environment set:

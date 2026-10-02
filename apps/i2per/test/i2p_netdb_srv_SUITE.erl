@@ -16,6 +16,9 @@
     netdb_srv_corrupt_state_fails_closed/1,
     netdb_srv_load_error_blocks_rewrite/1,
     netdb_srv_remove_expired/1,
+    netdb_srv_configured_expiration_is_honoured/1,
+    netdb_srv_configured_expiration_floor_makes_the_horizon_slide/1,
+    netdb_srv_inverted_expiration_bounds_are_swapped_not_fatal/1,
     netdb_srv_stats/1
 ]).
 
@@ -38,6 +41,9 @@ all() ->
         netdb_srv_corrupt_state_fails_closed,
         netdb_srv_load_error_blocks_rewrite,
         netdb_srv_remove_expired,
+        netdb_srv_configured_expiration_is_honoured,
+        netdb_srv_configured_expiration_floor_makes_the_horizon_slide,
+        netdb_srv_inverted_expiration_bounds_are_swapped_not_fatal,
         netdb_srv_stats
     ].
 
@@ -71,6 +77,14 @@ netdb_srv_roundtrip(_Config) ->
         [Key] = i2p_netdb_srv:closest_non_floodfills(Key, 3, []),
         added = i2p_netdb_srv:store(FF, Now),
         [FFKey] = i2p_netdb_srv:closest_floodfills(FFKey, 3, []),
+        %% **Read the store after a lookup, not only before.** All three of the
+        %% lookups above write their memoised store back into the process state, and
+        %% a case that never reads the store again cannot tell that from one where
+        %% the reply and the store were swapped — a list is a perfectly good reply
+        %% and a perfectly bad store, so the mistake stays silent until something
+        %% reads a field. The `count/0` and `keys/0` calls below are that read, and
+        %% they are the reason this case is more than a smoke test.
+        [Key] = i2p_netdb_srv:closest_non_floodfills(rand_hash(), 3, []),
         Bin = i2p_router_info:to_binary(RI),
         {ok, older} = i2p_netdb_srv:store_binary(Bin, Now),
         removed = i2p_netdb_srv:remove(Key),
@@ -231,6 +245,150 @@ netdb_srv_remove_expired(_Config) ->
         end
     end.
 
+%% The configured horizon reaches the store, and both the admission check and the
+%% sweep honour it.
+%%
+%% The srv is where the configuration is read, so this is the case that says the
+%% key in `sys.config` does something. `#RA5PVR1` is about making the *policy*
+%% sliding; this is the part that already landed, namely that an operator can reach
+%% the horizon at all.
+%%
+%% Structurally rather than by deadline: set a one-minute horizon, store a
+%% RouterInfo published three minutes ago (admissible at the default 27-hour horizon,
+%% and inside one minute at the configured one, so it has to be refused at the door),
+%% then sweep and confirm nothing had to be removed.
+netdb_srv_configured_expiration_is_honoured(_Config) ->
+    application:set_env(i2per, netdb_expiration_ms, 60 * 1000),
+    Pid =
+        case whereis(i2p_netdb_srv) of
+            undefined ->
+                {ok, P} = i2p_netdb_srv:start_link(),
+                P;
+            Existing ->
+                Existing
+        end,
+    try
+        %% The store carries the configured value, not the module default. The srv
+        %% applies it as a *range* with both bounds set to the key, so it is a flat
+        %% horizon and the reported value is the setting at any size -- which is what
+        %% makes this case about *the key applying* rather than about the curve.
+        60000 = maps:get(expiration_max_ms, i2p_netdb_srv:stats()),
+        60000 = maps:get(expiration_min_ms, i2p_netdb_srv:stats()),
+        60000 = maps:get(expiration_ms, i2p_netdb_srv:stats()),
+
+        Now = now_ms(),
+        {RI, _} = fixture_router(Now - 3 * 60 * 1000),
+        Key = i2p_router_info:hash(RI),
+        %% Refused by the configured horizon, not admitted and then swept.
+        too_old = i2p_netdb_srv:store(RI, Now),
+        not_found = i2p_netdb_srv:find(Key),
+        0 = i2p_netdb_srv:count(),
+
+        %% And a fresh one is still accepted, so the horizon did not break the store.
+        {Fresh, _} = fixture_router(Now),
+        added = i2p_netdb_srv:store(Fresh, Now),
+        1 = i2p_netdb_srv:count(),
+        {0, _} = i2p_netdb_srv:remove_expired(),
+        1 = i2p_netdb_srv:count()
+    after
+        application:unset_env(i2per, netdb_expiration_ms),
+        case whereis(i2p_netdb_srv) of
+            Pid ->
+                unlink(Pid),
+                exit(Pid, shutdown);
+            _ ->
+                ok
+        end
+    end.
+
+%% **The floor is a second key, and setting it makes the horizon slide.**
+%%
+%% `netdb_expiration_ms` is the ceiling and, on its own, a *flat* horizon -- the
+%% meaning it had before the policy slid, which the case above pins. Adding
+%% `netdb_expiration_min_ms` is what opts into i2pd's curve.
+%%
+%% So with the floor set to one minute and the ceiling left at its default, a
+%% two-hour-old RouterInfo is still admitted: a small store runs at the ceiling
+%% regardless of the floor, and a two-hour-old entry is inside 27 hours. The
+%% important part is that it is *admitted* -- read the floor as a flat horizon and
+%% that same entry would be refused, which would mean the key had been applied as
+%% the wrong setting. The curve biting at capacity is covered in
+%% `i2p_netdb_expiry_tests`, where a store can be grown to 5000 without going
+%% through the srv.
+netdb_srv_configured_expiration_floor_makes_the_horizon_slide(_Config) ->
+    application:set_env(i2per, netdb_expiration_min_ms, 60 * 1000),
+    Pid =
+        case whereis(i2p_netdb_srv) of
+            undefined ->
+                {ok, P} = i2p_netdb_srv:start_link(),
+                P;
+            Existing ->
+                Existing
+        end,
+    try
+        Stats = i2p_netdb_srv:stats(),
+        60000 = maps:get(expiration_min_ms, Stats),
+        %% The ceiling is untouched by the floor setting: the two are separate keys
+        %% because the useful one depends on how full the store is.
+        true = maps:get(expiration_max_ms, Stats) =:= i2p_netdb:default_expiration_ms(),
+        %% An empty store sits at the ceiling, not at the floor.
+        true = maps:get(expiration_ms, Stats) =:= i2p_netdb:default_expiration_ms(),
+
+        Now = now_ms(),
+        {RI, _} = fixture_router(Now - 2 * 60 * 60 * 1000),
+        added = i2p_netdb_srv:store(RI, Now),
+        1 = i2p_netdb_srv:count()
+    after
+        application:unset_env(i2per, netdb_expiration_min_ms),
+        case whereis(i2p_netdb_srv) of
+            Pid ->
+                unlink(Pid),
+                exit(Pid, shutdown);
+            _ ->
+                ok
+        end
+    end.
+
+%% A floor above the ceiling is a configuration the store cannot use, and the router
+%% runs at an interval between the two numbers the operator gave rather than
+%% refusing to start -- which would turn a recoverable typo into a router that will
+%% not boot, the same reasoning `configured_interval/2` already applies to a
+%% non-integer value.
+netdb_srv_inverted_expiration_bounds_are_swapped_not_fatal(_Config) ->
+    application:set_env(i2per, netdb_expiration_min_ms, 12 * 60 * 60 * 1000),
+    application:set_env(i2per, netdb_expiration_ms, 60 * 60 * 1000),
+    Pid =
+        case whereis(i2p_netdb_srv) of
+            undefined ->
+                {ok, P} = i2p_netdb_srv:start_link(),
+                P;
+            Existing ->
+                Existing
+        end,
+    try
+        Stats = i2p_netdb_srv:stats(),
+        3600000 = maps:get(expiration_min_ms, Stats),
+        43200000 = maps:get(expiration_max_ms, Stats),
+
+        Now = now_ms(),
+        %% Two hours old: inside the swapped 12-hour ceiling, and far outside the
+        %% one-hour value the operator typed into the *ceiling* key. Admitted, so
+        %% the store is running rather than the srv having refused to start.
+        {RI, _} = fixture_router(Now - 2 * 60 * 60 * 1000),
+        added = i2p_netdb_srv:store(RI, Now),
+        1 = i2p_netdb_srv:count()
+    after
+        application:unset_env(i2per, netdb_expiration_min_ms),
+        application:unset_env(i2per, netdb_expiration_ms),
+        case whereis(i2p_netdb_srv) of
+            Pid ->
+                unlink(Pid),
+                exit(Pid, shutdown);
+            _ ->
+                ok
+        end
+    end.
+
 netdb_srv_stats(_Config) ->
     Pid =
         case whereis(i2p_netdb_srv) of
@@ -242,6 +400,12 @@ netdb_srv_stats(_Config) ->
         end,
     try
         Stats = i2p_netdb_srv:stats(),
+        true = maps:is_key(expiration_ms, Stats),
+        %% The horizon slides, so the value in force is not the policy. The two
+        %% bounds are, so `stats/0` has to carry them or an operator has no way to
+        %% see what they configured. See `#RA5PVR1`.
+        true = maps:is_key(expiration_min_ms, Stats),
+        true = maps:is_key(expiration_max_ms, Stats),
         true = maps:is_key(routers, Stats),
         true = maps:is_key(lease_sets, Stats),
         true = maps:is_key(capacity, Stats),

@@ -8,9 +8,58 @@ RouterInfos are keyed by their router hash (SHA-256 of the RouterIdentity) and
 kept in a capacity-bounded LRU cache. Storing mirrors i2pd's
 `NetDb::AddRouterInfo`: a RouterInfo with an equal or older publish timestamp
 never replaces an existing one, one stamped too far in the future is rejected,
-and one too old is rejected. A store is immutable; every operation returns a
-new store, so the owning process (`m:i2p_netdb_srv`) can keep the shared state
-without locks.
+and one too old is rejected.
+
+## The router table, and who may read it
+
+The RouterInfos live in an ETS table rather than in the store's own state map,
+because "do we hold this RouterInfo?" is asked on the data path, once per
+1028-byte tunnel frame, by a process that is not the NetDb. As a `gen_server`
+call that question cost a process round trip and a copy of a whole RouterInfo to
+answer yes or no. As `ets:member/2` it costs neither, and it is **the only
+thing that answers it** — which is the point. One authority for that question,
+not two that can disagree.
+
+The table is created by `f:new/0,1` and owned by the calling process, so it dies
+with the NetDb that created it rather than outliving it. It is `protected`, so
+the owner writes and everyone reads; the single-writer property is enforced by
+ETS rather than by convention, and a non-owner write raises `badarg` instead of
+silently doing nothing.
+
+**The recency order is a value, not a table.** It is a pair of `gb_trees` held
+in the store map: `Seq -> Hash` for eviction order, and `Hash -> Seq` so that
+promoting a router we already hold is a lookup rather than a traversal. It
+stays inside the store map on purpose. If the order were a second table it
+would be side-effect state, and this module's central property — one function
+stands between every mutation and both structures — would be lost.
+
+**The table carries a generation counter, because a store that mutates a table
+in place is only half a value.** Every mutation writes the table and then
+returns a *new* store holding the order. A caller that drops that returned store
+has mutated the table without moving the order, and nothing about the result
+says so: the mutation inserted one row and evicted one, so the two sizes still
+agree, and `f:consistent/1` cannot see it.
+
+So the table holds one reserved row, under `?GEN_KEY`, carrying a counter that
+advances on every table mutation; the store map holds the value it believes is
+current. Every mutator claims the next generation before it writes, and the claim
+fails with `stale_store` if the table's counter has already moved on. One
+reserved row is not the order becoming a table: it is a single integer whose only
+job is to notice a lost return value, and it is why `f:generation/1` exists.
+
+Catching this at the mutator rather than in `f:consistent/1` is the whole point.
+`f:consistent/1` is asked after the fact, when the wrong router has already been
+evicted; the claim fires before a single row is written.
+
+A `queue` was the obvious candidate for the order and is the wrong shape: its
+O(1) removals (`out/1`, `drop/1`, `out_r/1`, `drop_r/1`) only reach the two
+ends, and promoting a router to most-recent means deleting it from the middle,
+which is `delete/2` and O(n). That is the hot operation, so the queue would leave
+it exactly as slow and only speed up the cold one.
+
+`f:self_check/1` asserts the table and the order agree. Both are written by the
+same expressions, so they cannot drift while the code is correct; the check is
+what makes that a property rather than a hope.
 
 LeaseSets are stored alongside, keyed by their destination hash, in their own
 capacity-bounded recency order. Storing mirrors i2pd's `NetDb::AddLeaseSet`:
@@ -35,6 +84,111 @@ The DHT helpers follow i2pd's `IdentMetrics` / `NetDb`:
   target set for a store), and `f:closest_non_floodfills/4` (the exploratory
   lookup set, mirroring `NetDb::GetExploratoryNonFloodfill`).
 
+## The routing-key memo, and why it is in the store
+
+All three closest lookups rank candidates by the XOR of two day-scoped routing
+keys, so at the shipped capacity of 5000 routers each one needs 5000 SHA-256s.
+The key is `SHA256(routerHash ‖ yyyymmdd)`, and neither input changes: the router
+hash is fixed for the life of a row, and the day changes once. So the store
+carries a memo of them, `routing :: {Day, #{RouterKey => RoutingKey}}`.
+
+It is a map in the store rather than a second ETS table, and that was measured
+rather than preferred. Resolving 5000 keys costs 2430 us from a map, 2891 us
+from an `ets:lookup` table, and 2860 us from a fourth column on the router row —
+against 4041 us for recomputing. The table loses because an ETS lookup rehashes a
+32-byte key, and the row loses for the same reason while also growing every entry
+by 40 bytes.
+
+Two properties make it safe rather than merely fast:
+
+- **A miss costs what the code cost before.** `memo_routing_key/3` falls back to
+  computing, so an incomplete memo is never worse than no memo. That is what lets
+  a new router be added without invalidating anything.
+- **The day tag is the entire invalidation policy.** Every value is wrong only if
+  the day moved, and a stale memo is a cache miss rather than a wrong answer.
+
+So the three questions a second table would have raised — who may write it, how it
+is evicted, and whether `.public` is defensible next to a deliberately `protected`
+router table — do not arise. There is no second table, and the only writer is the
+process that already owns the store.
+
+The consequence is that the three closest functions return `{Store2, Closest}`
+rather than `[router_key()]`. Filling the memo is a mutation, and this module's
+rule is that a mutation returns the store that describes it. A caller that drops
+it gets the old cost, not a wrong answer.
+
+## The expiry horizon is a function of how full the store is
+
+How old a RouterInfo may be before the store discards it is **not a number**. It
+is `f:expiration_ms/1`, interpolated between two bounds from the store's own size,
+following i2pd's `NetDb::SaveUpdated`:
+
+```erlang
+Horizon(Count) = Min + (Max - Min) * 90 / Count   %% Count > 90
+Horizon(Count) = Max                                %% Count =< 90
+```
+
+The fuller the store, the sooner a stale entry goes. The reasoning is that a
+store which cannot hold everything should spend its space on the routers most
+likely to still be there, and a RouterInfo is republished often enough that a
+tight horizon costs a lookup rather than an entry.
+
+| Stored routers | Horizon | |
+|---|---|---|
+| 90 or fewer | 27h 00m | the ceiling; i2pd's maximum |
+| 200 | 12h 58m 30s | |
+| 500 | 6h 05m 24s | |
+| 1000 | 3h 47m 42s | |
+| 2000 | 2h 38m 51s | |
+| 4000 | 2h 04m 25s | i2p-java's aggressive-mode threshold |
+| 5000 | 1h 57m 32s | i2per's shipped capacity |
+
+**The two ends are i2pd's, so the curve matches i2pd exactly at every size.** What
+differs is what else i2pd folds into the same branch, and none of it is adopted:
+
+- **A floodfill expires everything at a flat 1 hour.** It assumes the router is
+  receiving republication, which is a property of a working floodfill with a
+  working reseed. i2per cannot verify that from inside the store, and a router
+  *configured* as a floodfill that is not actually receiving publications would
+  have its NetDb emptied — the one failure that a tighter policy must never cause.
+- **A RouterInfo advertising SSU2 introducers expires in about an hour.** This
+  keys off an introducer flag that `m:i2p_router_info` decodes when *building* a
+  RouterInfo but not when parsing one, so it is not available here without a
+  parser change.
+- **i2p-java's aggressive mode above 4000 routers** — a 30-minute cutoff (12 for
+  routers advertising the `U` cap) dropping candidates with probability 32/128 —
+  and the three guards that come with it (no expiry below 300 entries, never drop
+  a router with an established connection, a floodfill never drops a router within
+  1/256 of its own routing key) are not adopted. The mode is the other policy
+  shape this ticket chose between, and it needs an RNG to decide which entry goes.
+  Its guards are guards on *that* mode: the connection guard exists to stop a
+  30-minute cutoff severing live sessions, and the adopted curve's floor is 90
+  minutes. The below-300 rule is a second, larger version of the ceiling that
+  already covers it.
+- **i2pd's first-hour uptime grace** is not adopted either, for a reason that is
+  about where the clock lives rather than about the policy: it is a fact about the
+  *process*, and the store is a value whose every field is a statement about its
+  contents. What it protects against — pruning a NetDb that has just been loaded
+  and has not yet had a chance to refill — is prevented here more precisely, and
+  without a guard, by the load path not consulting the horizon at all (see
+  `f:from_binary/1`). The next sweep is what compacts a loaded file to the current
+  policy.
+
+The guards are not all redundant in the same way, and the ones that are not are
+ruled out above rather than left unmentioned. i2pd's `total > 90` floor *is*
+adopted, but as the curve's saturation rather than as a separate condition: the
+interpolation is already at the ceiling for any count at or below 90, which is the
+part that matters, and the difference from i2pd is that i2per expires at 27 hours
+below that line rather than not at all.
+
+**Both callers read this one function.** The admission check in `f:store/3` and
+`f:remove_expired/3` ask the same store the same question, so the horizon is never
+two numbers that can disagree. What a sliding policy gives up is the stronger
+claim a flat one could make: an entry admitted under a 27-hour horizon is not
+guaranteed 27 hours, because a store that fills afterwards shortens the horizon
+underneath it. That is inherent to the policy rather than to this arrangement, and
+it is what i2pd does.
+
 ## Usage
 
 ```erlang
@@ -44,25 +198,35 @@ Now = erlang:system_time(millisecond),
 {ok, Store1, added} = i2p_netdb:store_binary(Store0, RouterInfoBytes, Now),
 {ok, Store2, updated} = i2p_netdb:store(Store1, RouterInfo, Now),
 
-%% Find by router hash and pick replication targets.
+%% Find by router hash and pick replication targets. **The three closest lookups
+%% hand the store back**, because they memoise routing keys as they go; keeping
+%% the result is what makes the next lookup cheaper.
 Key = i2p_router_info:hash(RouterInfo),
 {ok, RI} = i2p_netdb:find(Store2, Key),
-Floodfills = i2p_netdb:closest_floodfills(Store2, Key, 3, []),
-Exploratory = i2p_netdb:closest_non_floodfills(Store2, TargetKey, 3, []),
+{Store3, Floodfills} = i2p_netdb:closest_floodfills(Store2, Key, 3, []),
+{Store4, Exploratory} = i2p_netdb:closest_non_floodfills(Store3, TargetKey, 3, []),
 
 %% Store and find LeaseSets by destination hash.
 DestHash = i2p_leaset:hash(LeaseSet),
-{ok, Store3, added} = i2p_netdb:store_ls(Store2, LeaseSet, NowSec),
-{ok, LeaseSet} = i2p_netdb:find_ls(Store3, DestHash),
+{ok, Store5, added} = i2p_netdb:store_ls(Store4, LeaseSet, NowSec),
+{ok, LeaseSet} = i2p_netdb:find_ls(Store5, DestHash),
 ```
 
-The store is pure — the gen_server in `m:i2p_netdb_srv` owns a `store()`
-process-local and answers queries against it.
+The store is a value the gen_server in `m:i2p_netdb_srv` owns, and every
+operation returns a new one. The RouterInfos inside it are reachable without
+going through that process; see **The router table, and who may read it**.
+
+```erlang
+%% Existence is a table read, not a call into the NetDb process.
+true = i2p_netdb:has_router(Store, Key).
+```
 """.
 
 -export([
     new/0,
     new/1,
+    new/2,
+    new/3,
     store/3,
     store_binary/3,
     store_ls/3,
@@ -76,6 +240,16 @@ process-local and answers queries against it.
     ls_count/1,
     count/1,
     capacity/1,
+    default_expiration_ms/0,
+    default_min_expiration_ms/0,
+    min_routers/0,
+    min_expiration_ms/1,
+    max_expiration_ms/1,
+    expiration_ms/1,
+    expiration_ms_at/2,
+    expiration_threshold_ms/0,
+    set_expiration_ms/2,
+    set_expiration_range/3,
     routing_key/1,
     routing_key/2,
     distance/2,
@@ -88,18 +262,59 @@ process-local and answers queries against it.
     is_ipv4/1,
     to_binary/1,
     from_binary/1,
-    remove_expired/3
+    remove_expired/3,
+    has_router/2,
+    generation/1,
+    snapshot/1,
+    serialize/1,
+    router_table/1,
+    consistent/1,
+    self_check/1
 ]).
 
--export_type([store/0, router_key/0, ls_key/0]).
+-export_type([store/0, router_key/0, ls_key/0, snapshot/0]).
 
 -define(DEFAULT_CAPACITY, 5000).
+%% The RouterInfo expiry horizon's two ends, in ms. i2pd's
+%% \`NETDB_MAX_EXPIRATION_TIMEOUT\` and \`NETDB_MIN_EXPIRATION_TIMEOUT\`.
+%%
+%% **These are the bounds of the policy, not the policy.** A store holds both
+%% (\`expiration_min_ms\`, \`expiration_max_ms\`) and the horizon in force is
+%% interpolated between them from the store's own size, so it is not one number
+%% anyone reads. See \`f:expiration_ms/1\`.
+-define(MAX_EXPIRATION_MS, 27 * 60 * 60 * 1000).
+-define(MIN_EXPIRATION_MS, 90 * 60 * 1000).
+%% The store size at which the horizon reaches its ceiling. i2pd's
+%% \`NETDB_MIN_ROUTERS\`, and the numerator of the interpolation: i2pd scales by
+%% \`NETDB_MIN_ROUTERS/total\`, so a store at exactly this size is at the ceiling and
+%% a store of any size above it is proportionally further below.
+-define(MIN_ROUTERS, 90).
+%% The table is unnamed: a store's table is identified by the tid in its own
+%% state, not by a global name, so two stores in one node cannot collide. The
+%% srv reads the tid from its store and hands it to callers; see
+%% `m:i2p_netdb_srv:has_router/1`.
+-define(ROUTERS, i2per_netdb_routers).
+%% The one table row that is not a RouterInfo. An atom, where every router key is
+%% a 32-byte binary, so it cannot collide with one and no caller can name it by
+%% accident. Its value is the generation counter; see `f:claim_generation/1`.
+-define(GEN_KEY, '$generation').
+%% Bits of the derived-flag byte stored alongside each RouterInfo. See
+%% `f:floodfill_flags/1`.
+-define(FF_DECLARED, 1).
+-define(FF_ELIGIBLE, 2).
 %% i2pd NetDb.hpp: NETDB_MIN_FLOODFILL_VERSION = MAKE_VERSION_NUMBER(0, 9, 62).
 -define(NETDB_MIN_FLOODFILL_VERSION, 962).
 %% i2pd NetDb.cpp: reject RouterInfos stamped more than this into the future.
+%%
+%% **Not configurable, and deliberately so.** This is not a policy knob. It bounds
+%% how far ahead of the local clock a RouterInfo may claim to be published, which is
+%% a tolerance for clock skew between routers, and the number to use for that is
+%% i2pd's. Making it configurable would invite an operator to set it wide enough to
+%% accept RouterInfos that are meaningfully from the future, and the expiry sweep
+%% would then have to reason about them too. See `expiration_threshold_ms/0`, which
+%% exposes it as a read so a test or a status display can report the window the
+%% store is actually enforcing.
 -define(EXPIRATION_THRESHOLD_MS, 2 * 60 * 1000).
-%% i2pd NetDb.hpp: NETDB_MAX_EXPIRATION_TIMEOUT = 27 hours.
--define(MAX_EXPIRATION_MS, 27 * 60 * 60 * 1000).
 -define(CAPS_FLOODFILL, $f).
 -define(CAPS_UNREACHABLE, $U).
 -define(CAPS_HIDDEN, $H).
@@ -113,38 +328,139 @@ process-local and answers queries against it.
 -type ls_key() :: i2p_crypto:hash().
 
 -doc """
-An immutable store: a map of router hash to RouterInfo plus the MRU-first
-recency order used for capacity eviction, and a parallel map of destination
-hash to LeaseSet with its own recency order.
+A store: an ETS table of RouterInfos keyed by router hash, the paired recency
+order used for capacity eviction, and a parallel map of destination hash to
+LeaseSet with its own recency order.
+
+`routers` is an `ets:tid()` rather than a map because the existence question is
+asked per relayed frame from another process, and a table read answers it
+without a round trip. `order` and `order_pos` are the two halves of the recency
+order: `Seq -> Hash` for finding the least-recently-stored router, and
+`Hash -> Seq` for promoting one we already hold. They are kept in step by the
+same expressions that write the table, and `f:self_check/1` asserts they agree.
+
+`generation` is the store's half of the counter the table carries under
+`?GEN_KEY`. It is the store's belief about how many times its table has been
+written; every mutator advances both together and refuses to write when they
+disagree. See `f:generation/1`.
+
+`routing` is the day-tagged memo of routing keys: `{Day, #{RouterKey => RoutingKey}}`
+for the UTC day every value was computed for. It is a cache of a pure function
+of the key, so the day is the *only* thing that can make it wrong, and that is
+what the tag is for. It lives in the store map for the reason the recency order
+does — a second ETS table would be side-effect state, and the property that one
+function stands between every mutation and every derived structure would be lost.
+See `f:closest_keys/4`.
+
+LeaseSets keep a plain map and list. Nothing on the data path asks about them
+per frame, so they gain nothing from a table and would only pay for it. They also
+need no generation: they live in the store map, so a dropped LeaseSet return
+value loses nothing that is not already lost.
 """.
 -opaque store() :: #{
     capacity := pos_integer(),
-    routers := #{router_key() => i2p_router_info:router_info()},
-    order := [router_key()],
+    expiration_min_ms := pos_integer(),
+    expiration_max_ms := pos_integer(),
+    routers := ets:tid(),
+    order := gb_trees:tree(non_neg_integer(), router_key()),
+    order_pos := gb_trees:tree(router_key(), non_neg_integer()),
+    next_seq := pos_integer(),
+    generation := non_neg_integer(),
+    routing := {binary(), #{router_key() => router_key()}},
     lease_sets := #{ls_key() => i2p_leaset:lease_set()},
     ls_order := [ls_key()]
 }.
 
--doc "A fresh store with the default capacity (5000 routers).".
+-doc """
+A fresh store with the default capacity (5000 routers) and the default expiry
+horizon: i2pd's curve, from 27 hours at 90 routers down to about 1h57m at 5000.
+""".
 -spec new() -> store().
 new() ->
-    new(?DEFAULT_CAPACITY).
+    new(?DEFAULT_CAPACITY, ?MAX_EXPIRATION_MS, ?MIN_EXPIRATION_MS).
 
 -doc """
-A fresh store with a fixed `Capacity` — when a store would exceed it, the
-least recently stored RouterInfo is evicted.
+A fresh store with a fixed `Capacity` and the default expiry horizon.
+
+When a store would exceed the capacity, the least recently stored RouterInfo is
+evicted.
 """.
 -spec new(pos_integer()) -> store().
-new(Capacity) when is_integer(Capacity), Capacity > 0 ->
+new(Capacity) ->
+    new(Capacity, ?MAX_EXPIRATION_MS, ?MIN_EXPIRATION_MS).
+
+-doc """
+A fresh store with a fixed `Capacity` and a **flat** expiry horizon of
+`ExpirationMs`.
+
+This is the same as `f:new/3` with both bounds set to `ExpirationMs`, and it is
+spelled separately because a flat horizon is a policy an operator can still ask
+for: a store that holds few routers and wants them kept regardless is better
+served by one number than by a curve that happens to sit near the ceiling.
+""".
+-spec new(pos_integer(), pos_integer()) -> store().
+new(Capacity, ExpirationMs) ->
+    new(Capacity, ExpirationMs, ExpirationMs).
+
+-doc """
+A fresh store with a fixed `Capacity` and an expiry horizon that slides between
+`MinMs` and `MaxMs` with the store's size.
+
+`Capacity` is the number of RouterInfos the store holds before evicting the least
+recently stored. `MinMs` and `MaxMs` are the ends of the staleness policy: the
+horizon in force is `MaxMs` at `f:min_routers/0` routers or fewer, and
+interpolates down towards `MinMs` as the store fills. See
+**The expiry horizon is a function of how full the store is** in the module
+documentation, and `f:expiration_ms/1` for the function itself.
+
+The two are independent: capacity bounds memory, the horizon bounds staleness. A
+store can hold few routers for a long time, or many for a short time, and neither
+setting affects the other. The horizon is not persisted, so a store read back from
+a file starts at the default bounds whatever the running router is configured for.
+
+The returned store owns a new `protected` ETS table, so it is only safe to use
+from the process that called this: a `protected` table rejects writes from
+anyone else, which is what makes the single-writer property hold rather than
+merely be intended. The table dies with this process, so the store cannot
+outlive its owner.
+""".
+-spec new(pos_integer(), pos_integer(), pos_integer()) -> store().
+new(Capacity, MaxMs, MinMs) when
+    is_integer(Capacity),
+    Capacity > 0,
+    is_integer(MaxMs),
+    MaxMs > 0,
+    is_integer(MinMs),
+    MinMs > 0,
+    MinMs =< MaxMs
+->
     #{
         capacity => Capacity,
-        routers => #{},
-        order => [],
+        expiration_min_ms => MinMs,
+        expiration_max_ms => MaxMs,
+        routers => new_table(),
+        order => gb_trees:empty(),
+        order_pos => gb_trees:empty(),
+        next_seq => 1,
+        generation => 0,
+        routing => {<<>>, #{}},
         lease_sets => #{},
         ls_order => []
     };
-new(_) ->
+new(_, _, _) ->
     error(badarg).
+
+%% The table is `protected`, not `public`: the owning process writes, everyone
+%% reads. `read_concurrency` because the readers are exactly the case this
+%% table exists for -- many processes asking "do we hold this router?" on their
+%% own schedulers, with no writer in the middle.
+%%
+%% It starts with the generation row and nothing else, which is why every count
+%% of stored routers in this module subtracts one: see `f:router_count/1`.
+new_table() ->
+    Tab = ets:new(?ROUTERS, [set, protected, {read_concurrency, true}]),
+    true = ets:insert(Tab, {?GEN_KEY, 0}),
+    Tab.
 
 -doc """
 Store a verified RouterInfo.
@@ -161,7 +477,7 @@ store is returned unchanged).
     {store(), added | updated | older | from_future | too_old}.
 store(Store, RI, NowMs) when is_integer(NowMs) ->
     Key = i2p_router_info:hash(RI),
-    case maps:find(Key, maps:get(routers, Store)) of
+    case router(Key, Store) of
         {ok, Existing} ->
             case i2p_router_info:published(Existing) >= i2p_router_info:published(RI) of
                 true -> {Store, older};
@@ -251,7 +567,74 @@ in the LRU order.
 """.
 -spec find(store(), router_key()) -> {ok, i2p_router_info:router_info()} | error.
 find(Store, Key) ->
-    maps:find(Key, maps:get(routers, Store)).
+    router(Key, Store).
+
+%% The one place a RouterInfo is read out of the table, so there is a single
+%% answer to "do we hold this router?" rather than one per call site.
+router(Key, Store) ->
+    case ets:lookup(maps:get(routers, Store), Key) of
+        [{_, RI, _Flags}] -> {ok, RI};
+        [] -> error
+    end.
+
+-doc """
+Whether the store holds a RouterInfo for `Key`.
+
+Input: `Store` — the store; `Key` — the router hash.
+Output: `true` or `false`. **This is the existence question, and it is answered
+by the table alone.**
+
+The relay path asks it once per 1028-byte frame, from the process that relays
+other routers' tunnels, and only needs the yes or no. `ets:member/2` copies
+nothing and does not reach the NetDb process, where a lookup would cost a round
+trip and a copy of a whole RouterInfo to answer the same question.
+
+It is deliberately not `f:find/2` narrowed: that returns the RouterInfo, and
+the caller here discards it.
+""".
+-spec has_router(store(), router_key()) -> boolean().
+has_router(Store, Key) ->
+    ets:member(maps:get(routers, Store), Key).
+
+-doc """
+The store's generation: how many times its table has been written.
+
+Input: `Store` — the store.
+Output: a non-negative integer, equal to the counter the table carries under
+`?GEN_KEY`.
+
+A store that mutates a table in place is only half a value, and this is the half
+that says which one you are holding. Two stores naming the same table have
+different generations, because every mutation writes the table *and* returns a
+new store, so the counter is what distinguishes "the store I just mutated" from
+"the store I still hold" when the return value is lost.
+
+The main use is a **cross-process snapshot**. Reading the order and the table
+from another process can interleave with a mutation and produce a binary that
+was never true of any store; reading `generation/1` before and after the read
+and retrying when it moved is enough to make that safe. That is what lets the
+periodic save run outside the process that serves reads, because the reader can
+tell whether the writer saw a consistent store.
+""".
+-spec generation(store()) -> non_neg_integer().
+generation(Store) ->
+    maps:get(generation, Store).
+
+-doc """
+The tid of the store's RouterInfo table.
+
+Input: `Store` — the store.
+Output: the `ets:tid()`, which stays the same for the life of the store even as
+entries are inserted and deleted.
+
+It is published once at init by `m:i2p_netdb_srv` so that a reader can reach
+the table without asking the NetDb process for the store, which is what
+`m:i2p_netdb_srv:has_router/1` does. Publishing the tid rather than the store is
+deliberate: the store is replaced on every mutation, the tid is not.
+""".
+-spec router_table(store()) -> ets:tid().
+router_table(Store) ->
+    maps:get(routers, Store).
 
 -doc """
 Look up a LeaseSet by destination hash.
@@ -272,16 +655,14 @@ Output: `{Store2, removed}` when it was present, `{Store, not_found}` otherwise.
 """.
 -spec remove(store(), router_key()) -> {store(), removed | not_found}.
 remove(Store, Key) ->
-    Routers = maps:get(routers, Store),
-    case maps:is_key(Key, Routers) of
+    case ets:member(maps:get(routers, Store), Key) of
         true ->
-            {
-                Store#{
-                    routers := maps:remove(Key, Routers),
-                    order := lists:delete(Key, maps:get(order, Store))
-                },
-                removed
-            };
+            %% Claimed before the delete, for the reason `f:claim_generation/1`
+            %% gives. A store that deletes from a table it no longer describes
+            %% would drop a RouterInfo the order still claims to hold.
+            Store1 = claim_generation(Store),
+            true = ets:delete(maps:get(routers, Store1), Key),
+            {forget_routing(drop_from_order(Store1, Key), Key), removed};
         false ->
             {Store, not_found}
     end.
@@ -289,18 +670,33 @@ remove(Store, Key) ->
 -doc "All stored RouterInfos, in storage-recency order (MRU first).".
 -spec routers(store()) -> [i2p_router_info:router_info()].
 routers(Store) ->
-    Routers = maps:get(routers, Store),
-    [maps:get(K, Routers) || K <- maps:get(order, Store)].
+    [router_value(K, Store) || K <- mru_first(Store)].
 
 -doc "All stored router hashes, in storage-recency order (MRU first).".
 -spec keys(store()) -> [router_key()].
 keys(Store) ->
-    maps:get(order, Store).
+    mru_first(Store).
+
+%% MRU-first means **descending** `Seq`, because `Seq` increases with recency and
+%% the tree iterates ascending. Getting this backwards would silently reorder
+%% the on-disk netdb file and every `routers/1` listing, which is why it is
+%% named rather than inlined at each use.
+mru_first(Store) ->
+    lists:reverse(order_hashes(Store)).
+
+%% **The hashes held by the order, ascending in recency.**
+%%
+%% `gb_trees:keys/1` is the trap here: it returns the tree's *keys*, which for
+%% this order are the `{Seq, Hash}` pairs, not the hashes. Reading it as hashes
+%% hands `{Seq, Hash}` tuples to everything downstream, and the symptom shows up
+%% far away as a byte-size failure inside an unrelated function.
+order_hashes(Store) ->
+    [Hash || {_Seq, Hash} <- gb_trees:to_list(maps:get(order, Store))].
 
 -doc "The number of stored routers.".
 -spec count(store()) -> non_neg_integer().
 count(Store) ->
-    map_size(maps:get(routers, Store)).
+    gb_trees:size(maps:get(order, Store)).
 
 -doc "All stored destination hashes, in storage-recency order (MRU first).".
 -spec ls_keys(store()) -> [ls_key()].
@@ -317,10 +713,345 @@ ls_count(Store) ->
 capacity(Store) ->
     maps:get(capacity, Store).
 
+%% Both of these return a compile-time constant, so dialyzer's success typing is the
+%% literal rather than `pos_integer()` and it reports the spec as wider than what the
+%% body can produce. Suppressed, and deliberately kept as the wider `pos_integer()`:
+%% the point of exposing the number is that a caller configures against it, and a
+%% spec of `97200000` would break the build the day someone edits the macro to tune
+%% it, which is the one thing this exists to allow.
+-dialyzer(
+    {no_underspecs, [
+        default_expiration_ms/0,
+        default_min_expiration_ms/0,
+        min_routers/0,
+        expiration_threshold_ms/0
+    ]}
+).
+
+-doc """
+The default RouterInfo expiry horizon's ceiling in ms, 27 hours.
+
+i2pd's `NETDB_MAX_EXPIRATION_TIMEOUT`, and the horizon a store of 90 routers or
+fewer runs at. Exposed because `m:i2p_netdb_srv` reads operator configuration and
+needs the default from here rather than restating it, so there is one number and
+not two that can disagree.
+""".
+-spec default_expiration_ms() -> pos_integer().
+default_expiration_ms() ->
+    ?MAX_EXPIRATION_MS.
+
+-doc """
+The default RouterInfo expiry horizon's floor in ms, 90 minutes.
+
+i2pd's `NETDB_MIN_EXPIRATION_TIMEOUT`, and the horizon a full store converges on:
+at the shipped capacity of 5000 routers the curve sits at about 1h57m, so this is
+a floor the shipped configuration never quite reaches rather than one it sits on.
+""".
+-spec default_min_expiration_ms() -> pos_integer().
+default_min_expiration_ms() ->
+    ?MIN_EXPIRATION_MS.
+
+-doc """
+The store size at which the expiry horizon reaches its ceiling: 90 routers.
+
+i2pd's `NETDB_MIN_ROUTERS`, and the numerator of the interpolation, so it is both
+the size at which `f:expiration_ms/1` returns the ceiling exactly and the constant
+that scales the rest of the curve. Exported so a caller reporting the policy can
+name the pivot rather than infer it from two sampled values.
+""".
+-spec min_routers() -> pos_integer().
+min_routers() ->
+    ?MIN_ROUTERS.
+
+-doc "The lower bound of a store's expiry horizon, in ms.".
+-spec min_expiration_ms(store()) -> pos_integer().
+min_expiration_ms(Store) ->
+    maps:get(expiration_min_ms, Store).
+
+-doc "The upper bound of a store's expiry horizon, in ms.".
+-spec max_expiration_ms(store()) -> pos_integer().
+max_expiration_ms(Store) ->
+    maps:get(expiration_max_ms, Store).
+
+-doc """
+The RouterInfo expiry horizon in ms: how old a RouterInfo may be before this store
+discards it, **at this store's current size**.
+
+Set at `f:new/2,3` and changeable with `f:set_expiration_ms/2` and
+`f:set_expiration_range/3`. Both the admission check in `f:store/3` and
+`f:remove_expired/3` read this one value, so a store cannot admit a RouterInfo it
+is about to expire.
+
+**It is a function, not a field.** The store holds the two bounds and this
+interpolates between them from the store's own size; see
+`f:expiration_ms_at/2` for the curve and the module documentation for why. So
+there is no one number to read here, which is why `f:min_expiration_ms/1` and
+`f:max_expiration_ms/1` are exported beside it: a caller that wants to report the
+policy wants the bounds, and a caller that wants to know what is in force *now*
+wants this.
+""".
+-spec expiration_ms(store()) -> pos_integer().
+expiration_ms(Store) ->
+    expiration_ms_at(Store, count(Store)).
+
+-doc """
+The RouterInfo expiry horizon in ms a store of `Count` routers would apply.
+
+The curve is i2pd's, from `NetDb::SaveUpdated`:
+`Min + (Max - Min) * 90 / Count` for a store above 90 routers, and the ceiling for
+one at or below it. Integer arithmetic throughout — a float would make the horizon
+depend on rounding, and two routers reporting a store's policy would then be able
+to disagree about the last millisecond of it.
+
+Exposed with an explicit `Count` so the mapping is measurable rather than something
+a reader has to compute: a status display can report what the horizon *will* be
+once the store has grown, and a test can assert the shape at sizes no store in the
+tree actually reaches.
+""".
+-spec expiration_ms_at(store(), non_neg_integer()) -> pos_integer().
+expiration_ms_at(Store, Count) when is_integer(Count), Count >= 0, Count =< ?MIN_ROUTERS ->
+    max_expiration_ms(Store);
+expiration_ms_at(Store, Count) when is_integer(Count), Count > ?MIN_ROUTERS ->
+    Min = min_expiration_ms(Store),
+    Max = max_expiration_ms(Store),
+    Min + (Max - Min) * min_routers() div Count;
+expiration_ms_at(_Store, _Count) ->
+    error(badarg).
+
+-doc """
+How far ahead of the local clock a RouterInfo may claim to be published, in ms.
+
+i2pd's `NETDB_EXPIRATION_TIMEOUT_THRESHOLD`, and not configurable: it is a tolerance
+for clock skew rather than a policy, and the two halves of the admission window are
+not the same decision. See `f:new/2` for the horizon that *is* a policy.
+""".
+-spec expiration_threshold_ms() -> pos_integer().
+expiration_threshold_ms() ->
+    ?EXPIRATION_THRESHOLD_MS.
+
+-doc """
+Set a store's RouterInfo expiry horizon to a flat `ExpirationMs`, returning a new
+store.
+
+Input: `Store` — the current store; `ExpirationMs` — the new horizon, which must be
+a positive integer.
+Output: `Store2`, identical to `Store` apart from the horizon. The table is not
+touched, so this is a change of policy and not a mutation: no generation is claimed
+and nothing is read or written.
+
+**This sets both bounds to the same value**, so the store stops sliding and runs
+at one number. That is deliberate: a flat horizon is a real policy (see
+`f:new/2`), and an operator who wants one should not have to name a range that
+produces it. `f:set_expiration_range/3` is the one that slides.
+
+**The horizon is read at both the admission check and the sweep**, so changing it
+takes effect on the next store and the next sweep without either having to be told.
+That is the point of putting it in the store rather than reading configuration at
+two call sites.
+""".
+-spec set_expiration_ms(store(), pos_integer()) -> store().
+set_expiration_ms(Store, Ms) when is_integer(Ms), Ms > 0 ->
+    Store#{expiration_min_ms => Ms, expiration_max_ms => Ms};
+set_expiration_ms(_Store, _Ms) ->
+    error(badarg).
+
+-doc """
+Set a store's RouterInfo expiry horizon to slide between `MinMs` and `MaxMs`,
+returning a new store.
+
+Input: `Store` — the current store; `MinMs`, `MaxMs` — the new bounds, which must
+be positive integers with `MinMs =< MaxMs`.
+Output: `Store2`, identical to `Store` apart from the two bounds. As with
+`f:set_expiration_ms/2` this touches nothing else and claims no generation.
+
+`MinMs > MaxMs` is refused rather than tolerated. The interpolation would then
+return a horizon *above* the ceiling for every store large enough to be
+interpolated at all, so the store's most permissive setting would be the one
+neither bound names — a configuration error that reads as working.
+""".
+-spec set_expiration_range(store(), pos_integer(), pos_integer()) -> store().
+set_expiration_range(Store, MinMs, MaxMs) when
+    is_integer(MinMs), MinMs > 0, is_integer(MaxMs), MaxMs >= MinMs
+->
+    Store#{expiration_min_ms => MinMs, expiration_max_ms => MaxMs};
+set_expiration_range(_Store, _MinMs, _MaxMs) ->
+    error(badarg).
+
+-doc """
+The cheap invariant: the table and the order hold the same number of entries.
+
+Input: `Store` — the store. Output: `ok` or `{error, Reason}`.
+
+**This is the check that runs on every mutation,** because it is the one that
+catches the failure this arrangement actually risks. The dangerous mistake is a
+promote that adds a new position without dropping the old one, and that shows up
+immediately as a count disagreement: `count/1` reads the order while the table
+holds one RouterInfo, so the store starts evicting the wrong router.
+
+It is O(1): `ets:info/2` reads a field and `gb_trees:size/1` is stored in the
+tree header. Measured at the shipped capacity of 5000 routers, this is a fraction
+of a microsecond against **315 us** for the full `f:self_check/1`, which would
+have been a tax on the store path to catch a bug the cheap check already catches.
+""".
+-spec consistent(store()) -> ok | {error, term()}.
+consistent(#{order := Order, order_pos := Pos, routers := Tab}) ->
+    N = gb_trees:size(Order),
+    M = gb_trees:size(Pos),
+    Table = router_count(Tab),
+    case {N, M, Table} of
+        {N, N, N} -> ok;
+        _ -> {error, {size_disagreement, #{order => N, order_pos => M, table => Table}}}
+    end.
+
+-doc """
+Assert the store is internally consistent, in full.
+
+Input: `Store` — the store.
+Output: `ok`, or `{error, Reason}` naming the first disagreement found.
+
+**This is the property the whole two-structure arrangement rests on.** The
+RouterInfos live in an ETS table and the recency order lives in a `gb_trees`
+pair; nothing in the language stops them drifting apart, and if they did the
+failure would be quiet and slow — a store that never evicts because its order
+lost a key, or one that evicts a key it does not hold.
+
+It is O(n log n) and it is therefore **not** what runs on every store; that is
+`f:consistent/1`, which is O(1) and catches the likeliest failure. This is the
+one for the wholesale operations, where a whole batch of entries is rewritten at
+once and a partial bug is hardest to see: a load, and the expiry sweep.
+\`i2p_netdb_srv\` calls it after both. What it verifies:
+
+- the table and the order hold the same number of entries
+- every hash in `order` is in the table, and vice versa
+- `order_pos` is exactly the inverse of `order`
+- no two entries share a `Seq`
+- every stored RouterInfo's floodfill flags still agree with it
+- no memoised routing key is left behind for a router the store has dropped
+
+The last two are the checks for derived data. The flags are recomputed from the
+RouterInfo beside them, which is the only way they could come to disagree. The
+routing memo is checked in the one direction that matters, and the asymmetry is
+deliberate — see `f:stale_routing/1`.
+""".
+-spec self_check(store()) -> ok | {error, term()}.
+self_check(Store) ->
+    Order = maps:get(order, Store),
+    Pos = maps:get(order_pos, Store),
+    Tab = maps:get(routers, Store),
+    InOrder = gb_trees:size(Order),
+    InTable = router_count(Tab),
+    %% `to_list/1` gives `{{Seq, Hash}, Hash}`; both levels are matched, so `Seq`
+    %% is the integer and not the pair. Reading it one level shallow would count
+    %% distinct tuples rather than distinct sequences, and a store holding the
+    %% same `{Seq, Hash}` twice would pass this check.
+    Seqs = [Seq || {{Seq, _Hash}, _Value} <- gb_trees:to_list(Order)],
+    case {InOrder, InTable, gb_trees:size(Pos), length(lists:usort(Seqs))} of
+        {N, N, N, N} ->
+            case missing_from_table(Tab, Order) of
+                [] ->
+                    case missing_from_order(Tab, Pos) of
+                        [] ->
+                            %% Both sides are lists, not trees: the empty tree
+                            %% is `{0, nil}`, so comparing a tree to a list
+                            %% would fail even when both are empty.
+                            case
+                                gb_trees:to_list(Pos) =:=
+                                    gb_trees:to_list(
+                                        positions_of(Order)
+                                    )
+                            of
+                                true ->
+                                    case {stale_flags(Tab), stale_routing(Store)} of
+                                        {[], []} ->
+                                            ok;
+                                        {Stale, []} ->
+                                            {error, {flags_disagree_with_routerinfo, Stale}};
+                                        {[], Stale} ->
+                                            {error, {routing_key_without_router, Stale}};
+                                        {StaleFlags, StaleRouting} ->
+                                            {error, {
+                                                flags_disagree_with_routerinfo,
+                                                StaleFlags,
+                                                routing_key_without_router,
+                                                StaleRouting
+                                            }}
+                                    end;
+                                false ->
+                                    {error, order_pos_not_inverse_of_order}
+                            end;
+                        Missing ->
+                            {error, {in_table_not_in_order, Missing}}
+                    end;
+                Missing ->
+                    {error, {in_order_not_in_table, Missing}}
+            end;
+        {A, B, C, _} ->
+            {error, {size_disagreement, #{order => A, table => B, order_pos => C}}}
+    end.
+
+%% The lookups go through `order_pos`, which *is* keyed by hash. Asking the
+%% `order` tree instead would always miss: its keys are `{Seq, Hash}` pairs.
+%% Each membership test is O(log n), so the whole check is O(n log n) rather
+%% than the O(n^2) a list membership test would cost.
+missing_from_order(Tab, Pos) ->
+    [
+        Key
+     || [Key] <- ets:select(Tab, [{{'$1', '_'}, [], ['$1']}]),
+        Key =/= ?GEN_KEY,
+        not gb_trees:is_defined(Key, Pos)
+    ].
+
+missing_from_table(Tab, Order) ->
+    [Hash || {{_Seq, Hash}, _Value} <- gb_trees:to_list(Order), not ets:member(Tab, Hash)].
+
+%% Routers whose stored flags disagree with the RouterInfo beside them.
+%%
+%% The flags are derived, so this is the check that they still are. It recomputes
+%% them from the RouterInfo and compares, which is the whole point: a check that
+%% could only pass because nothing could drift would not be a check.
+stale_flags(Tab) ->
+    ets:foldl(
+        fun
+            %% **Arity 2, one clause per row shape.** `ets:foldl/3` hands the whole
+            %% row over as a single term, so the generation row arrives as the
+            %% 2-tuple it is rather than spread across three arguments. Writing it
+            %% spread is a compile-time arity mismatch, not a runtime one.
+            %%
+            %% No guard on the RouterInfo. An `is_map/1` guard discriminates the row
+            %% shapes just as well, and dialyzer then narrows the term to `map()` and
+            %% rejects the call to `floodfill_flags/1`, whose argument is the opaque
+            %% `m:i2p_router_info:router_info()`. Arity alone is the cleaner
+            %% discriminator: the two shapes differ in size, not in what they hold.
+            ({?GEN_KEY, _Generation}, Acc) ->
+                Acc;
+            ({Key, RI, Flags}, Acc) ->
+                case Flags =:= floodfill_flags(RI) of
+                    true -> Acc;
+                    false -> [Key | Acc]
+                end;
+            (_OtherRow, Acc) ->
+                Acc
+        end,
+        [],
+        Tab
+    ).
+
+%% Why `ets:foldl/3` and not `ets:select/2`. The generation row is a 2-tuple and
+%% every router row is a 3-tuple, so a single match spec has to admit both arities,
+%% and the one that did was refused by the match-spec compiler with a bare `badarg`
+%% and no hint. A fold handles the mixed shapes in one clause list and cannot be
+%% malformed, and `self_check/1` already walks the whole table so the cost is
+%% already being paid.
+
 -doc "The day-scoped routing key for the current UTC date: `SHA-256(Key ‖ yyyymmdd)`.".
 -spec routing_key(router_key()) -> router_key().
 routing_key(Key) ->
     routing_key(Key, current_day()).
+
+%% `current_day/0` is not cheap. It is `calendar:universal_time()` plus an
+%% `io_lib:format` plus a `list_to_binary`, and `routing_key/1` calls it -- so a
+%% caller that needs many routing keys in one pass wants `routing_key/2` and a day
+%% it looked up once. `f:closest_keys/3` is the caller that wants that.
 
 -doc """
 The day-scoped routing key for an explicit day.
@@ -351,12 +1082,15 @@ The `N` stored router hashes closest to `Target`.
 
 Input: `Store` — the store; `Target` — the router hash to measure against;
 `N` — how many to return.
-Output: up to `N` hashes, sorted by routing-key XOR distance to `Target`,
-closest first.
+Output: `{Store2, Hashes}` — up to `N` hashes sorted by routing-key XOR distance
+to `Target`, closest first, and the store with the routing keys it resolved
+memoised. **Keep the store.** Dropping it costs nothing but the old price: the
+next lookup recomputes every key, because the memo lives in the value rather than
+somewhere the caller does not have to thread.
 """.
--spec closest(store(), router_key(), non_neg_integer()) -> [router_key()].
+-spec closest(store(), router_key(), non_neg_integer()) -> {store(), [router_key()]}.
 closest(Store, Target, N) when is_integer(N), N >= 0 ->
-    closest_keys(maps:keys(maps:get(routers, Store)), Target, N);
+    closest_keys(Store, router_keys(Store), Target, N);
 closest(_Store, _Target, _N) ->
     error(badarg).
 
@@ -367,19 +1101,21 @@ Input: `Store`, `Target`, `N` as in `f:closest/3`; `Excluded` — a list of
 hashes to skip (e.g. routers we already asked). Only routers that are both
 declared (`caps` contains `f`) and eligible (`f:eligible_floodfill/1`) count —
 this is the replication set i2pd picks (`GetClosestFloodfills(ident, 3, ...)`).
+Output: `{Store2, Hashes}`, and the store is worth keeping for the reason
+`f:closest/3` gives.
 """.
 -spec closest_floodfills(store(), router_key(), non_neg_integer(), [router_key()]) ->
-    [router_key()].
+    {store(), [router_key()]}.
 closest_floodfills(Store, Target, N, Excluded) when
     is_integer(N), N >= 0, is_list(Excluded)
 ->
     Floodfills = [
         Key
-     || Key <- maps:keys(maps:get(routers, Store)),
+     || Key <- router_keys(Store),
         not lists:member(Key, Excluded),
         is_eligible_floodfill(Store, Key)
     ],
-    closest_keys(Floodfills, Target, N);
+    closest_keys(Store, Floodfills, Target, N);
 closest_floodfills(_Store, _Target, _N, _Excluded) ->
     error(badarg).
 
@@ -389,20 +1125,21 @@ The `N` closest *non-floodfill* hashes to `Target`, excluding `Excluded`.
 Input: as in `f:closest_floodfills/4`. Routers that declare the floodfill cap
 are skipped, mirroring i2pd's `GetExploratoryNonFloodfill` — the peer manager
 uses this set to probe for routers close to a key without querying
-floodfills.
+floodfills. Output: `{Store2, Hashes}`, and the store is worth keeping for the
+reason `f:closest/3` gives.
 """.
 -spec closest_non_floodfills(store(), router_key(), non_neg_integer(), [router_key()]) ->
-    [router_key()].
+    {store(), [router_key()]}.
 closest_non_floodfills(Store, Target, N, Excluded) when
     is_integer(N), N >= 0, is_list(Excluded)
 ->
     NonFloodfills = [
         Key
-     || Key <- maps:keys(maps:get(routers, Store)),
+     || Key <- router_keys(Store),
         not lists:member(Key, Excluded),
-        not declared_floodfill(maps:get(Key, maps:get(routers, Store)))
+        not declares_floodfill(Store, Key)
     ],
-    closest_keys(NonFloodfills, Target, N);
+    closest_keys(Store, NonFloodfills, Target, N);
 closest_non_floodfills(_Store, _Target, _N, _Excluded) ->
     error(badarg).
 
@@ -465,6 +1202,96 @@ is_ipv4(_) ->
     false.
 
 -doc """
+A description of what to serialise, taken from a store.
+
+`keys` is the recency order as a list of router hashes, `table` is the tid those
+keys live in, and `generation` is the counter to check afterwards.
+
+**This exists so the serialisation can happen in another process.** The
+RouterInfos are not in the snapshot, because they do not have to be: `table` is
+`protected`, so any process may read it, and `f:serialize/1` looks each entry up
+as it walks the list. Sending a snapshot costs about **49 us** at the shipped
+capacity of 5000 routers, against **8403 us** to serialise in the process that
+owns the store — a 170x cut in what a read-serving process pays for a save.
+
+`generation` is what makes a snapshot safe to use later. A key can be evicted
+between the snapshot being taken and the serialisation running, and the entry
+would then be in `keys` but not in `table`. `f:serialize/1` reports that as
+`{error, {stale, Key}}` rather than crashing on a `badmatch`, and the caller can
+compare the snapshot's generation against the store to decide whether to retry.
+""".
+-type snapshot() :: #{
+    capacity := pos_integer(),
+    keys := [router_key()],
+    lease_sets := #{ls_key() => i2p_leaset:lease_set()},
+    ls_order := [ls_key()],
+    generation := non_neg_integer(),
+    table := ets:tid()
+}.
+
+-doc """
+Take a snapshot of the store, for serialising it elsewhere.
+
+Input: `Store` — the store.
+Output: a `snapshot()`, which `f:serialize/1` turns into the same bytes
+`f:to_binary/1` would have produced for this store.
+
+This is the cheap half of moving a save off the read path. See the `snapshot()`
+type for why the RouterInfos are not included.
+""".
+-spec snapshot(store()) -> snapshot().
+snapshot(Store) ->
+    #{
+        capacity => capacity(Store),
+        keys => keys(Store),
+        lease_sets => maps:get(lease_sets, Store),
+        ls_order => maps:get(ls_order, Store),
+        generation => maps:get(generation, Store),
+        table => maps:get(routers, Store)
+    }.
+
+-doc """
+Serialize a snapshot to a binary.
+
+Input: `Snapshot` — from `f:snapshot/1`.
+Output: `{ok, Bin}` in exactly the format `f:to_binary/1` writes, or
+`{error, {stale, Key}}` when `Key` is in the snapshot's key list but no longer in
+the table.
+
+**The error is the point.** A snapshot outlives the store state it was taken
+from, and a key evicted in between is in `keys` but absent from `table`. A clean
+reason lets the caller re-snapshot and retry; a `badmatch` out of `f:router/2`
+would not, and would take the calling process down with it.
+""".
+-spec serialize(snapshot()) -> {ok, binary()} | {error, term()}.
+serialize(#{keys := Keys, table := Tab} = Snapshot) ->
+    case snapshot_entries(Tab, Keys, []) of
+        {ok, RouterBins} ->
+            LSMaps = maps:get(lease_sets, Snapshot),
+            LSOrder = maps:get(ls_order, Snapshot),
+            LSBins = [ls_entry(Key, LSMaps) || Key <- LSOrder],
+            {ok,
+                <<"I2PNETDB", ?VERSION:8, (maps:get(capacity, Snapshot)):32/big,
+                    (length(Keys)):32/big, (iolist_to_binary(RouterBins))/binary,
+                    (length(LSOrder)):32/big, (iolist_to_binary(LSBins))/binary>>};
+        {error, _} = Err ->
+            Err
+    end.
+
+snapshot_entries(_Tab, [], Acc) ->
+    {ok, lists:reverse(Acc)};
+snapshot_entries(Tab, [Key | Rest], Acc) ->
+    case ets:lookup(Tab, Key) of
+        [{_, RI, _Flags}] ->
+            Bin = i2p_router_info:to_binary(RI),
+            snapshot_entries(
+                Tab, Rest, [<<Key/binary, (byte_size(Bin)):16/big, Bin/binary>> | Acc]
+            );
+        [] ->
+            {error, {stale, Key}}
+    end.
+
+-doc """
 Serialize the store to a binary.
 
 Input: `Store` — a store.
@@ -473,14 +1300,26 @@ LRU order and capacity. Each RouterInfo and LeaseSet is encoded as raw signed
 bytes via `m:i2p_router_info:to_binary/1` and `m:i2p_leaset:to_binary/1`. The
 format is `<<"I2PNETDB">> ‖ version(1) ‖ capacity(4) ‖ router_count(4) ‖
 entries ‖ ls_count(4) ‖ entries`.
+
+Equivalent to `{ok, Bin} = f:serialize(f:snapshot(Store))` for a store nothing is
+mutating, and it stays defined for one that is: it reads the table through the
+store rather than through a snapshot.
+
+**The file records capacity but not the expiry horizon.** Those are not the same
+kind of value: capacity is a property of the store that was saved, while the
+horizon is a policy the running router decides now, exactly as it decides the sweep
+interval. A router restarted with a shorter horizon must honour the shorter one
+against the routers it just loaded, so persisting the old value would be a way to
+make configuration silently not apply. `f:from_binary/1` therefore loads at the
+default and the caller applies whatever policy it is configured for with
+`f:set_expiration_range/3`.
 """.
 -spec to_binary(store()) -> binary().
 to_binary(Store) ->
     Capacity = capacity(Store),
-    RouterOrder = maps:get(order, Store),
-    Routers = maps:get(routers, Store),
+    RouterOrder = mru_first(Store),
     RouterCount = length(RouterOrder),
-    RouterBins = [router_entry(Key, Routers) || Key <- RouterOrder],
+    RouterBins = [router_entry(Key, Store) || Key <- RouterOrder],
     LSOrder = maps:get(ls_order, Store),
     LSMaps = maps:get(lease_sets, Store),
     LSCount = length(LSOrder),
@@ -496,22 +1335,35 @@ Output: `{ok, Store}` when the binary is well-formed and every RouterInfo /
 LeaseSet signature verifies (`m:i2p_router_info:decode/1`,
 `m:i2p_leaset:decode/1`); `{error, Reason}` otherwise. Entries with invalid
 signatures or truncated bytes are silently dropped.
+
+**Capacity is restored from the file; the expiry horizon is not.** The horizon
+arrives at the default bounds, and the caller sets the policy it is configured for
+with `f:set_expiration_range/3` — see `f:to_binary/1` for why it is not persisted.
+
+**A load does not apply the horizon to what it loads.** Entries are seeded straight
+into the recency order rather than through `f:store/3`, so a file written by a
+router running a longer horizon is restored in full and the *next sweep* is what
+compacts it to the current policy. That is deliberate, and it is also the whole of
+the protection against a policy change emptying the store on the next boot: a
+router that upgrades from a flat 27 hours to the sliding curve starts with a full
+store and gives up its stalest entries at the sweep interval rather than all at
+once. It is also why i2pd's first-hour uptime grace is not needed here — see the
+module documentation.
 """.
 -spec from_binary(binary()) -> {ok, store()} | {error, term()}.
 from_binary(<<"I2PNETDB", ?VERSION:8, Rest/binary>>) ->
     maybe
         {ok, Capacity, RouterCount, AfterCount} ?= split_header(Rest),
-        {ok, Routers, Order, AfterRouters} ?=
-            parse_router_entries(AfterCount, RouterCount, #{}, []),
+        {ok, Entries, AfterRouters} ?=
+            parse_router_entries(AfterCount, RouterCount, []),
         {ok, LSCount, AfterLSCount} ?= split_ls_header(AfterRouters),
         {ok, LSMaps, LSOrder} ?= parse_ls_section(AfterLSCount, LSCount),
-        {ok, #{
-            capacity => Capacity,
-            routers => Routers,
-            order => lists:reverse(Order),
-            lease_sets => LSMaps,
-            ls_order => lists:reverse(LSOrder)
-        }}
+        %% The file records routers oldest-first, so the parsed list is already
+        %% in ascending recency and can seed the order directly. Seeding it here
+        %% rather than replaying each entry through `f:store/3` keeps a load from
+        %% paying a signature verification per entry twice over.
+        {ok, Store} = seed_order(new(Capacity), Entries),
+        {ok, Store#{lease_sets => LSMaps, ls_order => lists:reverse(LSOrder)}}
     else
         {error, _} = Err -> Err;
         error -> {error, malformed_router}
@@ -547,29 +1399,34 @@ Input: `Store` — the store; `NowMs` — wall-clock ms since epoch; `NowSec` �
 wall-clock seconds since epoch.
 Output: `{Store2, {RoutersRemoved, LSRemoved}}` where the counts reflect how
 many entries were evicted. A RouterInfo is expired when its published timestamp
-plus the 27-hour i2pd expiration threshold has fully passed. A LeaseSet is
-expired when `m:i2p_leaset:valid/2` returns `{error, expired}`.
+plus the horizon at the store's current size has fully passed — the same
+`f:expiration_ms/1` the admission check reads, and read once for the whole walk
+because the walk does not change the size. A LeaseSet is expired when
+`m:i2p_leaset:valid/2` returns `{error, expired}`.
 """.
 -spec remove_expired(store(), non_neg_integer(), non_neg_integer()) ->
     {store(), {non_neg_integer(), non_neg_integer()}}.
 remove_expired(Store, NowMs, NowSec) when is_integer(NowMs), is_integer(NowSec) ->
-    Routers0 = maps:get(routers, Store),
-    Order0 = maps:get(order, Store),
-    {KeptRouters, KeptRouterOrder, RemovedRouters} = partition_routers(
-        Routers0, Order0, NowMs, 0, []
-    ),
-    LeaseSets0 = maps:get(lease_sets, Store),
-    LSOrder0 = maps:get(ls_order, Store),
+    %% Claimed unconditionally, before the first delete rather than at the first
+    %% delete. The sweep cannot know whether it will remove anything until it has
+    %% walked the whole order, and a claim made mid-walk would be a claim made
+    %% after rows were already gone. So a sweep that removes nothing still advances
+    %% the generation by one. That costs a reader one retry of a cross-process
+    %% snapshot every 30 minutes, and it is a far better trade than a sweep that
+    %% deletes from a table it has not checked.
+    Store1 = claim_generation(Store),
+    Expired = expired_hashes(Store1, NowMs),
+    Store2 = drop_each(Store1, Expired),
+    LeaseSets0 = maps:get(lease_sets, Store2),
+    LSOrder0 = maps:get(ls_order, Store2),
     {KeptLS, KeptLSOrder, RemovedLS} = partition_ls(
         LeaseSets0, LSOrder0, NowSec, 0, []
     ),
-    Store2 = Store#{
-        routers => KeptRouters,
-        order => lists:reverse(KeptRouterOrder),
+    Store3 = Store2#{
         lease_sets => KeptLS,
         ls_order => lists:reverse(KeptLSOrder)
     },
-    {Store2, {RemovedRouters, RemovedLS}};
+    {Store3, {length(Expired), RemovedLS}};
 remove_expired(_Store, _NowMs, _NowSec) ->
     error(badarg).
 
@@ -590,22 +1447,102 @@ is_all_digits(Bin) ->
 
 insert_newer(Store, Key, RI, NowMs, Outcome) ->
     Timestamp = i2p_router_info:published(RI),
-    case valid_window(Timestamp, NowMs) of
+    case valid_window(Timestamp, NowMs, Store) of
         true ->
-            Routers0 = maps:get(routers, Store),
-            Routers = Routers0#{Key => RI},
-            Order0 = maps:get(order, Store),
-            Order1 = [Key | lists:delete(Key, Order0)],
-            {trim(Store#{routers => Routers, order => Order1}), Outcome};
+            %% Claimed *before* the write, not after: the claim is what detects a
+            %% stale store, and a store that has already been written is already
+            %% corrupt. On the raise path nothing is written at all.
+            Store1 = claim_generation(Store),
+            true = ets:insert(maps:get(routers, Store1), {Key, RI, floodfill_flags(RI)}),
+            {trim(promote(Store1, Key)), Outcome};
         false ->
             {Store, outcome_for_window(Timestamp, NowMs)}
     end.
 
+%% Take the next generation, or fail loudly if the table has moved on without us.
+%%
+%% This is the fix for a store that mutates in place while documenting itself as a
+%% value. A caller that drops the store `insert_newer/5` just returned has an
+%% ETS table one RouterInfo ahead of the recency order it still holds, and no size
+%% check can see it, because the mutation inserted a row and evicted a row. The
+%% next mutation is where that becomes damage -- `promote/2` and `trim/1` both
+%% reason about the order, so they evict against a store that no longer describes
+%% the table, and `f:to_binary/1` persists the wrong order.
+%%
+%% Failing here means the store is caught before that mutation happens, at a point
+%% where the table is still exactly as the last good store left it. Raising rather
+%% than returning an error is deliberate: this is a programming error in a caller
+%% that does not exist, `m:i2p_netdb_srv` is the only mutator and it always keeps
+%% the result, and an `error` tuple would have to be threaded through every
+%% mutator's spec for a case that should never be reachable.
+%% **The number of RouterInfos in the table, which is one less than its size.**
+%%
+%% The table carries the generation row alongside the routers (see
+%% `f:claim_generation/1`), so `ets:info(Tab, size)` counts one non-router row.
+%% Every count of stored routers in this module goes through here rather than
+%% subtracting one at each call site, because a place that forgets is a store that
+%% reports a phantom router forever -- the count never matches the order and
+%% `f:consistent/1` reports a disagreement that does not exist.
+router_count(Tab) ->
+    ets:info(Tab, size) - 1.
+
+claim_generation(#{routers := Tab, generation := Mine} = Store) ->
+    case ets:lookup(Tab, ?GEN_KEY) of
+        [{?GEN_KEY, Mine}] ->
+            Next = Mine + 1,
+            true = ets:insert(Tab, {?GEN_KEY, Next}),
+            Store#{generation := Next};
+        [{?GEN_KEY, Theirs}] ->
+            error({stale_store, #{expected => Mine, table => Theirs}});
+        [] ->
+            error({stale_store, #{expected => Mine, table => missing}})
+    end.
+
+%% Move `Key` to most-recently-stored. `order_pos` is what makes this cheap:
+%% without it the old `Seq` would be unknown and the entry could only be found by
+%% walking the whole order, which is the O(n) this replaced.
+promote(#{order := Order, order_pos := Pos, next_seq := Seq} = Store, Key) ->
+    {Order1, Pos1} =
+        case gb_trees:take_any(Key, Pos) of
+            error ->
+                {Order, Pos};
+            {OldSeq, Pos1a} ->
+                %% The old position has to leave BOTH trees, not just the
+                %% lookup one. Leaving it in `order` is what would make a
+                %% re-stored router look like two entries: `count/1` reads the
+                %% order, and the table holds one RouterInfo.
+                {_Key, Order1a} = gb_trees:take({OldSeq, Key}, Order),
+                {Order1a, Pos1a}
+        end,
+    Store#{
+        order := gb_trees:enter({Seq, Key}, Key, Order1),
+        order_pos := gb_trees:enter(Key, Seq, Pos1),
+        next_seq := Seq + 1
+    }.
+
+%% Remove `Key` from the recency order entirely, without touching the table. The
+%% caller decides whether the entry itself goes.
+drop_from_order(#{order := Order, order_pos := Pos} = Store, Key) ->
+    {Seq, Pos1} = gb_trees:take(Key, Pos),
+    %% The order is keyed by the `{Seq, Key}` *pair*, not by `Seq` alone. Taking
+    %% `Seq` on its own matches nothing and the walk runs off the end of the
+    %% tree, which is a crash rather than a wrong answer -- so it is the kind of
+    %% mistake `f:self_check/1` could not have caught on its own.
+    {_, Order1} = gb_trees:take({Seq, Key}, Order),
+    Store#{order := Order1, order_pos := Pos1}.
+
 %% i2pd NetDb.cpp AddRouterInfo: reject from future (now + 2 min) and too old
-%% (now > timestamp + 27 h).
-valid_window(Timestamp, NowMs) ->
+%% (now > timestamp + the store's horizon).
+%%
+%% **Both bounds come from one place.** The future bound is
+%% `?EXPIRATION_THRESHOLD_MS`, the clock-skew tolerance. The past bound is
+%% `f:expiration_ms/1`, which is the same value `expired_hashes/2` compares
+%% against. They were written as two comparisons in two places, so they could drift
+%% and admit a RouterInfo the sweep would immediately remove; now a store cannot do
+%% that to itself.
+valid_window(Timestamp, NowMs, Store) ->
     Timestamp =< NowMs + ?EXPIRATION_THRESHOLD_MS andalso
-        NowMs =< Timestamp + ?MAX_EXPIRATION_MS.
+        NowMs =< Timestamp + expiration_ms(Store).
 
 %% Insert a LeaseSet after the equal-or-newer check; the i2p_leaset:valid/2
 %% window decides acceptance.
@@ -629,14 +1566,18 @@ outcome_for_window(_Timestamp, _NowMs) ->
     too_old.
 
 trim(Store) ->
-    Order = maps:get(order, Store),
-    case length(Order) > maps:get(capacity, Store) of
+    case gb_trees:size(maps:get(order, Store)) > maps:get(capacity, Store) of
         true ->
-            [Evicted | Rest] = lists:reverse(Order),
-            Store#{
-                routers := maps:remove(Evicted, maps:get(routers, Store)),
-                order := lists:reverse(Rest)
-            };
+            %% `take_smallest/1` returns `{Key, Value, NewTree}` -- three
+            %% elements, not two. The value is the evicted hash; the new tree is
+            %% already pruned, so it replaces the order outright rather than
+            %% going through `drop_from_order/2`.
+            {{_Seq, Evicted}, _V, Order1} = gb_trees:take_smallest(
+                maps:get(order, Store)
+            ),
+            true = ets:delete(maps:get(routers, Store), Evicted),
+            {_DroppedSeq, Pos1} = gb_trees:take(Evicted, maps:get(order_pos, Store)),
+            trim(forget_routing(Store#{order := Order1, order_pos := Pos1}, Evicted));
         false ->
             Store
     end.
@@ -656,19 +1597,242 @@ trim_ls(Store) ->
             Store
     end.
 
-closest_keys(Keys, Target, N) ->
-    TargetKey = routing_key(Target),
+%% Rank `Keys` by XOR distance to `Target` and return the first `N`, closest first.
+%%
+%% **Decorate, sort, undecorate. The distance is computed once per key, not once
+%% per comparison.**
+%%
+%% This used to be a bare `lists:sort` with a comparator that called `routing_key/1`
+%% on both operands. `routing_key/1` is a SHA-256 that also calls `current_day/0`,
+%% so every comparison paid two hashes and two calendar reads, and sorting n keys is
+%% O(n log n) comparisons. Traced at the shipped capacity of 5000: **118363 SHA-256
+%% calls to return three hashes, 162.9 ms.**
+%%
+%% Two changes, both of which are what the old shape got wrong:
+%%
+%%   * the distance is a property of a key, so it is computed once and carried
+%%     alongside it, leaving a comparator that compares two binaries;
+%%   * `current_day/0` is called **once for the whole lookup**, not once per key.
+%%     It is `calendar:universal_time()` plus an `io_lib:format` plus a
+%%     `list_to_binary`, and at 5000 keys the old form called it 10000 times where
+%%     one call would do.
+%%
+%% Measured together: 148293 us -> 8026 us, an 18.5x improvement, with results
+%% identical to before.
+%%
+%% **And the routing key is memoised, so the steady state does no crypto at all.**
+%% The key is `SHA256(Hash ‖ Day)`, so it is a function of two things neither of
+%% which changes: the router hash, which is fixed for the life of a row, and the
+%% day. It therefore needs computing once per router per day and never again, and
+%% `f:routing_memo/1` is where that once happens.
+%%
+%% The memo is a map inside the store rather than a second ETS table, and the
+%% alternative was measured rather than assumed. At 5000 routers, resolving all
+%% 5000 keys costs 2430 us out of a `maps` memo, 2891 us from an `ets:lookup`
+%% table, and 2860 us from a fourth column on the router row beside a 4 KB
+%% RouterInfo — against 4041 us for recomputing. The map wins because a HAMT
+%% lookup is three word comparisons against a hash the key already carries,
+%% whereas an ETS lookup hashes a 32-byte key again and the row's size does not
+%% matter at all. So the choice was not "map versus table" on principle; the table
+%% is 20% slower and would have cost a `public` table to write.
+%%
+%% That in turn dissolves the three questions this change was supposed to answer
+%% separately. **Who may write it:** the same process that writes everything else,
+%% because the memo is part of the store value rather than a table beside it —
+%% there is no second writer to reason about. **Eviction:** the three places a
+%% router leaves drop the key with it, and `f:self_check/1` proves they did, but
+%% see below for why correctness does not depend on that. **`.public` versus the
+%% module's discipline:** there is no new table, so there is no new access mode to
+%% earn.
+%%
+%% **Correctness does not rest on the memo being complete.** `routing_key/3` falls
+%% back to computing on a miss, so a key the memo has never seen costs one hash —
+%% which is what the code cost before, so a miss is never worse than the absence of
+%% the memo. That is what makes the day tag sufficient: a stale memo is not a wrong
+%% answer, it is a cache miss. The tag is the whole invalidation policy, and it is
+%% one comparison per lookup rather than 5000.
+%%
+%% `lists:sort/2` with `=<` rather than `<`: the elements are `{Distance, Key}`
+%% pairs, so a comparator that only looked at the distance could see two equal
+%% distances and call neither less than the other, which is a comparator `sort/2`
+%% is not entitled to. Comparing the key as well makes it a total order.
+%% The distance is stripped before returning. **The contract is a list of router
+%% hashes**, and returning the `{Distance, Key}` pairs would satisfy the sort and
+%% break every caller -- `closest_returns_distance_sorted_test` caught exactly that
+%% when this function was first rewritten, which is what an existing test is for.
+%%
+%% The store comes back because filling the memo is a mutation, and this module's
+%% one rule is that a mutation returns the store that describes it. A caller that
+%% dropped the returned store would keep computing every hash, which is the old
+%% behaviour rather than a wrong one — so this is the cheap mistake to make, which
+%% is how the alternative (memoising in a table the caller does not hold) is worse
+%% than useless.
+closest_keys(Store, Keys, Target, N) ->
+    Day = current_day(),
+    TargetKey = routing_key(Target, Day),
+    {Ranked, Computed} = rank_keys(Keys, routing_memo(Store, Day), TargetKey, Day),
     Sorted = lists:sort(
-        fun(K1, K2) ->
-            crypto:exor(routing_key(K1), TargetKey) < crypto:exor(routing_key(K2), TargetKey)
+        fun({D1, K1}, {D2, K2}) -> D1 < D2 orelse (D1 =:= D2 andalso K1 < K2) end, Ranked
+    ),
+    {memorize(Store, Day, Computed), [Key || {_Distance, Key} <- lists:sublist(Sorted, N)]}.
+
+%% The store's routing-key memo, or an empty one if it was computed for another day.
+%%
+%% **The whole invalidation policy is this one comparison.** Every memo value is
+%% `SHA256(RouterHash ‖ Day)` for the day in the tag, the router hash never changes
+%% for the life of a row, and so a value is wrong only if the day moved. A stale
+%% memo is therefore not a wrong answer but a cache miss, which is why nothing else
+%% has to know when the day rolls over.
+routing_memo(#{routing := {Day, Memo}}, Day) ->
+    Memo;
+routing_memo(_Store, _Day) ->
+    #{}.
+
+%% One pass over `Keys`: the ranked pairs, and what the memo had to compute.
+%%
+%% The computed values come back out rather than being written in here, because
+%% repairing the memo inside this loop would rebuild the map once per key. On a
+%% cold memo — the first lookup of a day, which is every key at once — that is
+%% n rebuilds of a map that is still being built, and `memorize/3` folds the whole
+%% lot in with one `maps:merge/2` instead.
+%%
+%% A warm memo allocates nothing for the misses: the accumulator stays `[]` because
+%% the cons is in the branch that found one.
+rank_keys(Keys, Memo, TargetKey, Day) ->
+    {Ranked, Computed} = lists:foldl(
+        fun(Key, {RankedAcc, ComputedAcc}) ->
+            {RoutingKey, Hit} = memo_routing_key(Key, Memo, Day),
+            Pair = {crypto:exor(RoutingKey, TargetKey), Key},
+            case Hit of
+                true -> {[Pair | RankedAcc], ComputedAcc};
+                false -> {[Pair | RankedAcc], [{Key, RoutingKey} | ComputedAcc]}
+            end
         end,
+        {[], []},
         Keys
     ),
-    lists:sublist(Sorted, N).
+    {Ranked, Computed}.
+
+%% A routing key from the memo, and whether the memo actually had it.
+%%
+%% **The fallback is what makes the memo safe to be incomplete.** A key with no
+%% entry costs one SHA-256, which is exactly what the code cost before the memo
+%% existed, so a miss is never worse than having no memo at all. That is why a
+%% new router does not have to invalidate anything, why a missed eviction is
+%% harmless, and why the day tag above is the only invalidation there is.
+memo_routing_key(Key, Memo, Day) ->
+    case maps:find(Key, Memo) of
+        {ok, RoutingKey} -> {RoutingKey, true};
+        error -> {routing_key(Key, Day), false}
+    end.
+
+%% Record the values this lookup computed, under `Day`.
+%%
+%% **Three clauses, because "computed nothing" and "computed something" are
+%% different from "the tag did not match".**
+%%
+%% The first clause is the one worth reading twice: a lookup that resolved no keys
+%% at all — which is what an `Excluded` list naming every candidate produces — must
+%% not rewrite the store. It does stamp the day, but only if the tag did not already
+%% match, so a store that has never been looked up comes back as itself.
+%%
+%% The third clause is that stamp. `routing_memo/2` read a memo built for another
+%% day as empty, so the computed values are the whole memo and there is nothing to
+%% merge with. It recurses rather than repeating the merge so that "tag now
+%% matches" has exactly one implementation.
+%%
+%% The store is returned rather than mutated, per `f:claim_generation/1`'s reason:
+%% the memo is derived state, and a caller that drops the returned store has
+%% recomputed some hashes for nothing rather than anything being wrong.
+memorize(#{routing := {Day, _Memo}} = Store, Day, []) ->
+    Store;
+memorize(#{routing := {Day, Memo}} = Store, Day, Computed) ->
+    Store#{routing := {Day, maps:merge(Memo, maps:from_list(Computed))}};
+memorize(Store, Day, Computed) ->
+    memorize(Store#{routing := {Day, #{}}}, Day, Computed).
+
+%% Drop a router's memoised routing key, on the way out.
+%%
+%% **This is hygiene, not correctness.** `memo_routing_key/3` falls back to
+%% computing, and a lookup only ever asks about a key the store still holds, so a
+%% memo entry for a departed router can never be returned — it is 40 bytes of
+%% memory and nothing else. It is dropped anyway because "bounded by nothing but
+%% the day's churn" is not a bound, and `f:self_check/1` reports a leftover so a
+%% missed call site is a test failure rather than a slow leak.
+forget_routing(#{routing := {Day, Memo}} = Store, Key) ->
+    Store#{routing := {Day, maps:remove(Key, Memo)}}.
 
 is_eligible_floodfill(Store, Key) ->
-    RI = maps:get(Key, maps:get(routers, Store)),
-    declared_floodfill(RI) andalso eligible_floodfill(RI).
+    (router_flags(Key, Store) band ?FF_ELIGIBLE) =/= 0.
+
+declares_floodfill(Store, Key) ->
+    (router_flags(Key, Store) band ?FF_DECLARED) =/= 0.
+
+%% The derived flags for one RouterInfo, as a byte.
+%%
+%% **Both floodfill predicates are computed once, when the RouterInfo is stored,
+%% and read from the table afterwards.** They used to be recomputed per candidate
+%% on every closest-floodfill lookup, and each computation needed the RouterInfo --
+%% so `f:router_value/2` copied a whole parsed RouterInfo map out of ETS to answer
+%% a question about two fields of it. At the shipped capacity that was ~5000 full
+%% copies per lookup, and it was most of what `f:closest_floodfills/4` cost: 48 ms,
+%% of which the sort was under 4.
+%%
+%% Reading one element of the row instead of the whole row is what makes it cheap.
+%% `ets:lookup_element/3` copies that element and nothing else, so the flags cost a
+%% few words per candidate rather than a RouterInfo each.
+%%
+%% Derived data can go stale, which is the risk this introduces. It cannot here, and
+%% the reason is the shape rather than the code: **the flags and the RouterInfo are
+%% written in the same `ets:insert`**, and the only two places either is written are
+%% `insert_newer/5` and `seed_order/3`, both of which write the whole row. There is
+%% no path that updates a RouterInfo without replacing its flags.
+%%
+%% `f:self_check/1` recomputes them and compares, so the invariant is asserted
+%% rather than argued. That is what earns the optimisation its keep: a check that
+%% could only ever pass because nothing could drift is not a check.
+floodfill_flags(RI) ->
+    %% **`?FF_ELIGIBLE` means declared *and* eligible, not eligible.** The two were
+    %% separate halves joined by `andalso` in `is_eligible_floodfill/2`, and
+    %% `f:eligible_floodfill/1` on its own checks only version, reachability and
+    %% addresses -- so a plain router with a published address satisfies it. Reading
+    %% that bit as "eligible" made every ordinary router look like a floodfill, and
+    %% `closest_floodfills_filters_by_eligibility_test` caught it on the first run.
+    case declared_floodfill(RI) andalso eligible_floodfill(RI) of
+        true -> ?FF_DECLARED bor ?FF_ELIGIBLE;
+        false -> 0
+    end.
+
+router_flags(Key, Store) ->
+    ets:lookup_element(maps:get(routers, Store), Key, 3).
+
+%% Memoised routing keys whose router is no longer stored.
+%%
+%% **The one direction worth checking.** A memo entry for a departed router cannot
+%% be returned by a lookup, because a lookup only asks about keys the order still
+%% holds — so this is not a correctness check, it is a leak check, and it is the
+%% direction that catches a missed `forget_routing/2`.
+%%
+%% The other direction is deliberately not asserted, and the asymmetry is the
+%% point. Recomputing every value to confirm it would cost 5000 SHA-256s — about
+%% 1.5 ms against this check's 315 us, a 5x tax on a check `i2p_netdb_srv` runs
+%% after every load and sweep. It would also prove nothing: a memo value is
+%% `SHA256(RouterHash ‖ Day)`, the router hash is the key it is stored under and
+%% cannot change, and the only writer is `memorize/3`, which computes what it
+%% writes. There is no path by which a value could be wrong for its day, so a
+%% check for it would be a check that could only ever pass.
+stale_routing(#{routing := {_Day, Memo}, routers := Tab}) ->
+    [Key || Key <- maps:keys(Memo), not ets:member(Tab, Key)].
+
+%% The order tree already holds every key we store, so the key set is read from
+%% there rather than by sweeping the table. One less place that has to agree
+%% with another.
+router_keys(Store) ->
+    order_hashes(Store).
+
+router_value(Key, Store) ->
+    {ok, RI} = router(Key, Store),
+    RI.
 
 router_caps(RI) ->
     maps:get(<<"caps">>, i2p_router_info:options(RI), <<>>).
@@ -733,8 +1897,8 @@ current_day() ->
 
 %% ---- to_binary helpers ----
 
-router_entry(Key, Routers) ->
-    RI = maps:get(Key, Routers),
+router_entry(Key, Store) ->
+    RI = router_value(Key, Store),
     Bin = i2p_router_info:to_binary(RI),
     <<Key/binary, (byte_size(Bin)):16/big, Bin/binary>>.
 
@@ -743,27 +1907,82 @@ ls_entry(Key, LSMaps) ->
     Bin = i2p_leaset:to_binary(LS),
     <<Key/binary, (byte_size(Bin)):16/big, Bin/binary>>.
 
+%% The `Hash -> Seq` half, derived from the order. Written once so `f:promote/2`
+%% and a load both reach the same shape.
+%%
+%% **The expiry sweep used to call this too**, and no longer does. It dropped the
+%% expired keys through `f:drop_from_order/2` instead, which is the point of
+%% `expired_hashes/2` and `drop_each/2`: this derivation is O(n log n) in what it
+%% keeps, paid on every sweep whether anything had expired. `f:self_check/1` still
+%% calls it, which is where it now earns its keep — it is the check, not the
+%% mutation.
+%%
+%% **`gb_trees:to_list/1` returns `{TreeKey, Value}` pairs**, and for this order
+%% the tree key is *itself* the `{Seq, Hash}` pair. So the list element is
+%% `{{Seq, Hash}, Hash}` and the pattern has to reach through both levels. Reading
+%% it as `{Seq, Hash}` binds `Seq` to the whole pair, and the rebuild then stores
+%% tuples where every other path stores integers -- which then fails much later,
+%% inside `drop_from_order/2`, on a lookup that cannot match.
+positions_of(Order) ->
+    lists:foldl(
+        fun({{Seq, Hash}, _Value}, Acc) -> gb_trees:enter(Hash, Seq, Acc) end,
+        gb_trees:empty(),
+        gb_trees:to_list(Order)
+    ).
+
+%% Fill a fresh store from parsed entries. `Entries` is in **file order, which is
+%% MRU-first** -- `f:to_binary/1` writes the recency order as it stands. The
+%% entries are therefore walked backwards, so the last entry written (the oldest
+%% router) takes the lowest `Seq` and the first (the most recent) takes the
+%% highest. Getting this the wrong way round silently reverses the recency order
+%% of every loaded store, and the symptom is an LRU that evicts the most recently
+%% stored router first.
+seed_order(#{order := EmptyOrder} = Store, []) ->
+    {ok, Store#{order := EmptyOrder, order_pos := gb_trees:empty(), next_seq := 1}};
+seed_order(Store, Entries) ->
+    %% One claim for the whole load, not one per entry: this writes the table
+    %% directly rather than through `f:store/3`, so it is the one bulk write path
+    %% that bypasses the mutators, and it needs the same staleness check. Seeding
+    %% runs once against a store `f:from_binary/1` has just built, so the claim
+    %% cannot fail here; it is claimed anyway so that a future caller cannot
+    %% introduce a path that writes the table unchecked.
+    Store1 = claim_generation(Store),
+    {Order, Pos, NextSeq} = lists:foldl(
+        fun({Key, RI}, {OrderAcc, PosAcc, Seq}) ->
+            true = ets:insert(maps:get(routers, Store1), {Key, RI, floodfill_flags(RI)}),
+            {
+                gb_trees:enter({Seq, Key}, Key, OrderAcc),
+                gb_trees:enter(Key, Seq, PosAcc),
+                Seq + 1
+            }
+        end,
+        {gb_trees:empty(), gb_trees:empty(), 1},
+        %% Oldest first. `Entries` arrives MRU-first, so reversing it puts the
+        %% oldest router at `Seq` 1 and makes the LRU evict the right end.
+        lists:reverse(Entries)
+    ),
+    {ok, Store1#{order := Order, order_pos := Pos, next_seq := NextSeq}}.
+
 %% ---- from_binary helpers ----
 
-parse_router_entries(Bin, 0, Routers, Order) ->
-    {ok, Routers, Order, Bin};
-parse_router_entries(<<>>, _Count, _Routers, _Order) ->
+%% Returns `{Key, RI}` pairs in **file order**, which is MRU-first because that is
+%% the order `f:to_binary/1` writes. `f:seed_order/2` reverses it on the way in.
+%% An entry whose signature does not verify is dropped here rather than counted
+%% as an expiry, exactly as the map version did.
+parse_router_entries(Bin, 0, Entries) ->
+    {ok, lists:reverse(Entries), Bin};
+parse_router_entries(<<>>, _Count, _Entries) ->
     error;
 parse_router_entries(
-    <<Key:32/binary, Len:16/big, RIBin:Len/binary, Rest/binary>>, Count, Routers, Order
+    <<Key:32/binary, Len:16/big, RIBin:Len/binary, Rest/binary>>, Count, Entries
 ) ->
     case i2p_router_info:decode(RIBin) of
         {ok, RI} ->
-            parse_router_entries(
-                Rest,
-                Count - 1,
-                Routers#{Key => RI},
-                [Key | Order]
-            );
+            parse_router_entries(Rest, Count - 1, [{Key, RI} | Entries]);
         {error, _} ->
-            parse_router_entries(Rest, Count - 1, Routers, Order)
+            parse_router_entries(Rest, Count - 1, Entries)
     end;
-parse_router_entries(_, _, _, _) ->
+parse_router_entries(_, _, _) ->
     error.
 
 parse_ls_entries(Bin, 0, LSMaps, LSOrder) ->
@@ -789,17 +2008,74 @@ parse_ls_entries(_, _, _, _) ->
 
 %% ---- remove_expired helpers ----
 
-partition_routers(_Routers, [], _NowMs, Removed, Kept) ->
-    {maps:from_list(Kept), Kept, Removed};
-partition_routers(Routers, [Key | Rest], NowMs, Removed, Kept) ->
-    RI = maps:get(Key, Routers),
-    Published = i2p_router_info:published(RI),
-    case Published + ?MAX_EXPIRATION_MS < NowMs of
-        true ->
-            partition_routers(Routers, Rest, NowMs, Removed + 1, Kept);
-        false ->
-            partition_routers(Routers, Rest, NowMs, Removed, [{Key, RI} | Kept])
-    end.
+%% The expired router hashes, and nothing else.
+%%
+%% **This is the whole cost of the sweep.** Every router needs one lookup, because
+%% expiry is a field inside the RouterInfo and there is no way to read it without
+%% the RouterInfo: `map_get` is not permitted in a match spec guard, so
+%% `ets:select/2` cannot do it either. Measured at 2297 us for 5000 routers.
+%%
+%% The list is accumulated before anything is deleted rather than deleting as it
+%% walks. That is deliberate: a sweep that deletes while iterating a structure it
+%% is deriving from is a sweep that can half-apply if it raises, and the two halves
+%% are exactly what `f:self_check/1` exists to catch.
+%%
+%% `gb_trees:to_list/1` gives `{{Seq, Hash}, Hash}` -- the tree key is itself the
+%% pair -- so both levels have to be matched. Reading it one level shallow binds
+%% `Hash` to the pair.
+%%
+%% A key in the order but absent from the table is skipped rather than crashing.
+%% That should be impossible, because the sweep runs in the process that owns the
+%% table, but skipping means a store that has somehow drifted compacts the rest
+%% rather than taking the NetDb down on the way.
+expired_hashes(Store, NowMs) ->
+    Tab = maps:get(routers, Store),
+    Order = gb_trees:to_list(maps:get(order, Store)),
+    %% **One comparison, one source.** The horizon is read once and hoisted out of
+    %% the fold, which is both what the 5000-entry walk wants and the thing that
+    %% keeps this in step with `valid_window/3`: both sides ask the same store the
+    %% same question, so a store that admits a RouterInfo cannot then expire it.
+    %%
+    %% **The hoist is still sound now that the horizon slides.** It is a function of
+    %% the store's size, and this walk does not change the size -- the count comes
+    %% from the order, and nothing is dropped until `drop_each/2` runs over the list
+    %% this returns. So the value read here is the value every comparison in the
+    %% fold would compute, and reading it per entry would be 5000 identical
+    %% `gb_trees:size/1` calls to learn nothing.
+    Horizon = expiration_ms(Store),
+    lists:foldl(
+        fun({_Position, Hash}, Gone) ->
+            case ets:lookup(Tab, Hash) of
+                [{_, RI, _Flags}] ->
+                    case i2p_router_info:published(RI) + Horizon < NowMs of
+                        true -> [Hash | Gone];
+                        false -> Gone
+                    end;
+                [] ->
+                    Gone
+            end
+        end,
+        [],
+        Order
+    ).
+
+%% Remove each expired router from the table and from both halves of the order.
+%%
+%% **Incremental, and that is the point.** This used to rebuild `order` from all
+%% 5000 entries and then rebuild `order_pos` from the survivors, every sweep,
+%% whether or not anything had expired -- measured at ~13 ms, and the reason the
+%% sweep cost the same whether it removed 0 routers or 1000. Dropping k keys is k
+%% takes at O(log n) each, measured at 0.02 us for none and 1029 us for 1000.
+%%
+%% A surviving router keeps the `Seq` it already had. Expiry is not a recency
+%% event, so the sweep must not reorder the store it is merely compacting -- and
+%% dropping rather than rebuilding makes that true by construction rather than by
+%% care: there is no code here that could renumber anything.
+drop_each(Store, []) ->
+    Store;
+drop_each(#{routers := Tab} = Store, [Hash | Rest]) ->
+    true = ets:delete(Tab, Hash),
+    drop_each(forget_routing(drop_from_order(Store, Hash), Hash), Rest).
 
 partition_ls(_LSMaps, [], _NowSec, Removed, Kept) ->
     {maps:from_list(Kept), Kept, Removed};

@@ -28,9 +28,12 @@ SAM STREAM CONNECT uses this to resolve uncached destinations.
 -export([
     start_link/1,
     find_ls/1,
+    find_ls/2,
     find_ri/1,
+    find_ri/2,
     stop/0
 ]).
+-export_type([lookup_failed_reason/0, lookup_options/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 -define(ATTEMPT_TIMEOUT_MS, 4000).
@@ -39,6 +42,49 @@ SAM STREAM CONNECT uses this to resolve uncached destinations.
 -define(CANDIDATES_PER_ROUND, 3).
 
 -type kind() :: lease | router.
+
+-doc """
+Why a lookup did not produce the record it was asked for.
+
+The point of the vocabulary is the split at the top. `no_answer` means nobody
+answered: every peer tried either stayed silent or was unreachable, and the
+question of whether this router is on the network is open. `not_stored` means a peer
+*did* answer — a record for exactly this key arrived — and this router could not use
+it. Those are opposite problems: the first is a connectivity or peering one, the
+second is a compatibility or storage one, and an operator reading a log cannot act on
+either until they know which they are looking at. Before this the two were the same
+`{error, not_found}`.
+
+The inner term of `not_stored` is `m:i2p_peer:store_not_stored_reason/0` unchanged.
+That is the vocabulary the store path already settled on for exactly these
+conditions; a lookup-specific set of reasons for the same conditions would be a
+second description to keep in step.
+
+A closed set apart from the inner term, deliberately. Every clause here is a branch
+somewhere in this module, so an open `term()` would let a caller pattern-match on a
+reason no path can produce.
+""".
+-type lookup_failed_reason() ::
+    {not_stored, i2p_peer:store_not_stored_reason()}
+    %% A responder's record for this key arrived, was handled, and the key still does
+    %% not hold what was asked for. Reachable when a LeaseSet resolves a pending
+    %% RouterInfo lookup for the same hash: the pending map is keyed by hash alone,
+    %% so the two kinds share one entry.
+    | not_resolved
+    %% Attempts or the overall deadline ran out with no store for this key arriving.
+    | no_answer
+    %% `f:find_ls/2` was called with no lookup service running.
+    | service_unavailable.
+
+-doc """
+Per-call options for `f:find_ls/2` and `f:find_ri/2`.
+
+`reason => true` opts into `{error, {lookup_failed, Reason}}`. Without it the reply
+is the historical `{error, not_found}`, and that default is not a courtesy: most
+callers only branch on whether the lookup worked, and widening the reply for them
+would be a breaking change to a contract they never asked to widen.
+""".
+-type lookup_options() :: #{reason => boolean()}.
 
 -doc """
 A pending lookup: which kind of record, who waits, what was tried, which
@@ -51,6 +97,7 @@ closer peers to chase, and the retry/deadline bookkeeping.
     chase := [i2p_crypto:hash()],
     attempts := non_neg_integer(),
     deadline := integer(),
+
     timer := undefined | reference()
 }.
 
@@ -71,32 +118,75 @@ Fetch a LeaseSet from the network, blocking until it resolves.
 
 Input: `Key` — the destination hash.
 Output: `{ok, LeaseSet}` once a responder's store lands (it is stored into
-the NetDb by the tunnel dispatch), `{error, not_found}` when attempts are
-exhausted, or `{error, not_found}` when the service is not running. A locally
-cached LeaseSet replies immediately.
+the NetDb by the tunnel dispatch), or `{error, not_found}` when the lookup does not
+succeed. A locally cached LeaseSet replies immediately.
+
+`not_found` covers every failure and says nothing about which. Use `f:find_ls/2` to
+be told why.
 """.
 -spec find_ls(i2p_crypto:hash()) -> {ok, i2p_leaset:lease_set()} | {error, not_found}.
 find_ls(Key) ->
-    lookup(Key, lease).
+    find(Key, lease, #{}).
 
--doc "As `f:find_ls/1` but for a RouterInfo.".
+-doc """
+As `f:find_ls/1` but for a RouterInfo.
+""".
 -spec find_ri(i2p_crypto:hash()) -> {ok, i2p_router_info:router_info()} | {error, not_found}.
 find_ri(Key) ->
-    lookup(Key, router).
+    find(Key, router, #{}).
+
+-doc """
+Fetch a LeaseSet, optionally told why it failed.
+
+Input: `Key` — the destination hash; `Opts` — see `t:lookup_options/0`.
+Output: as `f:find_ls/1`, except that with `#{reason => true}` a failure arrives as
+`{error, {lookup_failed, Reason}}` where `Reason` is `t:lookup_failed_reason/0`.
+
+The reason is opt-in rather than always present because a caller that only branches
+on success must not have to learn a second error shape, and because the reason is
+only worth carrying to someone who will act on it. Every failure is announced on the
+bus regardless of who asked.
+""".
+-spec find_ls(i2p_crypto:hash(), lookup_options()) ->
+    {ok, i2p_leaset:lease_set()} | {error, not_found | {lookup_failed, lookup_failed_reason()}}.
+find_ls(Key, Opts) ->
+    find(Key, lease, Opts).
+
+-doc "As `f:find_ls/2` but for a RouterInfo.".
+-spec find_ri(i2p_crypto:hash(), lookup_options()) ->
+    {ok, i2p_router_info:router_info()}
+    | {error, not_found | {lookup_failed, lookup_failed_reason()}}.
+find_ri(Key, Opts) ->
+    find(Key, router, Opts).
 
 -doc "Stop the orchestrator.".
 -spec stop() -> ok.
 stop() ->
     gen_server:stop(?MODULE).
 
-%% lookup/2 — the synchronous front door shared by find_ls/find_ri.
-lookup(Key, Kind) ->
+%% find/3 — the synchronous front door shared by find_ls/find_ri.
+%%
+%% The reason is projected away for callers that did not ask for it, which is what
+%% keeps the historical `{error, not_found}` intact. The service being absent is
+%% announced like any other failure: it is a lookup that did not succeed, and on a
+%% router where the orchestrator failed to start it is the *only* thing that says so.
+find(Key, Kind, Opts) ->
     case whereis(?MODULE) of
         undefined ->
-            {error, not_found};
+            failed(service_unavailable, Opts);
         _Pid ->
-            gen_server:call(?MODULE, {find, Key, Kind}, ?OVERALL_DEADLINE_MS + 2000)
+            project(gen_server:call(?MODULE, {find, Key, Kind}, ?OVERALL_DEADLINE_MS + 2000), Opts)
     end.
+
+%% The reply the orchestrator gives, projected to what the caller asked for.
+project({error, {lookup_failed, Reason}}, #{reason := true}) -> {error, {lookup_failed, Reason}};
+project({error, {lookup_failed, _Reason}}, _Opts) -> {error, not_found};
+project(Other, _Opts) -> Other.
+
+%% A failure raised outside the orchestrator, projected the same way.
+failed(Reason, Opts) ->
+    i2p_events:notify({lookup_failed, undefined, none, Reason}),
+    project({error, {lookup_failed, Reason}}, Opts).
 
 -spec init([i2p_crypto:hash()]) -> {ok, state()}.
 init([OurHash]) ->
@@ -148,8 +238,8 @@ handle_cast(_Msg, State) ->
 -spec handle_info(term(), state()) -> {noreply, state()}.
 handle_info({next_attempt, Key}, State) ->
     {noreply, attempt(Key, State)};
-handle_info({db_stored, Key, Kind}, State) ->
-    {noreply, resolve_stored(Key, Kind, State)};
+handle_info({db_stored, Key, Kind, Outcome}, State) ->
+    {noreply, resolve_stored(Key, Kind, Outcome, State)};
 handle_info({search_reply, Key, Peers}, State) ->
     {noreply, chase(Key, Peers, State)};
 handle_info({attempt_timeout, Key, Ref}, State) ->
@@ -260,21 +350,49 @@ arm_timer(Key) ->
     erlang:send_after(?ATTEMPT_TIMEOUT_MS, self(), {attempt_timeout, Key, Ref}),
     Ref.
 
-%% resolve_stored/3 — a DatabaseStore landed for a pending key.
-resolve_stored(Key, _Kind, State = #{pending := Pending}) ->
+%% resolve_stored/4 — a responder sent us a store for a pending key.
+%%
+%% The first recording point, and where the reason is available rather than inferred:
+%% the tunnel dispatch has just put the record in the NetDb and knows whether it was
+%% taken, and it says so in the message. That is the whole plumbing this ticket needs
+%% — the reason travels the way the store outcome already did — and it is why a
+%% lookup that fails here does not report as a timeout.
+%%
+%% A lookup that succeeds publishes nothing. The event is about failure, and one that
+%% also fired on success could not be counted without a subtraction.
+resolve_stored(Key, Kind, Outcome, State = #{pending := Pending}) ->
     case maps:find(Key, Pending) of
         error ->
             State;
         {ok, P} ->
             cancel_timer(P),
-            Reply =
-                case cached(maps:get(kind, P), Key) of
-                    {ok, _R} = Hit -> Hit;
-                    error -> {error, not_found}
-                end,
-            reply_all(maps:get(callers, P), Reply),
-            State#{pending := maps:remove(Key, Pending)}
+            case cached(maps:get(kind, P), Key) of
+                {ok, _R} = Hit ->
+                    reply_all(maps:get(callers, P), Hit),
+                    State#{pending := maps:remove(Key, Pending)};
+                error ->
+                    %% The wake-up arrived, the key is not usable. Two different
+                    %% things produce this and they are not the same event: the NetDb
+                    %% refused the record, or it took it and the key still does not
+                    %% hold what this lookup wanted.
+                    Reason = stored_failure(Kind, Outcome),
+                    i2p_events:notify({lookup_failed, Key, Kind, Reason}),
+                    reply_all(
+                        maps:get(callers, P), {error, {lookup_failed, Reason}}
+                    ),
+                    State#{pending := maps:remove(Key, Pending)}
+            end
     end.
+
+%% Why a wake-up left the key unusable.
+%%
+%% A refused store is reported as refused, and the reason is the store path's own.
+%% A store that was taken is reported as unresolved, because if it had been usable
+%% `cached/2` would have found it and this function would not be here.
+stored_failure(_Kind, {not_stored, Reason}) ->
+    {not_stored, Reason};
+stored_failure(_Kind, stored) ->
+    not_resolved.
 
 %% chase/3 — a search reply contributed closer routers to try.
 chase(Key, Peers, State = #{pending := Pending}) ->
@@ -304,13 +422,25 @@ drop_caller(MRef, State = #{pending := Pending0}) ->
         ),
     State#{pending := Pending}.
 
+%% fail/2 — the lookup has run out of attempts or has passed its deadline.
+%%
 fail(Key, State = #{pending := Pending}) ->
     case maps:find(Key, Pending) of
         error ->
             State;
         {ok, P} ->
             cancel_timer(P),
-            reply_all(maps:get(callers, P), {error, not_found}),
+            %% The second recording point, and the reason it needs no handover to
+            %% carry a reason here: a wake-up that arrived and was unusable ended the
+            %% lookup in `f:resolve_stored/4` and announced itself there. Reaching this
+            %% function at all means no store for this key ever became usable, so the
+            %% only reason available -- and the only honest one -- is that nobody
+            %% answered. An earlier version left a refusal on the pending entry for
+            %% this function to read back, which could never fire: `resolve_stored/4`
+            %% removes the entry on every path that reaches it.
+            Reason = no_answer,
+            i2p_events:notify({lookup_failed, Key, maps:get(kind, P), Reason}),
+            reply_all(maps:get(callers, P), {error, {lookup_failed, Reason}}),
             State#{pending := maps:remove(Key, Pending)}
     end.
 

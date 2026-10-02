@@ -99,6 +99,8 @@ B0 = i2p_ssu2:bob_init(BskPriv, Bpk, Bik),
     header_mask/2,
     seal_long/3,
     open_long/3,
+    open_conn_id/3,
+    open_header16/3,
     seal_ephemeral/3,
     open_ephemeral/3,
     seal_short/3,
@@ -369,6 +371,66 @@ to be an SSU2 packet.
 open_long(Packet, KH1, KH2) when byte_size(Packet) >= ?MIN_PACKET ->
     {ok, long_header_protect(Packet, KH1, KH2)};
 open_long(_Packet, _KH1, _KH2) ->
+    error.
+
+-doc """
+Recover only the destination connection id from a datagram — the one field
+`m:i2p_ssu2_listener` needs to route almost every datagram it sees.
+
+Bytes 0..7 of both header forms are XORed with the *first* tail-derived mask,
+and nothing else in the header is masked with it. So routing by connection id
+costs one ChaCha20 pass, where `f:open_long/3` costs three: it also restores
+bytes 8..15 under the second mask and decrypts bytes 16..31. The listener
+recovered the type byte with `f:open_long/3` for want of a cheaper call, then
+threw all but the first eight bytes away.
+
+Exact for both header forms and for both header keys, because the mask is
+derived from the datagram's own tail rather than from anything the sender
+chose: a datagram whose length is below `?MIN_PACKET` has no tail to derive
+from and is rejected, exactly as `f:open_long/3` rejects it.
+
+Input: the datagram and both header protection keys; output: `{ok, ConnId}`
+where `ConnId` is the 64-bit big-endian value from header bytes 0..7, or
+`error` when the datagram is too short to carry an SSU2 header.
+""".
+-spec open_conn_id(binary(), i2p_crypto:key(), i2p_crypto:key()) ->
+    {ok, conn_id()} | error.
+open_conn_id(Packet, KH1, _KH2) when byte_size(Packet) >= ?MIN_PACKET ->
+    M1 = header_mask(KH1, binary:part(Packet, byte_size(Packet) - 24, 12)),
+    <<First:8/binary, _/binary>> = Packet,
+    <<ConnId:64/big-unsigned-integer>> = crypto:exor(First, M1),
+    {ok, ConnId};
+open_conn_id(_Packet, _KH1, _KH2) ->
+    error.
+
+-doc """
+Recover header bytes 0..15 of a datagram — everything a router needs to tell one
+long-header message type from another.
+
+Two ChaCha20 passes, one per tail-derived mask, and **no** third pass: bytes
+16..31 are encrypted under the intro key with a zero nonce and stay encrypted.
+`f:open_long/3` decrypts those too, because a caller going on to read a source
+connection id or a token needs them; a caller that only wants to ask what type a
+datagram is does not, and `m:i2p_ssu2_listener` is that caller.
+
+The caveat `f:open_conn_id/3` documents applies here with more force: **the type
+byte in this output is only meaningful for a datagram addressed to our own
+introduction key out of session.** For an in-session short header, bytes 8..15 are
+masked with the *session's* header protection key, so what comes back is noise. It
+is exact for both header forms as bytes; it is the *interpretation* that is
+narrow.
+
+Input: the datagram and both header protection keys. Output: `{ok, Header}` with
+the 16 recovered bytes, or `error` when the datagram is shorter than
+`?MIN_PACKET`.
+""".
+-spec open_header16(binary(), i2p_crypto:key(), i2p_crypto:key()) ->
+    {ok, <<_:128>>} | error.
+open_header16(Packet, KH1, KH2) when byte_size(Packet) >= ?MIN_PACKET ->
+    {M1, M2} = masks_for(Packet, KH1, KH2),
+    <<First:8/binary, Second:8/binary, _/binary>> = Packet,
+    {ok, <<(crypto:exor(First, M1))/binary, (crypto:exor(Second, M2))/binary>>};
+open_header16(_Packet, _KH1, _KH2) ->
     error.
 
 -doc """
@@ -725,8 +787,6 @@ ensure_min_payload(Payload) ->
     PadLen = ?MIN_PAYLOAD - byte_size(Payload),
     <<Payload/binary, (tlv(?BLOCK_PADDING, <<0:PadLen/unit:8>>))/binary>>.
 
--define(ACK_MAX, 255).
-
 %% Walk an ACK block's trailing range bytes into `{Nack, Ack}` run-length
 %% pairs. Fail-closed: a fractional range, or one where both counts are zero
 %% (the encoding forbids it), yields `error`.
@@ -737,18 +797,14 @@ decode_ack_ranges(<<Nack:8, Ack:8, Rest/binary>>, Acc) when Nack > 0; Ack > 0 ->
 decode_ack_ranges(_Malformed, _Acc) ->
     error.
 
-%% Internal shared accumulator for ack_ranges/4.
--define(ACK_MODE_NACK, nack).
--define(ACK_MODE_ACK, ack).
-
 -doc """
 Build an `{ack, AckThrough, Acnt, Ranges}` block describing the packet
-numbers that have been received.
+numbers a session has received.
 
-Input: `ReceivedNums` — the packet numbers received so far (the receiver's
-in-order ack state); `MaxRanges` — an upper bound on how many `{Nack, Ack}`
-run-length ranges to emit (older, lower-numbered packets are dropped first
-when exceeded, per the spec's bounded-ackroom rule).
+Input: `Recv` — a `m:i2p_ssu2_recv:window/0`, the session's receive window;
+`MaxRanges` — an upper bound on how many `{Nack, Ack}` run-length ranges to emit
+(older, lower-numbered packets are dropped first when exceeded, per the spec's
+bounded-ackroom rule).
 
 Output: a `t:ack_block/0` ACK block. `AckThrough` is the highest received packet;
 `Acnt` the number of consecutive received packets immediately below it; the
@@ -758,60 +814,16 @@ starts with a NACK count (the spec encodes the first gap as `nack` bits).
 Example (the spec's worked case): for received `[10,9,8,6,5,2,1,0]` with
 7,4,3 missing, produces `AckThrough=10, Acnt=2, Ranges=[{1,2},{2,3}]` — i.e.
 NACK 7, ACK 6 5, then NACK 4 3, ACK 2 1 0.
+
+The window is `m:i2p_ssu2_recv`'s, not a list of packet numbers, and the
+encoding is its `f:build/2`. This exists as the named entry point because the
+block is a wire-format concept and belongs to the codec; the walk itself lives
+with the window it walks, so there is one implementation of the format rather
+than two that must agree. See #7GP4A4K.
 """.
--spec build_ack([non_neg_integer()], non_neg_integer()) -> ack_block().
-build_ack(ReceivedNums, MaxRanges) when
-    is_list(ReceivedNums), is_integer(MaxRanges), MaxRanges >= 0
-->
-    Recv = sets:from_list(ReceivedNums),
-    case sets:size(Recv) of
-        0 ->
-            {ack, 0, 0, []};
-        _ ->
-            AckThrough = lists:max(ReceivedNums),
-            MinRecv = lists:min(ReceivedNums),
-            Acnt = top_ack_count(Recv, AckThrough - 1, 0),
-            Ranges = ack_ranges(Recv, AckThrough - Acnt - 1, MinRecv, MaxRanges, []),
-            {ack, AckThrough, Acnt, Ranges}
-    end.
-
-top_ack_count(_Recv, N, Count) when N < 0; Count >= ?ACK_MAX ->
-    Count;
-top_ack_count(Recv, N, Count) ->
-    case sets:is_element(N, Recv) of
-        true -> top_ack_count(Recv, N - 1, Count + 1);
-        false -> Count
-    end.
-
-ack_ranges(_Recv, Low, MinRecv, MaxRanges, Acc) when
-    Low < MinRecv; MaxRanges =< 0
-->
-    lists:reverse(Acc);
-ack_ranges(Recv, Low, MinRecv, MaxRanges, Acc) ->
-    Nack = count_run(Recv, Low, 0, ?ACK_MODE_NACK),
-    Ack = count_run(Recv, Low - Nack, 0, ?ACK_MODE_ACK),
-    case {Nack, Ack} of
-        {0, 0} ->
-            lists:reverse(Acc);
-        _ ->
-            NextLow = Low - Nack - Ack,
-            ack_ranges(Recv, NextLow, MinRecv, MaxRanges - 1, [{Nack, Ack} | Acc])
-    end.
-
-count_run(_Recv, _Start, Count, _Mode) when Count >= ?ACK_MAX ->
-    Count;
-count_run(_Recv, Start, Count, _Mode) when Start < 0 ->
-    Count;
-count_run(Recv, Start, Count, ?ACK_MODE_NACK) ->
-    case sets:is_element(Start, Recv) of
-        false -> count_run(Recv, Start - 1, Count + 1, ?ACK_MODE_NACK);
-        true -> Count
-    end;
-count_run(Recv, Start, Count, ?ACK_MODE_ACK) ->
-    case sets:is_element(Start, Recv) of
-        true -> count_run(Recv, Start - 1, Count + 1, ?ACK_MODE_ACK);
-        false -> Count
-    end.
+-spec build_ack(i2p_ssu2_recv:window(), non_neg_integer()) -> ack_block().
+build_ack(Recv, MaxRanges) when is_integer(MaxRanges), MaxRanges >= 0 ->
+    i2p_ssu2_recv:build(Recv, MaxRanges).
 
 -doc """
 Expand an ACK block back into the concrete acked and nacked packet numbers.
@@ -1797,6 +1809,17 @@ decode_symmetric(Bik, ExpectedType, Packet) ->
             error
     end.
 
+%% A datagram has to carry a full Poly1305 tag, and this is the one place that
+%% fact is enforced. Without the check a datagram between ?MIN_PACKET and 47 bytes
+%% leaves fewer than 16 bytes after the 32-byte long header, `Sz` goes negative,
+%% and the match raises -- which killed the SSU2 socket owner outright, because
+%% this runs on attacker-reachable input with only the public introduction key in
+%% the attacker's way. See #YNBT5ZD. A library decides no process's fate: it
+%% answers `error`, and the caller decides what that means.
+finish_symmetric(_Bik, _Header, _PktNum, _Tok, _SrcConnId, _DstConnId, CTWithMac) when
+    byte_size(CTWithMac) < 16
+->
+    error;
 finish_symmetric(Bik, Header, PktNum, Tok, SrcConnId, DstConnId, CTWithMac) ->
     Sz = byte_size(CTWithMac) - 16,
     <<CT:Sz/binary, MAC:16/binary>> = CTWithMac,

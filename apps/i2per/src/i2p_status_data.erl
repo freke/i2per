@@ -8,19 +8,72 @@ plain data map. It exists so remote processes (the `i2per_status` web
 service on another node) can fetch a complete snapshot with a single
 `erpc:call(Node, ?MODULE, view, [], Timeout)` — every module it touches is
 guaranteed present wherever the router runs.
+
+## The contract
+
+This map is **public**: something outside this repository is entitled to read it
+and to keep working when the router is upgraded underneath it. Two rules follow,
+and both are tested rather than promised.
+
+**Additive-only within a major version.** A key that exists is never removed,
+never retyped, and never changes what it means. Adding a key bumps `version`.
+A consumer that ignores `version` still keeps working, which is the point: the
+version is there to let a consumer *notice*, not to make reading it mandatory.
+
+**The key set has one source of truth.** `f:view_keys/0` is the list, a test
+pins the returned map against it, and a consumer that needs the shape reads it
+rather than retyping it. A key added to `f:view/0` without being added to the
+list fails the build, which is the only place drift gets caught before a
+consumer does.
+
+Counters are **cumulative since router start** and come from `m:i2p_stats`.
+The core supplies totals and its boot time; deriving a rate is the consumer's
+job, by sampling twice and subtracting. Nothing here computes one.
 """.
 
--export([view/0, aggregate_peers/1]).
+-export([view/0, view_keys/0, aggregate_peers/1]).
+
+%% Bumped whenever a key is added. Not bumped for a value change, because a
+%% value change is not allowed: see the additive-only contract above.
+-define(VIEW_VERSION, 1).
+
+%% `underspecs` is off for the read API's two functions, deliberately, and this
+%% is the one place in the tree where that is the right call.
+%%
+%% Both specs are **contracts**, not descriptions of what happens to be built
+%% today. `f:view/0` promises a map shape that is allowed to grow; `f:view_keys/0`
+%% promises the list of keys that shape has. Dialyzer's success typing is the
+%% literal shape and the literal list, so a strict spec would have to be edited
+%% in lockstep with the implementation — turning the contract into a second copy
+%% of the data, which is the one thing this project has a standing rule against.
+%%
+%% The agreement between the two is enforced by `apps/i2per/test/
+%% i2p_read_api_SUITE.erl`, which fails when the returned map's keys and
+%% `f:view_keys/0` disagree in either direction. That test is the enforcement
+%% mechanism these suppressed warnings defer to; without it, deleting this
+%% attribute would be a small improvement.
+-dialyzer({no_underspecs, [view/0, view_keys/0]}).
 
 -doc """
 Aggregate router status.
 
-Output: a map with our identity (base64 destination-style hash encoding of
-the router hash), peer/tunnel/netdb/SAM-session counters. Read-only; safe to
-call from any process on any connected node via `erpc`.
+Output: a map with the read API's `version`, the router's uptime and boot time,
+the cumulative counters from `m:i2p_stats`, our identity (base64
+destination-style hash encoding of the router hash), and the peer, tunnel, netdb
+and SAM-session counts. Read-only; safe to call from any process on any
+connected node via `erpc`.
+
+The uptime and counters distinguish their own faults: when the router's stats
+process is not running, `counters` is empty, `uptime_ms` is `0` and
+`boot_time` is `undefined`. Those mean "nothing is counting", which is a
+different fault from "counting, and the value is zero".
 """.
 -spec view() ->
     #{
+        version := pos_integer(),
+        uptime_ms := non_neg_integer(),
+        boot_time := integer() | undefined,
+        counters := #{atom() => non_neg_integer()},
         identity := binary(),
         peers := #{connected => non_neg_integer(), other => non_neg_integer()},
         tunnels :=
@@ -38,6 +91,10 @@ call from any process on any connected node via `erpc`.
 view() ->
     Tunnels = i2p_tunnel_srv:status(),
     #{
+        version => ?VIEW_VERSION,
+        uptime_ms => i2p_stats:uptime_ms(),
+        boot_time => i2p_stats:boot_time(),
+        counters => i2p_stats:snapshot(),
         identity => identity_b64(i2p_peer:router_hash()),
         peers => aggregate_peers(i2p_peer:status()),
         tunnels => #{
@@ -54,6 +111,28 @@ view() ->
         netdb => #{ri => i2p_netdb_srv:count(), ls => i2p_netdb_srv:ls_count()},
         sessions => length(i2p_sam_sup:client_sessions())
     }.
+
+-doc """
+The read API's top-level keys, sorted.
+
+Output: the list of keys `f:view/0` returns. This is the contract's source of
+truth: a test asserts the view's keys equal this, and a consumer that wants to
+validate or render the shape reads this rather than retyping it. Adding a key
+means adding it here.
+""".
+-spec view_keys() -> [atom()].
+view_keys() ->
+    [
+        boot_time,
+        counters,
+        identity,
+        netdb,
+        peers,
+        sessions,
+        tunnels,
+        uptime_ms,
+        version
+    ].
 
 %% identity_b64/1 — standard base64 of the 32-byte hash (display only).
 identity_b64(Hash) when byte_size(Hash) =:= 32 ->

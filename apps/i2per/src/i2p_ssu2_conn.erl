@@ -66,6 +66,14 @@ outbound datagrams through it because only the listener owns the socket.
 %% Overridable per app via `i2per` env `handshake_retry_ms` /
 %% `handshake_max_resends`.
 -define(MAX_RESENDS, 9).
+%% How many `{nack, ack}` range pairs a session's ACK blocks may carry. This is
+%% a *policy* choice — the wire format would allow more — and it is deliberately
+%% the single place the number is written down, because the receive window's
+%% bound is derived from it: an ACK block cannot name a packet number further
+%% than `?ACK_MAX + this * 2 * ?ACK_MAX` below the highest received, so this
+%% value is also how far back `m:i2p_ssu2_recv` retains. Raising it widens the
+%% window as a side effect; the two cannot be changed independently without the
+%% window becoming wrong about what an ACK can still express. See #7GP4A4K.
 -define(MAX_ACK_RANGES, 20).
 %% How long after the in-session message 4 Alice waits before judging the
 %% reachability result, so an absent but still-in-flight out-of-session
@@ -449,7 +457,7 @@ init(Config = #{role := alice}) ->
         timer_ref => Timer,
         resends => 0,
         pkt_out => 0,
-        seen_in => []
+        seen_in => i2p_ssu2_recv:new()
     }};
 %% Bob: consume the listener's first SessionRequest immediately.
 init(Config = #{role := bob}) ->
@@ -491,7 +499,7 @@ init(Config = #{role := bob}) ->
                         timer_phase => created_sent,
                         resends => 0,
                         pkt_out => 0,
-                        seen_in => []
+                        seen_in => i2p_ssu2_recv:new()
                     }}
             end;
         error ->
@@ -532,7 +540,7 @@ handle_cast(_Other, State) ->
 
 handle_info({ssu2_packet, Packet}, State) ->
     Phase = maps:get(phase, State, undefined),
-    trace({ssu2_packet, byte_size(Packet), Phase}, [], State),
+    i2p_log:debug({ssu2_packet, byte_size(Packet), Phase}, role(State)),
     try
         {noreply, on_packet(Packet, State)}
     catch
@@ -586,7 +594,7 @@ handle_info(
     State = #{redirect_pid := RedirectPid}
 ) ->
     Owner = maps:get(owner, maps:get(config, State)),
-    trace({relay, redirect_ready, pid, RedirectPid}, [], State),
+    i2p_log:debug({relay, redirect_ready, pid, RedirectPid}, role(State)),
     _ = Owner ! {i2p_ssu2_redirect, self(), RedirectPid, Keys},
     {noreply, State};
 %% The redirect session died before establishing: the relay served nothing; end
@@ -595,7 +603,7 @@ handle_info(
     {'DOWN', _Ref, process, RedirectPid, Reason},
     State = #{redirect_pid := RedirectPid}
 ) ->
-    trace({relay, redirect_down, pid, RedirectPid, reason, Reason}, [], State),
+    i2p_log:debug({relay, redirect_down, pid, RedirectPid, reason, Reason}, role(State)),
     {stop, {redirect_failed, Reason}, State};
 handle_info(
     {'DOWN', _Ref, process, Listener, _},
@@ -649,12 +657,12 @@ on_packet(Packet, State = #{phase := confirmed_wait}) ->
     Bik = bik(State),
     case i2p_ssu2:open_long(Packet, Bik, Bik) of
         {ok, <<_:64, _Num:32, ?TYPE_SESSION_REQUEST:8, 2:8, 2:8, _:8, _:64, _/binary>>} ->
-            trace({reanswer_created, byte_size(Packet)}, [], State),
+            i2p_log:debug({reanswer_created, byte_size(Packet)}, role(State)),
             resend_now(State),
             State;
         _ ->
             Fragments = [Packet | maps:get(fragments, State)],
-            trace({fragment_buffer, byte_size(Packet), length(Fragments)}, [], State),
+            i2p_log:debug({fragment_buffer, byte_size(Packet), length(Fragments)}, role(State)),
             case i2p_ssu2:receive_session_confirmed(hs(State), Fragments) of
                 {ok, Info, HS1} ->
                     establish(HS1, Info, State#{fragments => Fragments});
@@ -702,7 +710,7 @@ peek_peertest(Packet, State = #{pending_test := Pending}) when Pending =/= undef
     own_type7(Packet, State);
 peek_peertest(Packet, State) ->
     case own_type7(Packet, State) of
-        true -> trace({peek_gated_pending_undefined}, [], State);
+        true -> i2p_log:debug({peek_gated_pending_undefined}, role(State));
         false -> ok
     end,
     false.
@@ -723,7 +731,7 @@ peek_holepunch(Packet, State = #{relay_pending := Pending}) when Pending =/= und
     own_type11(Packet, State);
 peek_holepunch(Packet, State) ->
     case own_type11(Packet, State) of
-        true -> trace({peek_gated_holepunch_pending_undefined}, [], State);
+        true -> i2p_log:debug({peek_gated_holepunch_pending_undefined}, role(State));
         false -> ok
     end,
     false.
@@ -744,12 +752,12 @@ holepunch(Packet, State) ->
     OwnIntro = maps:get(intro_key, maps:get(local, maps:get(config, State))),
     case i2p_ssu2:decode_holepunch(OwnIntro, Packet) of
         {ok, Info} ->
-            trace({holepunch, received}, [], State),
+            i2p_log:debug({holepunch, received}, role(State)),
             Owner = maps:get(owner, maps:get(config, State)),
             _ = Owner ! {holepunch, self(), Info},
             State;
         error ->
-            trace(holepunch_decode_error, [], State),
+            i2p_log:debug(holepunch_decode_error, role(State)),
             State
     end.
 
@@ -763,16 +771,16 @@ out_of_session_peertest(Packet, State = #{pending_test := Pending}) when Pending
         {ok, #{blocks := Blocks}} ->
             case lists:keyfind(peertest, 1, Blocks) of
                 {peertest, 5, _Code, _Flags, _Hash, _Ver, Nonce, _Ts, _Port, _Ip, _Sig} ->
-                    trace({oos, 5}, [], State),
+                    i2p_log:debug({oos, 5}, role(State)),
                     maybe_seen5(Nonce, State);
                 {peertest, 7, _Code, _Flags, _Hash, _Ver, Nonce, _Ts, _Port, _Ip, _Sig} ->
-                    trace({oos, 7}, [], State),
+                    i2p_log:debug({oos, 7}, role(State)),
                     maybe_seen7(Nonce, State);
                 _Other ->
                     State
             end;
         error ->
-            trace(oos_decode_error, [], State),
+            i2p_log:debug(oos_decode_error, role(State)),
             State
     end;
 out_of_session_peertest(_Packet, State) ->
@@ -884,7 +892,16 @@ become_established_common(HS, Keys, State) ->
             out_pkts => #{},
             reassembly => #{},
             pending_test => undefined,
-            pt_target => undefined
+            pt_target => undefined,
+            %% The handshake's inbound reassembly buffer. It only ever holds
+            %% SessionConfirmed fragments, and by here they have all been
+            %% consumed, so leaving it resident would keep the last fragment's
+            %% payload alive for the whole session. It was also the one field
+            %% this transition forgot, which is why a session's heap depended on
+            %% what the handshake happened to leave behind rather than on its
+            %% data phase.
+            fragments => [],
+            sr_info => undefined
         },
     State2 = arm_keepalive_timer(arm_idle_timer(State1)),
     case role(State2) of
@@ -907,34 +924,45 @@ data_packet(Packet, State = #{keys := Keys}) ->
     OwnIntro = maps:get(intro_key, maps:get(local, maps:get(config, State))),
     case i2p_ssu2:decode_data(Keys, RecvDir, OwnIntro, Packet) of
         {ok, #{pkt_num := Num, immediate_ack := ImmediateAck, blocks := Blocks}} ->
-            case seen(Num, maps:get(seen_in, State)) of
-                {new, SeenIn} ->
-                    trace({recv, RecvDir, Num, new, [block_kind(B) || B <- Blocks]}, [], State),
-                    State1 = State#{seen_in => SeenIn},
-                    State2 = handle_blocks(Blocks, State1),
-                    maybe_ack(Num, Blocks, ImmediateAck, State2);
-                duplicate ->
-                    trace({recv, RecvDir, Num, duplicate}, [], State),
-                    State
-            end;
+            on_data(Num, Blocks, ImmediateAck, RecvDir, State);
         error ->
-            trace({recv, RecvDir, decode_error}, [], State),
+            i2p_log:debug({recv, RecvDir, decode_error}, role(State)),
             State
     end.
 
-seen(Num, SeenIn) ->
-    case lists:member(Num, SeenIn) of
-        true ->
-            duplicate;
-        false ->
-            {new, [Num | SeenIn]}
+%% Classify an inbound Data packet number against the receive window, then
+%% deliver its blocks. The three outcomes differ only in what happens to the
+%% window and to the telemetry -- the blocks are delivered either way, because
+%% an out-of-window packet is still a real, authenticated packet carrying data
+%% this router has not processed, and dropping it would lose traffic to save
+%% bookkeeping. Block handling is idempotent by message identity, so delivering
+%% a duplicate we could not recognise costs work rather than correctness.
+on_data(Num, Blocks, ImmediateAck, RecvDir, State = #{seen_in := SeenIn}) ->
+    case i2p_ssu2_recv:add(Num, SeenIn, ?MAX_ACK_RANGES) of
+        {new, SeenIn1} ->
+            i2p_log:debug(
+                {recv, RecvDir, Num, new, [block_kind(B) || B <- Blocks]}, role(State)
+            ),
+            deliver(Num, Blocks, ImmediateAck, State#{seen_in => SeenIn1});
+        duplicate ->
+            i2p_log:debug({recv, RecvDir, Num, duplicate}, role(State)),
+            State;
+        stale ->
+            %% Too old to be nameable in any ACK we could send, so it cannot be
+            %% recorded — see `m:i2p_ssu2_recv`. Counted rather than silently
+            %% treated as new, because a peer doing this routinely is
+            %% retransmitting numbers the spec says it must not reuse.
+            i2p_stats:add(ssu2_stale_packets, 1),
+            i2p_log:debug(
+                {recv, RecvDir, Num, out_of_window, [block_kind(B) || B <- Blocks]},
+                role(State)
+            ),
+            deliver(Num, Blocks, ImmediateAck, State)
     end.
 
-%% Optional diagnostic trace emission. It is a no-op unless a collector is
-%% registered (see `m:i2p_ssu2_trace`) and is never part of the protocol
-%% state machine.
-trace(Label, Details, State) ->
-    i2p_ssu2_trace:emit(self(), Label, {role(State), Details}).
+deliver(Num, Blocks, ImmediateAck, State) ->
+    State1 = handle_blocks(Blocks, State),
+    maybe_ack(Num, Blocks, ImmediateAck, State1).
 
 block_kind({i2np, Type, _MsgId, _Exp, _Body}) ->
     {i2np, Type};
@@ -1077,7 +1105,7 @@ send_packet(Blocks, State = #{keys := Keys, pkt_out := Num}, Track) ->
         Datagram,
         maps:get(endpoint, State)
     ),
-    trace({send, Num, Track, [block_kind(B) || B <- Blocks]}, [], State),
+    i2p_log:debug({send, Num, Track, [block_kind(B) || B <- Blocks]}, role(State)),
     Out =
         case Track of
             true -> maps:put(Num, Blocks, maps:get(out_pkts, State));
@@ -1155,10 +1183,10 @@ handle_peertest(Blocks, State) ->
             %% Bob-side reject "no Charlie available" (code 2).
             case is_coordinator_owned(State) of
                 true ->
-                    trace({pt_dispatch, bob, 1, defer_coordinator}, [], State),
+                    i2p_log:debug({pt_dispatch, bob, 1, defer_coordinator}, role(State)),
                     State;
                 false ->
-                    trace({pt_dispatch, bob, 1, reject}, [], State),
+                    i2p_log:debug({pt_dispatch, bob, 1, reject}, role(State)),
                     reply_peertest_reject(Nonce, Ts, Port, Ip, State)
             end;
         {charlie, {peertest, 2, _Code, _Flags, AliceHash, _Ver, Nonce, Ts, Port, Ip, _Sig}} ->
@@ -1167,7 +1195,7 @@ handle_peertest(Blocks, State) ->
             %% (from her forwarded RouterInfo) we also send the out-of-session
             %% message 5 to her; then reply message 3 signed with our own key,
             %% echoing Alice's nonce/timestamp/port/IP.
-            trace({pt_dispatch, charlie, 2, charlie_reply}, [], State),
+            i2p_log:debug({pt_dispatch, charlie, 2, charlie_reply}, role(State)),
             State1 = send_charlie_msg5(Nonce, Ts, Port, Ip, State),
             charlie_reply(AliceHash, Nonce, Ts, Port, Ip, State1);
         {alice, {peertest, 4, Code, _Flags, _Hash, _Ver, Nonce, _Ts, _Port, Ip, _Sig}} ->
@@ -1181,7 +1209,7 @@ handle_peertest(Blocks, State) ->
                 true ->
                     case i2p_peertest:is_reject(Code) of
                         true ->
-                            trace({pt_dispatch, alice, 4, reject_concluded}, [], State),
+                            i2p_log:debug({pt_dispatch, alice, 4, reject_concluded}, role(State)),
                             conclude_peertest_reject(Nonce, State);
                         false ->
                             %% Message 4 accepted: Charlie is reachable.
@@ -1190,20 +1218,19 @@ handle_peertest(Blocks, State) ->
                             %% have his endpoint cached; otherwise
                             %% `forward_block` will do so when his
                             %% RouterInfo arrives.
-                            trace({pt_dispatch, alice, 4, accepted}, [], State),
+                            i2p_log:debug({pt_dispatch, alice, 4, accepted}, role(State)),
                             maybe_seen4_accept(Nonce, Ip, State)
                     end;
                 false ->
-                    trace({pt_dispatch, alice, 4, legacy_firewalled}, [], State),
+                    i2p_log:debug({pt_dispatch, alice, 4, legacy_firewalled}, role(State)),
                     i2p_events:notify({peertest_result, addr_type(Ip), firewalled}),
                     State
             end;
         _ ->
-            trace(
+            i2p_log:debug(
                 {pt_dispatch, peertest_discriminator(Block, State), peertest_msg_num(Block),
                     passthrough},
-                [],
-                State
+                role(State)
             ),
             State
     end.
@@ -1418,7 +1445,7 @@ begin_relay(State) ->
     Block7 = i2p_relay:request_block(2, Nonce, Tag, Ts, Port, Ip, Sig),
     State1 = send_blocks([Block7], State),
     _ = ets:insert(i2p_ssu2_sessions, {i2p_relay:dst_conn_id(Nonce), self()}),
-    trace({relay, request_sent, nonce, Nonce}, [], State1),
+    i2p_log:debug({relay, request_sent, nonce, Nonce}, role(State1)),
     State1#{relay_pending => #{nonce => Nonce}}.
 
 %% Charlie's RelayResponse (block 8) arrived in-session. Verify her signature
@@ -1433,10 +1460,10 @@ requester_relay_response(
     Pub = i2p_keys:signing_key(i2p_router_info:identity(CharlieRI)),
     case i2p_relay:verify_response(BobHash, Ver, Nonce, Ts, Port, Ip, Sig, Pub) of
         true when Code =:= 0, is_integer(Token) ->
-            trace({relay, response_ok, nonce, Nonce}, [], State),
+            i2p_log:debug({relay, response_ok, nonce, Nonce}, role(State)),
             spawn_redirect(Port, Ip, Token, clear_relay_nonce(State));
         true ->
-            trace({relay, rejected, code, Code}, [], State),
+            i2p_log:debug({relay, rejected, code, Code}, role(State)),
             exit({relay_rejected, Code});
         false ->
             exit({relay_bad_response_sig, Nonce})
@@ -1477,11 +1504,11 @@ spawn_redirect(Port, Ip, Token, State) ->
     case i2p_ssu2_sup:start_session(i2p_ssu2_sup:session_child(RedirectConfig)) of
         {ok, RedirectPid} ->
             _ = erlang:monitor(process, RedirectPid),
-            trace({relay, redirect_spawned, pid, RedirectPid}, [], State),
+            i2p_log:debug({relay, redirect_spawned, pid, RedirectPid}, role(State)),
             State#{redirect_pid => RedirectPid};
         {ok, RedirectPid, _Extra} ->
             _ = erlang:monitor(process, RedirectPid),
-            trace({relay, redirect_spawned, pid, RedirectPid}, [], State),
+            i2p_log:debug({relay, redirect_spawned, pid, RedirectPid}, role(State)),
             State#{redirect_pid => RedirectPid};
         {error, Reason} ->
             exit({session_admission_failed, Reason})
@@ -1548,7 +1575,7 @@ handle_forward(Blocks, State) ->
         [] ->
             ok;
         _ ->
-            trace({forwarded, [block_kind(B) || B <- Forward]}, [], State),
+            i2p_log:debug({forwarded, [block_kind(B) || B <- Forward]}, role(State)),
             _ = Owner ! {ssu2_data, self(), lists:reverse(Forward)},
             ok
     end,
@@ -1725,8 +1752,9 @@ send_termination(Reason, State) ->
 ack_packet_zero(_Keys, State = #{seen_in := SeenIn}) ->
     %% Alice's SessionConfirmed is her data-phase packet zero; record its
     %% receipt and ACK it with Bob's first Data packet (spec: Bob 0 = ACK).
-    State1 = State#{seen_in => [0 | SeenIn]},
-    AckBlock = i2p_ssu2:build_ack([0], ?MAX_ACK_RANGES),
+    {new, SeenIn1} = i2p_ssu2_recv:add(0, SeenIn, ?MAX_ACK_RANGES),
+    State1 = State#{seen_in => SeenIn1},
+    AckBlock = i2p_ssu2:build_ack(SeenIn1, ?MAX_ACK_RANGES),
     send_packet([AckBlock], State1, false).
 
 %% ------------------------------------------------------------------
@@ -1908,7 +1936,7 @@ maybe_arm_data_resend(State = #{out_pkts := Out}) ->
 %% be rescheduled forever.
 resend_unacked(State = #{out_pkts := Out}) ->
     Pending = maps:to_list(Out),
-    trace({data_resend_pending, length(Pending)}, [], State),
+    i2p_log:debug({data_resend_pending, length(Pending)}, role(State)),
     Empty = State#{out_pkts => #{}, data_resend_ref => undefined},
     lists:foldl(fun({_Num, Blocks}, St) -> send_blocks(Blocks, St) end, Empty, Pending).
 

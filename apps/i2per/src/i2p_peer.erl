@@ -97,6 +97,7 @@ i2p_peer:stop().
     learn_ri/1,
     discover/0,
     tunnel_lookup_reply/2,
+    reply_via_outbound/3,
     lookup/2,
     publish/1,
     publish_floodfills/0,
@@ -109,11 +110,48 @@ i2p_peer:stop().
 ]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
--export_type([local_keys/0]).
+-export_type([local_keys/0, store_outcome/0, store_not_stored_reason/0]).
 
 -define(HANDSHAKE_TIMEOUT, 15000).
 -define(MAX_BACKOFF_SECONDS, 300).
 -define(REFRESH_INTERVAL_SECONDS, 300).
+%% How often the bounded structures are swept: `pending_sends` entries past
+%% their age, and `peers` entries with no connection and no monitor.
+%%
+%% **One timer for both, not one each.** A sweep is O(size of the structure) and
+%% neither structure grows past its cap, so two timers would buy nothing but a
+%% second thing to cancel. It rides the same cadence as the RouterInfo refresh
+%% because both are housekeeping rather than work.
+-define(SWEEP_INTERVAL_SECONDS, 300).
+%% Frames queued for one peer. At the shipped `transit_bandwidth_kbps = 64` with
+%% one token per 1028-byte frame this is roughly eight seconds of admitted
+%% traffic.
+%%
+%% **Sized against the reconnection window, not against memory.** A peer in
+%% `backoff` retries on a doubling backoff up to `?MAX_BACKOFF_SECONDS`, so a
+%% queue that survives about that long loses nothing a peer would have wanted.
+%% 64 comfortably exceeds the first few backoff steps while bounding the worst
+%% case to roughly 64 KB per peer rather than nothing at all.
+-define(MAX_PENDING_SENDS_PER_PEER, 64).
+%% How long a queued frame is worth keeping. A relay frame belongs to a tunnel,
+%% and a tunnel that has been waiting five minutes is gone, so the frame is
+%% worthless to whoever receives it. **This is what reclaims the permanent-stall
+%% case** -- a depth cap alone converts unbounded growth into a bounded amount
+%% retained for ever, once per peer the router ever learned.
+-define(PENDING_SEND_MAX_AGE_MS, 300000).
+%% RouterInfos remembered as dialable. Each entry holds a whole RouterInfo, so
+%% this is the largest of the three bounded structures per entry.
+%%
+%% **Well above the number of peers the router will ever hold.** `max_ntcp2_connections`
+%% is 64 and `max_ssu2_sessions` is 32, so 500 is several times what can be live
+%% at once, which leaves room for backoff entries and for seeds. The cap exists
+%% to stop a router that is being fed distinct RouterInfos from retaining them
+%% all for the life of the process, not to ration anything it needs.
+-define(MAX_KNOWN, 500).
+%% Peers retained in `peers`. Generous relative to the connection caps, because
+%% a peer in `backoff` is still worth keeping until it has been unreachable
+%% longer than the backoff ceiling.
+-define(MAX_PEERS, 256).
 %% Boot kick delay: after the peer manager comes up (and any reseed pass
 %% lands), fire an exploratory lookup at idle seeds so real floodfills enter
 %% the NetDb on their own instead of waiting for the first publish cycle.
@@ -301,14 +339,21 @@ init([Local, Seeds]) ->
     KickRef = erlang:send_after(discovery_kick_ms(), self(), kick_floodfill_discovery),
     {ok, #{
         local => Local,
-        known => SeedConfigs,
+        known => maps:from_list([{maps:get(hash, C), C} || C <- SeedConfigs]),
+        %% The operator's seed order, kept apart from `known` because it is
+        %% meaning, not data. `f:discovery_candidates/1` dials the *first* three
+        %% dialable seeds, so a map keyed by hash would silently discard which
+        %% seeds the operator ranked highest. This list is the ranking; it is
+        %% bounded by the seed count and never grows.
+        seed_order => [maps:get(hash, C) || C <- SeedConfigs],
         peers => #{},
         inbound => #{},
         pending => #{},
         pending_sends => #{},
         our_hash => i2p_router_info:hash(maps:get(ri, Local)),
         refresh_ref => RefreshRef,
-        discovery_kick_ref => KickRef
+        discovery_kick_ref => KickRef,
+        sweep_ref => erlang:send_after(?SWEEP_INTERVAL_SECONDS * 1000, self(), sweep)
     }}.
 
 handle_call(router_hash, _From, State) ->
@@ -375,6 +420,7 @@ handle_cast(stop, State) ->
     #{peers := Peers} = State,
     _ = cancel_timer(maps:find(refresh_ref, State)),
     _ = cancel_timer(maps:find(discovery_kick_ref, State)),
+    _ = cancel_timer(maps:find(sweep_ref, State)),
     lists:foreach(
         fun({_Hash, #{conn := Conn}}) ->
             case Conn of
@@ -398,8 +444,14 @@ handle_cast(_Msg, State) ->
 
 handle_info({conn_started, PeerHash, ConnPid, Transport}, State) ->
     {noreply, handle_conn_started(PeerHash, ConnPid, Transport, State)};
+%% A connect failure with a reason, and one without. The second shape is what a
+%% failure before the connection process exists can only say: `ntcp2_connect/4`
+%% reports a supervisor refusal with nothing more to go on, and inventing a reason
+%% for it would be worse than admitting there is not one.
+handle_info({connect_failed, PeerHash, Reason}, State) ->
+    {noreply, handle_connect_failed(PeerHash, Reason, State)};
 handle_info({connect_failed, PeerHash}, State) ->
-    {noreply, handle_connect_failed(PeerHash, State)};
+    {noreply, handle_connect_failed(PeerHash, unknown, State)};
 handle_info({ntcp2_ready, ConnPid, RemoteRI}, State) ->
     case find_conn_peer(ConnPid, State) of
         {_PeerHash, _PeerState} ->
@@ -432,8 +484,113 @@ handle_info(refresh_routerinfo, State) ->
     {noreply, State1#{refresh_ref := RefreshRef}};
 handle_info(kick_floodfill_discovery, State) ->
     {noreply, kick_floodfill_discovery(State)};
+handle_info(sweep, State) ->
+    State1 = sweep(State),
+    Ref = erlang:send_after(?SWEEP_INTERVAL_SECONDS * 1000, self(), sweep),
+    {noreply, State1#{sweep_ref := Ref}};
 handle_info(_Msg, State) ->
     {noreply, State}.
+
+%% Sweep the two structures that accumulate. Neither grows past its cap, so this
+%% is bounded work, and it is the only thing that reclaims either of them.
+%%
+%% **`pending_sends` is aged, `peers` is evicted.** Different questions:
+%% a queued frame is stale after `?PENDING_SEND_MAX_AGE_MS` because the tunnel
+%% it belongs to is gone, whereas a peer entry is stale when it has no
+%% connection and no monitor -- it is not being dialled, nothing is holding it,
+%% and the backoff that would have retried it has run out.
+sweep(State) ->
+    NowMs = erlang:system_time(millisecond),
+    {Pending1, Expired} = sweep_pending_sends(maps:get(pending_sends, State), NowMs, #{}, 0),
+    ok = count_expired(Expired),
+    State#{
+        pending_sends := Pending1,
+        peers => sweep_peers(maps:get(peers, State))
+    }.
+
+count_expired(0) -> ok;
+count_expired(N) -> i2p_stats:add(pending_sends_expired, N).
+
+sweep_pending_sends(Pending, NowMs, Kept, Expired) ->
+    maps:fold(
+        fun(PeerHash, Msgs, {Acc, N}) ->
+            {KeptMsgs, Stale} = fresh_sends(Msgs, NowMs, []),
+            Next =
+                case KeptMsgs of
+                    [] -> Acc;
+                    _ -> maps:put(PeerHash, KeptMsgs, Acc)
+                end,
+            {Next, N + length(Stale)}
+        end,
+        {Kept, Expired},
+        Pending
+    ).
+
+%% Split a peer's queue into the entries still worth sending and the ones past
+%% their age.
+%%
+%% Returns `{Kept, Stale}`, both in queue order.
+%%
+%% **Walks from the head, keeping the fresh prefix and discarding the rest.**
+%% `enqueue_send/3` prepends, so the head is the newest and the tail is the
+%% oldest -- which means the entries that aged out are the tail, and a walk that
+%% dropped from the head would keep precisely the frames that had waited longest.
+%% It stops at the first expired entry rather than filtering, so a queue whose
+%% timestamps are out of order is left whole instead of being half-swept on a
+%% false reading.
+fresh_sends(Msgs, NowMs, Acc) ->
+    case Msgs of
+        [{at, Ts, _} = M | Rest] when NowMs - Ts =< ?PENDING_SEND_MAX_AGE_MS ->
+            fresh_sends(Rest, NowMs, [M | Acc]);
+        [] ->
+            {lists:reverse(Acc), []};
+        _ ->
+            {lists:reverse(Acc), Msgs}
+    end.
+
+%% Drop peers nothing is holding: no live connection, no monitor, and not
+%% mid-dial. Those are the entries `put_peer/3` added and nothing has reclaimed.
+%%
+%% **`connecting` is never evicted.** A peer in `connecting` has a dial in flight
+%% from `maybe_connect_status/3`; evicting it would leave that dial to complete
+%% into a `peers` entry that is gone, and `handle_conn_started/4` answers
+%% `error` for an unknown peer by stopping the connection. So an in-flight dial
+%% would be torn down by its own successful handshake.
+%%
+%% `?MAX_PEERS` is a backstop rather than the primary mechanism: a peer in
+%% `backoff` keeps being retried, so it is only ever unreachable-but-retained,
+%% and the count is expected to sit well below the cap. It exists so a router
+%% being fed distinct peers cannot grow this map without limit either.
+sweep_peers(Peers) when map_size(Peers) =< ?MAX_PEERS ->
+    Peers;
+sweep_peers(Peers) ->
+    Idle = maps:filter(fun(_Hash, Peer) -> idle_peer(Peer) end, Peers),
+    case map_size(Idle) of
+        0 ->
+            %% Every peer is connected, monitored or mid-dial. Nothing is
+            %% reclaimable, and the cap is not a licence to drop a live
+            %% connection -- so the map is left to exceed the cap and to report
+            %% honestly in `status/0` rather than to be truncated here.
+            Peers;
+        IdleCount ->
+            %% Drop at least enough to get back under the cap, and if the idle
+            %% peers cannot cover it, all of them. Which peers go is the lowest
+            %% hash order, because there is no recency to consult: a peer entry
+            %% carries no timestamp, and adding one would mean a write on the
+            %% dial path for a bound that is not expected to bite.
+            Over = map_size(Peers) - ?MAX_PEERS,
+            Evicted = lists:sublist(lists:sort(maps:keys(Idle)), max(Over, IdleCount)),
+            ok = count_evicted(length(Evicted)),
+            maps:without(Evicted, Peers)
+    end.
+
+count_evicted(0) -> ok;
+count_evicted(N) -> i2p_stats:add(peers_evicted, N).
+
+idle_peer(Peer) ->
+    maps:get(conn, Peer, undefined) =:= undefined andalso
+        maps:get(mon, Peer, undefined) =:= undefined andalso
+        maps:get(status, Peer, none) =/= connecting.
 
 %%%%%%%%% %%% Internal %%%%%%%
 
@@ -483,15 +640,69 @@ handle_ssu2_ready(ConnPid, State) ->
 %% framing blocks `#{type := 3, data := Data}`. Rebuild the 9-byte short-header
 %% wire for each so `handle_frame/3` treats both transports identically.
 handle_ssu2_data(ConnPid, Blocks, State) ->
+    {Messages, Unhandled} = lists:partition(fun is_i2np_block/1, Blocks),
     Framed = [
         #{type => 3, data => <<Type:8, MsgId:32, ShortExp:32, Body/binary>>}
-     || {i2np, Type, MsgId, ShortExp, Body} <- Blocks
+     || {i2np, Type, MsgId, ShortExp, Body} <- Messages
     ],
-    lists:foldl(
+    State1 = lists:foldl(
         fun(Block, AccState) -> handle_block(ConnPid, ssu2, Block, AccState) end,
         State,
         Framed
+    ),
+    lists:foldl(
+        fun(Block, AccState) -> note_unhandled_ssu2_block(ConnPid, Block, AccState) end,
+        State1,
+        Unhandled
     ).
+
+is_i2np_block({i2np, _, _, _, _}) -> true;
+is_i2np_block(_) -> false.
+
+%% A non-I2NP SSU2 block reached the peer manager, which has no handler for it.
+%% Every shape `m:i2p_ssu2_conn` forwards is meaningful to somebody: the
+%% introducer-relay blocks (7/8/9 and the 15/16 tag exchange) and the peer-test
+%% blocks (1-4) belong to `m:i2p_relay_coord` and `m:i2p_peertest_coord`, and
+%% the RouterInfo and path-challenge blocks are forwarded so the owner can
+%% observe an introduction or liveness exchange. Nothing consumes them here, so
+%% they are named and counted rather than discarded: silently losing exactly the
+%% blocks those coordinators need is how a future implementation ends up looking
+%% broken for a reason that lives in this module.
+%%
+%% Both lines stay, and they are not a duplicate. The event carries the block name
+%% alone, which is the dimension a counter wants; the log line adds the *peer*, which
+%% the event deliberately does not carry because its cardinality is unbounded. That
+%% is the ADR 0002 split rather than a breach of it: the fact is recorded once, and
+%% the two lines record different parts of it.
+%%
+%% The warning is emitted once per peer and kind, because a peer that floods us with
+%% these must not turn the log into the flood it is causing. The event is not
+%% deduplicated, for the same reason in reverse: a counter wants the total.
+note_unhandled_ssu2_block(ConnPid, Block, State) ->
+    Name = ssu2_block_name(Block),
+    i2p_events:notify({ssu2_block_unhandled, Name}),
+    Identity =
+        case find_conn_peer(ConnPid, State) of
+            {Hash, _PeerState} -> {peer, base64:encode(Hash)};
+            not_found -> unknown
+        end,
+    Key = {Identity, Name},
+    Seen = maps:get(unhandled_ssu2_blocks, State, #{}),
+    case maps:is_key(Key, Seen) of
+        true ->
+            State;
+        false ->
+            i2p_log:emit(
+                unhandled_ssu2_block_peer, "unhandled ssu2 ~0p block from ~0p", [Name, Identity]
+            ),
+            State#{unhandled_ssu2_blocks => Seen#{Key => true}}
+    end.
+
+%% The first element is the block's own name for every shape the SSU2 codec
+%% produces, so this classifies without repeating `f:i2p_ssu2_conn:block_kind/1`
+%% and cannot drift from it.
+ssu2_block_name(Block) when is_tuple(Block) -> element(1, Block);
+ssu2_block_name(Block) -> Block.
 
 %% Tear down a connection whose session process died or closed, keyed by pid
 %% rather than by monitor ref (SSU2 sessions close with `{ssu2_closed, ...}`
@@ -500,7 +711,8 @@ handle_conn_down_by_pid(ConnPid, State) ->
     case find_conn_peer(ConnPid, State) of
         {PeerHash, _PeerState} ->
             i2p_events:notify({peer_disconnected, PeerHash}),
-            enter_backoff(PeerHash, State);
+            {State1, _Backoff} = enter_backoff(PeerHash, State),
+            State1;
         not_found ->
             case inbound_conn_by_pid(ConnPid, State) of
                 {ok, Hash} ->
@@ -512,10 +724,24 @@ handle_conn_down_by_pid(ConnPid, State) ->
             end
     end.
 
-handle_connect_failed(PeerHash, State) ->
+%% handle_connect_failed/3 — a connect attempt did not become a connection.
+%%
+%% The event is announced here, at the one point a connect failure and the backoff
+%% it causes are the same decision, and it carries the resulting interval. The
+%% interval is the point: a peer being retried in a tight loop and a peer the
+%% router has effectively given up on differ only in that number, and without it
+%% the two look identical from outside. Reported as one event rather than two
+%% because they cannot disagree — the backoff is computed by the very call this
+%% makes, so a separate "failed" and a separate "backing off" could only ever be
+%% two views of one value.
+handle_connect_failed(PeerHash, Reason, State) ->
     case peer_status(PeerHash, State) of
-        connecting -> enter_backoff(PeerHash, State);
-        _ -> State
+        connecting ->
+            {State1, Backoff} = enter_backoff(PeerHash, State),
+            ok = i2p_events:notify({peer_connect_failed, PeerHash, Reason, Backoff}),
+            State1;
+        _ ->
+            State
     end.
 
 handle_conn_ready(ConnPid, Transport, State) ->
@@ -548,7 +774,8 @@ handle_conn_down(MonRef, State) ->
     case find_peer_by_mon(MonRef, State) of
         {PeerHash, _PeerState} ->
             i2p_events:notify({peer_disconnected, PeerHash}),
-            enter_backoff(PeerHash, State);
+            {State1, _Backoff} = enter_backoff(PeerHash, State),
+            State1;
         not_found ->
             case find_inbound_by_mon(MonRef, State) of
                 {ConnPid, Hash} ->
@@ -916,8 +1143,8 @@ ntcp2_connect(PeerHash, RemoteRI, Local, Owner) ->
             Owner ! {conn_started, PeerHash, ConnPid, ntcp2};
         {ok, ConnPid, _} ->
             Owner ! {conn_started, PeerHash, ConnPid, ntcp2};
-        {error, _} ->
-            Owner ! {connect_failed, PeerHash}
+        {error, Reason} ->
+            Owner ! {connect_failed, PeerHash, {supervisor, Reason}}
     end.
 
 handle_frame(ConnPid, Payload, State) ->
@@ -961,23 +1188,136 @@ handle_block(ConnPid, Transport, #{type := 3, data := Data}, State) ->
 handle_block(_ConnPid, _Transport, _Block, State) ->
     State.
 
+-doc """
+Why a DatabaseStore was not kept, as carried on the `i2p_events` bus.
+
+`{unsupported_type, Type}` is a store type that decodes but is not implemented
+(ELS2 and MetaLeaseSet today). `{refused_with_reason, Outcome}` is the NetDb's
+own verdict in its own vocabulary — `older`, `from_future`, `too_old`,
+`expired`. A bare `{Reason}` is a decode failure from the NetDb, and
+`unparseable_router_info_data` is ours, for a type 0 store whose data field is
+not a RouterInfo.
+
+This is the reason vocabulary the telemetry work needs at the store recording
+point. It is deliberately not flattened into a single atom: "we do not implement
+this type" and "the NetDb thought it was too old" call for different responses,
+and a counter that cannot tell them apart cannot answer the question it was
+built to answer.
+""".
+-type store_not_stored_reason() ::
+    {unsupported_type, byte()}
+    | {refused_with_reason, older | from_future | too_old | expired}
+    | {atom()}
+    | unparseable_router_info_data.
+
+-doc """
+What became of a decoded DatabaseStore.
+
+`stored` is the only outcome that licenses floodfill replication, because
+replication is the side effect that tells the rest of the network to hold an
+entry. A type we do not implement and an entry the NetDb refused are both
+`not_stored`, and pushing either onward would be us asking three other routers
+to serve something we never held. See `t:store_not_stored_reason/0` for the
+reason a `not_stored` carries.
+""".
+-type store_outcome() :: stored | not_stored.
+
+%% `store_entry/4` returns `{Outcome, State}` where a `not_stored` outcome
+%% carries its reason in a three-tuple, so the reason travels with the decision
+%% rather than needing a second return value that only one branch populates.
+-spec store_entry(byte(), binary(), pid() | undefined, term()) ->
+    {stored, term()} | {not_stored, store_not_stored_reason(), term()}.
+
+%% `f:handle_db_store/4` decided what became of an entry and then ignored its
+%% own decision, replicating unconditionally on a path that had already
+%% determined the entry was unusable. Two consequences, both of which this
+%% function is the only defence against:
+%%
+%%  - a store type we do not implement (ELS2, MetaLeaseSet) was handed to
+%%    `f:i2p_floodfill:replication_outbox/5` with its original type byte, so
+%%    three other routers were asked to serve an entry we never parsed;
+%%  - an entry the NetDb's clock window refused was pushed on the same way.
+%%
+%% On top of that, the per-type handlers replicated through `f:replicate_if_new/6`
+%% *and* the caller replicated again, so every entry we did store went out
+%% twice. The duplication of delivery is its own harm: the second copy reaches
+%% the same three floodfills, each of which stores it and re-broadcasts in turn.
+%%
+%% So: replicate once, on `stored`, and report everything else with its reason
+%% so an operator can tell a refusal from a corruption and neither from silence.
 handle_db_store(ConnPid, MsgID, Body, State) ->
     case i2p_i2np:decode_db_store(Body) of
         {ok, #{key := Key, store_type := StoreType, data := Data} = Store} ->
             reply_to_store(Store, MsgID, State),
-            State1 =
-                case StoreType of
-                    0 -> handle_ri_store(Key, Data, ConnPid, State);
-                    1 -> handle_ls_store(Key, Data, State);
-                    3 -> handle_ls_store(Key, Data, State);
-                    _ -> State
-                end,
-            maybe_replicate(StoreType, Key, Data, ConnPid, State1),
-            State1;
+            Result = store_entry(StoreType, Data, ConnPid, State),
+            replicate_stored(StoreType, Key, Data, Result, ConnPid);
         error ->
+            %% A DatabaseStore we cannot even parse came from a peer that is
+            %% not speaking the protocol. Nothing is replicated and nothing is
+            %% stored, so there is no entry to report a reason for.
             stop_conn(ConnPid),
             State
     end.
+
+%% Route a decoded DatabaseStore by type and report what became of it, as
+%% `{Outcome, State}` with the reason carried inside a `not_stored` outcome. Type
+%% 0 is a RouterInfo, 1 a LeaseSet, 3 a local LeaseSet; 5 (ELS2) and 7
+%% (MetaLeaseSet) decode but are not implemented, and neither is anything a
+%% future type brings.
+store_entry(0, Data, ConnPid, State) ->
+    store_ri_entry(Data, ConnPid, State);
+store_entry(StoreType, Data, _ConnPid, State) when StoreType =:= 1; StoreType =:= 3 ->
+    store_ls_entry(Data, State);
+store_entry(StoreType, _Data, _ConnPid, State) ->
+    {not_stored, {unsupported_type, StoreType}, State}.
+
+store_ri_entry(Data, _ConnPid, State) ->
+    case i2p_i2np:parse_router_info_data(Data) of
+        {ok, RIBytes} ->
+            NowMs = erlang:system_time(millisecond),
+            case i2p_netdb_srv:store_binary(RIBytes, NowMs) of
+                {ok, Outcome} ->
+                    netdb_outcome(Outcome, remember_ri_entry(RIBytes, State));
+                {error, Reason} ->
+                    {not_stored, {Reason}, State}
+            end;
+        error ->
+            {not_stored, unparseable_router_info_data, State}
+    end.
+
+store_ls_entry(Data, State) ->
+    case i2p_netdb_srv:store_ls_binary(Data, erlang:system_time(second)) of
+        {ok, Outcome} ->
+            netdb_outcome(Outcome, State);
+        {error, Reason} ->
+            {not_stored, {Reason}, State}
+    end.
+
+%% The NetDb's own verdict, in its own vocabulary. `added` and `updated` mean we
+%% hold the entry; every other outcome — `older`, `from_future`, `too_old`,
+%% `expired` — means we do not, and must not forward it. An `older` outcome is
+%% worth a second thought: the key *is* in the store, but a copy we already had,
+%% so forwarding the bytes we were just handed would push a stale one.
+netdb_outcome(Outcome, State) when Outcome =:= added; Outcome =:= updated -> {stored, State};
+netdb_outcome(Outcome, State) -> {not_stored, {refused_with_reason, Outcome}, State}.
+
+%% Only `stored` licenses replication, and it licenses exactly one. Everything
+%% else is reported, because an entry that arrived and was not kept is the fact
+%% an operator needs: silently dropping it is indistinguishable from a peer that
+%% never sent anything.
+replicate_stored(StoreType, Key, Data, {stored, State}, ConnPid) ->
+    _ = maybe_replicate(StoreType, Key, Data, ConnPid, State),
+    State;
+replicate_stored(_StoreType, _Key, _Data, {not_stored, Reason, State}, _ConnPid) ->
+    %% The announcement is the whole report (ADR 0002: each fact is recorded once,
+    %% on one instrument). This used to also call `f:report_not_stored/1`, which
+    %% logged the same reason at `debug` -- invisible under the shipped `notice`
+    %% default, so it bought nothing for a subscriber-less router either -- and at
+    %% `warning` for an unparseable RouterInfo, where the prominence was the only
+    %% addition and `unparseable_router_info_data` is already a distinct reason a
+    %% consumer can count apart from `{unsupported_type, T}`. Both lines are gone.
+    i2p_events:notify({db_store_not_stored, Reason}),
+    State.
 
 %% A DatabaseStore with a nonzero (and not 0xFFFFFFFF) reply token asks for a
 %% DeliveryStatus acknowledgement. i2pd replies unconditionally, before any
@@ -1000,33 +1340,6 @@ reply_to_store(#{reply_token := _, reply := {0, Gateway}}, MsgID, State) ->
     end;
 reply_to_store(#{reply_token := _, reply := _}, _MsgID, _State) ->
     ok.
-
-handle_ri_store(Key, Data, ConnPid, State) ->
-    case i2p_i2np:parse_router_info_data(Data) of
-        {ok, RIBytes} ->
-            NowMs = erlang:system_time(millisecond),
-            case i2p_netdb_srv:store_binary(RIBytes, NowMs) of
-                {ok, Outcome} ->
-                    replicate_if_new(0, Key, Data, ConnPid, Outcome, State),
-                    case i2p_router_info:decode(RIBytes) of
-                        {ok, RI} -> remember_ri(RI, State);
-                        {error, _} -> State
-                    end;
-                {error, _} ->
-                    State
-            end;
-        error ->
-            State
-    end.
-
-handle_ls_store(Key, Data, State) ->
-    case i2p_netdb_srv:store_ls_binary(Data, erlang:system_time(second)) of
-        {ok, Outcome} ->
-            replicate_if_new(1, Key, Data, undefined, Outcome, State),
-            State;
-        {error, _} ->
-            State
-    end.
 
 handle_db_lookup(ConnPid, Transport, Body, State) ->
     case i2p_i2np:decode_db_lookup(Body) of
@@ -1082,6 +1395,14 @@ Output: `ok` - the DatabaseStore or DatabaseSearchReply is injected into the
 requester's inbound tunnel (`{tunnel, From, ReplyTid}` delivery) through one
 of our outbound tunnels; when none is active the reply is dropped and the
 requester's retry picks another responder.
+
+**Two ways to drop, and both answer `ok`.** Having no outbound tunnel at all is
+the one the caller can see, and it is handled here. The other is the tunnel
+going away *between* choosing it and sending on it -- a second lookup, which can
+answer `error` after a successful pick -- counted as
+`lookup_replies_dropped_no_tunnel` in `m:i2p_stats`. Neither is this router's
+fault and neither is worth failing a lookup over, so this function is total by
+design rather than by luck; see #MCVQ6D6 for why that used to be an assertion.
 """.
 -spec tunnel_lookup_reply(i2p_i2np:db_lookup(), i2p_crypto:hash()) -> ok.
 tunnel_lookup_reply(
@@ -1111,9 +1432,38 @@ tunnel_lookup_reply(
                     expiration_ms => 60_000,
                     body => maps:get(body, Msg)
                 }),
-            ok = i2p_tunnel_srv:send_via_outbound(OutTid, {tunnel, FromHash, ReplyTid}, Wire);
+            reply_via_outbound(OutTid, {tunnel, FromHash, ReplyTid}, Wire);
         error ->
             ok
+    end.
+
+%% The send above answers `error` when the tunnel is gone, and the two calls it
+%% takes are separate: `pick_lookup_outbound/0` reads the pool, then
+%% `send_via_outbound/3` re-resolves the id through `find_outbound/2`. A tunnel
+%% retired by `pool_tick` in that window makes the second answer `error`, which
+%% the `ok =` turned into a `badmatch` in the process every send path goes
+%% through. The `error ->` branch one line below the assert is the same
+%% condition handled for the pick; the send needed the same answer.
+%%
+%% **Not a counter here, and the reason is that the reply is not ours.** The
+%% client-side twin of this loss is `client_messages_dropped_no_tunnel`
+%% (#G9HZK8F), and merging the two would be the same category error as calling
+%% that one `frames`: a lost client send is a client waiting on its own traffic,
+%% and a lost lookup reply is *another router* waiting on an answer we had. The
+%% operator acts on those differently -- one is our user's experience, the other
+%% is our usefulness to the network -- so they are two counters.
+%%
+%% Exported for the same reason `f:tunnel_lookup_reply/2` is: it is the named
+%% unit of the fix, and the race that reaches it cannot be built through the
+%% public surface -- a pick returns a pool *key* and the send re-resolves that
+%% same key, so only a concurrent removal separates them. Calling this directly
+%% is the only way to put a red case on the line that changed, rather than a
+%% green one on the drop path beside it.
+-spec reply_via_outbound(0..16#FFFFFFFF, i2p_tunnel_srv:send_delivery(), binary()) -> ok.
+reply_via_outbound(OutTid, Delivery, Wire) ->
+    case i2p_tunnel_srv:send_via_outbound(OutTid, Delivery, Wire) of
+        ok -> ok;
+        error -> i2p_stats:add(lookup_replies_dropped_no_tunnel, 1)
     end.
 
 handle_db_search_reply(ConnPid, Transport, Body, State) ->
@@ -1150,10 +1500,13 @@ send_store(ConnPid, Transport, Key, RI, Token, Reply) ->
     Data = i2p_i2np:router_info_data(i2p_router_info:to_binary(RI)),
     send_i2np(ConnPid, Transport, i2p_i2np:db_store(Key, 0, Token, Reply, Data)).
 
-%% Floodfill replication: forward a newly stored entry to the 3 closest
-%% eligible floodfills (excluding self and the sender).  Only triggers on
-%% `added` or `updated` outcomes — `older`, `from_future`, and `too_old`
-%% are not forwarded (matching i2pd NetDb::Store).
+%% Floodfill replication: forward a stored entry to the 3 closest eligible
+%% floodfills (excluding self and the sender).
+%%
+%% The caller is what makes this safe: `f:replicate_stored/6` reaches here only
+%% on a `stored` outcome, so the `added`/`updated` filter this comment used to
+%% describe now lives in one place, at the point where the decision is made,
+%% rather than in a helper every caller had to remember to use.
 maybe_replicate(StoreType, Key, Data, ConnPid, State) ->
     case i2p_floodfill:is_floodfill() of
         false ->
@@ -1171,12 +1524,13 @@ maybe_replicate(StoreType, Key, Data, ConnPid, State) ->
             ok
     end.
 
-replicate_if_new(StoreType, Key, Data, ConnPid, added, State) ->
-    maybe_replicate(StoreType, Key, Data, ConnPid, State);
-replicate_if_new(StoreType, Key, Data, ConnPid, updated, State) ->
-    maybe_replicate(StoreType, Key, Data, ConnPid, State);
-replicate_if_new(_StoreType, _Key, _Data, _ConnPid, _Outcome, _State) ->
-    ok.
+%% A RouterInfo the NetDb accepted, which also means we should be willing to
+%% dial it. `remember_ri/2` is the same list the seed set lives in.
+remember_ri_entry(RIBytes, State) ->
+    case i2p_router_info:decode(RIBytes) of
+        {ok, RI} -> remember_ri(RI, State);
+        {error, _} -> State
+    end.
 
 sender_hash(ConnPid, State) ->
     case conn_peer_hash(ConnPid, State) of
@@ -1240,13 +1594,26 @@ kick_floodfill_discovery(State) ->
     ),
     State.
 
-discovery_candidates(#{our_hash := OurHash, known := Known}) ->
+discovery_candidates(#{our_hash := OurHash, known := Known, seed_order := Seeds}) ->
     Floodfills = i2p_netdb_srv:closest_floodfills(OurHash, 3, [OurHash]),
     case Floodfills of
         [] ->
-            lists:sublist([Hash || #{hash := Hash, ri := RI} <- Known, dialable_ri(RI)], 3);
+            %% **`seed_order`, not `known`.** This is the fallback for a router
+            %% with no eligible floodfill in its NetDb, and the operator ranked
+            %% these seeds by putting them in that order. Iterating the map
+            %% instead would pick three at random, so `seed_order` is the
+            %% ranking and `known` is only consulted for the RouterInfo.
+            lists:sublist(
+                [Hash || Hash <- Seeds, dialable_in_known(Hash, Known)], 3
+            );
         _ ->
             Floodfills
+    end.
+
+dialable_in_known(Hash, Known) ->
+    case maps:find(Hash, Known) of
+        {ok, #{ri := RI}} -> dialable_ri(RI);
+        error -> false
     end.
 
 dialable_ri(RI) ->
@@ -1350,6 +1717,16 @@ enqueue_lookup(PeerHash, LookupType, State) ->
 %% pre-encoded `i2p_framing` block; SSU2 takes the message split into its
 %% type/msg-id/body components (the SSU2 session re-adds the 9-byte short
 %% header inside its own I2NP block).
+%%
+%% Neither transport's send makes this process wait, and that is the property
+%% this function is shaped around rather than a detail of it. This is a single
+%% `gen_server` through which every inbound message from every connection
+%% passes, so a send that blocked on one connection stopped I2NP for all of
+%% them. Both entries are casts now (`f:i2p_ntcp2_conn:send/2`,
+%% `f:i2p_ssu2_conn:send_i2np/4`), and a send to a connection that cannot take
+%% it is lost rather than waited on — which the monitor on every connection
+%% already turns into a disconnect and a backoff, the same recovery a failed
+%% connect gets. Nothing here branches on the result, because there is none.
 send_i2np(ConnPid, Transport, I2NPMsg) ->
     %% Stays a case: is_process_alive/1 is a BIF but not guard-legal.
     case is_process_alive(ConnPid) of
@@ -1404,28 +1781,90 @@ learn_ri(RI, State) ->
         Outcome when Outcome =:= added; Outcome =:= updated; Outcome =:= older ->
             remember_ri(RI, State);
         Refused ->
-            logger:warning(
+            %% Log-only. An out-of-band RouterInfo nobody asked for is not a
+            %% DatabaseStore on a pending lookup, so there is no lookup to fail and
+            %% nothing for `db_store_not_stored` to be about.
+            i2p_log:emit(
+                netdb_refused_routerinfo,
                 "netdb refused RouterInfo ~0p: ~0p",
                 [i2p_router_info:hash(RI), Refused]
             ),
             State
     end.
 
+%% A RouterInfo the NetDb accepted, which also means we should be willing to
+%% dial it. `remember_ri/2` is the same structure the seed set lives in.
+%%
+%% **Bounded, and keyed by hash.** Two reasons, and the second is the one that
+%% made it a map rather than a capped list:
+%%
+%% - every distinct RouterInfo the router accepts was retained for the life of
+%%   the process, at roughly the size of a RouterInfo each. Nothing ever
+%%   removed one, so this grew without limit on a router that is being fed
+%%   distinct RouterInfos;
+%% - and because it was a *list*, `known_hash/2` was `lists:any/2` over all of
+%%   it, on the dial path, per accepted RouterInfo and per dial decision. A cap
+%%   alone would have bounded the growth and left an O(n) scan behind.
+%%
+%% An existing entry is *not* re-inserted on a repeat RouterInfo, so a peer we
+%% already know does not get its place in the cap refreshed by a duplicate.
 remember_ri(RI, State = #{known := Known}) ->
     Hash = i2p_router_info:hash(RI),
-    case known_hash(Hash, Known) of
-        true -> State;
-        false -> State#{known := [#{ri => RI, hash => Hash} | Known]}
+    case maps:is_key(Hash, Known) of
+        true ->
+            State;
+        false ->
+            Known1 = trim_known(maps:put(Hash, #{ri => RI, hash => Hash}, Known)),
+            State#{known := Known1}
     end.
 
-known_hash(Hash, Known) ->
-    lists:any(fun(#{hash := H}) -> H =:= Hash end, Known).
+%% Enforce `?MAX_KNOWN` by dropping the stalest RouterInfo.
+%%
+%% **By publish time, which is the thing the entry actually stores.** A
+%% RouterInfo is republished rather than mutated, so its `published` field is
+%% both how fresh the knowledge is and the same measure `m:i2p_netdb` expires
+%% its own entries by. Evicting the stalest here keeps the two structures
+%% answering the same question the same way, and it needs no extra field and no
+%% second order to maintain.
+%%
+%% Not least-recently-dialed. That would need an order touched on the dial path,
+%% which is the path this change exists to keep cheap.
+trim_known(Known) when map_size(Known) =< ?MAX_KNOWN ->
+    Known;
+trim_known(Known) ->
+    ok = i2p_stats:add(known_evicted, 1),
+    maps:remove(oldest_known(Known), Known).
+
+%% The hash whose RouterInfo carries the earliest publish time.
+%%
+%% **A scan, and said so rather than hidden.** O(n) at the cap, run once per
+%% insert *past* the cap, so it amortises to nothing for a router sitting at its
+%% cap. An ordered map would make it O(1) and cost a structure maintained on the
+%% dial path; at ?MAX_KNOWN = 500 the scan is not what matters here, and if it
+%% ever becomes what matters that is a change to make against a measurement.
+oldest_known(Known) ->
+    Oldest = maps:fold(
+        fun(Hash, #{ri := RI}, Acc) ->
+            case Acc of
+                undefined ->
+                    {Hash, i2p_router_info:published(RI)};
+                {_H, Ts} ->
+                    case i2p_router_info:published(RI) < Ts of
+                        true -> {Hash, i2p_router_info:published(RI)};
+                        false -> Acc
+                    end
+            end
+        end,
+        undefined,
+        Known
+    ),
+    element(1, Oldest).
 
 find_peer_config(Hash, #{known := Known, peers := Peers}) ->
-    case [Config || #{hash := H} = Config <- Known, H =:= Hash] of
-        [Config | _] ->
+    case maps:find(Hash, Known) of
+        {ok, Config} ->
             Config;
-        [] ->
+        error ->
             case maps:find(Hash, Peers) of
                 {ok, #{config := Config}} -> Config;
                 error -> undefined
@@ -1438,9 +1877,13 @@ connect_to(RI, State) ->
         none ->
             case dialable_ri(RI) of
                 true ->
-                    Config = #{ri => RI, hash => Hash},
-                    Known = maps:get(known, State),
-                    maybe_connect(Hash, State#{known := [Config | Known]});
+                    %% `remember_ri/2` rather than a bare insert, so the entry goes
+                    %% through the `?MAX_KNOWN` bound like every other one. It was
+                    %% a raw `maps:put` shape once the list became a map, and a
+                    %% second write path around the bound is how a cap stops being
+                    %% a cap.
+                    State1 = remember_ri(RI, State),
+                    maybe_connect(Hash, State1);
                 false ->
                     State
             end;
@@ -1479,7 +1922,12 @@ enter_backoff(PeerHash, State) ->
     },
     i2p_peer_rep:connect_failed(PeerHash),
     _ = erlang:send_after(Backoff * 1000, self(), {retry_peer, PeerHash}),
-    put_peer(PeerHash, Updated, State).
+    %% The interval is returned as well as stored. It is the only figure that
+    %% distinguishes a peer being retried aggressively from one the router has
+    %% written off, and `f:handle_connect_failed/3` announces it. The other two
+    %% callers of this function are connection *drops*, not connect failures, and
+    %% are left to `peer_disconnected`.
+    {put_peer(PeerHash, Updated, State), Backoff}.
 
 calculate_backoff(Attempts) ->
     min(?MAX_BACKOFF_SECONDS, trunc(math:pow(2, Attempts))).
@@ -1544,9 +1992,43 @@ forward_to_tunnel(ConnPid, Msg, #{our_hash := OurHash} = _State) ->
     end.
 
 %% Queue a message to be sent once the peer connection becomes ready.
+%%
+%% **Bounded in depth, dropping the OLDEST.** Two properties, and the ordering is
+%% the one that is easy to get backwards:
+%%
+%% - `enqueue_send/3` prepends, so the head is the newest and the tail is the
+%%   oldest. A relay frame belongs to a tunnel, and a frame that has waited is
+%%   worth less than one that has not, so a full queue sheds its tail. Taking
+%%   the head instead would keep the frame that has been waiting longest and
+%%   deliver it in preference to a fresh one.
+%% - The cap is what stops a peer that never connects from accumulating; the age
+%%   in `f:sweep/1` is what stops the *capped* queue from being held for ever.
+%%   Neither alone is enough: a cap alone converts unbounded growth into a
+%%   bounded 64 KB per peer retained permanently, which is still a leak across
+%%   every dead peer the router ever learned.
+%%
+%% A refused frame is counted. A frame dropped for want of queue space is a
+%% different operator fact from one dropped for want of a route
+%% (`transit_frames_dropped_no_route` on #W46KMT8), and a queue that is silently
+%% truncating is exactly the kind of thing this board has twice found.
 enqueue_send(PeerHash, Msg, #{pending_sends := Pending} = State) ->
     Existing = maps:get(PeerHash, Pending, []),
-    State#{pending_sends := maps:put(PeerHash, [Msg | Existing], Pending)};
+    %% Stamped on the way in, because the age sweep has to distinguish a frame
+    %% queued a moment ago from one queued five minutes ago and the queue itself
+    %% carries no other time.
+    Stamped = {at, erlang:system_time(millisecond), Msg},
+    case length(Existing) >= ?MAX_PENDING_SENDS_PER_PEER of
+        true ->
+            ok = i2p_stats:add(pending_sends_dropped_depth, 1),
+            Trimmed = lists:sublist(Existing, ?MAX_PENDING_SENDS_PER_PEER - 1),
+            State#{
+                pending_sends := maps:put(
+                    PeerHash, [Stamped | Trimmed], Pending
+                )
+            };
+        false ->
+            State#{pending_sends := maps:put(PeerHash, [Stamped | Existing], Pending)}
+    end;
 enqueue_send(PeerHash, Msg, State) ->
     enqueue_send(PeerHash, Msg, State#{pending_sends => #{}}).
 
@@ -1554,8 +2036,11 @@ enqueue_send(PeerHash, Msg, State) ->
 send_pending_sends(ConnPid, Transport, PeerHash, #{pending_sends := Pending} = State) ->
     case maps:find(PeerHash, Pending) of
         {ok, Msgs} ->
+            %% Unwraps the `{at, _, _}` stamp and reverses, so a peer receives
+            %% its frames in the order they were queued rather than the order
+            %% they were enqueued.
             lists:foreach(
-                fun(Msg) -> send_i2np(ConnPid, Transport, Msg) end,
+                fun({_at, _Ts, Msg}) -> send_i2np(ConnPid, Transport, Msg) end,
                 lists:reverse(Msgs)
             ),
             State#{pending_sends := maps:remove(PeerHash, Pending)};

@@ -20,10 +20,25 @@ fetch_and_process_test() ->
         [i2p_router_info:hash(RI) || RI <- Decoded]
     ).
 
+%% Fallback across hosts: a dead one first, then a live one.
+%%
+%% **Order matters here and it is load-bearing.** `f:serve_su3/1` binds an ephemeral
+%% port and `f:dead_port/0` binds one and releases it, so asking for the dead port
+%% *first* leaves the OS free to hand that same number straight back to
+%% `f:serve_su3/1`. When it does, both URLs address the one-shot server: the first
+%% fetch consumes its single accept and the second gets nothing, so the case fails
+%% with `{error, no_router_infos}`.
+%%
+%% That is a flake, not a bug, and it is how this case failed roughly one run in
+%% three -- with a report naming reseed and pointing at the reseed parser. Starting
+%% the live server first and only then releasing a dead port removes it at the root:
+%% a port held by a live listener cannot be allocated again, so the two are
+%% guaranteed distinct.
 run_falls_back_to_next_host_test() ->
     Ris = [router_info(4702)],
-    DeadPort = dead_port(),
     LivePort = serve_su3(sign(Ris)),
+    DeadPort = dead_port(),
+    ?assertNotEqual(LivePort, DeadPort),
     {ok, [RI]} = i2p_reseed:run([url(DeadPort), url(LivePort)], trust()),
     ?assertEqual(i2p_router_info:hash(hd(Ris)), i2p_router_info:hash(RI)).
 
@@ -91,17 +106,10 @@ real_live_su3_bundle_test() ->
 %% Fixtures
 %% --------------------------------------------------------------------------
 
+%% Shared with the other reseed-shaped suites and generated once per run. See
+%% `i2p_ct_helpers:su3_keypair/0` for why the key is 4096 bits.
 keypair() ->
-    case persistent_term:get({?MODULE, keypair}, undefined) of
-        undefined ->
-            Priv = public_key:generate_key({rsa, 4096, 65537}),
-            #{cert := Cert} = public_key:pkix_test_root_cert("reseed-test", [{key, Priv}]),
-            Pair = {Priv, Cert},
-            persistent_term:put({?MODULE, keypair}, Pair),
-            Pair;
-        Pair ->
-            Pair
-    end.
+    i2p_ct_helpers:su3_keypair().
 
 trust() ->
     #{<<"test-signer">> => element(2, keypair())}.

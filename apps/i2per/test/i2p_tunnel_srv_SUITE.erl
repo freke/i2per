@@ -17,6 +17,9 @@
     build_pacing_limits_transit_acceptance/1,
     transit_bandwidth_unlimited_by_default/1,
     transit_bandwidth_drops_over_budget_frames/1,
+    transit_bytes_counted_per_carried_frame/1,
+    tunnel_outcome_counted_with_and_without_a_consumer/1,
+    transit_bytes_counted_when_budget_allows_every_frame/1,
     stb_endpoint_role_accepted/1,
     stb_unaddressed_dropped/1,
     inbound_build_roundtrip/1,
@@ -41,7 +44,14 @@
     e2e_garlic_delivered_to_stream_session/1,
     send_via_outbound_roundtrip_single/1,
     send_via_outbound_roundtrip_multi/1,
+    transit_denial_reports_capacity/1,
+    transit_denial_reports_duplicate_receive_id/1,
+    transit_denial_reports_build_budget_drained/1,
+    transit_acceptance_announces_no_denial/1,
     publish_lease_stores_ls/1,
+    leaseset_publish_with_no_floodfill_reports_failure/1,
+    leaseset_publish_with_no_inbound_tunnel_reports_failure/1,
+    pending_publication_is_announced_once/1,
     publish_retries_on_pool_tick/1,
     publish_prefers_demanded_length/1
 ]).
@@ -57,6 +67,9 @@ all() ->
         build_pacing_limits_transit_acceptance,
         transit_bandwidth_unlimited_by_default,
         transit_bandwidth_drops_over_budget_frames,
+        transit_bytes_counted_per_carried_frame,
+        transit_bytes_counted_when_budget_allows_every_frame,
+        tunnel_outcome_counted_with_and_without_a_consumer,
         stb_endpoint_role_accepted,
         stb_unaddressed_dropped,
         inbound_build_roundtrip,
@@ -81,7 +94,14 @@ all() ->
         e2e_garlic_delivered_to_stream_session,
         send_via_outbound_roundtrip_single,
         send_via_outbound_roundtrip_multi,
+        transit_denial_reports_capacity,
+        transit_denial_reports_duplicate_receive_id,
+        transit_denial_reports_build_budget_drained,
+        transit_acceptance_announces_no_denial,
         publish_lease_stores_ls,
+        leaseset_publish_with_no_floodfill_reports_failure,
+        leaseset_publish_with_no_inbound_tunnel_reports_failure,
+        pending_publication_is_announced_once,
         publish_retries_on_pool_tick,
         publish_prefers_demanded_length
     ].
@@ -94,6 +114,7 @@ end_per_testcase(_Case, _Config) ->
     application:unset_env(?APP, transit_bandwidth_kbps),
     application:unset_env(?APP, i2p_peer),
     application:unset_env(?APP, tunnel_pool),
+    application:unset_env(?APP, transit_max_tunnels),
     %% sup_wiring stops and restarts the app within its own case; when it
     %% leaves the app down, stopping again here is already-done, not an error.
     case application:stop(?APP) of
@@ -257,6 +278,225 @@ transit_bandwidth_drops_over_budget_frames(_Config) ->
         unregister_peer(),
         stop_tunnel_srv(Pid)
     end.
+
+%%%%%%%%% Transit bytes: counted per frame actually carried %%%%%%%%%
+
+%% What is counted is the **wire** figure, and the reason is not an
+%% approximation. A transit hop never decrypts tunnel data, so the payload inside
+%% the frame belongs to two parties who are not this router and who have never
+%% told it what is in there. The honest number is what crossed the relay: the
+%% full 1028-byte tunnel-data frame, most of which is a tunnel id, an IV and a
+%% layered cipher. These figures are therefore an upper bound on client traffic
+%% carried, and are deliberately not comparable with the transport-boundary byte
+%% counters, which do measure real framing.
+%%
+%% The interesting assertion is the one about the frame that was **refused**.
+%% With a 1 kbit/s budget only three of four delivered frames fit, and the
+%% outbound total is checked against the bytes that actually appeared on the
+%% wire — captured from the mock peer, not from the counter. So a charge for the
+%% refused frame would make the counter exceed the wire, and a charge for nothing
+%% at all would make it fall short. Both fail.
+transit_bytes_counted_per_carried_frame(_Config) ->
+    ok = application:set_env(?APP, transit_bandwidth_kbps, 1),
+    [Router, Next] = [make_router() || _ <- lists:seq(1, 2)],
+    lists:foreach(
+        fun(R) -> store_netdb(maps:get(ri, R)) end,
+        [Router, Next]
+    ),
+    {Pid, _Local} = start_tunnel_srv(Router),
+    TestPid = self(),
+    try
+        ok = create_transit_entry(Router, Next, 930),
+        MockPeer = spawn(fun() -> mock_peer_loop(TestPid) end),
+        true = register(i2p_peer, MockPeer),
+        #{transit_bytes_in := In0, transit_bytes_out := Out0} = i2p_stats:snapshot(),
+
+        lists:foreach(
+            fun(I) -> deliver_transit_frame(930, I) end,
+            lists:seq(1, 4)
+        ),
+        Wires = receive_frames(3, []),
+        OnWire = lists:sum([byte_size(W) || W <- Wires]),
+
+        %% What left the router is what left the router.
+        ?assertEqual(OnWire, maps:get(transit_bytes_out, i2p_stats:snapshot()) - Out0),
+        %% A transit hop does not alter the body, so carried in equals carried
+        %% out, frame for frame.
+        ?assertEqual(
+            maps:get(transit_bytes_out, i2p_stats:snapshot()) - Out0,
+            maps:get(transit_bytes_in, i2p_stats:snapshot()) - In0
+        ),
+        %% And it is the wire frame, not the payload inside it. Three frames at
+        %% the tunnel-data frame size; a fourth would mean the refused frame was
+        %% charged, and a payload-sized figure would mean we had somehow measured
+        %% what we cannot decrypt.
+        ?assertEqual(3 * 1028, OnWire),
+        ?assertEqual(1028, byte_size(hd(Wires)))
+    after
+        unregister_peer(),
+        stop_tunnel_srv(Pid)
+    end.
+
+%% The same thing with the budget wide open, so the figure tracks the number of
+%% frames carried rather than being a constant the over-budget case happens to
+%% agree with. Four in, four counted, in each direction.
+transit_bytes_counted_when_budget_allows_every_frame(_Config) ->
+    application:unset_env(?APP, transit_bandwidth_kbps),
+    [Router, Next] = [make_router() || _ <- lists:seq(1, 2)],
+    lists:foreach(
+        fun(R) -> store_netdb(maps:get(ri, R)) end,
+        [Router, Next]
+    ),
+    {Pid, _Local} = start_tunnel_srv(Router),
+    TestPid = self(),
+    try
+        ok = create_transit_entry(Router, Next, 931),
+        MockPeer = spawn(fun() -> mock_peer_loop(TestPid) end),
+        true = register(i2p_peer, MockPeer),
+        #{transit_bytes_in := In0, transit_bytes_out := Out0} = i2p_stats:snapshot(),
+
+        N = 4,
+        lists:foreach(
+            fun(I) -> deliver_transit_frame(931, I) end,
+            lists:seq(1, N)
+        ),
+        Wires = receive_frames(N, []),
+        ?assertEqual(N * 1028, maps:get(transit_bytes_out, i2p_stats:snapshot()) - Out0),
+        ?assertEqual(N * 1028, maps:get(transit_bytes_in, i2p_stats:snapshot()) - In0),
+        ?assertEqual(N * 1028, lists:sum([byte_size(W) || W <- Wires]))
+    after
+        unregister_peer(),
+        stop_tunnel_srv(Pid)
+    end.
+
+%%%%%%%%% Tunnel lifecycle counters %%%%%%%%%
+
+%% The defect this exists to close: the only tunnel tallies in the tree used to
+%% live in the separate status application, zero-initialised when it started. So
+%% the success ratio was answerable only from the moment something attached to
+%% watch — a router nobody watched reported no builds at all, and one watched for
+%% an hour reported an hour rather than its lifetime.
+%%
+%% So the same build is driven twice and the two deltas compared. **Not** a
+%% comparison against a magic number: whatever the build path counts internally,
+%% it counts identically whether a consumer is attached or not, and that equality
+%% is the property. It is also exact — both runs do the same work, so there is
+%% nothing to tolerate.
+%%
+%% The "without" half is the regression, and it is the *default* state: no
+%% `gen_event` handler is installed on the bus at all when the first build runs.
+tunnel_outcome_counted_with_and_without_a_consumer(_Config) ->
+    [Local | Hops] = [make_router() || _ <- lists:seq(1, 4)],
+    lists:foreach(
+        fun(R) -> store_netdb(maps:get(ri, R)) end,
+        [Local | Hops]
+    ),
+    {Pid, _Local} = start_tunnel_srv(Local),
+    %% The bus really is bare for the first half, and that is load-bearing rather
+    %% than tidiness. An earlier version of this case compared a run with a
+    %% collector against a run without *one of its own*, and a leftover
+    %% `i2p_events_forward` from an earlier suite was installed on the bus the
+    %% whole time — so both halves had a handler and the comparison could not have
+    %% told a core-owned counter from a subscriber-owned one. That is exactly the
+    %% distinction under test.
+    %%
+    %% Clearing the bus is safe here because no suite relies on inheriting a
+    %% handler: every consumer in the test tree installs its own, and the ones
+    %% left behind are the accident this is removing for the length of the case.
+    ok = clear_event_handlers(),
+    try
+        Without = drive_one_build(Local, Hops),
+
+        ok = gen_event:add_handler(i2p_events, i2p_events_tests_collector, [self()]),
+        try
+            With = drive_one_build(Local, Hops),
+            %% Identical. Whatever the build path counts internally, it counts the
+            %% same with a consumer attached and with none. Also exact: both runs
+            %% do the same work, so there is nothing to tolerate.
+            ?assertEqual(Without, With),
+            %% And the figure is not the "nothing happened" answer, so the
+            %% equality above is not two zeroes.
+            ?assert(maps:get(tunnels_built_outbound, With) >= 1),
+            ?assert(maps:get(tunnels_built_inbound, With) >= 1)
+        after
+            _ = gen_event:delete_handler(i2p_events, i2p_events_tests_collector, [])
+        end
+    after
+        %% Same teardown the neighbouring build cases use, and for the same
+        %% reason: the mock peer registered for a build is process state that
+        %% outlives the case unless it is explicitly removed, and a case that
+        %% leaves it behind breaks the next one that registers its own.
+        unregister_peer(),
+        stop_tunnel_srv(Pid)
+    end.
+
+%% Remove every handler currently on the bus. Used by the case above to reach a
+%% genuinely unobserved state.
+%% Event observation for this suite, via `f:i2p_ct_helpers:events_from/1`.
+%%
+%% That helper waits for a *known* event to come back from the bus before it drains,
+%% rather than draining on a zero timeout. The first version of this suite's own
+%% helper did drain on a zero timeout, on the reasoning that the
+%% `i2p_tunnel_srv:status()` call at the end of `deliver_stbs/3` was a barrier --
+%% and it was not. `i2p_events:notify/1` returns as soon as `gen_event` has
+%% *queued* the event; the handler is called afterwards, in the manager's own
+%% process. A status call on the tunnel server orders the announce against the
+%% server, not against the manager, so the message may not have been sent yet.
+%% The suite passed three runs in a row, which is exactly what a race does.
+%%
+%% Only the denials are filtered by the cases, so an assertion is about the thing
+%% under test and not about whatever else the build path announces.
+with_events(Fun) ->
+    i2p_ct_helpers:events_from(Fun).
+
+denials(Events) -> [E || E = {transit_denied, _, _} <- Events].
+
+publish_failures(Events) -> [E || E = {leaseset_publish_failed, _, _} <- Events].
+
+%% Deliver one STB per receive ID. `build_transit_stb/3` claims the receive ID
+%% from `Base`, so repeating a `Base` is what produces a duplicate.
+deliver_stbs(OurRouter, HopRouters, Bases) ->
+    lists:foreach(
+        fun(Base) ->
+            Stb = build_transit_stb(OurRouter, HopRouters, Base),
+            i2p_tunnel_srv !
+                {i2np, self(), crypto:strong_rand_bytes(32), Stb#{
+                    msg_id := crypto:strong_rand_bytes(4)
+                }}
+        end,
+        Bases
+    ),
+    %% Every STB was sent to the server before this call, and messages from one
+    %% process to another arrive in order, so by the time it returns every record
+    %% has been decided. What it does *not* establish is delivery to this mailbox;
+    %% `with_events/1` waits for that.
+    _ = i2p_tunnel_srv:status().
+
+clear_event_handlers() ->
+    lists:foreach(
+        fun(Handler) ->
+            _ = gen_event:delete_handler(i2p_events, Handler, [])
+        end,
+        gen_event:which_handlers(i2p_events)
+    ).
+
+%% Build one inbound and one outbound tunnel over `Hops`, and return the movement
+%% in every tunnel counter. Counting is at the point the build succeeds, so the
+%% delta is the build's own — and it is read after both builds have been consumed
+%% from the tunnel server, which is the barrier.
+drive_one_build(Local, Hops) ->
+    Before = tunnel_counters(),
+    Inbound = build_an_inbound(Local, Hops),
+    _ = build_an_outbound(Hops, Inbound),
+    After = tunnel_counters(),
+    maps:map(fun(_K, V) -> V - maps:get(_K, Before, 0) end, After).
+
+tunnel_counters() ->
+    Snap = i2p_stats:snapshot(),
+    maps:with(
+        [K || K <- maps:keys(Snap), lists:prefix("tunnels_", atom_to_list(K))],
+        Snap
+    ).
 
 %%%%%%%%% Endpoint roles are accepted; reply rides the record's path %%%%%%%%%
 
@@ -1565,11 +1805,237 @@ build_an_outbound(Hops, Inbound) ->
     #{tunnels := Tunnels} = i2p_tunnel_srv:status(),
     #{tun_id => FirstTunID, entry => maps:get(FirstTunID, Tunnels), hop_keys => HopKeys}.
 
+%%%%%%%%% Transit denials are reported, with the reason %%%%%%%%%
+
+%% A full transit pool. `transit_max_tunnels` is 1, so the second build record
+%% is refused on capacity. Before this the decision was a bare ret 30 sealed into
+%% the record: correct on the wire, and invisible everywhere else, so a router that
+%% was refusing every transit tunnel looked exactly like one nobody was asking.
+transit_denial_reports_capacity(_Config) ->
+    ok = application:set_env(?APP, transit_max_tunnels, 1),
+    [OurRouter | HopRouters] = [make_router() || _ <- lists:seq(1, 3)],
+    lists:foreach(
+        fun(R) -> store_netdb(maps:get(ri, R)) end,
+        [OurRouter | HopRouters]
+    ),
+    {Pid, _Local} = start_tunnel_srv(OurRouter),
+    try
+        Events = with_events(
+            fun() ->
+                deliver_stbs(OurRouter, HopRouters, [600, 610])
+            end
+        ),
+        ?assertEqual([{transit_denied, 610, capacity}], denials(Events))
+    after
+        stop_tunnel_srv(Pid)
+    end.
+
+%% The receive ID is already in the transit map. This is a different operator
+%% problem from capacity -- the creator is retrying into a tunnel it already
+%% holds, and no amount of raising the cap helps -- which is exactly why the two
+%% were separated rather than both reported as "denied".
+transit_denial_reports_duplicate_receive_id(_Config) ->
+    [OurRouter | HopRouters] = [make_router() || _ <- lists:seq(1, 3)],
+    lists:foreach(
+        fun(R) -> store_netdb(maps:get(ri, R)) end,
+        [OurRouter | HopRouters]
+    ),
+    {Pid, _Local} = start_tunnel_srv(OurRouter),
+    try
+        Events = with_events(
+            fun() ->
+                deliver_stbs(OurRouter, HopRouters, [620, 620])
+            end
+        ),
+        ?assertEqual([{transit_denied, 620, duplicate_receive_id}], denials(Events)),
+        %% And the first copy really was accepted, so the second was refused for
+        %% being a duplicate rather than both being refused for some other reason.
+        #{transit := Transit} = i2p_tunnel_srv:status(),
+        ?assertEqual([620], maps:keys(Transit))
+    after
+        stop_tunnel_srv(Pid)
+    end.
+
+%% The build-pacing budget is drained. A rate-limit decision, not a refusal on the
+%% merits, and the one reason an operator can act on by raising `tunnel_build_rate`.
+%%
+%% Five records, because a bucket holds four seconds' worth of tokens (see
+%% `m:i2p_tunnel_srv:init_bucket/2`) — the same arithmetic the neighbouring
+%% `build_pacing_limits_transit_acceptance/1` case depends on. Four are accepted and
+%% the fifth is the denial; the earlier four appearing in `transit_status/0` is what
+%% shows the denial was the budget and not something else about the fifth record.
+transit_denial_reports_build_budget_drained(_Config) ->
+    ok = application:set_env(?APP, tunnel_build_rate, 1),
+    [OurRouter | HopRouters] = [make_router() || _ <- lists:seq(1, 3)],
+    lists:foreach(
+        fun(R) -> store_netdb(maps:get(ri, R)) end,
+        [OurRouter | HopRouters]
+    ),
+    {Pid, _Local} = start_tunnel_srv(OurRouter),
+    try
+        Bases = [630, 640, 650, 660, 670],
+        Events = with_events(
+            fun() ->
+                deliver_stbs(OurRouter, HopRouters, Bases)
+            end
+        ),
+        ?assertEqual([{transit_denied, 670, build_budget_drained}], denials(Events)),
+        #{transit := Transit} = i2p_tunnel_srv:status(),
+        ?assertEqual([630, 640, 650, 660], lists:sort(maps:keys(Transit)))
+    after
+        stop_tunnel_srv(Pid)
+    end.
+
+%% An accepted record announces nothing. The three cases above would all still pass
+%% if the event were moved onto the common path, and a bus that announced a denial
+%% for every tunnel it accepted would be worse than no event at all.
+transit_acceptance_announces_no_denial(_Config) ->
+    [OurRouter | HopRouters] = [make_router() || _ <- lists:seq(1, 3)],
+    lists:foreach(
+        fun(R) -> store_netdb(maps:get(ri, R)) end,
+        [OurRouter | HopRouters]
+    ),
+    {Pid, _Local} = start_tunnel_srv(OurRouter),
+    try
+        Events = with_events(
+            fun() ->
+                deliver_stbs(OurRouter, HopRouters, [650])
+            end
+        ),
+        ?assertEqual([], denials(Events)),
+        #{transit := Transit} = i2p_tunnel_srv:status(),
+        ?assert(maps:is_key(650, Transit))
+    after
+        unregister_peer(),
+        stop_tunnel_srv(Pid)
+    end.
+
+%%%%%%%%% LeaseSet publication failures are reported %%%%%%%%%
+
+%% The case that was silently wrong. The NetDb holds no floodfill, so the LeaseSet
+%% is signed and stored locally and then handed to nobody. `leaseset_published`
+%% used to be announced on that path unconditionally, so a router that had not yet
+%% learned a floodfill reported every client lease as published while being
+%% unreachable to the entire network.
 %%%%%%%%% Client LeaseSet publication %%%%%%%%%
 
 %% Publishing records a LeaseSet2 in the NetDb whose lease points at the
 %% freshly activated inbound tunnel's gateway and receive ID, then sends the
 %% LeaseSet2 DatabaseStore to an eligible floodfill.
+%%
+%% The three cases after `publish_lease_stores_ls/1` cover the paths where that
+%% does not happen.
+%%%%%%%%% LeaseSet publication failures are reported %%%%%%%%%
+
+leaseset_publish_with_no_floodfill_reports_failure(_Config) ->
+    [Local | Hops] = [make_router() || _ <- lists:seq(1, 4)],
+    lists:foreach(
+        fun(R) -> store_netdb(maps:get(ri, R)) end,
+        [Local | Hops]
+    ),
+    {Pid, _Local} = start_tunnel_srv(Local),
+    try
+        _Inbound = build_an_inbound(Local, Hops),
+        #{identity := Id, sign_priv := Seed} = i2p_keys:generate_with_privkeys(),
+        DestHash = i2p_keys:hash(Id),
+        Events = with_events(
+            fun() ->
+                ok = i2p_tunnel_srv:publish_lease_set(Id, Seed),
+                %% The status call is the barrier: the publish cast was sent before
+                %% it, and the announcement happens inside the cast's handler, so by
+                %% the time this returns the event is already in this mailbox.
+                _ = i2p_tunnel_srv:status()
+            end
+        ),
+        ?assertEqual(
+            [{leaseset_publish_failed, DestHash, no_floodfill_targets}],
+            publish_failures(Events)
+        ),
+        %% And the success event did not fire. This is the assertion that was
+        %% impossible to write before, because the success event was on the same
+        %% clause as the attempt and fired either way.
+        ?assertEqual([], [E || E = {leaseset_published, _} <- Events]),
+        unregister_peer()
+    after
+        unregister_peer(),
+        stop_tunnel_srv(Pid)
+    end.
+
+%% A client with no inbound tunnel has no gateway to point a lease at. This is the
+%% most common way a lease never goes out, and before this it left no trace
+%% anywhere: the destination sat in the published map with `until_sec => 0` and
+%% nothing said why.
+leaseset_publish_with_no_inbound_tunnel_reports_failure(_Config) ->
+    [Local | _Hops] = [make_router() || _ <- lists:seq(1, 2)],
+    lists:foreach(
+        fun(R) -> store_netdb(maps:get(ri, R)) end,
+        [Local | _Hops]
+    ),
+    {Pid, _Local} = start_tunnel_srv(Local),
+    try
+        #{identity := Id, sign_priv := Seed} = i2p_keys:generate_with_privkeys(),
+        DestHash = i2p_keys:hash(Id),
+        Events = with_events(
+            fun() ->
+                ok = i2p_tunnel_srv:publish_lease_set(Id, Seed),
+                _ = i2p_tunnel_srv:status()
+            end
+        ),
+        ?assertEqual(
+            [{leaseset_publish_failed, DestHash, no_inbound_tunnel}],
+            publish_failures(Events)
+        ),
+        %% The destination is still recorded, so the pool tick retries it.
+        ?assertEqual([], [E || E = {leaseset_published, _} <- Events])
+    after
+        unregister_peer(),
+        stop_tunnel_srv(Pid)
+    end.
+
+%% The pool tick retries a pending publication about every 30 seconds, forever.
+%% Re-announcing the same unresolved condition on each retry would be a periodic
+%% flood of something that has not changed, so the retry is silent and the first
+%% attempt is the only report.
+pending_publication_is_announced_once(_Config) ->
+    [Local | Hops] = [make_router() || _ <- lists:seq(1, 4)],
+    lists:foreach(
+        fun(R) -> store_netdb(maps:get(ri, R)) end,
+        [Local | Hops]
+    ),
+    {Pid, _Local} = start_tunnel_srv(Local),
+    try
+        #{identity := Id, sign_priv := Seed} = i2p_keys:generate_with_privkeys(),
+        DestHash = i2p_keys:hash(Id),
+        First = with_events(
+            fun() ->
+                ok = i2p_tunnel_srv:publish_lease_set(Id, Seed),
+                _ = i2p_tunnel_srv:status()
+            end
+        ),
+        ?assertEqual(
+            [{leaseset_publish_failed, DestHash, no_inbound_tunnel}],
+            publish_failures(First)
+        ),
+        %% The retry, which is the pool tick doing its job. Silent.
+        Later = with_events(
+            fun() ->
+                i2p_tunnel_srv ! pool_tick,
+                _ = i2p_tunnel_srv:status()
+            end
+        ),
+        ?assertEqual([], publish_failures(Later)),
+        %% And the destination is still outstanding rather than dropped, which is
+        %% what makes the retry meaningful. `status/0` does not expose the
+        %% published map, so this is observed the way an operator would see it: the
+        %% LeaseSet is still nowhere to be found, and the neighbouring
+        %% `publish_retries_on_pool_tick/1` case shows it appears once a tunnel does.
+        ?assertEqual(not_found, i2p_netdb_srv:find_ls(DestHash)),
+        unregister_peer()
+    after
+        unregister_peer(),
+        stop_tunnel_srv(Pid)
+    end.
+
 publish_lease_stores_ls(_Config) ->
     [Local | Hops] = [make_router() || _ <- lists:seq(1, 4)],
     lists:foreach(

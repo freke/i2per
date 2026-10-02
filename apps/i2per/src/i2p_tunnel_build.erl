@@ -460,18 +460,18 @@ finish_build(Build, Records, State) ->
                         built_at => erlang:system_time(second)
                     },
                     FirstTunID = hd(maps:get(tunnel_ids, Build)),
-                    i2p_events:notify(
-                        {tunnel_built, outbound, length(maps:get(router_hashes, Build))}
+                    i2p_tunnel_outcome:built(
+                        outbound, length(maps:get(router_hashes, Build))
                     ),
                     State#{PoolMapKey := maps:put(FirstTunID, Entry, PoolMap)};
                 false ->
                     %% At least one hop rejected or dropped silently; the
                     %% tunnel is unusable — drop the whole build.
-                    i2p_events:notify({tunnel_failed, outbound, rejected}),
+                    i2p_tunnel_outcome:failed(outbound, rejected),
                     State
             end;
         error ->
-            i2p_events:notify({tunnel_failed, outbound, invalid}),
+            i2p_tunnel_outcome:failed(outbound, invalid),
             State
     end.
 
@@ -522,7 +522,7 @@ finish_inbound(Build, Records, State) ->
     NumReal = length(HopKeys),
     case process_inbound_records(Records, NumReal, HopKeys, Local) of
         error ->
-            i2p_events:notify({tunnel_failed, inbound, invalid}),
+            i2p_tunnel_outcome:failed(inbound, invalid),
             State;
         ok ->
             OurRecvID = lists:last(maps:get(tunnel_ids, Build)),
@@ -537,7 +537,7 @@ finish_inbound(Build, Records, State) ->
                 frag_map => #{},
                 built_at => erlang:system_time(second)
             },
-            i2p_events:notify({tunnel_built, inbound, NumReal}),
+            i2p_tunnel_outcome:built(inbound, NumReal),
             State#{PoolMapKey := maps:put(OurRecvID, Entry, PoolMap)}
     end.
 
