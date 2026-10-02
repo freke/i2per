@@ -28,6 +28,14 @@ Tests for the transit relay's per-frame RouterInfo existence check.
 %% The property, asserted rather than asserted-about: while relaying frames the
 %% calling process makes no *blocking* call into the NetDb.
 %%
+%% **The `after` clause is load-bearing, and it is here because this case can
+%% contaminate every module that runs after it.** `f:start_tracing/0` enables two
+%% `erlang:trace_pattern/3` match specs -- which are **global**, not per-process --
+%% and attaches a tracer to whichever process calls it, which under eunit is a
+%% worker shared by the whole tier. `f:collect_calls/1` disables them, but only if
+%% `send_frames/2` returns. So a case that leaks is a case that leaks *only when it
+%% fails*, and a suite run green cannot see it. See `f:stop_tracing/1`.
+%%
 %% **The distinction is the claim, so the trace has to distinguish it.** The
 %% relay does call `i2p_netdb_srv:has_router/1` once per frame -- that is how it
 %% decides whether it can route -- but `has_router/1` is a direct
@@ -45,12 +53,16 @@ relay_path_makes_no_blocking_call_per_frame_test() ->
     with_netdb(
         fun(Held, Missing) ->
             Traced = start_tracing(),
-            send_frames(Held, ?FRAMES),
-            send_frames(Missing, ?FRAMES),
-            All = collect_calls(Traced),
-            ?assertEqual(
-                [], blocking_calls(All) ++ gen_server_calls(All)
-            )
+            try
+                send_frames(Held, ?FRAMES),
+                send_frames(Missing, ?FRAMES),
+                All = collect_calls(Traced),
+                ?assertEqual(
+                    [], blocking_calls(All) ++ gen_server_calls(All)
+                )
+            after
+                stop_tracing(Traced)
+            end
         end
     ).
 
@@ -201,10 +213,11 @@ start_tracing() ->
     %% it blocks, rather than requiring a list of every wrapper that is a
     %% `gen_server:call` in disguise.
     _ = erlang:trace_pattern({gen_server, call, '_'}, true, [local]),
-    %% `spawn_link`, so the collector cannot outlive the case even if the case
-    %% dies before `f:collect_calls/1` runs. A tracer left running would keep
-    %% receiving trace messages for a trace that is off, and would be a process
-    %% the shared eunit worker is linked to.
+    %% `spawn_link`, as a last resort and **not** as the safety net it looks like:
+    %% eunit **catches** a failed assertion, so the worker does not exit and the
+    %% link does not fire. The collector is stopped explicitly instead, in an
+    %% `after` clause -- see `f:stop_tracing/1`. What this link does still cover is
+    %% the worker itself being killed.
     Tracer = spawn_link(fun() -> tracer_loop([]) end),
     _ = erlang:trace(self(), true, [call, {tracer, Tracer}]),
     {self(), Tracer}.
@@ -240,3 +253,39 @@ collect_calls({Me, Tracer}) ->
     after 1000 ->
         erlang:error(timeout_collecting_traced_calls)
     end.
+
+%% Everything `f:start_tracing/0` turned on, turned off -- and the collector stopped.
+%%
+%% **This is the teardown, and it is in an `after` clause because
+%% `f:collect_calls/1` cannot be one.** `collect_calls/1` does disable the tracing,
+%% but it is reached only if `send_frames/2` returns, and `send_frames/2` is
+%% `ok = i2p_tunnel_relay:send_tunnel_data(...)`, which raises on a badmatch. On
+%% that path two things used to survive the case and contaminate whatever ran next:
+%%
+%% - **the two `trace_pattern`s, which are global.** They are not scoped to the
+%%   traced process, so leaving them enabled has every traced process in the VM
+%%   reporting `i2p_netdb_srv` calls and `gen_server:call` calls.
+%% - **the tracer on the shared eunit worker.** A process carries at most one
+%%   tracer, so the next module to trace that worker gets `badarg`, *can only have
+%%   one tracer per process*.
+%%
+%% The second is the failure this module's tracer comment describes as the reason
+%% for naming the tracer explicitly at all, arriving by the other door. And it is
+%% invisible in the passing direction, which is what makes it worth a clause rather
+%% than a code path: a case that only leaks when it fails cannot be caught by
+%% running the suite green.
+%%
+%% **Idempotent on purpose.** A passing case has already disabled everything by the
+%% time it reaches here, and disabling twice is a no-op rather than an error. That is
+%% what lets one clause serve both paths instead of needing to know which one it is.
+%%
+%% `unlink` before the kill, because a collector killed while still linked takes
+%% the worker with it -- the same reason `f:with_netdb/1` drops its link before
+%% tearing its fixture down.
+stop_tracing({Me, Tracer}) ->
+    _ = erlang:trace(Me, false, [call]),
+    _ = erlang:trace_pattern({i2p_netdb_srv, '_', '_'}, false, [local]),
+    _ = erlang:trace_pattern({gen_server, call, '_'}, false, [local]),
+    unlink(Tracer),
+    exit(Tracer, kill),
+    ok.
