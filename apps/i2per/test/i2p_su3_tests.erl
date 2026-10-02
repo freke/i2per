@@ -10,7 +10,10 @@
 %% Round-trip
 %% --------------------------------------------------------------------------
 
-round_trip_test() ->
+round_trip_test_() ->
+    {timeout, 60, fun round_trip/0}.
+
+round_trip() ->
     {Priv, Cert} = keypair(),
     Content = crypto:strong_rand_bytes(1024),
     Bin = i2p_su3:encode(<<"1789000000">>, <<"alice@mail.i2p">>, Content, Priv),
@@ -22,7 +25,10 @@ round_trip_test() ->
     ?assertEqual(Content, i2p_su3:content(Su3)),
     ?assertEqual(ok, i2p_su3:verify(Su3, Cert)).
 
-long_version_not_padded_test() ->
+long_version_not_padded_test_() ->
+    {timeout, 60, fun long_version_not_padded/0}.
+
+long_version_not_padded() ->
     %% A version already >= 16 bytes must be carried verbatim.
     {Priv, Cert} = keypair(),
     Version = binary:copy(<<"v">>, 20),
@@ -41,7 +47,10 @@ long_version_not_padded_test() ->
 %% guard. A 1024-bit key always yields a signature of at most 128 bytes, which
 %% makes the short-signature path deterministic.
 
-short_signature_padded_to_declared_length_test() ->
+short_signature_padded_to_declared_length_test_() ->
+    {timeout, 60, fun short_signature_padded_to_declared_length/0}.
+
+short_signature_padded_to_declared_length() ->
     Priv = public_key:generate_key({rsa, 1024, 65537}),
     Content = crypto:strong_rand_bytes(1024),
     Bin = i2p_su3:encode(<<"1789000000">>, <<"alice@mail.i2p">>, Content, Priv),
@@ -49,7 +58,10 @@ short_signature_padded_to_declared_length_test() ->
     {ok, Su3} = i2p_su3:decode(Bin),
     ?assertEqual(Content, i2p_su3:content(Su3)).
 
-short_signature_verifies_test() ->
+short_signature_verifies_test_() ->
+    {timeout, 60, fun short_signature_verifies/0}.
+
+short_signature_verifies() ->
     Priv = public_key:generate_key({rsa, 1024, 65537}),
     #{cert := Cert} = public_key:pkix_test_root_cert("su3-short", [{key, Priv}]),
     Content = crypto:strong_rand_bytes(1024),
@@ -62,7 +74,10 @@ short_signature_verifies_test() ->
 %% Signature failures
 %% --------------------------------------------------------------------------
 
-tampered_content_rejected_test() ->
+tampered_content_rejected_test_() ->
+    {timeout, 60, fun tampered_content_rejected/0}.
+
+tampered_content_rejected() ->
     {Priv, Cert} = keypair(),
     Bin0 = i2p_su3:encode(<<"1789000000">>, <<"s">>, <<"payload">>, Priv),
     BodyLen = byte_size(Bin0) - 512,
@@ -72,7 +87,10 @@ tampered_content_rejected_test() ->
     {ok, Su3} = i2p_su3:decode(Tampered),
     ?assertEqual({error, bad_signature}, i2p_su3:verify(Su3, Cert)).
 
-tampered_signature_rejected_test() ->
+tampered_signature_rejected_test_() ->
+    {timeout, 60, fun tampered_signature_rejected/0}.
+
+tampered_signature_rejected() ->
     {Priv, Cert} = keypair(),
     Bin0 = i2p_su3:encode(<<"1789000000">>, <<"s">>, <<"payload">>, Priv),
     BodyLen = byte_size(Bin0) - 512,
@@ -81,7 +99,10 @@ tampered_signature_rejected_test() ->
     {ok, Su3} = i2p_su3:decode(Tampered),
     ?assertEqual({error, bad_signature}, i2p_su3:verify(Su3, Cert)).
 
-wrong_certificate_rejected_test() ->
+wrong_certificate_rejected_test_() ->
+    {timeout, 60, fun wrong_certificate_rejected/0}.
+
+wrong_certificate_rejected() ->
     {Priv, _Cert} = keypair(),
     {_OtherPriv, OtherCert} = other_keypair(),
     Bin = i2p_su3:encode(<<"1789000000">>, <<"s">>, <<"x">>, Priv),
@@ -92,21 +113,33 @@ wrong_certificate_rejected_test() ->
 %% Header rejections
 %% --------------------------------------------------------------------------
 
-truncated_header_rejected_test() ->
+truncated_header_rejected_test_() ->
+    {timeout, 60, fun truncated_header_rejected/0}.
+
+truncated_header_rejected() ->
     ?assertEqual({error, truncated_header}, i2p_su3:decode(binary:part(i2psu3(), 39, 1))).
 
-bad_magic_rejected_test() ->
+bad_magic_rejected_test_() ->
+    {timeout, 60, fun bad_magic_rejected/0}.
+
+bad_magic_rejected() ->
     BadMagic = <<"SU3!">>,
     ?assertEqual(
         {error, bad_magic},
         i2p_su3:decode(<<BadMagic/binary, 0:288>>)
     ).
 
-bad_format_version_rejected_test() ->
+bad_format_version_rejected_test_() ->
+    {timeout, 60, fun bad_format_version_rejected/0}.
+
+bad_format_version_rejected() ->
     Bin = set_header_byte(i2psu3(), 7, 1),
     ?assertEqual({error, bad_format_version}, i2p_su3:decode(Bin)).
 
-unsupported_signature_type_rejected_test() ->
+unsupported_signature_type_rejected_test_() ->
+    {timeout, 60, fun unsupported_signature_type_rejected/0}.
+
+unsupported_signature_type_rejected() ->
     %% Type 7 (EdDSA-SHA512-Ed25519ph) exists on the wire but is not supported.
     TypeBin = set_header_bytes(i2psu3(), 8, <<7:16/big>>),
     ?assertEqual(
@@ -114,19 +147,31 @@ unsupported_signature_type_rejected_test() ->
         i2p_su3:decode(TypeBin)
     ).
 
-bad_signature_length_rejected_test() ->
+bad_signature_length_rejected_test_() ->
+    {timeout, 60, fun bad_signature_length_rejected/0}.
+
+bad_signature_length_rejected() ->
     Bin = set_header_bytes(i2psu3(), 10, <<256:16/big>>),
     ?assertEqual({error, bad_signature_length}, i2p_su3:decode(Bin)).
 
-short_version_rejected_test() ->
+short_version_rejected_test_() ->
+    {timeout, 60, fun short_version_rejected/0}.
+
+short_version_rejected() ->
     Bin = set_header_byte(i2psu3(), 13, 15),
     ?assertEqual({error, short_version}, i2p_su3:decode(Bin)).
 
-trailing_data_rejected_test() ->
+trailing_data_rejected_test_() ->
+    {timeout, 60, fun trailing_data_rejected/0}.
+
+trailing_data_rejected() ->
     Bin = i2psu3(),
     ?assertEqual({error, trailing_data}, i2p_su3:decode(<<Bin/binary, 0:8>>)).
 
-truncated_body_rejected_test() ->
+truncated_body_rejected_test_() ->
+    {timeout, 60, fun truncated_body_rejected/0}.
+
+truncated_body_rejected() ->
     Bin = i2psu3(),
     ?assertEqual({error, truncated}, i2p_su3:decode(binary:part(Bin, 0, byte_size(Bin) - 1))).
 
@@ -134,11 +179,17 @@ truncated_body_rejected_test() ->
 %% Certificate helpers
 %% --------------------------------------------------------------------------
 
-cert_valid_at_now_test() ->
+cert_valid_at_now_test_() ->
+    {timeout, 60, fun cert_valid_at_now/0}.
+
+cert_valid_at_now() ->
     {_Priv, Cert} = keypair(),
     ?assert(i2p_su3:cert_valid_at(Cert, calendar:universal_time())).
 
-cert_expired_test() ->
+cert_expired_test_() ->
+    {timeout, 60, fun cert_expired/0}.
+
+cert_expired() ->
     {_Priv, Cert} = keypair(),
     ?assertNot(i2p_su3:cert_valid_at(Cert, {{2100, 1, 1}, {0, 0, 0}})).
 
