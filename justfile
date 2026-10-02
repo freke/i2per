@@ -14,38 +14,33 @@ test: eunit ct
 eunit:
     rebar3 as test eunit --cover
 
-# The fast tier: the whole unit layer, plus the CT suites chosen to catch the
-# breakages a unit test cannot see. Named for what it is rather than `smoke`,
-# which is already the live-network probe further down and means something else.
-# **Measured 2026-10-02 at ~54s** -- eunit 13s plus 41s for 100 CT cases --
-# against ~221s for `just check`. About 4x, for 45% of the CT cases and 100% of
-# the eunit ones.
+# %%%%% The PR tier %%%%%
 #
-# The gate already stops at its first failure, so a red `just check` reports in
-# seconds rather than after CT. This recipe is for the other case: a *green* run
-# you have to wait four minutes to learn about.
+# What a pull request runs. **Measured 2026-10-02 at ~55s** -- eunit 13s plus
+# 41s for 100 CT cases -- against ~221s for `just check`.
 #
-# **What is chosen, and why these.** Each suite earns its place by covering
-# something eunit structurally cannot: `i2p_boot_SUITE` starts the real
-# supervision tree, `i2p_config_srv_SUITE` and `i2p_read_api_SUITE` cover the
-# configuration and the 0.2.0 read contract, `i2p_tunnel_srv_SUITE` is the tunnel
-# path end to end, and the two transport suites mean a change that breaks NTCP2
-# *or* SSU2 cannot pass this. `i2p_ssu2_handshake_SUITE` is the cheap SSU2 proxy:
-# the fuller `i2p_ssu2_e2e_SUITE` costs 26s on its own and pushed the tier to 98s.
+# The gate stops at its first failure, so a *red* run already reports in seconds.
+# This recipe is for the other case: a green run you would otherwise wait ten
+# minutes to learn about.
 #
-# **What it does not cover, stated rather than implied.** No SAM suite, so the
-# client-facing path is unchecked here (`i2p_sam_SUITE` alone is 31s). No
-# streaming, addressbook, reseed, netdb-srv, or peer-lifecycle suites. A change
-# confined to those can pass this and still be caught by the full gate -- which
-# is the point of having both, not a reason to trust this one alone.
+# **Lint is in it, `doc` is not.** Formatting costs ~1s and is a thing a PR gets
+# wrong; the ExDoc build is a few seconds of work nobody is waiting on, and `main`
+# builds it.
+#
+# **This is not the gate, and it is not named as if it were.** 6 of 25 CT suites,
+# so a PR touching SAM, streaming, addressbook, reseed, netdb-srv or a
+# peer-lifecycle suite can go green and break `main`. That is the price of a
+# one-minute signal, paid deliberately rather than by accident; `main` runs
+# everything. Why these six, and exactly what is given up, is argued in
+# `scripts/ct-suites.sh` next to the list itself.
 #
 # No `--cover`: this is for turnaround, and the aggregate report is
 # `just coverage`'s business. `--sname` for the same reason as `ct` below.
 #
-# The fast tier: all 940 eunit cases plus 100 CT ones, in about 55s
-check-fast:
+# The PR tier: all 940 eunit cases plus 100 CT ones, in about 55s
+check-fast: lint
     rebar3 as test eunit
-    rebar3 ct --suite=apps/i2per/test/i2p_boot_SUITE,apps/i2per/test/i2p_config_srv_SUITE,apps/i2per/test/i2p_read_api_SUITE,apps/i2per/test/i2p_tunnel_srv_SUITE,apps/i2per/test/i2p_ntcp2_conn_SUITE,apps/i2per/test/i2p_ssu2_handshake_SUITE --sname i2per_ct
+    rebar3 ct --sname i2per_ct --suite="$(bash scripts/ct-suites.sh fast)"
 
 # Run the full suite (eunit + ct) with coverage and render the merged report
 coverage:
@@ -57,6 +52,26 @@ coverage:
 # --cover so `just check` still produces the ct.coverdata half of the aggregate)
 ct:
     rebar3 ct --cover --sname i2per_ct
+
+# %%%%% The slow tier %%%%%
+#
+# `i2p_ssu2_e2e_SUITE`'s receive-window case drives 22,000 real encrypted
+# datagrams through a live session pair: 15s here, and the suite measured
+# **5m52s** alone on a GitHub runner -- about 14x slower than the rest of CT,
+# which is only ~2.5x slower. Nine testcases out of 223 were taking six of the
+# gate's 8m21s of CT, in *both* jobs, so one suite was setting the critical path
+# for the whole pipeline.
+#
+# It is here so it can be run *alone* when it is the thing being worked on. CI
+# does not: `main` runs all 223 and a pull request runs the six above.
+#
+# **No `--cover`.** Coverdata is per-`rebar3 ct`-process and this is a
+# single-suite run for development, not an aggregate. Measured at 2s of 43s --
+# worth dropping, not worth a report nobody reads.
+
+# The slow suites alone. For working on the receive window, not for CI.
+ct-slow:
+    rebar3 ct --sname i2per_ct --suite="$(bash scripts/ct-suites.sh slow)"
 
 # Run one CT suite
 ct-suite name:

@@ -1,4 +1,4 @@
-# The two release-gate jobs, decided in #FP2QFD7 and split on purpose.
+# The release-gate jobs, decided in #FP2QFD7 and split on purpose.
 #
 # They are separate jobs rather than one job with a matrix because they answer
 # two different questions, and a matrix cannot answer both at once:
@@ -11,6 +11,46 @@
 # warnings this one does not: `warnings_as_errors` is the *only* thing separating
 # the two jobs, so folding them together would make "fails on an older OTP" and
 # "fails on a lint regression" the same red mark.
+
+# %%%%% Tiers, not shards %%%%%
+#
+# A pull request runs the **fast tier**: lint, all 940 eunit cases, 100 CT cases.
+# Measured at 56s here and about 3m30s on a runner, of which 1m23s is building
+# the pinned toolchain.
+#
+# `main` runs **everything**: lint, docs, 940 eunit, all 223 CT, dialyzer. About
+# 11 minutes, unattended.
+#
+# The reason for the split is one testcase. `i2p_ssu2_e2e_SUITE`'s receive-window
+# case drives 22,000 real encrypted datagrams through a live session pair. It is
+# 15s here and **5m52s** on a runner, where the rest of CT is only ~2.5x slower
+# and that suite is ~14x. Nine cases out of 223 were taking six of the gate's
+# 8m21s of CT, in both jobs, so one suite was the critical path for everything.
+#
+# **What this costs, stated rather than implied.** A pull request that breaks SAM,
+# streaming, addressbook, reseed, netdb-srv or a peer-lifecycle suite can go
+# green and turn `main` red. That is a real hole and it is chosen, not overlooked:
+# the alternative was a ten-minute signal on every push, which is the same gate
+# arriving too late to be useful. If a merge has to be safe on its own merits,
+# wire `just check` onto `pull_request` and accept the wait -- one line, and the
+# comment here says so rather than leaving it to be rediscovered.
+#
+# **The suite lists live in `scripts/ct-suites.sh`**, not here and not in the
+# justfile, because three copies of a partition would drift and a drifted
+# partition is a gate that quietly stops running something.
+
+# %%%%% Hermetic, always %%%%%
+#
+# **No job here runs i2pd, and none ever will.** `apps/i2per/interop/i2p_i2pd_interop_SUITE`
+# boots a live i2pd and talks to a routable network; it is excluded from every tier
+# by `scripts/ct-suites.sh`, which asserts that and fails rather than emitting it.
+# rebar3 does not discover it either -- it sits outside a `test/` directory -- so
+# it was never reachable from here in the first place.
+#
+# For the interoperability check, run `just interop` locally. Deliberately not a CI
+# job and deliberately not `workflow_dispatch` either: a suite that needs the
+# network is a suite whose failure means nothing when the network is what broke.
+# Nothing in this workflow reaches the network.
 
 name: gate
 
@@ -72,14 +112,22 @@ jobs:
         # later as "rebar3: command not found".
         run: devenv shell -- bash -c 'command -v rebar3 && command -v erlfmt && command -v just'
 
-      - name: just check
-        # lint + doc + eunit + ct, the four gates `justfile` defines. Invoked
-        # through `just` rather than spelled out here so CI and a developer run
-        # the same list: a gate that is written twice is a gate that is checked
-        # once.
+      - name: just check-fast (pull request tier)
+        # lint + eunit + the 6 CT suites a PR can afford. Invoked through `just`
+        # rather than spelled out here so CI and a developer run the same list: a
+        # gate that is written twice is a gate that is checked once.
+        if: github.event_name == 'pull_request'
+        run: devenv shell -- just check-fast
+
+      - name: just check (full suite)
+        # lint + doc + eunit + all 223 CT. The other half of the tier split.
+        if: github.event_name != 'pull_request'
         run: devenv shell -- just check
 
       - name: just dialyzer
+        # On both tiers, deliberately. Dialyzer analyses source, not tests, so its
+        # answer does not depend on which CT tier ran -- and 49s on a runner is not
+        # worth spending a tier boundary on.
         run: devenv shell -- just dialyzer
 
   # %%%%% The compatibility job %%%%%
@@ -141,13 +189,29 @@ jobs:
           rebar3 compile
           diff -u /tmp/rebar.config.gate rebar.config || true
 
-      - name: eunit and ct
+      - name: eunit
+        # Both tiers. All 940 cases in ~50s on a runner, and it is the one layer
+        # with no gap in it.
+        run: rebar3 as test eunit
+
+      - name: ct
+        # The same tier split as the pinned job, from the same script. A pull
+        # request gets 6 suites; a push to `main` -- or a manual dispatch, which
+        # is a request to run the gate -- gets all 25.
+        #
+        # `--sname` gives the CT node a fixed dist name, which
+        # `apps/i2per_status/test/i2per_status_SUITE` needs to spawn a peer
+        # router. Same reason as the justfile recipe.
         run: |
-          rebar3 as test eunit
-          # `--sname` gives the CT node a fixed dist name, which
-          # `apps/i2per_status/test/i2per_status_SUITE` needs to spawn a peer
-          # router. Same reason as the justfile recipe.
-          rebar3 ct --sname i2per_ct
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            tier=fast
+          else
+            tier=all
+          fi
+          echo "::group::CT tier: $tier"
+          bash scripts/ct-suites.sh "$tier" | tr ',' '\n' | sed 's/^/  /'
+          echo "::endgroup::"
+          rebar3 ct --sname i2per_ct --suite="$(bash scripts/ct-suites.sh "$tier")"
 
       - name: dialyzer
         # Still run. A compatibility job that skipped it would not answer "can
