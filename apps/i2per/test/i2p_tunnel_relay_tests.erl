@@ -26,25 +26,51 @@ Tests for the transit relay's per-frame RouterInfo existence check.
 %%% --------------------------------------------------------------------------
 
 %% The property, asserted rather than asserted-about: while relaying frames the
-%% calling process makes no call into the NetDb.
+%% calling process makes no *blocking* call into the NetDb.
 %%
-%% The trace is on `call` events only, and the match pattern keeps just the
-%% NetDb's functions, so an unrelated call cannot mask a real one and a real one
-%% cannot hide behind an unrelated call. Zero is the assertion; there is no
-%% tolerance and no "mostly".
+%% **The distinction is the claim, so the trace has to distinguish it.** The
+%% relay does call `i2p_netdb_srv:has_router/1` once per frame -- that is how it
+%% decides whether it can route -- but `has_router/1` is a direct
+%% `ets:member/2` against the published table, not a `gen_server:call/2`, and
+%% that change is the entire optimisation `m:i2p_tunnel_relay` documents for
+%% this path. So "made no call at all" is false, and asserting it would be a
+%% test demanding the code be wrong.
+%%
+%% What must not happen is a `handle_call/3`, which is what blocks behind a NetDb
+%% write. So the assertion is over the *callback* entry points rather than over
+%% every exported function, and it is exhaustive over them: a new
+%% `gen_server`-style entry point added to `i2p_netdb_srv` shows up here as a
+%% failure rather than passing unnoticed.
 relay_path_makes_no_blocking_call_per_frame_test() ->
     with_netdb(
         fun(Held, Missing) ->
             Traced = start_tracing(),
-            try
-                send_frames(Held, ?FRAMES),
-                send_frames(Missing, ?FRAMES),
-                ?assertEqual([], collect_calls(Traced, []))
-            after
-                stop_tracing(Traced)
-            end
+            send_frames(Held, ?FRAMES),
+            send_frames(Missing, ?FRAMES),
+            All = collect_calls(Traced),
+            ?assertEqual(
+                [], blocking_calls(All) ++ gen_server_calls(All)
+            )
         end
     ).
+
+%% The `gen_server` callbacks out of what the trace saw.
+%%
+%% **A name list, not a pattern match on `handle_call/3`.** The property is about
+%% blocking, and a `gen_server` blocks on any of its callbacks; matching one
+%% function name would let a second callback through. Kept next to the assertion
+%% so the two are read together.
+blocking_calls(Traced) ->
+    Blocking = [handle_call, handle_cast, handle_info, handle_continue, terminate],
+    [MFA || MFA = {i2p_netdb_srv, Name, _} <- Traced, lists:member(Name, Blocking)].
+
+%% `gen_server:call/4` as the trace reports it: the function traced is
+%% `gen_server:call`, so the *name* in the MFA is `call`, not one of the
+%% callbacks. Matched on the module and the function name, because that is the
+%% shape `trace_pattern({gen_server, call, '_'}, ...)` produces and the one this
+%% asserts against.
+gen_server_calls(Traced) ->
+    [MFA || MFA = {gen_server, call, _} <- Traced].
 
 %% The two answers are one answer, not two. A frame for a router we hold is
 %% handed on; a frame for one we do not is dropped, and the drop is counted so
@@ -144,26 +170,73 @@ rand_hash() ->
 
 %%% --------------------------------------------------------------------------
 %%% Tracing
-%%% --------------------------------------------------------------------------
 
 %% Trace this process's own outgoing calls, keeping only the NetDb's.
+%%
+%% **The tracer is a process of this case's own, named explicitly.** That is the
+%% whole change from the version that took the default: without
+%% `{tracer, Tracer}` the tracer is *the calling process*, which under eunit is a
+%% worker shared by every module in the tier. A process carries at most one
+%% tracer, so any earlier module that left a trace on that worker makes this
+%% call raise `badarg` -- `can only have one tracer per process`.
+%%
+%% That is not hypothetical. It is what this case did, and it failed the moment
+%% the tier ran as an explicit module list instead of a whole-tree discovery
+%% run: `i2p_netdb_verify_tests` traces the worker with a tracer of its own and
+%% does not clear it.
+%%
+%% A private collector also makes the barrier exact. Reading trace messages out
+%% of the case's own mailbox conflates this trace with every other module's
+%% leftovers in the shared worker; asking a process nobody else can address
+%% cannot.
+-spec start_tracing() -> {pid(), pid()}.
 start_tracing() ->
+    {module, i2p_netdb_srv} = code:ensure_loaded(i2p_netdb_srv),
+    {module, gen_server} = code:ensure_loaded(gen_server),
     _ = erlang:trace_pattern({i2p_netdb_srv, '_', '_'}, true, [local]),
-    _ = erlang:trace(self(), true, [call]),
-    self().
+    %% `gen_server` alongside the NetDb, because a blocking call is not
+    %% identifiable from the callee: `i2p_netdb_srv:count/0` looks like any
+    %% other exported function until you see its body reach for `gen_server`.
+    %% Tracing both makes the claim "this path blocks" visible at the point where
+    %% it blocks, rather than requiring a list of every wrapper that is a
+    %% `gen_server:call` in disguise.
+    _ = erlang:trace_pattern({gen_server, call, '_'}, true, [local]),
+    %% `spawn_link`, so the collector cannot outlive the case even if the case
+    %% dies before `f:collect_calls/1` runs. A tracer left running would keep
+    %% receiving trace messages for a trace that is off, and would be a process
+    %% the shared eunit worker is linked to.
+    Tracer = spawn_link(fun() -> tracer_loop([]) end),
+    _ = erlang:trace(self(), true, [call, {tracer, Tracer}]),
+    {self(), Tracer}.
 
-stop_tracing(Me) ->
-    _ = erlang:trace_pattern({i2p_netdb_srv, '_', '_'}, false, [local]),
-    _ = erlang:trace(Me, false, [call]),
-    ok.
-
-%% The traced calls arrive as ordinary messages, so draining the mailbox is a
-%% barrier rather than a sleep: by the time this runs every traced call has
-%% returned and its message is already queued.
-collect_calls(Me, Acc) ->
+%% Owns the trace messages. Accumulates the NetDb's calls and answers a
+%% `{collect, From, Ref}` request with everything seen since the last one, so a
+%% second collection does not re-report the first batch.
+tracer_loop(Acc) ->
     receive
-        {trace, Me, call, MFA, _Ret} ->
-            collect_calls(Me, [MFA | Acc])
-    after 0 ->
-        lists:reverse(Acc)
+        {trace, _Pid, call, {M, F, A}} ->
+            tracer_loop([{M, F, A} | Acc]);
+        {collect, From, Ref} ->
+            From ! {collected, Ref, lists:reverse(Acc)},
+            tracer_loop([])
+    end.
+
+%% Every `i2p_netdb_srv` call this process made under the trace, and the trace off.
+%%
+%% **The trace is turned off before the collection is requested**, not after.
+%% `erlang:trace/3` returns once the flag is set, and the messages it stops
+%% sending are already queued in the collector, so the answer that comes back
+%% covers every call that had already returned. Collecting first and disabling
+%% after would race a call still in flight.
+-spec collect_calls({pid(), pid()}) -> [mfa()].
+collect_calls({Me, Tracer}) ->
+    _ = erlang:trace(Me, false, [call]),
+    _ = erlang:trace_pattern({i2p_netdb_srv, '_', '_'}, false, [local]),
+    _ = erlang:trace_pattern({gen_server, call, '_'}, false, [local]),
+    Ref = make_ref(),
+    Tracer ! {collect, self(), Ref},
+    receive
+        {collected, Ref, Calls} -> Calls
+    after 1000 ->
+        erlang:error(timeout_collecting_traced_calls)
     end.
