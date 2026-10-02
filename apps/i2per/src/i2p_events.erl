@@ -18,6 +18,11 @@ Emitted events (`t:event/0`):
 - `{peer_connected, PeerHash}` / `{peer_disconnected, PeerHash}` /
   `{peer_connect_failed, PeerHash, Reason, BackoffSeconds}` — a connect that
   did not become a connection, with the interval the router will now wait
+- `{ssu2_dial_parked, PeerHash, Reason}` — a dial sat on SSU2, gave up, and
+  went to NTCP2 instead, with the reason it gave up. Distinct from
+  `peer_connect_failed`, which needs *both* legs to fail and so never fires
+  for a peer that connected over TCP: a park costs real time and connects
+  anyway, so the fact that would report it had no instrument
 - `{peer_send_stalled, PeerHash, Reason}` — a peer stopped accepting our sends
 - `{tunnel_built, Direction, Hops}` / `{tunnel_failed, Direction, Why}` /
   `{tunnel_expired, Direction}`
@@ -74,6 +79,16 @@ lookup service not being running, where there is no key and nothing was asked fo
     %% load-bearing field: without it a peer being retried in a tight loop and a
     %% peer the router has given up on look identical.
     | {peer_connect_failed, i2p_crypto:hash(), term(), pos_integer()}
+    %% A dial waited on SSU2, gave up, and fell back to NTCP2, carrying why.
+    %% **Not a peer that could not be connected** — that is `peer_connect_failed`,
+    %% and it needs both legs to fail, so it never fires for the peer this event
+    %% describes most often: one that answered on TCP and left a UDP stall behind.
+    %% The reason is the load-bearing field, because it is the one bit that says
+    %% something came back: `{protocol_error, _}` means a datagram arrived and
+    %% could not be used, which is proof UDP works that way, while
+    %% `{handshake_timeout, _}` and `timeout` are silence. See
+    %% `m:i2p_peer:ssu2_park_reason/0`.
+    | {ssu2_dial_parked, i2p_crypto:hash(), i2p_peer:ssu2_park_reason()}
     %% A peer that stopped accepting our sends, and why. The counterpart of
     %% `peer_disconnected`, which says the connection is gone without saying
     %% whether it went on its own terms. A session that merely degrades when it

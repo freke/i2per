@@ -10,7 +10,9 @@
 %%
 %% Listeners bind at port 0 and close in `after` blocks. The slow fallback case
 %% allows the SSU2 handshake budget before the NTCP2 leg appears; the backoff
-%% case walks the configured retry windows.
+%% case walks the configured retry windows. The two park cases do not: they arm
+%% the retransmit schedule down, or answer on the first reply, so a park costs
+%% milliseconds rather than the ten seconds it costs a real dial.
 
 -module(i2p_peer_transport_SUITE).
 
@@ -21,9 +23,13 @@
     transport_ntcp2_when_ssu2_disabled/1,
     transport_ssu2_when_available/1,
     transport_falls_back_to_ntcp2/1,
+    ssu2_park_on_a_dead_port_is_reported_with_its_reason/1,
+    ssu2_park_separates_silence_from_a_wrong_answer/1,
     one_stalled_connection_does_not_stop_the_others/1,
     dead_peer_backs_off_then_recovers/1
 ]).
+
+-include_lib("eunit/include/eunit.hrl").
 
 -define(APP, i2per).
 -define(TIMEOUT, 10000).
@@ -38,6 +44,10 @@
 -define(FILL_FRAMES, 400).
 -define(BLOCKED_WINDOW_MS, 15000).
 
+%% The retransmit interval the park case arms, chosen so the dial it parks on is
+%% over inside the case rather than after it. See `arm_handshake/1`.
+-define(PARK_RETRY_MS, 20).
+
 suite() ->
     [].
 
@@ -47,6 +57,8 @@ all() ->
         transport_ntcp2_when_ssu2_disabled,
         transport_ssu2_when_available,
         transport_falls_back_to_ntcp2,
+        ssu2_park_on_a_dead_port_is_reported_with_its_reason,
+        ssu2_park_separates_silence_from_a_wrong_answer,
         one_stalled_connection_does_not_stop_the_others,
         dead_peer_backs_off_then_recovers
     ].
@@ -62,6 +74,7 @@ all() ->
 init_per_testcase(Case, Config) ->
     ok = arm_ssu2(Case),
     ok = arm_sndbuf(Case),
+    ok = arm_handshake(Case),
     {ok, _} = application:ensure_all_started(?APP),
     [{timetrap, timetrap_for(Case)} | Config].
 
@@ -75,11 +88,35 @@ arm_sndbuf(one_stalled_connection_does_not_stop_the_others) ->
 arm_sndbuf(_Case) ->
     ok.
 
+%% The SessionRequest retransmit schedule, taken down to about 40 ms.
+%%
+%% A dial that parks on a silent UDP port is parked by this budget -- nine
+%% unanswered retransmits at 1 Hz, ~10 s -- and not by the 20 s ceiling above it,
+%% so a case that leaves it alone is asserting against the slowest thing in the
+%% suite for a fact that arrives the moment the budget expires. Both values are
+%% app-env levers `docs/protocol.md` documents and an operator can set, which is
+%% what makes this the same kind of lever as `arm_sndbuf/1` above rather than a
+%% private mechanism added for the test.
+%%
+%% One retransmit is not zero: `f:handshake_max_resends/0` accepts only a
+%% positive count, so the earliest budget a dial can be given is two timer
+%% firings. At `?PARK_RETRY_MS` that is ~40 ms, and the assertion waits on the
+%% event rather than on the clock either way.
+arm_handshake(ssu2_park_on_a_dead_port_is_reported_with_its_reason) ->
+    application:set_env(?APP, handshake_retry_ms, ?PARK_RETRY_MS),
+    application:set_env(?APP, handshake_max_resends, 1);
+arm_handshake(_Case) ->
+    ok.
+
 arm_ssu2(transport_ntcp2_when_remote_is_ntcp2_only) ->
     application:set_env(?APP, ssu2_enabled, true);
 arm_ssu2(transport_ssu2_when_available) ->
     application:set_env(?APP, ssu2_enabled, true);
 arm_ssu2(transport_falls_back_to_ntcp2) ->
+    application:set_env(?APP, ssu2_enabled, true);
+arm_ssu2(ssu2_park_on_a_dead_port_is_reported_with_its_reason) ->
+    application:set_env(?APP, ssu2_enabled, true);
+arm_ssu2(ssu2_park_separates_silence_from_a_wrong_answer) ->
     application:set_env(?APP, ssu2_enabled, true);
 arm_ssu2(_Case) ->
     ok.
@@ -93,6 +130,8 @@ end_per_testcase(_Case, _Config) ->
     application:stop(?APP),
     ok = application:unset_env(?APP, ssu2_enabled),
     ok = application:unset_env(?APP, ntcp2_sndbuf),
+    ok = application:unset_env(?APP, handshake_retry_ms),
+    ok = application:unset_env(?APP, handshake_max_resends),
     ok.
 
 %% ---------------------------------------------------------------------------
@@ -207,6 +246,179 @@ transport_falls_back_to_ntcp2(_Config) ->
         i2p_ntcp2_listener:stop(LB),
         i2p_ssu2_listener:stop(AL)
     end.
+
+%% --------------------------------------------------------------------------
+%% Why a dial was parked (the half above is that it parked; this is that we can
+%% now say what happened)
+%% --------------------------------------------------------------------------
+
+%% The same fallback as above, against a silent UDP port, and the assertion is on
+%% the *reason*: the park happened before the peer connected, so nothing about
+%% the outcome differs from the case above -- what differs is that this one says
+%% so.
+%%
+%% `{handshake_timeout, session_request}` is the silence case. We sent and nothing
+%% came back. It is a real answer about the network -- and an operator-fixable one
+%% -- because across peers a dial that always ends here while NTCP2 always
+%% succeeds means the UDP is being dropped on our side, which nothing in this
+%% router said before.
+%%
+%% Both halves of the claim are asserted, and neither alone would do: the counter
+%% says a park was charged, and the event says what it was. A counter with no
+%% reason answers "how often" and a reason with no counter answers "once, to
+%% whom"; a stall has to be countable to be a rate and has to carry its reason to
+%% be worth counting.
+ssu2_park_on_a_dead_port_is_reported_with_its_reason(_Config) ->
+    {A, B, _C} = trio(),
+    {AL, APort} = ssu2_listener(A),
+    {ok, LB} = i2p_ntcp2_listener:listen(0, B, self()),
+    try
+        ALocal = ssu2_local(A, i2p_ct_helpers:free_port(), APort),
+        BRI = ssu2_ri_at(listen_port(LB), i2p_ct_helpers:free_port(), B),
+        BHash = i2p_router_info:hash(BRI),
+        start_peer(ALocal, [BRI]),
+        Before = counter(ssu2_dials_parked),
+        Events = i2p_ct_helpers:events_from(fun() ->
+            ok = i2p_peer:lookup(BHash, exploratory),
+            %% The NTCP2 leg runs only after the park, so reaching `connected`
+            %% is the barrier for it.
+            await_peer_status(BHash, connected, 1600)
+        end),
+        ?assertEqual(1, counter(ssu2_dials_parked) - Before),
+        ?assertEqual([{handshake_timeout, session_request}], park_reasons(Events)),
+        %% A park that then connects over TCP is not a failed connect:
+        %% `peer_connect_failed` fires only once *both* legs are down, and this
+        %% peer came up on the second one. Asserted because the two facts were
+        %% previously the same absence -- neither reported -- and merging them
+        %% the other way would make a working TCP dial read as a fault.
+        ?assertEqual([], [R || {peer_connect_failed, _, R, _} <- Events]),
+        i2p_peer:stop()
+    after
+        i2p_ntcp2_listener:stop(LB),
+        i2p_ssu2_listener:stop(AL)
+    end.
+
+%% The comparison the whole reason vocabulary exists for, and it is the one a
+%% single dial cannot make for itself: silence and a wrong answer are the same
+%% fallback, the same counter, and the same peer status.
+%%
+%% The remote's SSU2 address answers, but wrongly: a datagram sealed under our
+%% own intro key, routed to the waiting session by the connection id it chose,
+%% and typed as something other than the SessionCreated it is waiting for (see
+%% `wrong_answer/2`). So the session exits `{protocol_error, created_decode}` on
+%% the first reply -- no retransmit budget spent, and therefore no timing in this
+%% case at all.
+%%
+%% `{protocol_error, _}` against `{handshake_timeout, _}` is the load-bearing
+%% pair. Something came back and was wrong is proof that UDP works in this
+%% direction; nothing came back is not. Both are a fallback to NTCP2 and neither
+%% differs from the case above in anything an operator could previously read.
+ssu2_park_separates_silence_from_a_wrong_answer(_Config) ->
+    {A, B, _C} = trio(),
+    {AL, APort} = ssu2_listener(A),
+    {ok, LB} = i2p_ntcp2_listener:listen(0, B, self()),
+    Answerer = wrong_answer(intro_key(B), intro_key(A)),
+    {_AnswererPid, _AnswererSock, AnswererPort} = Answerer,
+    try
+        ALocal = ssu2_local(A, i2p_ct_helpers:free_port(), APort),
+        BRI = ssu2_ri_at(listen_port(LB), AnswererPort, B),
+        BHash = i2p_router_info:hash(BRI),
+        start_peer(ALocal, [BRI]),
+        Events = i2p_ct_helpers:events_from(fun() ->
+            ok = i2p_peer:lookup(BHash, exploratory),
+            await_peer_status(BHash, connected, 1600)
+        end),
+        ?assertEqual([{protocol_error, created_decode}], park_reasons(Events)),
+        i2p_peer:stop()
+    after
+        wrong_answer_stop(Answerer),
+        i2p_ntcp2_listener:stop(LB),
+        i2p_ssu2_listener:stop(AL)
+    end.
+
+%% The reasons this router reported a park, in the order it reported them, and
+%% nothing else. Read through rather than matched inline so that a case asserting
+%% "exactly one park, and here is why" says that in one expression.
+park_reasons(Events) ->
+    [Reason || {ssu2_dial_parked, _PeerHash, Reason} <- Events].
+
+%% One counter by name. `f:snapshot/0` reports a registered counter whether or not
+%% it has ever moved, so this cannot fail on the first read of a fresh router.
+counter(Name) ->
+    maps:get(Name, i2p_stats:snapshot(), 0).
+
+%% A UDP endpoint that answers every datagram with a well-formed SSU2 long-header
+%% packet addressed back to the sender -- one this router will classify as its own
+%% and route to the waiting session -- carrying a type it is not asking for.
+%%
+%% **An echo cannot stand in for this, and why it cannot is the claim under test.**
+%% Our listener opens a datagram's connection id under *our* intro key, so an echo
+%% of our own SessionRequest -- sealed, as it must be, under the *remote's* -- is
+%% never routed to the session and is dropped unread. It arrives, and reads as
+%% silence: exactly the conflation this case exists to catch, arrived at by
+%% accident. So the reply is sealed under ours instead, which is what makes it
+%% something that came back rather than nothing did.
+%%
+%% Both keys are the production derivations, read out of the fixtures rather than
+%% invented: the request is opened under the intro key published in the remote's
+%% address, and the reply sealed under ours.
+%%
+%% **The socket is opened inside the answerer, not here and handed over.**
+%% `gen_udp:open/2` makes its caller the socket's *controlling process*, and an
+%% active-mode datagram goes to that process however many other processes hold
+%% the port term -- so opening it here delivered every `{udp, ...}` to the test
+%% process, where `f:events_from/1`'s drain discarded them, and the case read as
+%% total silence from an endpoint that had answered every time. `{active, once}`
+%% rather than a blocking `gen_udp:recv/3` keeps the loop idle between
+%% datagrams: a zero-timeout poll would be a spin, and a blocking recv would sit
+%% in the driver past the stop message.
+wrong_answer(RemoteIntroKey, LocalIntroKey) ->
+    Owner = self(),
+    Pid = spawn_link(fun() -> wrong_answer_open(Owner, RemoteIntroKey, LocalIntroKey) end),
+    receive
+        {wrong_answer_ready, Sock, Port} -> {Pid, Sock, Port}
+    end.
+
+wrong_answer_open(Owner, RemoteIntroKey, LocalIntroKey) ->
+    {ok, Sock} = gen_udp:open(0, [binary, {active, once}, {reuseaddr, true}]),
+    {ok, Port} = inet:port(Sock),
+    Owner ! {wrong_answer_ready, Sock, Port},
+    wrong_answer_loop(Sock, RemoteIntroKey, LocalIntroKey).
+
+wrong_answer_stop({Pid, _Sock, _Port}) ->
+    Pid ! {wrong_answer_stop, self()},
+    receive
+        {wrong_answer_stopped, Pid} -> ok
+    end.
+
+wrong_answer_loop(Sock, RemoteIntroKey, LocalIntroKey) ->
+    receive
+        {udp, Sock, IP, Port, Datagram} ->
+            Reply = not_a_session_created(Datagram, RemoteIntroKey, LocalIntroKey),
+            ok = gen_udp:send(Sock, IP, Port, Reply),
+            ok = inet:setopts(Sock, [{active, once}]),
+            wrong_answer_loop(Sock, RemoteIntroKey, LocalIntroKey);
+        {wrong_answer_stop, Owner} ->
+            gen_udp:close(Sock),
+            Owner ! {wrong_answer_stopped, self()}
+    end.
+
+%% A long-header datagram for the connection id the request chose, sealed under
+%% our intro key, typed 0 where `f:receive_session_created/2` is about to look for
+%% a type 1.
+%%
+%% The 32 zero bytes stand in for the ciphertext and the last 16 for the Poly1305
+%% tag, and both are zeros on purpose: the packet has to be *routable* and nothing
+%% more. A correctly authenticated SessionCreated would be accepted rather than
+%% failing, and then this would be a different case.
+not_a_session_created(Datagram, RemoteIntroKey, LocalIntroKey) ->
+    {ok, DstConnId} = i2p_ssu2:open_conn_id(Datagram, RemoteIntroKey, RemoteIntroKey),
+    Header = i2p_ssu2:long_header(DstConnId, 0, 0, DstConnId, 0),
+    i2p_ssu2:seal_long(
+        <<Header/binary, 0:256, 0:128>>,
+        LocalIntroKey,
+        LocalIntroKey
+    ).
 
 %% --------------------------------------------------------------------------
 %% One wedged connection does not stop the router

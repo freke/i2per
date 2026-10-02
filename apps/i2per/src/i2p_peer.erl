@@ -110,7 +110,12 @@ i2p_peer:stop().
 ]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
--export_type([local_keys/0, store_outcome/0, store_not_stored_reason/0]).
+-export_type([
+    local_keys/0,
+    store_outcome/0,
+    store_not_stored_reason/0,
+    ssu2_park_reason/0
+]).
 
 -define(HANDSHAKE_TIMEOUT, 15000).
 -define(MAX_BACKOFF_SECONDS, 300).
@@ -917,16 +922,41 @@ init_connect(PeerHash, #{ri := RemoteRI}, Local) ->
     case ssu2_connect(PeerHash, RemoteRI, Local) of
         ok ->
             ok;
-        fallback ->
+        {fallback, Reason} ->
+            ok = park_reported(PeerHash, Reason),
             ntcp2_connect(PeerHash, RemoteRI, Local, Owner)
     end.
 
-%% Outbound SSU2 dial (Alice role). Bypassed — returning `fallback` — unless
-%% SSU2 is enabled at boot, this router's SSU2 listener is up, and the remote
-%% publishes a usable SSU2 address. The blocking handshake runs in this
-%% spawned process; on success it hands the session to the peer manager and
-%% reports it as connected (as NTCP2 does) and on any failure falls back to
-%% NTCP2.
+%% The park report, split by whether anything was parked at all. Two clauses
+%% rather than a guard inside one, because the two cases are different facts and
+%% the split is itself the assertion: `not_attempted` reaches neither the bus nor
+%% the counter, so a counter named for parks cannot be moved by a dial that
+%% skipped the transport without waiting.
+%%
+%% Announced from the dialing process rather than by the peer manager, and that
+%% is the point rather than an accident: the handshake blocks in this process, so
+%% the manager has nothing to report until the dial returns — which, for a dead
+%% UDP port, is after the whole stall this ticket exists to make visible.
+%% `f:notify/1` discards delivery failures and `f:add/2` is an atomic on shared
+%% memory, so both are safe from here and neither can crash a working dial.
+park_reported(_PeerHash, not_attempted) ->
+    ok;
+park_reported(PeerHash, Reason) ->
+    ok = i2p_stats:add(ssu2_dials_parked, 1),
+    ok = i2p_events:notify({ssu2_dial_parked, PeerHash, Reason}).
+
+%% Outbound SSU2 dial (Alice role). Bypassed — returning `{fallback,
+%% not_attempted}` — unless SSU2 is enabled at boot, this router's SSU2 listener
+%% is up, and the remote publishes a usable SSU2 address. The blocking handshake
+%% runs in this spawned process; on success it hands the session to the peer
+%% manager and reports it as connected (as NTCP2 does), and on any failure
+%% returns `{fallback, Reason}` naming why, so the caller can fall back to NTCP2
+%% and still say what the park was. Return shape is `ok | {fallback,
+%% t:ssu2_park_reason/0}`; deliberately unspecced like the rest of this dial path,
+%% because a spec here narrows `local_keys/0` into `f:init_connect/3` and then
+%% reads as a contract violation on the NTCP2 fallback, which passes the whole
+%% local map. The reason vocabulary itself is checked where it is observable --
+%% in `t:i2p_events:event/0`, at the `f:notify/1` call site.
 ssu2_connect(PeerHash, RemoteRI, Local) ->
     case
         i2p_identity:ssu2_enabled() andalso
@@ -934,7 +964,7 @@ ssu2_connect(PeerHash, RemoteRI, Local) ->
             i2p_router_info:ssu2_address_options(RemoteRI) =/= error
     of
         false ->
-            fallback;
+            {fallback, not_attempted};
         true ->
             ssu2_connect_ready(PeerHash, RemoteRI, Local)
     end.
@@ -946,7 +976,8 @@ ssu2_connect_ready(PeerHash, RemoteRI, Local) ->
             %% Firewalled remote: there is no dialable host/port, only her
             %% introducers. Reach her indirectly through the relay machinery
             %% (relay blocks 7/8 + token redirect); on any failure fall back
-            %% to NTCP2 exactly as the direct dial path does.
+            %% to NTCP2 exactly as the direct dial path does, carrying the
+            %% reason out with it.
             indirect_ssu2_connect(PeerHash, RemoteRI, RemoteOpts, Local);
         true ->
             %% Published claims a dialable SSU2 address; narrow the full
@@ -965,7 +996,8 @@ ssu2_connect_ready(PeerHash, RemoteRI, Local) ->
 %% Outbound SSU2 dial (Alice role) to a router publishing a dialable SSU2
 %% address. The blocking handshake runs in this spawned process; on success it
 %% hands the session to the peer manager and reports it as connected (as NTCP2
-%% does) and on any failure falls back to NTCP2.
+%% does) and on any failure falls back to NTCP2, carrying the session's own exit
+%% reason rather than discarding it.
 direct_ssu2_connect(PeerHash, RemoteOpts, Local) ->
     LocalKeys = #{
         static_priv => maps:get(static_priv, Local),
@@ -993,8 +1025,8 @@ direct_ssu2_connect(PeerHash, RemoteOpts, Local) ->
             Manager ! {conn_started, PeerHash, ConnPid, ssu2},
             Manager ! {ssu2_ready, ConnPid, Keys, undefined},
             ok;
-        {error, _Reason} ->
-            fallback
+        {error, Reason} ->
+            {fallback, Reason}
     end.
 
 %% Narrow a full firewalled-shaped address-options map (as produced by
@@ -1027,11 +1059,11 @@ dialable_remote_opts(RemoteOpts) ->
 %% RelayResponse (block 8) with her endpoint + token, then a redirect dial to
 %% her, carrying the token. On success the redirect session is handed to the
 %% peer manager exactly like a direct dial's, and the introducer leg (its
-%% relay served) is closed. Any failure falls back to NTCP2.
+%% relay served) is closed. Any failure falls back to NTCP2, naming the reason.
 indirect_ssu2_connect(PeerHash, RemoteRI, RemoteOpts, Local) ->
     case pick_introducer(RemoteOpts, RemoteRI, Local) of
-        {error, _Reason} ->
-            fallback;
+        {error, Reason} ->
+            {fallback, Reason};
         {ok, BobOpts, Relay} ->
             case dialable_remote_opts(BobOpts) of
                 {ok, DialBobOpts} ->
@@ -1063,8 +1095,8 @@ indirect_ssu2_connect(PeerHash, RemoteRI, RemoteOpts, Local) ->
                             %% gracefully (Bob drops the tagged/relay state).
                             i2p_ssu2_conn:terminate_session(BobPid, 0),
                             ok;
-                        {error, _Reason} ->
-                            fallback
+                        {error, Reason} ->
+                            {fallback, Reason}
                     end
             end
     end.
@@ -1209,6 +1241,56 @@ built to answer.
     | {refused_with_reason, older | from_future | too_old | expired}
     | {atom()}
     | unparseable_router_info_data.
+
+-doc """
+Why the SSU2 leg of an outbound dial was given up on.
+
+**The point of the vocabulary is one bit: did something come back.** A
+`{protocol_error, _}` means a datagram arrived and could not be used, which is
+*proof that UDP works in that direction*; `{handshake_timeout, _}` and `timeout`
+mean silence. Per dial those cannot be told apart from anything else — silence is
+over-determined, because our UDP may be blocked, the peer may be down, or a
+middlebox may be eating it. Across peers they can: SSU2 timing out for every peer
+while NTCP2 succeeds for every peer means the common cause is ours, and that is the
+one an operator can act on, since "your UDP is blocked" is a configuration fact
+and "peer X is UDP-dead" is not actionable at all. So the reason is kept, and this
+is the vocabulary it is kept in.
+
+The inner terms of the session-exit reasons are `m:i2p_ssu2_conn`'s own, verbatim
+and untranslated. Re-describing them here would be a second vocabulary for
+conditions that module already names, and a second one to keep in step with it.
+
+`not_attempted` is the one reason that is **not a park**: SSU2 was not available to
+try, so nothing waited, nothing was slow, and nothing is counted. It is a named
+value rather than a bare `fallback` because a dial that skipped the transport and a
+dial that was given up on by it are different facts even when neither is reported,
+and collapsing them is how the reason came to be discarded in the first place.
+See #1Q4JREN.
+""".
+-type ssu2_park_reason() ::
+    not_attempted
+    %% `m:i2p_ssu2_conn`'s handshake ran out of retransmits, naming the phase.
+    | {handshake_timeout, atom()}
+    %% A datagram arrived and could not be used. Proof UDP works that way.
+    | {protocol_error, atom()}
+    %% The introducer leg: the introducer refused the relay, its response
+    %% signature did not verify, or it refused to admit the session.
+    | {relay_rejected, non_neg_integer()}
+    | {relay_bad_response_sig, binary()}
+    | {session_admission_failed, term()}
+    %% The session's supervisor refused to start it, and the wait the conn module
+    %% imposes on it expired.
+    | {session_start_failed, term()}
+    | timeout
+    %% A firewalled remote whose introducers the NetDb could not supply with a
+    %% dialable address. The relay never ran, so this is silence with a cause we
+    %% do know.
+    | no_introducer
+    %% Anything else the session died of, verbatim: `normal`, `shutdown`,
+    %% `{idle_timeout, _}`, a crash. Open deliberately rather than a closed set,
+    %% because these are the module's exits rather than this module's branches,
+    %% and a closed list here would be an enumeration that goes stale silently.
+    | term().
 
 -doc """
 What became of a decoded DatabaseStore.
