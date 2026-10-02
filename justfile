@@ -14,6 +14,39 @@ test: eunit ct
 eunit:
     rebar3 as test eunit --cover
 
+# The fast tier: the whole unit layer, plus the CT suites chosen to catch the
+# breakages a unit test cannot see. Named for what it is rather than `smoke`,
+# which is already the live-network probe further down and means something else.
+# **Measured 2026-10-02 at ~54s** -- eunit 13s plus 41s for 100 CT cases --
+# against ~221s for `just check`. About 4x, for 45% of the CT cases and 100% of
+# the eunit ones.
+#
+# The gate already stops at its first failure, so a red `just check` reports in
+# seconds rather than after CT. This recipe is for the other case: a *green* run
+# you have to wait four minutes to learn about.
+#
+# **What is chosen, and why these.** Each suite earns its place by covering
+# something eunit structurally cannot: `i2p_boot_SUITE` starts the real
+# supervision tree, `i2p_config_srv_SUITE` and `i2p_read_api_SUITE` cover the
+# configuration and the 0.2.0 read contract, `i2p_tunnel_srv_SUITE` is the tunnel
+# path end to end, and the two transport suites mean a change that breaks NTCP2
+# *or* SSU2 cannot pass this. `i2p_ssu2_handshake_SUITE` is the cheap SSU2 proxy:
+# the fuller `i2p_ssu2_e2e_SUITE` costs 26s on its own and pushed the tier to 98s.
+#
+# **What it does not cover, stated rather than implied.** No SAM suite, so the
+# client-facing path is unchecked here (`i2p_sam_SUITE` alone is 31s). No
+# streaming, addressbook, reseed, netdb-srv, or peer-lifecycle suites. A change
+# confined to those can pass this and still be caught by the full gate -- which
+# is the point of having both, not a reason to trust this one alone.
+#
+# No `--cover`: this is for turnaround, and the aggregate report is
+# `just coverage`'s business. `--sname` for the same reason as `ct` below.
+#
+# The fast tier: all 940 eunit cases plus 100 CT ones, in about 55s
+check-fast:
+    rebar3 as test eunit
+    rebar3 ct --suite=apps/i2per/test/i2p_boot_SUITE,apps/i2per/test/i2p_config_srv_SUITE,apps/i2per/test/i2p_read_api_SUITE,apps/i2per/test/i2p_tunnel_srv_SUITE,apps/i2per/test/i2p_ntcp2_conn_SUITE,apps/i2per/test/i2p_ssu2_handshake_SUITE --sname i2per_ct
+
 # Run the full suite (eunit + ct) with coverage and render the merged report
 coverage:
     rebar3 as test do eunit --cover, ct --cover --sname i2per_ct
