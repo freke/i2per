@@ -12,8 +12,9 @@ The project interoperates with I2P routers. It does not bundle code from
 > **Status: proof of concept.** The 0.1.0 in this tree is a development snapshot,
 > not a published release.
 >
-> CI is here as of this tree's HEAD: a pinned gate on the `devenv.nix` toolchain
-> running `just check` and `just dialyzer`, plus a warnings-relaxed job asking
+> CI is here as of this tree's HEAD: a smoke tier on **every push** answering
+> "does the router still come up and work", and on `main` a pinned gate running
+> everything (`just test` and `just dialyzer`) plus a warnings-relaxed job asking
 > whether another OTP can build and run it. The read API is versioned and its key
 > set is checked across the core/consumer boundary, not only inside each
 > application. What 0.1.0 does **not** yet have is the external i2pd
@@ -102,16 +103,46 @@ packaged release section below when you need a full router process.
 From the repository root, inside the devenv shell:
 
 ```sh
-just compile
-just check       # formatting, generated documentation, EUnit, and Common Test
-just dialyzer    # static analysis
-just smoke       # offline boot and self-check
-just doc         # regenerate the local ExDoc site in doc/
+just smoke-test   # the push tier: lint, unit tests, most of the CT suites
+just test         # everything: lint, docs, all eunit, all CT, coverage
+just proper       # the property tests alone (also inside `just test`)
+just dialyzer     # static analysis
+just live-smoke   # boot a throwaway router and print its network observables
+just doc          # regenerate the local ExDoc site in doc/
 ```
 
-`just check` and `just dialyzer` are the release gates. `doc/` is generated
-output and is not committed. The repository test suite is part of the release
-quality process.
+### The three test layers
+
+The tree separates tests by *what is under test*, and the recipes are named
+after that:
+
+| recipe | runs | when |
+| --- | --- | --- |
+| `just proper` | 3 modules, 16 properties over generated inputs | `main`, and on request |
+| `just smoke-test` | lint, 935 unit cases, 211 of 224 CT cases | **every push** |
+| `just test` | lint, docs, dialyzer, all 951 eunit, all 224 CT | `main` |
+
+Measured at **91s** for `just smoke-test` and **205s** for `just test` on a
+developer machine. The smoke tier is under five minutes on a GitHub runner.
+
+**What the smoke tier skips, and why.** Two CT suites:
+`i2p_peer_transport_SUITE` (protocol-mandated connect timeouts) and
+`i2p_ssu2_e2e_SUITE` (22,000 real datagrams through a live session). Together
+they are more than the whole five-minute budget, for failures that are about
+waiting rather than behaviour. `just test` runs both.
+
+**Why properties are not in the smoke tier**, given they take 0.23s: a property
+test finds its counterexample from a *random* input, so a failure on a push is a
+bug report that arrives before anyone can reproduce it — and re-rolling the seed
+is the tempting response to a red that keeps flickering.
+
+The tier boundaries are derived from the tree by `scripts/ct-suites.sh` (CT) and
+`scripts/eunit-modules.sh` (eunit/PropEr), so a new suite is in tomorrow's smoke
+run by default rather than by an edit someone has to remember.
+
+`just test` and `just dialyzer` are the release gates. `just check` is an alias
+for `just test`. `doc/` is generated output and is not committed. The repository
+test suite is part of the release quality process.
 
 ## Run the packaged release
 
@@ -283,8 +314,8 @@ I2PD_BIN=/path/to/i2pd scripts/interop_i2pd.sh
 
 This starts a local i2pd, runs the NTCP2 and SSU2 interoperability cases, and
 removes the temporary instances. It contacts an external service and is never
-part of the normal gate. `just smoke` is an offline self-check. Use
-`just smoke --live` only when joining the real I2P network is intended.
+part of the normal gate. `just live-smoke` is an offline self-check. Use
+`just live-smoke --live` only when joining the real I2P network is intended.
 
 ## Release limitations
 

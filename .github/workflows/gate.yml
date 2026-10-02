@@ -1,43 +1,50 @@
-# The release-gate jobs, decided in #FP2QFD7 and split on purpose.
+# The gate, in three jobs that answer three different questions.
 #
-# They are separate jobs rather than one job with a matrix because they answer
-# two different questions, and a matrix cannot answer both at once:
+#   smoke     "does the router still work?"  -- every push and every pull
+#             request. The partition is every CT suite except the two that are
+#             too slow to run on every push, plus the whole unit layer.
+#   gate      "is this commit good enough to ship?" -- `main` only, and it runs
+#             everything: lint, docs, dialyzer, every eunit, every property,
+#             every CT suite, no time limit.
+#   compat    "can someone run this on another OTP?" -- `main` only.
 #
-#   gate      -- "does this commit pass on the environment it is developed in?"
-#   compat    -- "can someone run this on another OTP?"
+# Separate jobs rather than one job with a matrix, because a matrix of the pinned
+# version answers the compat question with the smoke job's strictness -- which is
+# why the README warns that a different OTP produces warnings this one does not.
+# `warnings_as_errors` is the *only* thing separating them, so folding them
+# together would make "fails on an older OTP" and "fails on a lint regression"
+# the same red mark.
 #
-# A matrix of the pinned version answers the second question with the first
-# job's strictness, which is why the README warns that a different OTP produces
-# warnings this one does not: `warnings_as_errors` is the *only* thing separating
-# the two jobs, so folding them together would make "fails on an older OTP" and
-# "fails on a lint regression" the same red mark.
-
 # %%%%% Tiers, not shards %%%%%
 #
-# A pull request runs the **fast tier**: lint, all 940 eunit cases, 100 CT cases.
-# Measured at 56s here and about 3m30s on a runner, of which 1m23s is building
-# the pinned toolchain.
+# A push runs the **smoke tier** and nothing else. A pull request runs the same
+# smoke job plus `compat`, because a PR is asking "would this merge cleanly" and
+# an OTP matrix is part of that answer before the merge rather than after.
 #
-# `main` runs **everything**: lint, docs, 940 eunit, all 223 CT, dialyzer. About
-# 11 minutes, unattended.
+# `main` runs **everything**: lint, docs, dialyzer, 951 eunit (935 unit + 16
+# property), all 224 CT across all 25 suites.
 #
-# The reason for the split is one testcase. `i2p_ssu2_e2e_SUITE`'s receive-window
-# case drives 22,000 real encrypted datagrams through a live session pair. It is
-# 15s here and **5m52s** on a runner, where the rest of CT is only ~2.5x slower
-# and that suite is ~14x. Nine cases out of 223 were taking six of the gate's
-# 8m21s of CT, in both jobs, so one suite was the critical path for everything.
+# **What the smoke tier costs, measured not estimated.** 79s of CT and 10s of
+# eunit here, across 23 of the 25 suites and 211 of the 224 CT cases. The
+# `gate (pinned toolchain)` job on this workflow's last pull-request run took
+# **162s** on a runner for a smaller payload, which puts the smoke job at roughly
+# 4-5 minutes against a 5-minute budget. **That margin is thin and the figure is
+# extrapolated, so it is stated rather than asserted** -- the first push that runs
+# this workflow should be read for its real wall time, and the partition widened
+# or narrowed on the measurement rather than on this paragraph.
 #
-# **What this costs, stated rather than implied.** A pull request that breaks SAM,
-# streaming, addressbook, reseed, netdb-srv or a peer-lifecycle suite can go
-# green and turn `main` red. That is a real hole and it is chosen, not overlooked:
-# the alternative was a ten-minute signal on every push, which is the same gate
-# arriving too late to be useful. If a merge has to be safe on its own merits,
-# wire `just check` onto `pull_request` and accept the wait -- one line, and the
-# comment here says so rather than leaving it to be rediscovered.
+# **What the smoke tier does not run, stated rather than implied.** Two suites:
+# `i2p_peer_transport_SUITE` (protocol-mandated connect timeouts and backoff) and
+# `i2p_ssu2_e2e_SUITE` (22,000 real encrypted datagrams through a live session
+# pair). Together ~50s here and ~125s on a runner -- more than the entire budget,
+# for two suites whose failures are about waiting rather than behaviour. A push
+# that breaks one goes green here and red on `main`. That is the price of a
+# five-minute signal, and it is chosen, not overlooked.
 #
-# **The suite lists live in `scripts/ct-suites.sh`**, not here and not in the
-# justfile, because three copies of a partition would drift and a drifted
-# partition is a gate that quietly stops running something.
+# **The suite lists live in `scripts/ct-suites.sh`** (CT) and
+# `scripts/eunit-modules.sh` (eunit/PropEr), not here and not in the justfile,
+# because three copies of a partition drift and a drifted partition is a gate
+# that quietly stops running something.
 
 # %%%%% Hermetic, always %%%%%
 #
@@ -74,9 +81,12 @@
 
 name: gate
 
+# **Every** push, on every branch -- that is the whole point of the smoke job.
+# Restricted to `main` (as this was) a feature branch gets nothing at all until
+# someone opens a pull request, so the answer to "does this still work" arrives
+# at the moment it is least useful.
 on:
   push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -91,13 +101,18 @@ permissions:
   contents: read
 
 jobs:
-  # %%%%% The pinned gate %%%%%
+  # %%%%% The push tier %%%%%
   #
-  # The toolchain `devenv.nix` declares, not "a recent version of each tool".
-  # `warnings_as_errors` stays intact, because that strictness is the point: a
-  # warning this environment does not produce is a warning the gate cannot catch.
-  gate:
-    name: gate (pinned toolchain)
+  # Runs on **every** push and every pull request, not just `main`. The question
+  # it answers is the one an operator has while the change is still being made:
+  # does the router come up and work?
+  #
+  # **The partition is derived from the tree**, so a new CT suite is in tomorrow's
+  # smoke run unless someone deliberately puts it in `slow`. That inverts the usual
+  # failure: with a hand-written list, the edit that adds a suite is the moment
+  # someone decides it does not matter yet.
+  smoke:
+    name: smoke (lint + unit + CT)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -132,29 +147,94 @@ jobs:
         # later as "rebar3: command not found".
         run: devenv shell -- bash -c 'command -v rebar3 && command -v erlfmt && command -v just'
 
-      - name: just check-fast (pull request tier)
-        # lint + eunit + the 6 CT suites a PR can afford. Invoked through `just`
-        # rather than spelled out here so CI and a developer run the same list: a
-        # gate that is written twice is a gate that is checked once.
-        if: github.event_name == 'pull_request'
-        run: devenv shell -- just check-fast
+      - name: Report the tiers
+        # Printed rather than hidden, so a red run names the partition it ran
+        # without anybody opening the script. A gate whose scope is invisible is a
+        # gate whose scope gets misremembered.
+        run: |
+          echo "::group::tiers"
+          echo "  eunit unit : $(bash scripts/eunit-modules.sh unit | tr ',' '\n' | wc -l) modules"
+          echo "  eunit prop : $(bash scripts/eunit-modules.sh prop | tr ',' '\n' | wc -l) modules (main only)"
+          echo "  CT smoke   : $(bash scripts/ct-suites.sh smoke | tr ',' '\n' | wc -l) suites"
+          echo "  CT slow    : $(bash scripts/ct-suites.sh slow | tr ',' '\n' | wc -l) suites (main only)"
+          echo "  CT all     : $(bash scripts/ct-suites.sh all | tr ',' '\n' | wc -l) suites"
+          echo "::endgroup::"
 
-      - name: just check (full suite)
-        # lint + doc + eunit + all 223 CT. The other half of the tier split.
-        if: github.event_name != 'pull_request'
-        run: devenv shell -- just check
+      - name: just smoke-test
+        # lint + the 935 unit cases + 211 CT cases. Invoked through `just` rather
+        # than spelled out here so CI and a developer run the same list: a gate
+        # that is written twice is a gate that is checked once.
+        #
+        # `--sname` is inside the recipe, because `apps/i2per_status_SUITE` spawns
+        # a `peer` router node and fails loudly without a dist-enabled CT node.
+        run: devenv shell -- just smoke-test
+
+  # %%%%% The main tier %%%%%
+  #
+  # `main` only. Everything, no time limit: lint, docs, dialyzer, every eunit
+  # including the property layer, and all 25 CT suites including the two the
+  # smoke tier holds back.
+  #
+  # **Separate from `smoke` rather than a superset step in it.** On `main` the
+  # smoke job has already answered "does it work"; what is left is the slower,
+  # less often-failing half, and running them as one job would make the fast
+  # answer wait for the slow one.
+  full:
+    name: full gate (lint + docs + dialyzer + every test)
+    runs-on: ubuntu-latest
+    needs: smoke
+    # **`main` only, by ref rather than by event.** `github.event_name !=
+    # 'pull_request'` would also let a `workflow_dispatch` -- which a human can
+    # fire on any branch -- run the full gate, and the rule is about the code
+    # being on `main`, not about how the run was started.
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install the pinned toolchain
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            accept-flake-config = true
+            extra-experimental-features = nix-command flakes
+
+      - uses: cachix/cachix-action@v17
+        with:
+          name: devenv
+
+      - name: Install the devenv CLI
+        run: nix profile install nixpkgs#devenv
+
+      - name: just test
+        # lint + docs + 951 eunit (935 unit + 16 property) + all 224 CT + the
+        # merged coverage report. Unattended, so the time is not a cost.
+        #
+        # **The property layer runs here and not in `smoke`, deliberately.** They
+        # are 0.23s of work, so runtime is not the reason. The reason is that a
+        # property test finds its counterexample from a *random* input: a failure
+        # on a push is a bug report that arrives before anyone can reproduce it,
+        # and re-rolling the seed is the tempting response to a red that keeps
+        # flickering. On `main`, where a red is investigated rather than re-rolled,
+        # that is the right place for it.
+        run: devenv shell -- just test
+
+      - name: just proper
+        # Explicitly, and separately from `just test` which already includes it.
+        # A property failure on `main` is the one failure class where "which seed"
+        # matters, and this step's log is where the module name is legible next to
+        # the counterexample rather than buried in a 224-case CT summary.
+        run: devenv shell -- just proper
 
       - name: just dialyzer
-        # On both tiers, deliberately. Dialyzer analyses source, not tests, so its
-        # answer does not depend on which CT tier ran -- and 49s on a runner is not
-        # worth spending a tier boundary on.
+        # `main` only, where there is time for it. It analyses source, not tests,
+        # so its answer does not depend on which CT tier ran.
         run: devenv shell -- just dialyzer
 
   # %%%%% The compatibility job %%%%%
   #
   # **Warnings are not fatal here, from day one.** That is not a relaxation
   # discovered later -- it is the only thing that makes this job a different
-  # question from `gate`. A compatibility matrix that failed on warnings would
+  # question from `full`. A compatibility matrix that failed on warnings would
   # report an older OTP as broken when the code is fine, and the natural
   # response would be to delete the matrix.
   #
@@ -164,9 +244,14 @@ jobs:
   # **This job does not install or run `erlfmt`.** Formatting is the pinned
   # job's question, and the same source through the same formatter version gives
   # the same answer twice. It used to install a pinned `erlfmt` here and never
-  # invoke it -- under a comment claiming a `-check` that no step contained, from
-  # a repository URL that does not resolve. If formatting ever *should* be
+  # invoke it -- under a comment claiming a `-check` that no step contained, from a
+  # repository URL that does not resolve. If formatting ever *should* be
   # checked per-OTP, that is a deliberate addition, not a repair of this.
+  #
+  # **Smoke tier, not the full one.** A different OTP is a question about whether
+  # the code runs there at all, so the answer is the partition that establishes
+  # "it runs". The full tier would make this job four times slower than the
+  # question it answers.
   #
   # Starts at one version, the same as devenv, because a matrix nobody has run
   # is a matrix of guesses. Expansion is 1.0.0 material.
@@ -209,29 +294,20 @@ jobs:
           rebar3 compile
           diff -u /tmp/rebar.config.gate rebar.config || true
 
-      - name: eunit
-        # Both tiers. All 940 cases in ~50s on a runner, and it is the one layer
-        # with no gap in it.
-        run: rebar3 as test eunit
+      - name: eunit (unit tier)
+        # The unit layer only. This job's question is "does it run on this OTP",
+        # and 935 in-process cases answer that; the property layer adds a
+        # randomised dimension that would make a version difference look like a
+        # flake.
+        run: rebar3 as test eunit --module="$(bash scripts/eunit-modules.sh unit)"
 
-      - name: ct
-        # The same tier split as the pinned job, from the same script. A pull
-        # request gets 6 suites; a push to `main` -- or a manual dispatch, which
-        # is a request to run the gate -- gets all 25.
+      - name: ct (smoke tier)
+        # The same partition the pinned job runs, from the same script.
         #
-        # `--sname` gives the CT node a fixed dist name, which
+        # `--sname` gives the CT node a fixed distribution name, which
         # `apps/i2per_status/test/i2per_status_SUITE` needs to spawn a peer
         # router. Same reason as the justfile recipe.
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            tier=fast
-          else
-            tier=all
-          fi
-          echo "::group::CT tier: $tier"
-          bash scripts/ct-suites.sh "$tier" | tr ',' '\n' | sed 's/^/  /'
-          echo "::endgroup::"
-          rebar3 ct --sname i2per_ct --suite="$(bash scripts/ct-suites.sh "$tier")"
+        run: rebar3 ct --sname i2per_ct --suite="$(bash scripts/ct-suites.sh smoke)"
 
       - name: dialyzer
         # Still run. A compatibility job that skipped it would not answer "can

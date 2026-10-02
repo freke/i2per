@@ -95,12 +95,25 @@ documentation; they must not be presented as implemented behavior.
 
 ## Build and review checks
 
+The test tree separates by what is under test: EUnit for a single function,
+Common Test for system behaviour, and PropEr for invariants over generated
+inputs.
+
+- `just smoke-test` is the push tier — lint, the unit layer, and most of the
+  Common Test suites. It runs on every push and is under five minutes on a CI
+  runner.
+- `just test` runs everything: lint, documentation generation, all EUnit, the
+  property layer, and all Common Test suites, plus the merged coverage report.
+  It runs on `main`.
+- `just proper` runs the property tests alone, for when a counterexample is what
+  you are chasing.
 - `just doc` generates the ExDoc site and catches malformed documentation
   attributes.
-- `just check` runs formatting, documentation generation, EUnit, and Common
-  Test.
 - `just dialyzer` checks the documented types and specifications against the
   implementation.
-- `just coverage` is an optional report and is not a release acceptance gate.
+
+The tier boundaries are derived from the tree by `scripts/ct-suites.sh` and
+`scripts/eunit-modules.sh`, so a new suite is in the next smoke run by default.
+`just check` is an alias for `just test`.
 
 The `doc/` directory is generated output. Never commit it.
