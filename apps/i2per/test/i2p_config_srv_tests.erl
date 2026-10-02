@@ -113,7 +113,49 @@ valid_values_test() ->
         Cases
     ),
     ?assertEqual({ok, 4}, application:get_env(i2per, transit_max_tunnels)),
-    ok = application:unset_env(i2per, transit_max_tunnels).
+    ok = restore_env(all_keys()).
+
+%% Every key this module's cases set, unset at the end.
+%%
+%% **This was `application:unset_env/2` on one key, and it leaked four.** The
+%% cases above set `transit_bandwidth_kbps`, `tunnel_build_rate`, `floodfill` and
+%% `net_id` as a side effect of being valid; only `transit_max_tunnels` was
+%% cleaned up. Nothing failed, because the leak is invisible to every test that
+%% does not read the whole environment -- until `i2p_config_tests` does:
+%% `i2p_config:in_force/0` reports *every* `loggable_config_keys/0` key that is
+%% set, so a key another module left behind shows up in a boot line this module
+%% is asserting the contents of.
+%%
+%% It surfaced the moment the unit tier ran as an explicit module list, which
+%% orders cases differently from a whole-tree discovery run. The fix belongs here
+%% rather than in the test that noticed: this module is the one that set the
+%% keys, so it is the one that owns putting them back.
+all_keys() ->
+    [
+        transit_max_tunnels,
+        transit_bandwidth_kbps,
+        tunnel_build_rate,
+        floodfill,
+        ntcp2_published,
+        live_network,
+        listen_host,
+        max_ntcp2_connections,
+        max_sam_sessions,
+        max_ssu2_sessions,
+        ntcp2_keepalive_interval_ms,
+        net_id,
+        tunnel_pool,
+        host,
+        port,
+        sam_port,
+        data_dir,
+        reseed,
+        addressbook,
+        server_tunnels
+    ].
+
+restore_env(Keys) ->
+    lists:foreach(fun(Key) -> application:unset_env(i2per, Key) end, Keys).
 
 invalid_values_test() ->
     Cases = [
