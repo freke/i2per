@@ -3,33 +3,31 @@
 {
   cachix.enable = false;
 
-  languages = {
-    erlang.enable = true;
-    javascript = {
-      enable = true;
-      npm.enable = true;
-    };
-  };
+  languages.erlang.enable = true;
   packages = [ pkgs.just pkgs.jujutsu pkgs.git pkgs.erlfmt pkgs.erlang-language-platform pkgs.gh ];
 
-  enterShell = ''
-    # gh asks the terminal for its background colour (OSC 11). Terminals that
-    # answer it leak the reply into the tty input queue, where it surfaces as
-    # junk at the prompt and can swallow the first keystrokes typed afterwards.
-    # muesli/termenv skips the query entirely when TERM begins with "screen",
-    # "tmux" or "dumb" — and keeps 256-colour output for anything containing
-    # "256color", which "dumb" would not. Scoped to gh so nothing else is told a
-    # lie about its TERM. Remove if gh ever stops querying the terminal.
-    gh() { TERM=screen-256color command gh "$@"; }
+  # No `enterShell` hook. The `gh` OSC 11 workaround used to live here, as a
+  # shell function exported with `export -f`, and it does not survive direnv:
+  # `direnv export` drops the function, and zsh has no `export -f` at all, so
+  # `type gh` reported the bare binary in every zsh session. `gh auth login` is
+  # the only interactive `gh`, and it now pins TERM itself -- see `just
+  # gh-login`, which carries the reasoning next to the thing that works.
 
-    # Exported, not merely defined: devenv's generated hook ends in `exec "$@"`,
-    # and the exec'd login shell inherits exported functions from the
-    # environment but not plain definitions. Verified: without this line,
-    # `type gh` in a devenv shell reports the binary path.
-    export -f gh
-  '';
-
+  # `just smoke-test`, not `rebar3 eunit`.
+  #
+  # `enterTest` runs when the environment is entered in test mode, so whatever is
+  # here is this project's answer to "does this still work". The answer was
+  # `rebar3 eunit`, which is a *second* answer: it runs the unit and property
+  # layers together, where `just smoke-test` runs the unit layer alone, and it
+  # skips `erlfmt` entirely. `scripts/eunit-modules.sh` exists to keep that
+  # partition in one place, so a bare `rebar3 eunit` is the one invocation that
+  # ignores it.
+  #
+  # Pointing at the recipe rather than restating the command is what keeps the
+  # two from drifting: the recipe is already what CI runs on every push
+  # (`.github/workflows/gate.yml`), so this cannot answer a different question
+  # from the gate's.
   enterTest = ''
-    rebar3 eunit
+    just smoke-test
   '';
 }

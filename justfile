@@ -172,6 +172,36 @@ clean:
     rebar3 clean
     rm -rf *dump
 
+# %%%%% gh: authenticate, once %%%%%
+#
+# The only `gh` command a human runs. Everything after it is agent-driven and
+# has no tty.
+#
+# **`TERM` is pinned for this one command.** gh asks the terminal for its
+# background colour (OSC 11) when it styles output; a terminal that answers
+# leaks the reply into the tty input queue, where it surfaces as junk at the
+# prompt and swallows the keystrokes typed next. muesli/termenv skips the query
+# when TERM begins with "screen", "tmux" or "dumb", and keeps 256-colour output
+# for anything containing "256color", which "dumb" would not. So this is the same
+# value the old `gh()` wrapper in devenv.nix used -- scoped to the one command
+# that is interactive, rather than to every `gh` in every shell.
+#
+# **That scoping is the fix, not a narrowing.** The wrapper was a shell function
+# exported with `export -f`, which cannot survive direnv: `direnv export` drops
+# it, and zsh has no `export -f` at all, so `type gh` reported the bare binary in
+# every zsh session. An env var on the one interactive command has no such
+# problem -- there is no shell function to lose in the handoff.
+#
+# Nothing else needs the pin. The agents' `gh` calls are non-interactive with no
+# tty, so there is no terminal to query and no input queue to corrupt.
+#
+# The token lands in ~/.config/gh/hosts.yml, so this is once per machine.
+#
+# Authenticate gh against github.com.
+gh-login flags="":
+    TERM=screen-256color gh auth login {{flags}}
+    gh auth status
+
 # Show jujutsu status
 status:
     jj status
