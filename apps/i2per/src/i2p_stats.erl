@@ -96,6 +96,29 @@ counters() ->
         %% yet", which is the first question when a status page looks empty.
         events_notified,
 
+        %% %%%%% Blocks we received and did not handle %%%%%
+        %%
+        %% **Every SSU2 Data block that reached the peer manager and matched no
+        %% handler**, counted once each. The count is remote-driven and
+        %% undeduplicated: a peer that sends nothing but blocks we do not handle
+        %% moves this as fast as it can transmit.
+        %%
+        %% This is the total that `ssu2_block_unhandled` used to be. The event
+        %% carried it by being emitted per block, and that made the announce rate
+        %% a function of what a remote peer chose to send -- which matters
+        %% because a wedged `gen_event` handler parks the manager and every event
+        %% queued behind it sits in the manager's mailbox. The flood rate *was*
+        %% the backlog rate. The event is now announced once per peer and kind;
+        %% this carries what it stopped carrying. See #HPH59JN.
+        %%
+        %% A counter rather than an event for the same reason as every other rate
+        %% here: this is a steady state on a router being sent junk, and an event
+        %% per 1028-byte block would drown the bus.
+        %%
+        %% Read alongside the per-peer log warning, which says *which* peer. This
+        %% says how much, and neither figure answers for the other.
+        ssu2_blocks_unhandled,
+
         %% %%%%% Bytes at the transport boundary %%%%%
         %%
         %% What is counted is what crossed the socket, in each direction, per
