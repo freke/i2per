@@ -1568,6 +1568,29 @@ loss while still bounding the stuck-remote case that SSU2-then-NTCP2 fallback
 recovers from. Both values are read from the `i2per` application environment
 when the retransmit timer is armed.
 
+#### Why a dial was parked
+
+Every time a dial gives up on SSU2 and repeats over NTCP2, the reason it gave up
+is announced as `{ssu2_dial_parked, PeerHash, Reason}` and charged to
+`ssu2_dials_parked`. A dial that never tried SSU2 is `not_attempted` and is
+neither announced nor counted. See #1Q4JREN.
+
+The point of the reason is one bit: **did something come back.**
+`{protocol_error, _}` means a datagram arrived and could not be used, which is
+proof that UDP works in that direction; `{handshake_timeout, _}` and `timeout`
+mean silence. A single dial cannot tell silence from our own UDP being blocked,
+from the peer being down, or from a middlebox — the three are
+over-determined. Across peers it can: SSU2 timing out for every peer while NTCP2
+succeeds for every peer means the common cause is ours, which is the one an
+operator can act on.
+
+This is a separate fact from `peer_connect_failed`, which fires only once *both*
+legs have failed and so never fires for the peer a park usually concerns: one that
+connected over TCP and left a UDP stall behind. The other three reasons —
+`{relay_rejected, _}`, `{relay_bad_response_sig, _}` and
+`{session_admission_failed, _}` — are the introducer leg, so they only appear on
+the firewalled-remote path.
+
 #### Handshake sequence
 
 ```mermaid
