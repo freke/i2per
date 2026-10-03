@@ -26,12 +26,29 @@ Tests for the transit relay's per-frame RouterInfo existence check.
 %%% --------------------------------------------------------------------------
 
 %% The property, asserted rather than asserted-about: while relaying frames the
-%% calling process makes no call into the NetDb.
+%% calling process makes no *blocking* call into the NetDb.
 %%
-%% The trace is on `call` events only, and the match pattern keeps just the
-%% NetDb's functions, so an unrelated call cannot mask a real one and a real one
-%% cannot hide behind an unrelated call. Zero is the assertion; there is no
-%% tolerance and no "mostly".
+%% **The `after` clause is load-bearing, and it is here because this case can
+%% contaminate every module that runs after it.** `f:start_tracing/0` enables two
+%% `erlang:trace_pattern/3` match specs -- which are **global**, not per-process --
+%% and attaches a tracer to whichever process calls it, which under eunit is a
+%% worker shared by the whole tier. `f:collect_calls/1` disables them, but only if
+%% `send_frames/2` returns. So a case that leaks is a case that leaks *only when it
+%% fails*, and a suite run green cannot see it. See `f:stop_tracing/1`.
+%%
+%% **The distinction is the claim, so the trace has to distinguish it.** The
+%% relay does call `i2p_netdb_srv:has_router/1` once per frame -- that is how it
+%% decides whether it can route -- but `has_router/1` is a direct
+%% `ets:member/2` against the published table, not a `gen_server:call/2`, and
+%% that change is the entire optimisation `m:i2p_tunnel_relay` documents for
+%% this path. So "made no call at all" is false, and asserting it would be a
+%% test demanding the code be wrong.
+%%
+%% What must not happen is a `handle_call/3`, which is what blocks behind a NetDb
+%% write. So the assertion is over the *callback* entry points rather than over
+%% every exported function, and it is exhaustive over them: a new
+%% `gen_server`-style entry point added to `i2p_netdb_srv` shows up here as a
+%% failure rather than passing unnoticed.
 relay_path_makes_no_blocking_call_per_frame_test() ->
     with_netdb(
         fun(Held, Missing) ->
@@ -39,12 +56,33 @@ relay_path_makes_no_blocking_call_per_frame_test() ->
             try
                 send_frames(Held, ?FRAMES),
                 send_frames(Missing, ?FRAMES),
-                ?assertEqual([], collect_calls(Traced, []))
+                All = collect_calls(Traced),
+                ?assertEqual(
+                    [], blocking_calls(All) ++ gen_server_calls(All)
+                )
             after
                 stop_tracing(Traced)
             end
         end
     ).
+
+%% The `gen_server` callbacks out of what the trace saw.
+%%
+%% **A name list, not a pattern match on `handle_call/3`.** The property is about
+%% blocking, and a `gen_server` blocks on any of its callbacks; matching one
+%% function name would let a second callback through. Kept next to the assertion
+%% so the two are read together.
+blocking_calls(Traced) ->
+    Blocking = [handle_call, handle_cast, handle_info, handle_continue, terminate],
+    [MFA || MFA = {i2p_netdb_srv, Name, _} <- Traced, lists:member(Name, Blocking)].
+
+%% `gen_server:call/4` as the trace reports it: the function traced is
+%% `gen_server:call`, so the *name* in the MFA is `call`, not one of the
+%% callbacks. Matched on the module and the function name, because that is the
+%% shape `trace_pattern({gen_server, call, '_'}, ...)` produces and the one this
+%% asserts against.
+gen_server_calls(Traced) ->
+    [MFA || MFA = {gen_server, call, _} <- Traced].
 
 %% The two answers are one answer, not two. A frame for a router we hold is
 %% handed on; a frame for one we do not is dropped, and the drop is counted so
@@ -144,26 +182,110 @@ rand_hash() ->
 
 %%% --------------------------------------------------------------------------
 %%% Tracing
-%%% --------------------------------------------------------------------------
 
 %% Trace this process's own outgoing calls, keeping only the NetDb's.
+%%
+%% **The tracer is a process of this case's own, named explicitly.** That is the
+%% whole change from the version that took the default: without
+%% `{tracer, Tracer}` the tracer is *the calling process*, which under eunit is a
+%% worker shared by every module in the tier. A process carries at most one
+%% tracer, so any earlier module that left a trace on that worker makes this
+%% call raise `badarg` -- `can only have one tracer per process`.
+%%
+%% That is not hypothetical. It is what this case did, and it failed the moment
+%% the tier ran as an explicit module list instead of a whole-tree discovery
+%% run: `i2p_netdb_verify_tests` traces the worker with a tracer of its own and
+%% does not clear it.
+%%
+%% A private collector also makes the barrier exact. Reading trace messages out
+%% of the case's own mailbox conflates this trace with every other module's
+%% leftovers in the shared worker; asking a process nobody else can address
+%% cannot.
+-spec start_tracing() -> {pid(), pid()}.
 start_tracing() ->
+    {module, i2p_netdb_srv} = code:ensure_loaded(i2p_netdb_srv),
+    {module, gen_server} = code:ensure_loaded(gen_server),
     _ = erlang:trace_pattern({i2p_netdb_srv, '_', '_'}, true, [local]),
-    _ = erlang:trace(self(), true, [call]),
-    self().
+    %% `gen_server` alongside the NetDb, because a blocking call is not
+    %% identifiable from the callee: `i2p_netdb_srv:count/0` looks like any
+    %% other exported function until you see its body reach for `gen_server`.
+    %% Tracing both makes the claim "this path blocks" visible at the point where
+    %% it blocks, rather than requiring a list of every wrapper that is a
+    %% `gen_server:call` in disguise.
+    _ = erlang:trace_pattern({gen_server, call, '_'}, true, [local]),
+    %% `spawn_link`, as a last resort and **not** as the safety net it looks like:
+    %% eunit **catches** a failed assertion, so the worker does not exit and the
+    %% link does not fire. The collector is stopped explicitly instead, in an
+    %% `after` clause -- see `f:stop_tracing/1`. What this link does still cover is
+    %% the worker itself being killed.
+    Tracer = spawn_link(fun() -> tracer_loop([]) end),
+    _ = erlang:trace(self(), true, [call, {tracer, Tracer}]),
+    {self(), Tracer}.
 
-stop_tracing(Me) ->
-    _ = erlang:trace_pattern({i2p_netdb_srv, '_', '_'}, false, [local]),
-    _ = erlang:trace(Me, false, [call]),
-    ok.
-
-%% The traced calls arrive as ordinary messages, so draining the mailbox is a
-%% barrier rather than a sleep: by the time this runs every traced call has
-%% returned and its message is already queued.
-collect_calls(Me, Acc) ->
+%% Owns the trace messages. Accumulates the NetDb's calls and answers a
+%% `{collect, From, Ref}` request with everything seen since the last one, so a
+%% second collection does not re-report the first batch.
+tracer_loop(Acc) ->
     receive
-        {trace, Me, call, MFA, _Ret} ->
-            collect_calls(Me, [MFA | Acc])
-    after 0 ->
-        lists:reverse(Acc)
+        {trace, _Pid, call, {M, F, A}} ->
+            tracer_loop([{M, F, A} | Acc]);
+        {collect, From, Ref} ->
+            From ! {collected, Ref, lists:reverse(Acc)},
+            tracer_loop([])
     end.
+
+%% Every `i2p_netdb_srv` call this process made under the trace, and the trace off.
+%%
+%% **The trace is turned off before the collection is requested**, not after.
+%% `erlang:trace/3` returns once the flag is set, and the messages it stops
+%% sending are already queued in the collector, so the answer that comes back
+%% covers every call that had already returned. Collecting first and disabling
+%% after would race a call still in flight.
+-spec collect_calls({pid(), pid()}) -> [mfa()].
+collect_calls({Me, Tracer}) ->
+    _ = erlang:trace(Me, false, [call]),
+    _ = erlang:trace_pattern({i2p_netdb_srv, '_', '_'}, false, [local]),
+    _ = erlang:trace_pattern({gen_server, call, '_'}, false, [local]),
+    Ref = make_ref(),
+    Tracer ! {collect, self(), Ref},
+    receive
+        {collected, Ref, Calls} -> Calls
+    after 1000 ->
+        erlang:error(timeout_collecting_traced_calls)
+    end.
+
+%% Everything `f:start_tracing/0` turned on, turned off -- and the collector stopped.
+%%
+%% **This is the teardown, and it is in an `after` clause because
+%% `f:collect_calls/1` cannot be one.** `collect_calls/1` does disable the tracing,
+%% but it is reached only if `send_frames/2` returns, and `send_frames/2` is
+%% `ok = i2p_tunnel_relay:send_tunnel_data(...)`, which raises on a badmatch. On
+%% that path two things used to survive the case and contaminate whatever ran next:
+%%
+%% - **the two `trace_pattern`s, which are global.** They are not scoped to the
+%%   traced process, so leaving them enabled has every traced process in the VM
+%%   reporting `i2p_netdb_srv` calls and `gen_server:call` calls.
+%% - **the tracer on the shared eunit worker.** A process carries at most one
+%%   tracer, so the next module to trace that worker gets `badarg`, *can only have
+%%   one tracer per process*.
+%%
+%% The second is the failure this module's tracer comment describes as the reason
+%% for naming the tracer explicitly at all, arriving by the other door. And it is
+%% invisible in the passing direction, which is what makes it worth a clause rather
+%% than a code path: a case that only leaks when it fails cannot be caught by
+%% running the suite green.
+%%
+%% **Idempotent on purpose.** A passing case has already disabled everything by the
+%% time it reaches here, and disabling twice is a no-op rather than an error. That is
+%% what lets one clause serve both paths instead of needing to know which one it is.
+%%
+%% `unlink` before the kill, because a collector killed while still linked takes
+%% the worker with it -- the same reason `f:with_netdb/1` drops its link before
+%% tearing its fixture down.
+stop_tracing({Me, Tracer}) ->
+    _ = erlang:trace(Me, false, [call]),
+    _ = erlang:trace_pattern({i2p_netdb_srv, '_', '_'}, false, [local]),
+    _ = erlang:trace_pattern({gen_server, call, '_'}, false, [local]),
+    unlink(Tracer),
+    exit(Tracer, kill),
+    ok.

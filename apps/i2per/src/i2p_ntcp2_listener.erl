@@ -14,11 +14,11 @@ accepts but does not touch established connections.
 `f:i2p_ntcp2_listener:listen/3` returns two processes, and the split is the whole
 design. This one owns the listening socket and answers the three questions that
 can be asked of a listener — its port, its address, and whether it should stop.
-`m:i2p_ntcp2_acceptor` is the only process that accepts, and it blocks in
+`m:i2p_tcp_acceptor` is the only process that accepts, and it blocks in
 `f:gen_tcp:accept/1` while it does so.
 
 The reason is that a listening socket delivers no message when a connection
-arrives, whatever its active mode — `m:i2p_ntcp2_acceptor` has the measurement
+arrives, whatever its active mode — `m:i2p_tcp_acceptor` has the measurement
 and the driver detail. So a process that accepts must either block in `accept`
 and answer nothing while it does, or return from it on a timer to look at its
 mailbox. This loop used to do the second, with a **one-second** timeout, and so
@@ -33,6 +33,11 @@ blocked, which is what the timeout used to be for. The loop below has no timeout
 clause at all: there is nothing left to poll for, so each message is answered when
 it arrives. The bound that matters moved to the other end — see
 `f:i2p_ntcp2_listener:stop/1`.
+
+`f:start_bob/3` is what an accepted socket becomes. It lives here rather
+than in `m:i2p_tcp_acceptor` because the child spec and the responder's
+announcement are this transport's, and the acceptor's job is to own the socket
+until they exist.
 
 ## Usage
 
@@ -150,9 +155,10 @@ init(Port, LocalKeys, Owner) ->
             {packet, raw},
             %% Passive, and load-bearing rather than conventional: an accepted
             %% socket inherits its listen socket's active mode, so this is what
-            %% makes every socket `m:i2p_ntcp2_acceptor` accepts one that cannot
+            %% makes every socket `m:i2p_tcp_acceptor` accepts one that cannot
             %% deliver a frame to the wrong owner during the handover. The module
-            %% doc there has the measurement.
+            %% doc there has the measurement, and sets it again on the accepted
+            %% socket so the invariant does not rest on this option alone.
             {active, false},
             {reuseaddr, true},
             {nodelay, true},
@@ -168,7 +174,9 @@ init(Port, LocalKeys, Owner) ->
     %% monitor rather than a link because the link is a platform detail
     %% (`f:proc_lib:start_link/3` unlinks after the ack on some releases and does
     %% not on others), and this must not depend on which one this is.
-    {ok, Acceptor} = i2p_ntcp2_acceptor:start_link(ListenSock, LocalKeys, Owner),
+    {ok, Acceptor} = i2p_tcp_acceptor:start_link(
+        ListenSock, fun(Sock) -> start_bob(Sock, LocalKeys, Owner) end
+    ),
     MRef = erlang:monitor(process, Acceptor),
     proc_lib:init_ack({ok, self()}),
     control_loop(ListenSock, BoundPort, ListenIP, Acceptor, MRef).
@@ -200,4 +208,34 @@ control_loop(ListenSock, BoundPort, ListenIP, Acceptor, MRef) ->
             %% supervisor then restarts the boot listener, which is the recovery
             %% that a crash report asks for anyway.
             exit({acceptor_gone, Reason})
+    end.
+
+%% Start the responder for one accepted socket and hand the socket over.
+%%
+%% Called by `m:i2p_tcp_acceptor` in the acceptor process, which is the socket's
+%% owner at this point and therefore the only process that can transfer it. The
+%% `controlling_process/2` has to come before anything the new owner does, which
+%% is why the socket arrives in the child spec rather than in a message the child
+%% might read too early: `i2p_ntcp2_conn:init/1` acknowledges its supervisor
+%% before the handshake starts, so the owner of the socket is already reading the
+%% peer's first message by the time the bytes arrive.
+start_bob(Sock, LocalKeys, Owner) ->
+    Args = #{role => bob, sock => Sock, local => LocalKeys, owner => Owner},
+    case i2p_ntcp2_sup:start_connection(i2p_ntcp2_sup:conn_child(Args)) of
+        {ok, Conn} ->
+            ok = gen_tcp:controlling_process(Sock, Conn);
+        {ok, Conn, _Extra} ->
+            ok = gen_tcp:controlling_process(Sock, Conn);
+        {error, _Reason} ->
+            %% The connection limit, or a supervisor that would not start it. The
+            %% peer is already connected at the TCP level and there is nothing to
+            %% tell it, so closing is the whole of the answer.
+            %%
+            %% No frame and no bus event for it, and that is a decision rather than
+            %% an omission. A frame here would be a fifth module emitting frames,
+            %% which `i2p_log_tests` exists to object to; an event has nowhere to
+            %% key: the handshake has not run, so there is no RouterInfo and no
+            %% peer hash to count against. What the peer sees — a completed TCP
+            %% connection closed at once — is what it saw before this loop moved.
+            ok = gen_tcp:close(Sock)
     end.

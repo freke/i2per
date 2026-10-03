@@ -263,6 +263,35 @@ counters() ->
         %% more peers than it can use.
         peers_evicted,
 
+        %% %%%%% Connections and sessions refused at a cap %%%%%
+        %%
+        %% **Three counters for one operator question: which of my three caps am
+        %% I hitting?** They are not one shared total because the three bounds
+        %% different things and are fixed by three different keys, so a single
+        %% number cannot be acted on — the fix for a SAM session refused at
+        %% `max_sam_sessions` is nothing like the fix for a peer connection
+        %% refused at `max_ntcp2_connections`.
+        %%
+        %% Expected to stay at zero. A non-zero value is not a fault in itself:
+        %% the cap did its job. It is the evidence that the cap is the thing
+        %% standing between this router and a peer set or a client, and before
+        %% these existed the only symptom was a connection that did not happen —
+        %% indistinguishable from a peer that refused us, a NetDb that had no
+        %% address, or a handshake that failed.
+        %%
+        %% Charged in `m:i2p_admission`, on the refusal, by the process that owns
+        %% the cap, rather than by each caller: three call sites to remember is
+        %% three chances to forget one, and a cap nobody counts is a cap an
+        %% operator can only infer.
+        %%
+        %% A rate rather than an incident, which is why these are counters: at
+        %% the cap the refusal fires on every inbound accept and on every
+        %% reconnect attempt, so an event each time would drown the bus. The
+        %% same reasoning as `transit_frames_dropped_no_route`.
+        ntcp2_connections_refused_limit,
+        ssu2_sessions_refused_limit,
+        sam_sessions_refused_limit,
+
         %% %%%%% Tunnel lifecycle %%%%%
         %%
         %% Cumulative since router start, and **not** a ratio: the ratio is the

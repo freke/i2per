@@ -77,6 +77,24 @@ network, and is eligible to answer lookups for them.
 **Reseed** — the signed bundle of network database entries a router fetches when
 it starts empty.
 
+## Transports
+
+**Transport** — a way for two routers to carry a session: SSU2 over UDP, or
+NTCP2 over TCP. A router publishes one address per transport it serves.
+
+**Transport availability** — whether this router serves a transport: whether
+it publishes an address for it, and whether peers can therefore reach it that
+way.
+
+**Transport preference** — which transport this router reaches for first when
+dialing. Independent of availability, and deliberately so: a router may serve
+both transports and still dial one of them first.
+
+Neither term is a judgement about which transport is better. The network runs
+both because one is UDP and one is TCP, so neither covers every network. A
+preference is therefore a statement about this router's own network — which is
+why it belongs to the operator, and why it is fixed when the router starts.
+
 ## Tunnels
 
 **Tunnel** — a chain of hops that carries messages on behalf of a client.
