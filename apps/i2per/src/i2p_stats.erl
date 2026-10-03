@@ -151,6 +151,37 @@ counters() ->
         %% sliding values, and this is a plain cumulative total.
         ssu2_stale_packets,
 
+        %% %%%%% Dials parked on SSU2 %%%%%
+        %%
+        %% **An outbound dial sat on SSU2, gave up, and went to NTCP2 instead.**
+        %%
+        %% Not a rate and not an incident: the dial's own cost is the point, and
+        %% the dial recovers, so on a healthy router with a dead UDP path this is
+        %% simply "the number of peers we had to fall back for". What makes it
+        %% worth counting is that before it existed the cost was invisible — the
+        %% dial was in `connecting`, not in backoff, and `peer_connect_failed`
+        %% fires only once *both* legs have failed, so a router whose UDP was
+        %% blocked everywhere looked exactly like one that was merely slow.
+        %%
+        %% Its own counter rather than a field on the connect failure for that
+        %% reason. A peer that connects over NTCP2 never reports a failure at
+        %% all, and that peer is precisely the one whose SSU2 attempt was thrown
+        %% away.
+        %%
+        %% **Counted only when something was actually parked.** A dial that never
+        %% tried SSU2 — the transport off at boot, no listener up, or the remote
+        %% publishing none — is `not_attempted` and moves nothing here. Counting it
+        %% would make this a count of dials, and a total that grows in proportion
+        %% to traffic says nothing about UDP.
+        %%
+        %% Which *kind* of park is not in this number but in the bus event of the
+        %% same name, which carries the reason: a `{protocol_error, _}` is a
+        %% datagram that arrived and could not be used, and so is proof that UDP
+        %% works that way, while a `{handshake_timeout, _}` is silence. Read
+        %% across peers, the second outnumbering the first everywhere is "our UDP
+        %% is blocked", which is the one an operator can act on. See #1Q4JREN.
+        ssu2_dials_parked,
+
         %% %%%%% Bytes carried for other routers %%%%%
         %%
         %% **These are wire bytes, not client bytes, and the difference is not an

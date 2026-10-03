@@ -44,7 +44,7 @@ counted and flagged rather than dropped.
 %% has quietly gone wrong fails loudly rather than agreeing with itself on a
 %% smaller world, and so adding a shape without updating it is a decision rather
 %% than an accident.
--define(SHAPE_COUNT, 18).
+-define(SHAPE_COUNT, 19).
 
 %%% %%%%% The two sides agree %%%%% %%%
 

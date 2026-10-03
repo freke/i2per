@@ -330,13 +330,13 @@ Adding a row here without recording it is not something the compiler can see. A
 type is not data, so nothing at the type level can say whether `started_as` is ever
 written; only a check that reads the tree can, and that is what this row is for.
 
-**What is deliberately not here.** `m:i2p_events:event/0` admits eighteen event
+**What is deliberately not here.** `m:i2p_events:event/0` admits nineteen event
 shapes and only seven are checklist rows, because the checklist is not the event
 vocabulary. It is ADR 0002's table of *symptoms an operator would report*, and a
 `peer_disconnected` is not one -- nothing an operator would come to the log to ask
 about. Declaring the rest would make the checklist a second copy of the event type,
 and the event type is already covered from both sides by
-`i2p_events_vocabulary_tests`. Two lists of the same eighteen things is the
+`i2p_events_vocabulary_tests`. Two lists of the same nineteen things is the
 duplication this project refuses; so is a third list of seven of them.
 """.
 -spec checklist() -> #{fact() => entry()}.
