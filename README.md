@@ -68,11 +68,34 @@ The toolchain this tree is built and gated against:
 `just check` runs `erlfmt`, which is not part of a stock Erlang install, and
 `rebar.config` compiles with `warnings_as_errors` — so a different OTP version
 can fail on warnings this one does not produce. Use the pinned environment
-instead of assembling the toolchain by hand:
+instead of assembling the toolchain by hand.
+
+**The pinned environment loads itself.** `.envrc` puts it in every shell you open
+in this directory, including your editor's, a REPL and anything an agent runs:
 
 ```sh
-devenv shell
+git clone https://github.com/freke/i2per && cd i2per
+direnv allow      # once per checkout, and deliberately not automatic
 ```
+
+That prompt is direnv's, and it is a security boundary rather than a papercut:
+running an `.envrc` executes shell code from the checkout, so direnv refuses
+until you have read it. Approve it once and every later shell is already
+correct.
+
+**Editing `.envrc` asks again.** direnv trusts a specific revision of the file,
+not the path, so any change to it re-blocks every open shell — and the symptom is
+`rebar3: command not found` in a shell that worked a minute ago. Run `direnv
+allow` again after editing it.
+
+For a shell that does not have direnv — a script, or CI:
+
+```sh
+devenv shell -- <command>
+```
+
+Note the `--`. `devenv shell` without it starts an interactive subshell, which is
+why an editor or a REPL opened from inside one still has no toolchain.
 
 ## Developer mode
 
@@ -100,7 +123,7 @@ packaged release section below when you need a full router process.
 
 ## Build and verify
 
-From the repository root, inside the devenv shell:
+From the repository root — where the pinned environment is already on `PATH`:
 
 ```sh
 just smoke-test   # the push tier: lint, unit tests, most of the CT suites
