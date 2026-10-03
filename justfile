@@ -24,22 +24,27 @@ compile:
 
 # %%%%% proper: property-based, on main and on request %%%%%
 #
-# 3 modules, 16 properties, **measured at 0.23s**. They are not in the smoke tier
+# 2 modules, 11 properties, **measured at 0.19s**. They are not in the smoke tier
 # for a reason that is not their runtime: they are the layer whose value is
 # statistical, so a fixed-seed failure is not reproducible by re-running the
 # suite, and a random input found on a push is a bug report that arrives before
 # anyone can reproduce it. They run on `main`, where a red is investigated rather
 # than re-rolled, and locally by name.
 #
+# The count fell from 16 because five of them could not fail: `just proper`
+# running 11 properties that each reject a plausible mutant is worth more than
+# 16 where one is a restatement of the code it calls. #M3VTQBV is what removed
+# them, and the mutants it used are in that ticket's `Solution:` comment.
+#
 # `just test` includes them, so "run everything" means everything.
 #
-# Run the property tests (3 modules, 16 properties).
+# Run the property tests (2 modules, 11 properties).
 proper:
     rebar3 as test eunit --module="$(bash scripts/eunit-modules.sh prop)"
 
 # %%%%% smoke-test: every push, under five minutes %%%%%
 #
-# lint + the 935 unit cases + **211 of the 224 CT cases** across 23 of the 25
+# lint + the 958 unit cases + **211 of the 224 CT cases** across 23 of the 25
 # suites. Measured at **~92s here** (79s CT, 10s eunit, 3s lint).
 #
 # **This is a partition of the tree, not a hand-picked list.** Every suite except
@@ -67,7 +72,7 @@ smoke-test: lint
 
 # %%%%% test: everything, no time limit %%%%%
 #
-# lint + doc + all 951 eunit (935 unit + 16 property) + all 224 CT + the merged
+# lint + doc + all 969 eunit (958 unit + 11 property) + all 224 CT + the merged
 # coverage report. Measured at **~4 minutes here**; `main` runs it unattended.
 #
 # **`--cover` on both halves, because `just cover` is the only thing that reads
