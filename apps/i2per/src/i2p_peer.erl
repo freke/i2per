@@ -744,18 +744,32 @@ is_i2np_block(_) -> false.
 %% blocks those coordinators need is how a future implementation ends up looking
 %% broken for a reason that lives in this module.
 %%
-%% Both lines stay, and they are not a duplicate. The event carries the block name
-%% alone, which is the dimension a counter wants; the log line adds the *peer*, which
-%% the event deliberately does not carry because its cardinality is unbounded. That
-%% is the ADR 0002 split rather than a breach of it: the fact is recorded once, and
-%% the two lines record different parts of it.
+%% **Both instruments fire once per peer and kind, and the counter fires always.**
 %%
-%% The warning is emitted once per peer and kind, because a peer that floods us with
-%% these must not turn the log into the flood it is causing. The event is not
-%% deduplicated, for the same reason in reverse: a counter wants the total.
+%% The warning was already deduplicated, because "a peer that floods us with these
+%% must not turn the log into the flood it is causing". The event used to be emitted
+%% per *block*, on the reasoning that "a counter wants the total" -- and it was right
+%% about the want and wrong about the instrument. The total now lives in
+%% `m:i2p_stats:ssu2_blocks_unhandled`, charged on every block, so the announce rate
+%% is free to be what it was always supposed to be: a notice.
+%%
+%% **Why that is not merely tidiness.** A wedged `gen_event` handler parks the manager,
+%% and every event queued behind it waits in the manager's mailbox, undelivered,
+%% for as long as the handler stays wedged. The announce rate *is* the backlog rate.
+%% Leaving one emit per block meant the most likely way to wedge a handler -- a peer
+%% flooding blocks the router does not handle -- was also the fastest way to fill the
+%% queue behind it, from the peer manager, which is the process every send path in
+%% the router goes through. See #HPH59JN.
+%%
+%% The key is the same one the log uses, `{Identity, Name}`, so the two instruments
+%% describe the same occurrences and the dedup set bounds both. Keeping the log line
+%% as well as the event is a deliberate overlap rather than an oversight: the log is
+%% the record that exists when nothing is attached, and `i2per_status` is never
+%% started by the router. See #HPH59JN for the two-instrument question this leaves
+%% open.
 note_unhandled_ssu2_block(ConnPid, Block, State) ->
     Name = ssu2_block_name(Block),
-    i2p_events:notify({ssu2_block_unhandled, Name}),
+    ok = i2p_stats:add(ssu2_blocks_unhandled, 1),
     Identity =
         case find_conn_peer(ConnPid, State) of
             {Hash, _PeerState} -> {peer, base64:encode(Hash)};
@@ -767,6 +781,7 @@ note_unhandled_ssu2_block(ConnPid, Block, State) ->
         true ->
             State;
         false ->
+            i2p_events:notify({ssu2_block_unhandled, Name}),
             i2p_log:emit(
                 unhandled_ssu2_block_peer, "unhandled ssu2 ~0p block from ~0p", [Name, Identity]
             ),
