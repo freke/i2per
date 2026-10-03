@@ -16,14 +16,16 @@ handles their ready, frame, and data messages.
 
 ## Transport selection
 
-Outbound dials run in a spawned process and prefer SSU2: when app env
-`i2per` -> `ssu2_enabled` is set, the local SSU2 listener is up, and the
-remote publishes a usable SSU2 address, the manager attempts the SSU2
-handshake there. The handshake blocks until it succeeds or fails; on failure
-(SessionCreated timeout, protocol error, or an attempt at a dead SSU2 port)
-the dial falls back to NTCP2 without retrying SSU2. When SSU2 is unavailable
-(disabled, no listener, or the remote is NTCP2-only) the dial goes straight
-to NTCP2. The live transport is surfaced per peer by `f:status/0`.
+Outbound dials run in a spawned process and prefer SSU2: when app env `i2per`
+-> `ssu2` is `prefer_udp` (`f:i2p_identity:ssu2_preferred/0`), the local SSU2
+listener is up, and the remote publishes a usable SSU2 address, the manager
+attempts the SSU2 handshake there. The handshake blocks until it succeeds or
+fails; on failure (SessionCreated timeout, protocol error, or an attempt at a
+dead SSU2 port) the dial falls back to NTCP2 without retrying SSU2. Under
+`enable_udp` — serve UDP, dial NTCP2 first — no dial attempts SSU2 at all, even
+though the listener is bound. When SSU2 is not preferred (not served, not
+preferred, no listener, or the remote is NTCP2-only) the dial goes straight to
+NTCP2. The live transport is surfaced per peer by `f:status/0`.
 
 Inbound sessions arrive from the boot listener as `bob`-role connections. The
 ready message carries the dialer's RouterInfo: when the connection's pid does
@@ -987,7 +989,7 @@ park_reported(PeerHash, Reason) ->
 %%
 %% Announced from the dialing process rather than decided in the manager, because
 %% the manager cannot know the answer: the choice between the two transports is
-%% made *here*, from `f:i2p_identity:ssu2_enabled/0`, whether the SSU2 listener
+%% made *here*, from `f:i2p_identity:ssu2_preferred/0`, whether the SSU2 listener
 %% exists, and what the remote publishes -- none of which the manager re-reads,
 %% and the first of which an operator can change.
 %%
@@ -1006,9 +1008,13 @@ attempt_announced(PeerHash, Transport) ->
     ok.
 
 %% Outbound SSU2 dial (Alice role). Bypassed — returning `{fallback,
-%% not_attempted}` — unless SSU2 is enabled at boot, this router's SSU2 listener
-%% is up, and the remote publishes a usable SSU2 address. The blocking handshake
-%% runs in this spawned process; on success it hands the session to the peer
+%% not_attempted}` — unless SSU2 is preferred for dialing, this router's SSU2
+%% listener is up, and the remote publishes a usable SSU2 address. **Preferred,
+%% not merely served**: under `enable_udp` the listener is bound and the address
+%% published, and every dial still goes to NTCP2, because serving UDP and
+%% reaching for it first are the two separate terms the glossary names.
+%%
+%% The blocking handshake runs in this spawned process; on success it hands the session to the peer
 %% manager and reports it as connected (as NTCP2 does), and on any failure
 %% returns `{fallback, Reason}` naming why, so the caller can fall back to NTCP2
 %% and still say what the park was. Return shape is `ok | {fallback,
@@ -1019,7 +1025,7 @@ attempt_announced(PeerHash, Transport) ->
 %% in `t:i2p_events:event/0`, at the `f:notify/1` call site.
 ssu2_connect(PeerHash, RemoteRI, Local) ->
     case
-        i2p_identity:ssu2_enabled() andalso
+        i2p_identity:ssu2_preferred() andalso
             erlang:whereis(i2p_ssu2_listener) =/= undefined andalso
             i2p_router_info:ssu2_address_options(RemoteRI) =/= error
     of
@@ -1768,7 +1774,7 @@ dialable_ri(RI) ->
         {ok, _} ->
             true;
         _ ->
-            i2p_identity:ssu2_enabled() andalso
+            i2p_identity:ssu2_preferred() andalso
                 i2p_router_info:ssu2_address_options(RI) =/= error
     end.
 

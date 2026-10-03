@@ -24,6 +24,7 @@
     transport_ntcp2_when_remote_is_ntcp2_only/1,
     transport_ntcp2_when_ssu2_disabled/1,
     transport_ssu2_when_available/1,
+    transport_enable_udp_serves_but_dials_ntcp2/1,
     transport_falls_back_to_ntcp2/1,
     ssu2_park_on_a_dead_port_is_reported_with_its_reason/1,
     ssu2_park_separates_silence_from_a_wrong_answer/1,
@@ -63,6 +64,7 @@ all() ->
         transport_ntcp2_when_remote_is_ntcp2_only,
         transport_ntcp2_when_ssu2_disabled,
         transport_ssu2_when_available,
+        transport_enable_udp_serves_but_dials_ntcp2,
         transport_falls_back_to_ntcp2,
         ssu2_park_on_a_dead_port_is_reported_with_its_reason,
         ssu2_park_separates_silence_from_a_wrong_answer,
@@ -72,7 +74,7 @@ all() ->
     ].
 
 %% ---------------------------------------------------------------------------
-%% Per-case lifecycle: the `ssu2_enabled` switch must be set before the app
+%% Per-case lifecycle: the `ssu2` setting must be set before the app
 %% and its SSU2 supervisor come up. App stop and unset_env in
 %% end_per_testcase leave a clean envelope for the next case. The fallback
 %% scenario spends ~20s in the SSU2 handshake budget, so it gets a wider
@@ -125,18 +127,23 @@ arm_handshake(a_peer_parked_on_ssu2_reports_ssu2_not_ntcp2) ->
 arm_handshake(_Case) ->
     ok.
 
+%% `prefer_udp`, not `enable_udp`: every case here is about the *preference*, and a
+%% case that wanted the listener without the preference is not testing transport
+%% selection at all.
 arm_ssu2(transport_ntcp2_when_remote_is_ntcp2_only) ->
-    application:set_env(?APP, ssu2_enabled, true);
+    application:set_env(?APP, ssu2, prefer_udp);
 arm_ssu2(transport_ssu2_when_available) ->
-    application:set_env(?APP, ssu2_enabled, true);
+    application:set_env(?APP, ssu2, prefer_udp);
 arm_ssu2(transport_falls_back_to_ntcp2) ->
-    application:set_env(?APP, ssu2_enabled, true);
+    application:set_env(?APP, ssu2, prefer_udp);
 arm_ssu2(ssu2_park_on_a_dead_port_is_reported_with_its_reason) ->
-    application:set_env(?APP, ssu2_enabled, true);
+    application:set_env(?APP, ssu2, prefer_udp);
 arm_ssu2(ssu2_park_separates_silence_from_a_wrong_answer) ->
-    application:set_env(?APP, ssu2_enabled, true);
+    application:set_env(?APP, ssu2, prefer_udp);
 arm_ssu2(a_peer_parked_on_ssu2_reports_ssu2_not_ntcp2) ->
-    application:set_env(?APP, ssu2_enabled, true);
+    application:set_env(?APP, ssu2, prefer_udp);
+arm_ssu2(transport_enable_udp_serves_but_dials_ntcp2) ->
+    application:set_env(?APP, ssu2, enable_udp);
 arm_ssu2(_Case) ->
     ok.
 
@@ -149,6 +156,7 @@ timetrap_for(_Case) ->
 
 end_per_testcase(_Case, _Config) ->
     application:stop(?APP),
+    ok = application:unset_env(?APP, ssu2),
     ok = application:unset_env(?APP, ssu2_enabled),
     ok = application:unset_env(?APP, ntcp2_sndbuf),
     ok = application:unset_env(?APP, handshake_retry_ms),
@@ -156,16 +164,17 @@ end_per_testcase(_Case, _Config) ->
     ok.
 
 %% ---------------------------------------------------------------------------
-%% Transport selection: with SSU2 armed, an outbound dial takes NTCP2
+%% Transport selection: with SSU2 preferred, an outbound dial takes NTCP2
 %% only when the remote cannot do SSU2; takes SSU2 when both endpoints are
 %% ready (and live messages cross the SSU2 session); and falls back to NTCP2
 %% when the remote advertises an SSU2 address that answers nothing. The global
-%% `ssu2_enabled` switch gates the whole preference, so a fully SSU2-capable
-%% setup still dials NTCP2 while the switch is off.
+%% `ssu2` setting gates the preference, so a fully SSU2-capable setup still
+%% dials NTCP2 under `no_udp` and -- the case this suite exists to separate --
+%% under `enable_udp` too.
 %% ---------------------------------------------------------------------------
 
 %% Remote advertises only NTCP2 (no SSU2 address): the SSU2 guard fails on the
-%% remote side and the dial goes over NTCP2, with the switch fully armed.
+%% remote side and the dial goes over NTCP2, with the preference fully armed.
 transport_ntcp2_when_remote_is_ntcp2_only(_Config) ->
     {A, B, _C} = trio(),
     {ok, LB} = i2p_ntcp2_listener:listen(0, B, self()),
@@ -188,8 +197,8 @@ transport_ntcp2_when_remote_is_ntcp2_only(_Config) ->
         i2p_ntcp2_listener:stop(LB)
     end.
 
-%% The `ssu2_enabled` switch is off (the default): even though the remote
-%% advertises SSU2 and this router would be SSU2-armed, the dial stays NTCP2.
+%% `no_udp` (the default): even though the remote advertises SSU2 and this router
+%% would be SSU2-armed, the dial stays NTCP2.
 transport_ntcp2_when_ssu2_disabled(_Config) ->
     {A, B, _C} = trio(),
     {ok, LB} = i2p_ntcp2_listener:listen(0, B, self()),
@@ -263,6 +272,64 @@ transport_falls_back_to_ntcp2(_Config) ->
         await_peer_status(BHash, connected, 1600),
         #{status := connected, transport := ntcp2} = peer_status(BHash),
         i2p_peer:stop()
+    after
+        i2p_ntcp2_listener:stop(LB),
+        i2p_ssu2_listener:stop(AL)
+    end.
+
+%% --------------------------------------------------------------------------
+%% `enable udp`: the state the boolean could not express
+%% --------------------------------------------------------------------------
+
+%% Serving UDP and preferring it are the two separate terms the glossary names,
+%% and `enable_udp` is the combination the boolean made unreachable: this router
+%% publishes an SSU2 address and bounds a listener, and still reaches for NTCP2
+%% first. The remote here is **fully SSU2-capable and its SSU2 endpoint works**,
+%% which is what makes the case worth having -- a remote that could not do SSU2
+%% would leave the dial on NTCP2 for a reason that has nothing to do with the
+%% setting.
+%%
+%% So the positive assertion is sharp: had the preference been read as "served",
+%% the SSU2 leg would have been taken, it would have *succeeded*, and the peer
+%% would report `ssu2`. It reports `ntcp2`, and the queued work crossed B's
+%% NTCP2 session.
+%%
+%% The mailbox snapshot afterwards is the second half. It is sound rather than a
+%% sleep-and-hope because the two legs are **sequential in one dial process**:
+%% `f:ssu2_connect/3` returns before `f:ntcp2_connect/4` is called, so a peer
+%% already connected over NTCP2 means any SSU2 attempt has finished. A finished
+%% successful one would have delivered its session's blocks to this process (B's
+%% listener is owned here), so finding none is the observation, and no window is
+%% needed to be sure of it.
+%%
+%% The serving half of `enable_udp` -- listener bound, address published -- is
+%% not asserted here because it is not what this layer owns: `i2p_boot_SUITE`
+%% boots a router under `enable_udp` and asserts both.
+transport_enable_udp_serves_but_dials_ntcp2(_Config) ->
+    {A, B, _C} = trio(),
+    {AL, APort} = ssu2_listener(A),
+    {ok, LB} = i2p_ntcp2_listener:listen(0, B, _Self = self()),
+    try
+        %% A serves UDP: its own RouterInfo carries both addresses.
+        ALocal = ssu2_local(A, i2p_ct_helpers:free_port(), APort),
+        {BL, BPort} = ssu2_listener(B),
+        BRI = ssu2_ri_at(listen_port(LB), BPort, B),
+        BHash = i2p_router_info:hash(BRI),
+        start_peer(ALocal, [BRI]),
+        %% The setting that makes this case different from the one above it.
+        ?assertEqual(false, i2p_identity:ssu2_preferred()),
+        ?assertEqual(true, i2p_identity:ssu2_available()),
+        ok = i2p_peer:lookup(BHash, exploratory),
+        %% B's **NTCP2** session is the one that carries the work, so B's SSU2
+        %% listener is left with nothing -- which is the whole claim, read from
+        %% the far end.
+        {CB, {lookup, _}} = await_frame(),
+        {store, _} = recv_db_store(CB),
+        await_peer_status(BHash, connected),
+        #{status := connected, transport := ntcp2} = peer_status(BHash),
+        ?assertEqual(nothing, ssu2_data_pending()),
+        i2p_peer:stop(),
+        i2p_ssu2_listener:stop(BL)
     after
         i2p_ntcp2_listener:stop(LB),
         i2p_ssu2_listener:stop(AL)
@@ -858,6 +925,19 @@ await_ssu2(TimeoutMs) ->
         end,
         TimeoutMs
     ).
+
+%% A snapshot of whether any SSU2 session has delivered to this process, taken
+%% without waiting. See `f:transport_enable_udp_serves_but_dials_ntcp2/1` for why
+%% a snapshot is enough there and a window would not be.
+%%
+%% Draining rather than peeking, so a delivery that had already arrived is
+%% consumed and not left to confuse whatever reads the mailbox next.
+ssu2_data_pending() ->
+    receive
+        {ssu2_data, _Pid, _Blocks} -> ssu2_data_appeared
+    after 0 ->
+        nothing
+    end.
 
 %% The I2NP block types carried in SSU2 Data blocks.
 ssu2_block_types(Blocks) ->

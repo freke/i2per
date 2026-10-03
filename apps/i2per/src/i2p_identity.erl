@@ -27,11 +27,13 @@ NTCP2 endpoint; the default `false` publishes the firewalled cost-14 form.
     rebuild_router_info/1,
     rebuild_router_info/2,
     set_ssu2_introducers/2,
-    ssu2_enabled/0,
+    ssu2_setting/0,
+    ssu2_available/0,
+    ssu2_preferred/0,
     allow_private_host/0
 ]).
 
--export_type([identity_file/0]).
+-export_type([identity_file/0, ssu2_setting/0]).
 
 -doc "Decoded private router identity material loaded from `identity.bin`.".
 -type identity_file() :: #{
@@ -42,6 +44,18 @@ NTCP2 endpoint; the default `false` publishes the firewalled cost-14 form.
     iv := i2p_crypto:aes_iv(),
     identity := i2p_keys:identity()
 }.
+
+-doc """
+How this router uses UDP, as application env `i2per` -> `ssu2`.
+
+The three values are the coherent combinations of two things the glossary
+separately names: whether this router *serves* a transport, and whether it
+*dials* it first. `no_udp` serves none and dials none, `enable_udp` serves UDP
+and still dials NTCP2 first, `prefer_udp` does both. The incoherent fourth
+combination -- serve nothing, dial UDP first -- has no address to send to, so it
+is not a value here rather than a value nothing selects.
+""".
+-type ssu2_setting() :: no_udp | enable_udp | prefer_udp.
 
 -define(FILE_VERSION, 2).
 
@@ -77,10 +91,13 @@ Input: `Id` — `t:identity_file/0`; `Host` — listening IP (binary); `Port` �
 bound TCP port; `Seed` — Ed25519 signing seed for RouterInfo generation.
 Output: a fully populated local-keys map ready for `m:i2p_peer:start_link/2`.
 
-When the `i2per` application env `ssu2_enabled` is `true`, the RouterInfo also
-carries an SSU2 RouterAddress (derived intro key + `ssu2_port`) and the local
-map carries the `intro_key` the SSU2 listener needs. Otherwise the RouterInfo
-is NTCP2-only — we never advertise a transport we are not serving. When
+When the `i2per` application env `ssu2` is anything but `no_udp`
+(`f:ssu2_available/0`), the RouterInfo also carries an SSU2 RouterAddress
+(derived intro key + `ssu2_port`) and the local map carries the `intro_key` the
+SSU2 listener needs. Which of the two values that serve UDP it is makes no
+difference here, because this is the question of what the RouterInfo advertises
+and not of what a dial reaches for. Otherwise the RouterInfo is NTCP2-only —
+we never advertise a transport we are not serving. When
 `ntcp2_published` is `false`, the NTCP2 address is the non-published form and
 is intentionally not returned by `i2p_router_info:ntcp2_connector/1`.
 """.
@@ -130,7 +147,7 @@ build_local(
         <<"router.version">> => <<"0.9.74">>,
         <<"caps">> => local_caps()
     },
-    case ssu2_enabled() of
+    case ssu2_available() of
         true ->
             Intro = intro_key(Priv),
             SSU2Port = ssu2_port(Port),
@@ -310,18 +327,81 @@ intro_key(StaticPriv) ->
     crypto:hash(sha256, <<StaticPriv/binary, "i2p-ssu2-intro">>).
 
 -doc """
-Whether the SSU2 transport is wired into this router.
+The UDP transport setting in force.
 
-Mirrors app env `i2per` -> `ssu2_enabled` (default `false`). When `true` the
-RouterInfo carries an SSU2 address and the boot listener is bound; `m:i2per_sup`
-consults this to decide whether to bring up SSU2 at boot.
+Mirrors app env `i2per` -> `ssu2` (default `no_udp`). The three values are
+`t:ssu2_setting/0`; see the type for what they mean.
+
+**Unknown values are refused rather than defaulted.** A typo would otherwise
+give an operator who asked for `prefer_udp` a router that publishes no SSU2
+address at all and quietly declines every UDP dial, with nothing in the log to
+say so -- and the boot line reports this key, so a setting that was read as
+something else is a setting nobody can account for at 3am.
+
+**`ssu2_enabled` is still read, and only as a fallback.** A configuration
+written before the enum still means what it meant: `true` was serving UDP *and*
+reaching for it first, which is `prefer_udp`, and `false` is `no_udp`. So nothing
+silently changes meaning. `ssu2` wins when both are set, because the enum is the
+key an operator is being asked to edit.
 """.
--spec ssu2_enabled() -> boolean().
-ssu2_enabled() ->
-    case application:get_env(i2per, ssu2_enabled) of
-        {ok, true} -> true;
-        _ -> false
+-spec ssu2_setting() -> ssu2_setting().
+ssu2_setting() ->
+    case application:get_env(i2per, ssu2) of
+        undefined -> legacy_ssu2_setting();
+        {ok, Setting} -> known_ssu2_setting(Setting)
     end.
+
+%% The deprecated boolean, at the meaning it always had. `true` gated both the
+%% published address and the outbound preference together, so it is `prefer_udp`
+%% and not `enable_udp`; reading it as the weaker value would silently change
+%% which transport a live router dials, which is the one thing the mapping has to
+%% preserve.
+legacy_ssu2_setting() ->
+    case application:get_env(i2per, ssu2_enabled) of
+        {ok, true} -> prefer_udp;
+        _ -> no_udp
+    end.
+
+known_ssu2_setting(no_udp) -> no_udp;
+known_ssu2_setting(enable_udp) -> enable_udp;
+known_ssu2_setting(prefer_udp) -> prefer_udp;
+known_ssu2_setting(Unknown) -> erlang:error({unknown_ssu2_setting, Unknown}).
+
+-doc """
+Whether this router serves the SSU2 transport.
+
+Input: none.
+Output: `true` when `f:ssu2_setting/0` is `enable_udp` or `prefer_udp`.
+
+The first half of the transport terms: this router binds a listener and
+publishes an address, so peers *may* reach it over UDP. Nothing about whether
+they do -- a peer behind a stateful firewall publishes an address and is served
+and unreachable at once, which is why **measured reachability** is a separate
+term with its own ladder.
+
+`m:i2per_sup` consults this to decide whether to bring SSU2 up at boot, and
+`f:build_local/5` to decide whether the RouterInfo carries the address. Both are
+questions about what this router serves, which is why both ask this and neither
+asks `f:ssu2_preferred/0`.
+""".
+-spec ssu2_available() -> boolean().
+ssu2_available() ->
+    ssu2_setting() =/= no_udp.
+
+-doc """
+Whether this router reaches for SSU2 first when dialing.
+
+Input: none.
+Output: `true` only when `f:ssu2_setting/0` is `prefer_udp`.
+
+The second half of the transport terms, and deliberately a separate question
+from `f:ssu2_available/0`: under `enable_udp` this router serves UDP and still
+dials NTCP2 first, which is the state i2p-java's bid values describe once it has
+a session. A router may serve both transports and reach for one of them.
+""".
+-spec ssu2_preferred() -> boolean().
+ssu2_preferred() ->
+    ssu2_setting() =:= prefer_udp.
 
 %% SSU2 UDP port: defaults to the configured TCP port (like real routers,
 %% which serve both transports on the same port number).
