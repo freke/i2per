@@ -3,9 +3,15 @@
 -moduledoc """
 Pure-Erlang SipHash-2-4 (Aumasson & Bernstein).
 
-Used by NTCP2 to obfuscate the 2-byte frame length: `hash = SipHash-2-4(IV, key)`
-where `key` is the first 32 bytes of the transport key stream and `IV` is the
-last 8 bytes of the previous frame's 16-byte header.
+Used by NTCP2 to obfuscate the 2-byte frame length: `f:obfuscate_length/2`
+computes `hash_le(IV, Key)` and masks the length with the low two bytes of the
+result.
+
+`Key` is bytes 0..15 of the 32-byte SipHash key material `m:i2p_framing` derives
+from the transport chaining key. `IV` starts as bytes 16..23 of that same
+material and then becomes **the previous frame's digest** -- `obfuscate_length/2`
+sets `iv := Next`, the whole 8-byte `hash_le/2` result, so it chains frame to
+frame. Nothing from a frame header on the wire enters it.
 
 Cross-checked against the official reference implementation (veorq/SipHash
 siphash.c) and OpenSSL's `openssl mac SIPHASH`; all reference vectors are
