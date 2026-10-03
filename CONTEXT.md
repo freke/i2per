@@ -82,13 +82,21 @@ it starts empty.
 **Transport** — a way for two routers to carry a session: SSU2 over UDP, or
 NTCP2 over TCP. A router publishes one address per transport it serves.
 
-**Transport availability** — whether this router serves a transport: whether
-it publishes an address for it, and whether peers can therefore reach it that
-way.
+**Transport availability** — whether this router serves a transport: whether it
+binds a listener for it and publishes an address for it. Nothing about whether
+peers can reach it that way, which is a different term.
 
 **Transport preference** — which transport this router reaches for first when
-dialing. Independent of availability, and deliberately so: a router may serve
-both transports and still dial one of them first.
+dialing. Independent of availability: a router may serve both transports and
+still dial one of them first.
+
+The two are separate because what this router offers and what the network
+reports back are different facts. A router that publishes an address and sits
+behind a stateful firewall is available and unreachable at the same time — the
+firewall permits traffic on a session it has already established while dropping
+unsolicited inbound. So availability is a statement about this router's own
+configuration, and whether peers can reach it is **reachability**, which is
+measured rather than declared. See **measured reachability**.
 
 Neither term is a judgement about which transport is better. The network runs
 both because one is UDP and one is TCP, so neither covers every network. A
