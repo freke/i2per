@@ -202,6 +202,39 @@ enabled = false
 min_routers = 50
 ```
 
+### UDP transport
+
+How this router uses UDP (SSU2) is one application-environment key, not an
+`i2per.conf` entry, and it is not settable through `i2p_config_srv`:
+
+```erlang
+%% sys.config, or: application:set_env(i2per, ssu2, prefer_udp).
+{ssu2, no_udp}.
+```
+
+| value | serves UDP | dials UDP first |
+|---|---|---|
+| `no_udp` (default) | no | no |
+| `enable_udp` | yes | no |
+| `prefer_udp` | yes | yes |
+
+Serving UDP and preferring it are separate choices, so `enable_udp` binds the
+listener and publishes the address in the RouterInfo while outbound dials still
+go to NTCP2 first. The fourth combination — serve nothing, dial UDP — is not
+offered, since there would be no address to dial.
+
+**The choice is boot-time and there is no runtime escape.** The listener is bound
+and the RouterInfo address published from the value read at start; changing the
+key while the router runs changes nothing, and a restart is the only way to
+change it. The running setting is on the boot's `config in force` line. Choosing
+`prefer_udp` on a UDP-blocked network therefore has no way back but a reboot, so
+it is worth deciding deliberately. The configuration value read at boot is
+rejected if it is not one of the three, rather than falling back to the default.
+
+The deprecated boolean `ssu2_enabled` is still read when `ssu2` is unset, and
+means what it always meant: `true` is `prefer_udp`, `false` is `no_udp`. Setting
+both is not a contradiction the router resolves by guessing — `ssu2` wins.
+
 Addressbook subscriptions are configured through `sys.config` or the
 application environment, not the INI file. Each entry names an I2P host and
 its destination:

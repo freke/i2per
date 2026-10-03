@@ -1537,15 +1537,21 @@ establishment and a ChaCha20-Poly1305 data phase. Implemented in
 classification) and `m:i2p_ssu2_conn` (one process per session).
 Spec: [SSU2 Specification](https://i2p.net/en/docs/specs/ssu2/).
 
-The router operator enables SSU2 with app env `i2per` -> `ssu2_enabled`; the
-persistent boot then binds a UDP listener (owner `m:i2p_peer`) and advertises
-the SSU2 RouterAddress next to NTCP2. The handshake and data phase can be
+The router operator sets app env `i2per` -> `ssu2` to one of `no_udp`
+(default), `enable_udp`, or `prefer_udp`. Either of the last two makes the
+persistent boot bind a UDP listener (owner `m:i2p_peer`) and advertise the SSU2
+RouterAddress next to NTCP2; `prefer_udp` additionally makes outbound dials reach
+for SSU2 first. The three values are the coherent combinations of two independent
+properties — serving a transport, and preferring it when dialing — so
+`enable_udp` (serve UDP, dial NTCP2 first) is expressible and the incoherent
+fourth (serve nothing, dial UDP) is not. The handshake and data phase can be
 verified against a live i2pd with `scripts/interop_i2pd.sh`.
 
 #### Outbound connection selection
 
 For outgoing connections `m:i2p_peer` prefers SSU2 and falls back to NTCP2.
-A peer's SSU2 dial is skipped — leaving NTCP2 — when the switch is off, when
+A peer's SSU2 dial is skipped — leaving NTCP2 — when `ssu2` is not `prefer_udp`
+(which includes `enable_udp`: the listener is bound, and no dial uses it), when
 this router has no local SSU2 listener, or when the remote RouterInfo carries
 no usable SSU2 address. When a dial is attempted and the handshake fails or
 times out (the remote's SSU2 address answers nothing), the dialog repeats over

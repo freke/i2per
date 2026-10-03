@@ -428,7 +428,7 @@ loggable_config_keys() ->
         ntcp2_published,
         port,
         sam_port,
-        ssu2_enabled,
+        ssu2,
         transit_bandwidth_kbps,
         transit_max_tunnels,
         tunnel_build_rate
