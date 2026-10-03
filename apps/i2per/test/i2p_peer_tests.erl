@@ -51,12 +51,42 @@ status_test() ->
     },
     Base = base_state(),
     S = Base#{peers := Peers},
+    %% The summary is asserted whole rather than field by field, because this is
+    %% the read API's shape and a dropped key is the failure that matters: a
+    %% per-field check would pass with `last_attempt` simply absent, and that
+    %% field is the only thing that distinguishes a parked dial from a fresh one.
     Summary =
         #{
-            H1 => #{status => connecting, attempts => 0, transport => ntcp2},
-            H2 => #{status => connected, attempts => 0, transport => ssu2}
+            H1 => #{
+                status => connecting, attempts => 0, transport => ntcp2, last_attempt => 0
+            },
+            H2 => #{
+                status => connected, attempts => 0, transport => ssu2, last_attempt => 0
+            }
         },
     ?assertEqual({reply, Summary, S}, i2p_peer:handle_call(status, from(), S)).
+
+%% A dial that announces itself moves the peer off the seed value its entry was
+%% created with. This is the unit half of what
+%% `a_peer_parked_on_ssu2_reports_ssu2_not_ntcp2` proves end to end: here the
+%% announcement is the message, and the assertion is that the manager records it
+%% without disturbing the rest of the entry.
+dial_attempt_overrides_the_seeded_transport_test() ->
+    H = mk_hash(),
+    S = with_peer(H, peer(H, #{}), base_state()),
+    ?assertEqual(ntcp2, maps:get(transport, maps:get(H, maps:get(peers, S)))),
+    {noreply, S1} = i2p_peer:handle_info({dial_attempt, H, ssu2}, S),
+    #{status := connecting, attempts := 0, transport := ssu2} =
+        maps:get(H, maps:get(peers, S1)).
+
+%% An announcement for a peer the manager no longer holds is dropped rather than
+%% creating an entry. The dialing process is unlinked and unmonitored, so it can
+%% outlive the peer it was dialling, and a dial that completes into an entry that
+%% has been swept would otherwise leave a half-built peer behind.
+dial_attempt_for_an_unknown_peer_is_dropped_test() ->
+    S = base_state(),
+    Unknown = mk_hash(),
+    ?assertEqual({noreply, S}, i2p_peer:handle_info({dial_attempt, Unknown, ssu2}, S)).
 
 generic_call_test() ->
     State = base_state(),

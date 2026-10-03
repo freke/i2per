@@ -12,7 +12,9 @@
 %% allows the SSU2 handshake budget before the NTCP2 leg appears; the backoff
 %% case walks the configured retry windows. The two park cases do not: they arm
 %% the retransmit schedule down, or answer on the first reply, so a park costs
-%% milliseconds rather than the ten seconds it costs a real dial.
+%% milliseconds rather than the ten seconds it costs a real dial. The
+%% read-during-a-park case arms it *up* instead, to a window wide enough to read
+%% the peer from inside the park rather than only after it.
 
 -module(i2p_peer_transport_SUITE).
 
@@ -25,6 +27,7 @@
     transport_falls_back_to_ntcp2/1,
     ssu2_park_on_a_dead_port_is_reported_with_its_reason/1,
     ssu2_park_separates_silence_from_a_wrong_answer/1,
+    a_peer_parked_on_ssu2_reports_ssu2_not_ntcp2/1,
     one_stalled_connection_does_not_stop_the_others/1,
     dead_peer_backs_off_then_recovers/1
 ]).
@@ -48,6 +51,10 @@
 %% over inside the case rather than after it. See `arm_handshake/1`.
 -define(PARK_RETRY_MS, 20).
 
+%% A wider retransmit interval, for the case that has to *observe* a park rather
+%% than merely reach its end. See `arm_handshake/1`.
+-define(OBSERVE_RETRY_MS, 125).
+
 suite() ->
     [].
 
@@ -59,6 +66,7 @@ all() ->
         transport_falls_back_to_ntcp2,
         ssu2_park_on_a_dead_port_is_reported_with_its_reason,
         ssu2_park_separates_silence_from_a_wrong_answer,
+        a_peer_parked_on_ssu2_reports_ssu2_not_ntcp2,
         one_stalled_connection_does_not_stop_the_others,
         dead_peer_backs_off_then_recovers
     ].
@@ -105,6 +113,15 @@ arm_sndbuf(_Case) ->
 arm_handshake(ssu2_park_on_a_dead_port_is_reported_with_its_reason) ->
     application:set_env(?APP, handshake_retry_ms, ?PARK_RETRY_MS),
     application:set_env(?APP, handshake_max_resends, 1);
+%% The park window this case observes has to be *wider than the window it reads
+%% in*, or the case is a race rather than a test. At `?PARK_RETRY_MS` (20ms) the
+%% dial is parked for ~40ms and the read is a 25ms poll, so the poll can easily
+%% straddle the whole park and never see it. Four resends at `?OBSERVE_RETRY_MS`
+%% give a ~500ms park against the same 25ms poll — twenty samples inside the
+%% window rather than one.
+arm_handshake(a_peer_parked_on_ssu2_reports_ssu2_not_ntcp2) ->
+    application:set_env(?APP, handshake_retry_ms, ?OBSERVE_RETRY_MS),
+    application:set_env(?APP, handshake_max_resends, 4);
 arm_handshake(_Case) ->
     ok.
 
@@ -118,10 +135,14 @@ arm_ssu2(ssu2_park_on_a_dead_port_is_reported_with_its_reason) ->
     application:set_env(?APP, ssu2_enabled, true);
 arm_ssu2(ssu2_park_separates_silence_from_a_wrong_answer) ->
     application:set_env(?APP, ssu2_enabled, true);
+arm_ssu2(a_peer_parked_on_ssu2_reports_ssu2_not_ntcp2) ->
+    application:set_env(?APP, ssu2_enabled, true);
 arm_ssu2(_Case) ->
     ok.
 
 timetrap_for(transport_falls_back_to_ntcp2) ->
+    60000;
+timetrap_for(a_peer_parked_on_ssu2_reports_ssu2_not_ntcp2) ->
     60000;
 timetrap_for(_Case) ->
     30000.
@@ -334,6 +355,126 @@ ssu2_park_separates_silence_from_a_wrong_answer(_Config) ->
         wrong_answer_stop(Answerer),
         i2p_ntcp2_listener:stop(LB),
         i2p_ssu2_listener:stop(AL)
+    end.
+
+%% --------------------------------------------------------------------------
+%% What the read API says *while* a dial is parked
+%% --------------------------------------------------------------------------
+
+%% The peer entry is created with `transport => ntcp2`, before any dial has
+%% chosen anything -- it is the seed value, not a report. Before this case that
+%% seed was also all the read API ever saw for the whole of an SSU2 park, so a
+%% peer sitting in a ten-second (or sixty-second, through an introducer) SSU2
+%% handshake reported `ntcp2`: the fallback, announced as though it had already
+%% happened.
+%%
+%% The park here is the observable, not a timing accident. The endpoint is a UDP
+%% socket that receives the SessionRequest and never answers, so the session
+%% stays in its retransmit budget for the ~500ms `arm_handshake/1` set up — a
+%% window twenty polls wide, against the 25ms poll interval. The case then reads
+%% the peer *during* that window rather than after it, so it asserts what an
+%% operator polling a page would have seen while the dial was stuck.
+%%
+%% Two things are asserted rather than one, because either alone is satisfiable
+%% by the wrong fix. `ssu2` alone could be satisfied by a router that never
+%% falls back; the counter proves the park was real and bounded, and the
+%% `connected` wait afterwards proves the fallback still happened. And the
+%% `ntcp2` assertion is the negative that the bug actually produced: it is the
+%% value the read API returned for the entire duration of the defect.
+a_peer_parked_on_ssu2_reports_ssu2_not_ntcp2(_Config) ->
+    {A, B, _C} = trio(),
+    {AL, APort} = ssu2_listener(A),
+    {ok, LB} = i2p_ntcp2_listener:listen(0, B, self()),
+    Silent = silent_endpoint(),
+    {_SilentPid, _SilentSock, SilentPort} = Silent,
+    try
+        ALocal = ssu2_local(A, i2p_ct_helpers:free_port(), APort),
+        BRI = ssu2_ri_at(listen_port(LB), SilentPort, B),
+        BHash = i2p_router_info:hash(BRI),
+        start_peer(ALocal, [BRI]),
+        Before = counter(ssu2_dials_parked),
+        ok = i2p_peer:lookup(BHash, exploratory),
+        %% The barrier is the park itself: a peer reported as attempting `ssu2`
+        %% is a dial that has committed and not yet finished, which is exactly
+        %% the interval the old code reported as `ntcp2`. Reaching the deadline
+        %% without seeing it means the announcement never happened — which is
+        %% what the bug looked like from here, the whole park reading `ntcp2`.
+        ok = await_attempting_ssu2(BHash, 40),
+        %% Matched rather than compared, so the failure names what it read: the
+        %% assertion is that `transport` is the attempt and not the seed.
+        #{status := connecting, transport := ssu2} = peer_status(BHash),
+        %% `last_attempt` is the field that separates this from a fresh dial,
+        %% which is what `attempts = 0` at `connecting` cannot do.
+        #{attempts := 0, last_attempt := Started} = peer_status(BHash),
+        true = is_integer(Started),
+        true = Started =< erlang:system_time(second),
+        %% The fallback still runs, and the transport follows it — the second
+        %% half of the same lie, one transport later.
+        await_peer_status(BHash, connected, 1600),
+        #{status := connected, transport := ntcp2} = peer_status(BHash),
+        %% Read *after* the park rather than during it, because that is when it
+        %% is knowable: the counter is charged when the park ends. Asserted here
+        %% so this case cannot pass by catching a dial a moment into one — the
+        %% thing observed above is a bounded wait, not an instant.
+        ?assertEqual(1, counter(ssu2_dials_parked) - Before),
+        i2p_peer:stop()
+    after
+        silent_endpoint_stop(Silent),
+        i2p_ntcp2_listener:stop(LB),
+        i2p_ssu2_listener:stop(AL)
+    end.
+
+%% Wait until the peer reports a dial in flight over SSU2. A deadline-bounded
+%% poll of a state predicate, which is a barrier in the sense the project's
+%% testing rule allows: reaching the end of the window fails the case rather
+%% than passing it.
+await_attempting_ssu2(_Hash, 0) ->
+    error({never_attempted_ssu2, i2p_peer:status()});
+await_attempting_ssu2(Hash, N) ->
+    case i2p_peer:status() of
+        #{Hash := #{status := connecting, transport := ssu2}} ->
+            ok;
+        _ ->
+            %% Documented load-safe window: 25ms poll backoff inside the
+            %% deadline-bounded await loop — a state poll over
+            %% `i2p_peer:status/0`, not a fixed sleep gating an assertion.
+            timer:sleep(25),
+            await_attempting_ssu2(Hash, N - 1)
+    end.
+
+%% A UDP endpoint that receives datagrams and answers none of them, so the dial
+%% parks on it for its whole retransmit budget.
+%%
+%% Owned by a spawned process for the reason `f:wrong_answer/2` is: `gen_udp:open/2`
+%% makes its caller the socket's controlling process, so an active-mode datagram
+%% is delivered there however many other processes hold the port term.
+silent_endpoint() ->
+    Owner = self(),
+    Pid = spawn_link(fun() -> silent_endpoint_open(Owner) end),
+    receive
+        {silent_endpoint_ready, Sock, Port} -> {Pid, Sock, Port}
+    end.
+
+silent_endpoint_open(Owner) ->
+    {ok, Sock} = gen_udp:open(0, [binary, {active, once}, {reuseaddr, true}]),
+    {ok, Port} = inet:port(Sock),
+    Owner ! {silent_endpoint_ready, Sock, Port},
+    silent_endpoint_loop(Sock).
+
+silent_endpoint_loop(Sock) ->
+    receive
+        {udp, Sock, _IP, _Port, _Datagram} ->
+            ok = inet:setopts(Sock, [{active, once}]),
+            silent_endpoint_loop(Sock);
+        {silent_endpoint_stop, Owner} ->
+            gen_udp:close(Sock),
+            Owner ! {silent_endpoint_stopped, self()}
+    end.
+
+silent_endpoint_stop({Pid, _Sock, _Port}) ->
+    Pid ! {silent_endpoint_stop, self()},
+    receive
+        {silent_endpoint_stopped, Pid} -> ok
     end.
 
 %% The reasons this router reported a park, in the order it reported them, and

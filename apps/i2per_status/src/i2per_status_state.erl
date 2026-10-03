@@ -196,7 +196,14 @@ A snapshot is the union of the two sets, and the union is what a reader of
     boot_time => integer() | undefined,
     counters => #{atom() => non_neg_integer()},
     identity => binary(),
-    peers => #{connected => non_neg_integer(), other => non_neg_integer()},
+    %% Optional because a snapshot built while the router is offline has no view
+    %% merged into it at all (`f:offline_view/0` is `#{}`). Required *within*
+    %% `peers` because the router always sends all three.
+    peers => #{
+        connected := non_neg_integer(),
+        connecting := non_neg_integer(),
+        other := non_neg_integer()
+    },
     tunnels => #{
         outbound => non_neg_integer(),
         inbound => non_neg_integer(),
@@ -418,10 +425,16 @@ empty_counters() ->
 %%
 %% Ordering is the router's own — the list is compared sorted, so this is a
 %% presentation detail and not a contract. **This is the consumer's expectation of
-%% the key set at `?VIEW_VERSION` 1**, and a router reporting a different `version`
+%% the key set at `?VIEW_VERSION` 2**, and a router reporting a different `version`
 %% is a different contract rather than a drift; the suite asserts the version
 %% matches before it compares the keys, so a mismatch is reported as a version
 %% difference and not as a list of missing keys.
+%%
+%% Version 2 added `connecting` *inside* the `peers` map, so this list is
+%% unchanged between 1 and 2 — which is the point of the list being top-level
+%% keys. The bump is what tells this consumer the nested shape moved; the
+%% version number in the suite's assertion is what would catch this app being
+%% left behind by it.
 -spec known_view_keys() -> [atom()].
 known_view_keys() ->
     [

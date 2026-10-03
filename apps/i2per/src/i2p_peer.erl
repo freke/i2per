@@ -253,17 +253,28 @@ Inspect the peer manager.
 
 Input: none.
 Output: a map of peer hash to `#{status => connecting | connected | backoff,
-attempts => non_neg_integer(), transport => ntcp2 | ssu2}` — the status of
-each connection, how many consecutive connect attempts it has made, and which
-transport a live connection uses (outbound selection prefers SSU2 and falls
-back to NTCP2).
+attempts => non_neg_integer(), transport => ntcp2 | ssu2, last_attempt =>
+integer()}` — the status of each connection, how many consecutive connect
+attempts it has made, which transport it is on or attempting, and when the
+current attempt began.
+
+`transport` is **the attempt, not the entry's creation-time default**. A peer
+whose SSU2 dial is parked reports `ssu2`, and only reports `ntcp2` once the
+fallback has actually begun, because the dialing process announces each attempt
+to this process as it makes it (see `f:attempt_announced/2`).
+
+`last_attempt` is the unix-seconds instant the current attempt began, and it is
+what separates a parked dial from a fresh one: `connecting` at `attempts = 0`
+is what a healthy dial looks like five milliseconds in, so the age of this field
+— not the attempt count — is what says a dial has been stuck.
 """.
 -spec status() ->
     #{
         i2p_crypto:hash() => #{
             status := connecting | connected | backoff,
             attempts := non_neg_integer(),
-            transport := ntcp2 | ssu2
+            transport := ntcp2 | ssu2,
+            last_attempt := integer()
         }
     }.
 status() ->
@@ -371,7 +382,8 @@ handle_call(status, _From, State) ->
             #{
                 status => maps:get(status, PeerState),
                 attempts => maps:get(attempts, PeerState),
-                transport => maps:get(transport, PeerState, ntcp2)
+                transport => maps:get(transport, PeerState, ntcp2),
+                last_attempt => maps:get(last_attempt, PeerState)
             }
         end,
         Peers
@@ -449,6 +461,12 @@ handle_cast(_Msg, State) ->
 
 handle_info({conn_started, PeerHash, ConnPid, Transport}, State) ->
     {noreply, handle_conn_started(PeerHash, ConnPid, Transport, State)};
+%% A dial told us which transport it is attempting. Sent by the dialing process
+%% before it blocks, so a peer parked in an SSU2 handshake reports `ssu2` rather
+%% than the `ntcp2` its entry was seeded with. See `f:attempt_announced/2` for
+%% why the dialing process is the one that has to say so.
+handle_info({dial_attempt, PeerHash, Transport}, State) ->
+    {noreply, handle_dial_attempt(PeerHash, Transport, State)};
 %% A connect failure with a reason, and one without. The second shape is what a
 %% failure before the connection process exists can only say: `ntcp2_connect/4`
 %% reports a supervisor refusal with nothing more to go on, and inventing a reason
@@ -598,6 +616,25 @@ idle_peer(Peer) ->
         maps:get(status, Peer, none) =/= connecting.
 
 %%%%%%%%% %%% Internal %%%%%%%
+
+%% Record the transport a dial has committed to, leaving the rest of the entry
+%% alone.
+%%
+%% The `error` clause is the same shape as `f:handle_conn_started/4`'s, and for
+%% the same reason: the dialing process is an unlinked spawn, so a message from
+%% one is input from outside this process even though it is not a socket. It is
+%% in practice unreachable — the entry is written before the spawn returns, and
+%% an attempt is only announced once per dial — but the failure mode for being
+%% wrong about that is a crash in the process every send path runs through, so
+%% it degrades to ignoring the announcement instead. Losing one transport report
+%% is a smaller fault than losing the peer manager.
+handle_dial_attempt(PeerHash, Transport, State) ->
+    case peer_state(PeerHash, State) of
+        {ok, PeerState} ->
+            put_peer(PeerHash, PeerState#{transport := Transport}, State);
+        error ->
+            State
+    end.
 
 handle_conn_started(PeerHash, ConnPid, Transport, State) ->
     case peer_state(PeerHash, State) of
@@ -945,6 +982,29 @@ park_reported(PeerHash, Reason) ->
     ok = i2p_stats:add(ssu2_dials_parked, 1),
     ok = i2p_events:notify({ssu2_dial_parked, PeerHash, Reason}).
 
+%% Tell the manager which transport this dial is about to attempt, before it
+%% blocks on the attempt.
+%%
+%% Announced from the dialing process rather than decided in the manager, because
+%% the manager cannot know the answer: the choice between the two transports is
+%% made *here*, from `f:i2p_identity:ssu2_enabled/0`, whether the SSU2 listener
+%% exists, and what the remote publishes -- none of which the manager re-reads,
+%% and the first of which an operator can change.
+%%
+%% Without it the entry keeps the `ntcp2` it was seeded with when the peer was
+%% created, so a peer parked in an SSU2 handshake reports a transport it is not
+%% on -- and the park is up to 10s direct, or 60s through an introducer, so the
+%% lie is the visible state for the whole of it rather than an instant.
+%%
+%% Sent before the blocking call and by the same process that later sends
+%% `conn_started`, so it reaches the manager first: signal order between one
+%% sender and one receiver is guaranteed by the runtime.
+attempt_announced(PeerHash, Transport) ->
+    Manager = whereis(?MODULE),
+    true = is_pid(Manager),
+    Manager ! {dial_attempt, PeerHash, Transport},
+    ok.
+
 %% Outbound SSU2 dial (Alice role). Bypassed — returning `{fallback,
 %% not_attempted}` — unless SSU2 is enabled at boot, this router's SSU2 listener
 %% is up, and the remote publishes a usable SSU2 address. The blocking handshake
@@ -966,6 +1026,7 @@ ssu2_connect(PeerHash, RemoteRI, Local) ->
         false ->
             {fallback, not_attempted};
         true ->
+            ok = attempt_announced(PeerHash, ssu2),
             ssu2_connect_ready(PeerHash, RemoteRI, Local)
     end.
 
@@ -1163,6 +1224,10 @@ our_endpoint(Local) ->
     end.
 
 ntcp2_connect(PeerHash, RemoteRI, Local, Owner) ->
+    %% The fallback announces itself too, and not as a detail: without it a peer
+    %% whose SSU2 leg parked would keep reporting `ssu2` for the whole NTCP2 dial
+    %% that followed, which is the same lie one transport later.
+    ok = attempt_announced(PeerHash, ntcp2),
     Args = #{
         role => alice,
         remote_ri => RemoteRI,
