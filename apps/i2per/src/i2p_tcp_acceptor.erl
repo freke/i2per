@@ -68,13 +68,25 @@ peer sends in that window.
 
 ## Lifetime
 
-The listener owns the listening socket, so the listener's death is what stops
-accepting: the socket closes, the blocked `f:gen_tcp:accept/1` answers
-`{error, closed}`, and this process exits `normal`. The other direction is each
-listener's to hold — it monitors this process and ends with it, so an acceptor
-that crashed cannot leave behind a live listener pid that has quietly stopped
-accepting, with every caller of its `port/1` still reporting a port nothing is
-listening on.
+A listener that is closing deliberately **announces it and then closes the
+listening socket**, and this process ends on the announcement: the socket close
+wakes the blocked `f:gen_tcp:accept/1`, the loop comes back round, `f:stopping/0`
+answers, and it exits `normal`. The announcement is read at the top of every pass
+rather than only from the error branch, so a connection this process had already
+taken and was busy with does not turn into one more `accept` on a socket that has
+been declared finished — which is the case the listener on the other end is
+actually waiting for.
+
+The socket can also go without an announcement, which is the listener dying rather
+than closing: then `f:gen_tcp:accept/1` answers `{error, closed}` and the exit is
+`normal` anyway.
+
+The other direction is each listener's to hold — it monitors this process and ends
+with it, so an acceptor that crashed cannot leave behind a live listener pid that
+has quietly stopped accepting, with every caller of its `port/1` still reporting a
+port nothing is listening on. That monitor is also what lets
+`m:i2p_sam_listener:stop/1` answer for a shutdown that actually finished rather
+than for one that was requested.
 """.
 
 -export([start_link/2]).
@@ -125,23 +137,65 @@ init(ListenSock, Handler) ->
     accept_loop(ListenSock, Handler).
 
 accept_loop(ListenSock, Handler) ->
+    %% Checked before every `accept`, never after one. A listener that is closing
+    %% deliberately says so first, and honouring it here rather than from the
+    %% error branch is what stops this process calling `accept` once more on a
+    %% socket it has been told is finished — including when it is coming back
+    %% from `Handler/1` with a connection in hand, which is the case a listener
+    %% on the other end is actually waiting for.
+    case stopping() of
+        true ->
+            exit(normal);
+        false ->
+            accept_next(ListenSock, Handler)
+    end.
+
+%% Has the listener said it is closing?
+%%
+%% A `receive` with `after 0` rather than a poll: this is a question about the
+%% mailbox, and a question about the mailbox has an answer at the instant it is
+%% asked. There is no waiting here, so there is nothing to bound.
+stopping() ->
+    receive
+        {stopping, _Listener} ->
+            true
+    after 0 ->
+        false
+    end.
+
+accept_next(ListenSock, Handler) ->
     case gen_tcp:accept(ListenSock) of
         {ok, Sock} ->
             ok = inet:setopts(Sock, [{nodelay, true}, {keepalive, true}, {active, false}]),
             ok = Handler(Sock),
             accept_loop(ListenSock, Handler);
-        {error, closed} ->
-            %% The listener closed the socket on its way out. This is the ordinary
-            %% end of this loop and the reason a listener's `stop/1` can answer
-            %% before this process has finished exiting.
-            exit(normal);
         {error, Reason} ->
-            %% A resource limit or an error this loop has no way to work around
-            %% (`emfile` on a busy node is the one worth naming). It stops
-            %% accepting, and the listener ends with it, so the supervisor sees a
-            %% listener that is not accepting rather than a router that looks
-            %% healthy and refuses connections. The reason is in the exit because
-            %% the shape this replaced — a `case_clause` on the same value — said
-            %% nothing about which value it was.
-            exit({accept_failed, Reason})
+            %% **The reason alone does not say whether this is an ordinary end.**
+            %%
+            %% A listener that announces its close and *then* closes the socket
+            %% under this outstanding `f:gen_tcp:accept/1` call is told `{error,
+            %% einval}`, not `{error, closed}`: the port went away with a request
+            %% in flight. Reading that as a failure would put a crash report on
+            %% the most ordinary event there is -- one per listener shutdown --
+            %% and `m:i2p_ntcp2_listener`'s `{acceptor_gone, _}` exit on top of it.
+            %% So the announcement decides, not the reason.
+            %%
+            %% `closed` with no announcement is the other ordinary end and stays
+            %% one: the listener's socket died with the listener, which is a kill,
+            %% and a kill is not an accept failure. Anything else is a real
+            %% resource limit or driver error and keeps the reason it always had.
+            case stopping() orelse Reason =:= closed of
+                true ->
+                    exit(normal);
+                false ->
+                    %% A resource limit or an error this loop has no way to work
+                    %% around (`emfile` on a busy node is the one worth naming). It
+                    %% stops accepting, and the listener ends with it, so the
+                    %% supervisor sees a listener that is not accepting rather than
+                    %% a router that looks healthy and refuses connections. The
+                    %% reason is in the exit because the shape this replaced — a
+                    %% `case_clause` on the same value — said nothing about which
+                    %% value it was.
+                    exit({accept_failed, Reason})
+            end
     end.

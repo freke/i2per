@@ -36,7 +36,34 @@ option.
 Which means the three control messages are now answered by a process that is not
 blocked, which is what the timeout used to be for. The loop below has no timeout
 clause at all: there is nothing left to poll for, so each message is answered when
-it arrives. The bound that matters moved to the other end — see `f:stop/1`.
+it arrives. The bound that matters is the one `f:stop/1` carries, and it is not a
+synchronisation — see the shutdown section below.
+
+## What `f:stop/1` promises, and what it takes to keep that promise
+
+`f:stop/1` returns `ok` when **the accept path can no longer produce a session**,
+which is a stronger statement than "this listener has been asked to stop" and a
+stronger one than "the listening socket is closed". All three are different, and
+the distinction is the whole of the shutdown contract between these two processes:
+
+- **asked to stop** — a reply sent before the process does anything else. What
+  this module used to send. A send does not wait for the sender to go on to exit,
+  so the answer arrived while the socket was still open.
+- **socket closed** — true the instant this process owns the last reference and
+  lets go of it. It ends a *blocked* `f:gen_tcp:accept/1`, and it is not enough:
+  an acceptor that has already returned a socket is inside `f:start_session/2`,
+  a `f:supervisor:start_child/2` that a socket close does not reach.
+- **accept path finished** — the acceptor is gone, so there is nothing left that
+  can call `f:start_session/2`. This is what `f:stop/1` waits for, and it is
+  reachable because the acceptor is already monitored.
+
+So the answer is sent after the close and after the acceptor's `'DOWN'`, in that
+order, and each step is commented where it is written — `f:shutdown/5` is the whole
+of it. A caller that has been told the listener stopped cannot then be handed a
+new SAM session, which is what the previous ordering allowed: a connection
+already sitting in the kernel's accept queue could still be taken,
+`f:start_session/2` could still run, and `max_sam_sessions` could still be hit —
+after `f:stop/1` reported that nothing further would happen.
 
 `f:start_session/2` is what an accepted socket becomes. It lives here rather than
 in `m:i2p_tcp_acceptor` because the child spec and the `{socket_ready, Sock}` the
@@ -53,6 +80,24 @@ ok = i2p_sam_listener:stop(Listener).
 """.
 
 -export([listen/1, port/1, address/1, stop/1, start_link/1, init/1]).
+
+%% How long the listener waits for its acceptor to reach the end of its accept
+%% loop once the listening socket is closed. The acceptor is blocked in
+%% `f:gen_tcp:accept/1` while it waits for a connection, so closing the socket is
+%% what ends it -- with one exception this bound is about, and it is the reason
+%% the bound is here at all: the acceptor can be *inside* `f:start_session/2`,
+%% which is a `f:supervisor:start_child/2`, and the socket close does not reach
+%% that. Generous by orders of magnitude against what it measures, because it is
+%% measuring a wedged process rather than a synchronisation.
+-define(ACCEPTOR_EXIT_TIMEOUT_MS, 500).
+
+%% How long `f:stop/1` waits for the listener's answer. **Larger than
+%% `?ACCEPTOR_EXIT_TIMEOUT_MS` on purpose**: the listener's own bound decides the
+%% ordinary case and answers before it, and a caller bound at the same figure
+%% would sometimes fire first and report a stop that was about to succeed. This
+%% one is the outer guarantee -- the *listener* is not answering at all, which is a
+%% different condition and is reported as one.
+-define(STOP_TIMEOUT_MS, 2000).
 
 -doc """
 Start a SAM listener on the given port.
@@ -87,13 +132,53 @@ address(Listener) ->
         {address, Ref, Address} -> Address
     end.
 
--doc "Stop accepting new connections; existing sessions are unaffected.".
+-doc """
+Stop accepting new connections; existing sessions are unaffected.
+
+Returns `ok` once the accept path **cannot produce another session**, which is a
+stronger statement than "the listening socket has been closed" and is what this
+function waits for. See the shutdown section of the module doc.
+
+Two failures are raised rather than swallowed, and they are different conditions
+so they are named differently:
+
+- **`{accept_path_did_not_stop, Listener}`** — the listener answered, and its
+  answer was that it could not confirm. Its acceptor would not finish, so it is
+  still possible for a queued connection to become a session. Not
+  `m:i2p_ntcp2_listener`'s `{listener_unanswered, _, _}`, which says the opposite:
+  there the listener is missing, here the listener is present and honest.
+- **`{listener_unanswered, Listener, stop}`** — nothing came back at all within
+  `?STOP_TIMEOUT_MS`, which is the listener itself being wedged rather than its
+  acceptor.
+
+Raising is the honest answer in both, because `ok` here would be the exact claim
+this function exists to stop making.
+
+A listener that is **already dead** answers `ok`, immediately, by monitor rather
+than by waiting: the listening socket is owned by that process, so its death
+closed the socket and its acceptor's `f:gen_tcp:accept/1` could accept nothing
+more. This is also why the listener always answers — a reply that can go missing
+cannot be told apart from a listener that was never there.
+""".
 -spec stop(pid()) -> ok.
 stop(Listener) ->
     Ref = make_ref(),
+    MRef = erlang:monitor(process, Listener),
     Listener ! {stop, self(), Ref},
     receive
-        {stopped, Ref} -> ok
+        {stopped, Ref} ->
+            erlang:demonitor(MRef, [flush]),
+            ok;
+        {stop_failed, Ref} ->
+            erlang:demonitor(MRef, [flush]),
+            erlang:error({accept_path_did_not_stop, Listener});
+        {'DOWN', MRef, process, Listener, _Reason} ->
+            %% The socket died with the listener, which is the whole of what a
+            %% close is. Not a timeout, so not an error: nothing can be accepted.
+            ok
+    after ?STOP_TIMEOUT_MS ->
+        erlang:demonitor(MRef, [flush]),
+        erlang:error({listener_unanswered, Listener, stop})
     end.
 
 -doc false.
@@ -134,35 +219,23 @@ init(#{port := Port, local := Local}) ->
     ),
     MRef = erlang:monitor(process, Acceptor),
     proc_lib:init_ack({ok, self()}),
-    control_loop(BoundPort, ListenIP, MRef, Acceptor).
+    control_loop(BoundPort, ListenIP, ListenSock, MRef, Acceptor).
 
 %% No timeout clause, and the absence is the fix. There is nothing to poll for any
 %% more — the accept moved to a process whose whole job is to block in it — so a
 %% message here is answered as soon as it is read rather than at the end of a wait
 %% that existed to make room for one connection per tick.
-control_loop(BoundPort, ListenIP, MRef, Acceptor) ->
+control_loop(BoundPort, ListenIP, ListenSock, MRef, Acceptor) ->
     receive
         {port, From, Ref} ->
             From ! {port, Ref, BoundPort},
-            control_loop(BoundPort, ListenIP, MRef, Acceptor);
+            control_loop(BoundPort, ListenIP, ListenSock, MRef, Acceptor);
         {address, From, Ref} ->
             From ! {address, Ref, ListenIP},
-            control_loop(BoundPort, ListenIP, MRef, Acceptor);
+            control_loop(BoundPort, ListenIP, ListenSock, MRef, Acceptor);
         {stop, From, Ref} ->
-            %% Answered before exiting, and exiting closes the listening socket
-            %% because this process owns it — which is what ends the acceptor's
-            %% blocked `f:gen_tcp:accept/1` with `{error, closed}`. Established
-            %% sessions are children of the same supervisor and are not touched by
-            %% any of this.
-            %%
-            %% `{stopped, Ref}`, and **not** the `{stop, Ref, stopped}` that
-            %% `m:i2p_ntcp2_listener` uses for the same question. The two listeners
-            %% multiplex their control messages differently -- NTCP2 funnels all
-            %% three through one `f:control/2` and so tags the reply with the
-            %% question, while this module has a function per question and each
-            %% matches its own shape -- and the two shapes are not interchangeable.
-            From ! {stopped, Ref},
-            exit(normal);
+            %% See `f:shutdown/5` for why the answer is not sent from here.
+            shutdown(ListenSock, Acceptor, MRef, From, Ref);
         {'DOWN', MRef, process, Acceptor, Reason} ->
             %% The socket is not accepting and nothing here can make it accept, so
             %% this process stops claiming that it is. The one way to get here
@@ -172,6 +245,77 @@ control_loop(BoundPort, ListenIP, MRef, Acceptor) ->
             %% listener, which is the recovery a crash report asks for anyway.
             exit({acceptor_gone, Reason})
     end.
+
+%% %%%%%%% %%% Stopping, and what the answer means %%%%%%% %%%
+
+%% **The close comes first, and the answer comes last, and the acceptor is waited
+%% for in between.** Those are three separate facts and the order is the whole
+%% guarantee, so it is worth saying what each one is for.
+%%
+%% 1. **`f:gen_tcp:close/1` before the answer.** The listening socket is owned by
+%%    this process, so it would close when this process exits — but that is
+%%    *after* a message sent from here has already been delivered, and a send does
+%%    not wait for the sender to go on to exit. Answering first and exiting
+%%    second is how a caller learns the listener stopped while a connection is
+%%    still sitting in the kernel's accept queue, about to be taken.
+%%
+%% 2. **Waiting for the acceptor at all.** Closing the socket ends a *blocked*
+%%    `f:gen_tcp:accept/1` — that is what `{error, closed}` means. It does not
+%%    reach an acceptor that has already returned a socket and is inside
+%%    `f:start_session/2`, which is a `f:supervisor:start_child/2`. Until that
+%%    returns, one more session can still appear, so answering before it does is
+%%    the same lie one step further in. The acceptor is already monitored, so
+%%    waiting for its `'DOWN'` needs no new mechanism: `m:i2p_tcp_acceptor` exits
+%%    `normal` on `{error, closed}` whether it was blocked or mid-handler, and a
+%%    crash is a `'DOWN'` too, so this receive cannot miss its exit.
+%%
+%% 3. **The bounded wait, and the answer on both sides of it.** Per #YJ0DSAT, an
+%%    exported function's wait is bounded rather than open. This one is new with
+%%    the guarantee above, and an unbounded version would be a hang this change
+%%    *introduces* rather than one it fixed: before it, `f:stop/1` returned the
+%%    moment it was asked.
+%%
+%%    **Both bounds answer, and that is not belt-and-braces — it is what makes
+%%    the answers mean anything.** This loop's own bound sends `{stop_failed,
+%%    Ref}`, and `f:stop/1` reports that as
+%%    `{accept_path_did_not_stop, _}`. If this loop gave up silently instead, the
+%%    caller's monitor would see *this process* exit with no reply and would have
+%%    to decide whether a listener that never answered is a listener that was
+%%    already gone — and `ok` is the wrong answer to that question, because the
+%%    socket closed on the way out while the acceptor it was waiting for did not.
+%%    A reply that can go missing cannot be told apart from a listener that was
+%%    never there, so the reply is unconditional and the caller's monitor branch
+%%    is left meaning exactly one thing.
+%%
+%%    `{stopped, Ref}` and **not** the `{stop, Ref, stopped}` that
+%%    `m:i2p_ntcp2_listener` uses for the same question. The two listeners
+%%    multiplex their control messages differently -- NTCP2 funnels all three
+%%    through one `f:control/2` and so tags the reply with the question, while
+%%    this module has a function per question and each matches its own shape --
+%%    and the two shapes are not interchangeable. `#YJ0DSAT` asks whether they
+%%    should be unified; this ticket needed a second answer tag for a second
+%%    outcome, which is recorded there rather than settled here.
+%%
+%% Established sessions are children of the same supervisor and are not touched by
+%% any of this.
+-spec shutdown(gen_tcp:socket(), pid(), reference(), pid(), reference()) -> no_return().
+shutdown(ListenSock, Acceptor, MRef, From, Ref) ->
+    %% Announced *before* the close, and that is the point of the order rather
+    %% than an incidental detail: closing the socket under the acceptor's
+    %% outstanding `f:gen_tcp:accept/1` makes the driver answer `{error, einval}`
+    %% rather than `{error, closed}`. The announcement is what lets
+    %% `m:i2p_tcp_acceptor` recognise this as the ordinary end instead of
+    %% exiting `{accept_failed, einval}` -- a crash report on every listener
+    %% shutdown, which is what the first version of this fix did.
+    Acceptor ! {stopping, self()},
+    ok = gen_tcp:close(ListenSock),
+    receive
+        {'DOWN', MRef, process, _Acceptor, _Reason} ->
+            From ! {stopped, Ref}
+    after ?ACCEPTOR_EXIT_TIMEOUT_MS ->
+        From ! {stop_failed, Ref}
+    end,
+    exit(normal).
 
 %%% %%%%% %%% What an accepted socket becomes %%%%% %%%
 
