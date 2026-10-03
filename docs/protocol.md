@@ -1620,6 +1620,47 @@ still counts every peer that is not connected, so a consumer reading version 1 o
 the map gets the same number it always did. The backoff count is therefore
 `other - connecting`. See #X7BP9G1.
 
+#### Leaving `connecting`
+
+A peer reaches `connecting` when `f:maybe_connect_status/3` spawns a dial, and it
+leaves when something says what the dial did: `{conn_started, ...}` for a
+connection, `{ssu2_ready, ...}` for an SSU2 session, `{connect_failed, ...}` for a
+failure. All three are messages **from the dial**, and the dial is an unlinked
+spawn — a raise on that path must not take the peer manager down, since every send
+the router makes runs through it. So a dial that raises between two of those
+messages says nothing at all, and before #8V1Z06A nothing else could: the peer sat
+at `connecting` for the life of the process, because `f:sweep_peers/1` deliberately
+never evicts a `connecting` peer (evicting would let the dial complete into an
+entry that is gone, and `f:handle_conn_started/4` stops a connection for an unknown
+peer).
+
+Two escapes close that, and both are counted `dials_escaped`:
+
+- **the dial's monitor.** `f:start_dial/3` spawns with `spawn_monitor/1`, so a
+  dial that ends reports `{dial_died, Reason}` on `peer_connect_failed` — carrying
+  the exit reason, which is the whole diagnosis (`true = is_pid(Manager)` in
+  `f:attempt_announced/2` raises `{badmatch, false}`, and that is now visible
+  rather than silent).
+- **a deadline on `connecting`**, because a monitor only reports a dial that
+  *ends*. A dial blocked forever on a socket produces nothing to report, so
+  `dial_deadline_ms` (app env `i2per`, default the SSU2 leg budget plus an NTCP2
+  handshake plus margin) ends the dial with a `dial_deadline` reason and stops the
+  dial process. The default is **derived** from the legs rather than written down
+  — `f:i2p_ssu2_conn:dial_budget_ms/0` is the longer of the direct handshake's
+  retransmit budget and the introducer leg's redirect wait — so retuning
+  `handshake_retry_ms` / `handshake_max_resends` widens it with them.
+
+A dial that dies *after* handing over a connection is neither escape. The peer
+stays `connecting` on purpose, because NTCP2's handshake has not answered yet, and
+the connection's own monitor releases it from there through `peer_disconnected` —
+`ntcp2_connect/4` sends `conn_started` and returns in the same breath, so every
+NTCP2 dial's `DOWN` follows a successful hand-over.
+
+`dials_escaped` is a statement about **this** router, where every ordinary connect
+failure is a statement about the remote: a non-zero value means a raise on the dial
+path, or a blocking call that stopped honouring its own bound. The reason is on the
+event, since "raised" and "never returned" are not the same fault.
+
 #### Handshake sequence
 
 ```mermaid

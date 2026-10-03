@@ -358,6 +358,200 @@ drop_is_not_reported_as_a_connect_failure_test() ->
         end)
     ).
 
+%%%%%%%%% A dial that stops reporting %%%%%%%%%
+%%
+%% #8V1Z06A. The dial is an unlinked spawn that reports by sending, so a dial that
+%% *raises* between its sends says nothing at all — and `connecting` has no timer,
+%% no re-dial, and is deliberately never evicted by `f:sweep_peers/1`, so the peer
+%% stayed there for the life of the process. These cases cover the two escapes
+%% that close that, and the negative each one has to get right.
+
+%% A dial that raised produces a terminal message, and the peer reaches backoff.
+%% The reason is the dial's own exit reason, because that is the whole diagnosis:
+%% `true = is_pid(Manager)` in `f:attempt_announced/2` raises `badmatch`, and until
+%% this existed the only sign of it was a peer that stopped being dialled.
+a_dial_that_raised_releases_its_peer_test() ->
+    H = mk_hash(),
+    DialPid = dead_pid(),
+    Peer = with_dial(peer(H, #{attempts => 2})),
+    S = with_peer(H, Peer, base_state()),
+    Down = {'DOWN', dial_mon(Peer), process, DialPid, {badmatch, false}},
+    {[Event], {noreply, S1}} = announcing(fun() -> i2p_peer:handle_info(Down, S) end),
+    ?assertMatch(
+        {peer_connect_failed, H, {dial_died, {badmatch, false}}, _},
+        Event
+    ),
+    ?assertEqual(backoff, peer_field(H, status, S1)),
+    ?assertEqual(3, peer_field(H, attempts, S1)),
+    %% The dial is gone, so the entry no longer claims one is in flight. Asserted
+    %% because it is what makes the released dial's own `DOWN` resolve to nothing:
+    %% `f:find_peer_by_dial_mon/2` is the only lookup that can see this ref again.
+    ?assertEqual(undefined, peer_field(H, dial, S1)).
+
+%% The escape is counted, because a clean connect failure is a statement about the
+%% remote and this is a statement about *this* router: a raise on the dial path, or
+%% a blocking call that stopped honouring its own bound. Nothing else in the tree
+%% moves this counter, so a non-zero value is only ever a dial that went silent.
+a_dial_that_raised_is_counted_test() ->
+    with_escape_count(fun(Before) ->
+        H = mk_hash(),
+        Peer = with_dial(peer(H, #{})),
+        S = with_peer(H, Peer, base_state()),
+        i2p_peer:handle_info({'DOWN', dial_mon(Peer), process, dead_pid(), boom}, S),
+        ?assertEqual(Before + 1, dials_escaped())
+    end).
+
+%% A dial that ended *normally* having reported a failure is not an escape. Its
+%% `DOWN` arrives after the `{connect_failed, ...}` it sent, so the peer is already
+%% in backoff — and counting that would put a "crash" on the counter for every
+%% ordinary connect failure the router has.
+a_clean_connect_failure_is_not_an_escape_test() ->
+    with_escape_count(fun(Before) ->
+        H = mk_hash(),
+        S = with_peer(H, with_dial(peer(H, #{})), base_state()),
+        {noreply, S1} = i2p_peer:handle_info({connect_failed, H, timeout}, S),
+        %% The dial's `DOWN`, with the reason a dial that returned `ok` from
+        %% `f:init_connect/3` would carry.
+        {noreply, S2} = i2p_peer:handle_info({'DOWN', make_ref(), process, dead_pid(), normal}, S1),
+        ?assertEqual(backoff, peer_field(H, status, S2)),
+        ?assertEqual(
+            [],
+            peer_connect_failures(fun() ->
+                i2p_peer:handle_info({'DOWN', make_ref(), process, dead_pid(), normal}, S2)
+            end)
+        ),
+        ?assertEqual(Before, dials_escaped())
+    end).
+
+%% A dial that died *after* handing over a connection is not a failure either. The
+%% peer stays `connecting` on purpose: NTCP2's handshake has not answered yet, and
+%% from there the connection's own monitor is what releases it, through the drop
+%% path and `peer_disconnected`. Counting this would put a crash on the counter for
+%% every NTCP2 dial, because `ntcp2_connect/4` sends `conn_started` and returns in
+%% the same breath and the dial's `DOWN` always follows.
+a_dial_that_handed_over_a_connection_is_not_a_failure_test() ->
+    with_escape_count(fun(Before) ->
+        H = mk_hash(),
+        Conn = dead_pid(),
+        S = with_peer(H, with_dial(peer(H, #{conn => Conn, mon => make_ref()})), base_state()),
+        DialPid = dead_pid(),
+        {noreply, S1} = i2p_peer:handle_info({'DOWN', make_ref(), process, DialPid, normal}, S),
+        ?assertEqual(connecting, peer_field(H, status, S1)),
+        ?assertEqual(
+            [],
+            peer_connect_failures(fun() ->
+                i2p_peer:handle_info({'DOWN', make_ref(), process, dead_pid(), normal}, S1)
+            end)
+        ),
+        ?assertEqual(Before, dials_escaped())
+    end).
+
+%% The `connecting` deadline, which is the escape for a dial that *never ends*.
+%% A monitor only reports a process that has exited; a dial blocked forever on a
+%% socket produces nothing to report, which is why the timer is not redundant with
+%% it. `dial_deadline` is a reason nothing else can produce, so asserting on it
+%% is what makes this case about the deadline rather than about a peer eventually
+%% failing for any reason at all.
+the_dial_deadline_releases_a_connecting_peer_test() ->
+    with_escape_count(fun(Before) ->
+        H = mk_hash(),
+        Peer = with_dial(peer(H, #{attempts => 1})),
+        S = with_peer(H, Peer, base_state()),
+        Expired = {timeout, dial_token(Peer), {dial_expired, H}},
+        {[Event], {noreply, S1}} = announcing(fun() -> i2p_peer:handle_info(Expired, S) end),
+        ?assertMatch({peer_connect_failed, H, dial_deadline, _}, Event),
+        ?assertEqual(backoff, peer_field(H, status, S1)),
+        ?assertEqual(Before + 1, dials_escaped())
+    end).
+
+%% The deadline's token is what makes it safe, and the case it turns on is a real
+%% one: a peer released early by a failure arms a fresh deadline on its next dial,
+%% and without the match the *previous* dial's timer would end that dial — seconds
+%% into a healthy SSU2 park, which is up to ten seconds. So the peer would be
+%% driven into backoff while a working dial was still in flight.
+a_deadline_from_a_released_dial_does_not_end_the_next_one_test() ->
+    with_escape_count(fun(Before) ->
+        H = mk_hash(),
+        Peer = with_dial(peer(H, #{attempts => 1})),
+        S = with_peer(H, Peer, base_state()),
+        {noreply, S1} = i2p_peer:handle_info({connect_failed, H, timeout}, S),
+        %% The same peer, mid-dial again, with the dial that has just ended still
+        %% holding a timer somewhere behind the peer manager.
+        Next = with_dial(peer(H, #{attempts => 2})),
+        S2 = with_peer(H, Next, S1),
+        ?assertEqual(
+            {noreply, S2}, i2p_peer:handle_info({timeout, make_ref(), {dial_expired, H}}, S2)
+        ),
+        ?assertEqual(connecting, peer_field(H, status, S2)),
+        ?assertEqual(
+            [],
+            peer_connect_failures(fun() ->
+                i2p_peer:handle_info({timeout, make_ref(), {dial_expired, H}}, S2)
+            end)
+        ),
+        ?assertEqual(Before, dials_escaped())
+    end).
+
+%% The deadline is only a safety net if it is *above* every leg of a dial, since a
+%% dial blocks on one SSU2 leg and then on NTCP2. Asserted against the legs rather
+%% than against a constant, so raising `handshake_retry_ms` / `handshake_max_resends`
+%% — or the introducer leg's own wait — cannot quietly make this deadline start
+%% cutting short dials that were going to work.
+the_dial_deadline_exceeds_every_leg_of_a_dial_test() ->
+    Legs = i2p_ssu2_conn:dial_budget_ms(),
+    ?assert(dial_deadline_ms_default() > Legs).
+
+%% And it moves with the operator's settings rather than being a second number that
+%% has to be kept in step by hand. The override is the app-env lever the CT case
+%% uses to exercise a bound this long without waiting for it.
+the_dial_deadline_follows_the_retransmit_settings_test() ->
+    HadRetry = application:get_env(i2per, handshake_retry_ms),
+    HadResends = application:get_env(i2per, handshake_max_resends),
+    HadDeadline = application:get_env(i2per, dial_deadline_ms),
+    application:set_env(i2per, handshake_retry_ms, 10000),
+    application:set_env(i2per, handshake_max_resends, 20),
+    try
+        %% 10000 x 20 is 200 s, well past the introducer leg's wait, so this is
+        %% the SSU2 budget that decides the deadline and the derived figure has to
+        %% follow it up rather than stay at the default's.
+        ?assert(dial_deadline_ms_default() > 200000)
+    after
+        restore_env(i2per, handshake_retry_ms, HadRetry),
+        restore_env(i2per, handshake_max_resends, HadResends),
+        restore_env(i2per, dial_deadline_ms, HadDeadline)
+    end.
+
+dial_deadline_ms_default() ->
+    case application:get_env(i2per, dial_deadline_ms) of
+        {ok, Ms} -> Ms;
+        undefined -> i2p_ssu2_conn:dial_budget_ms() + 15000 + 15000
+    end.
+
+restore_env(App, Key, {ok, Value}) ->
+    application:set_env(App, Key, Value);
+restore_env(App, Key, undefined) ->
+    application:unset_env(App, Key).
+
+peer_field(Hash, Key, State) ->
+    maps:get(Key, maps:get(Hash, maps:get(peers, State))).
+
+dials_escaped() ->
+    maps:get(dials_escaped, i2p_stats:snapshot(), 0).
+
+%% Counters are process-wide, so a case that asserts on one has to own the window
+%% it reads. The stats process is started for the duration if the tier has not
+%% already, and every escape case reads before and after inside that window.
+with_escape_count(Fun) ->
+    HadStats = ensure_stats(),
+    try
+        Fun(dials_escaped())
+    after
+        case HadStats of
+            started -> ok = gen_server:stop(whereis(i2p_stats));
+            existing -> ok
+        end
+    end.
+
 %%%%%%%%% Event observation %%%%%%%%%
 
 %% `i2p_ct_helpers:events_from/1` waits for a *known* event to come back from the
@@ -370,6 +564,24 @@ announced(Fun) ->
     case i2p_ct_helpers:events_from(Fun) of
         [Event] -> Event;
         [] -> none
+    end.
+
+%% The events, and what the function returned, from **one** run.
+%%
+%% `i2p_ct_helpers:events_from/1` runs the function inside its delivery barrier and
+%% discards the return value, so a case needing both used to have to call the
+%% handler a second time — which for these two would count the escape twice and
+%% assert a number nothing produces. The value is handed back through this
+%% process's dictionary, because `events_from/1` runs its argument in the caller.
+announcing(Fun) ->
+    Key = {?MODULE, self(), make_ref()},
+    Events = i2p_ct_helpers:events_from(fun() ->
+        put(Key, Fun()),
+        ok
+    end),
+    case get(Key) of
+        undefined -> error({no_result_from_handler, Fun});
+        Result -> {Events, Result}
     end.
 
 %% As `announced/1`, but for the case where the point is that a particular event
@@ -1143,10 +1355,32 @@ peer(Hash, Extra) ->
             backoff => 0,
             attempts => 0,
             last_attempt => 0,
-            status => connecting
+            status => connecting,
+            %% A dial in flight is a dial pid, its monitor ref, its deadline's
+            %% token and the timer itself. `undefined` on every peer that is not
+            %% mid-dial, which is what `f:i2p_peer:enter_backoff/2` sets it to and
+            %% what the `DOWN` for an already-released dial finds nothing of.
+            dial => undefined
         },
         Extra
     ).
+
+%% A stand-in for a live dial's bookkeeping. The pid is one that has already
+%% exited, so the kill `f:stop_dial/1` sends lands on nothing — it has to be a pid
+%% that is *not* the test process, since that exit is unconditional and an
+%% unlinked `exit(self(), kill)` takes the case down with it. The monitor ref and
+%% timer are as distinct as the real two, so a case that mixes them up is testing
+%% the mix-up rather than passing by accident.
+with_dial(PeerState) ->
+    PeerState#{dial => {dead_pid(), make_ref(), make_ref()}}.
+
+dial_token(PeerState) ->
+    {_Pid, _MonRef, TimerRef} = maps:get(dial, PeerState),
+    TimerRef.
+
+dial_mon(PeerState) ->
+    {_Pid, MonRef, _TimerRef} = maps:get(dial, PeerState),
+    MonRef.
 
 local() ->
     RI = mk_ri(),

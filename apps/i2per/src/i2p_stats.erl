@@ -182,6 +182,33 @@ counters() ->
         %% is blocked", which is the one an operator can act on. See #1Q4JREN.
         ssu2_dials_parked,
 
+        %% %%%%% Dials that stopped reporting %%%%%
+        %%
+        %% **A peer had to be released from `connecting` because its dial never
+        %% said what happened.** Expected to stay at zero. It counts three
+        %% situations that are one operator fact — a dial that produced no
+        %% outcome — and the bus event of the same moment carries which:
+        %% `{dial_died, _}` for a dial process that ended (abnormally, or normally
+        %% having sent nothing), `dial_deadline` for one that outlived
+        %% `f:i2p_peer:dial_deadline_ms/0`.
+        %%
+        %% This is not a connect failure, and the distinction is the point. Every
+        %% leg of a dial bounds itself — the SSU2 handshake by its retransmit
+        %% count, the introducer leg by `f:i2p_ssu2_conn`'s redirect wait, NTCP2
+        %% by its handshake timeout — and each reports when it gives up, so
+        %% `peer_connect_failed` is a statement about the remote. A dial that goes
+        %% silent is a statement about *this* router: a raise on the dial path, or
+        %% a blocking call that stopped honouring its own bound. Before these
+        %% escapes existed the symptom was a peer at `connecting` for the life of
+        %% the process, which `f:sweep_peers/1` deliberately never evicts, so the
+        %% router would carry on as though that peer were still being dialled.
+        %%
+        %% One counter rather than two, because the two causes are not separately
+        %% actionable and would only be told apart by eye. A non-zero value is the
+        %% evidence that the backstop is what ended a dial, which is what makes it
+        %% worth looking at rather than a healthy router's normal life. See #8V1Z06A.
+        dials_escaped,
+
         %% %%%%% Bytes carried for other routers %%%%%
         %%
         %% **These are wire bytes, not client bytes, and the difference is not an
