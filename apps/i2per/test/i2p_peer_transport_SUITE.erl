@@ -29,6 +29,7 @@
     ssu2_park_on_a_dead_port_is_reported_with_its_reason/1,
     ssu2_park_separates_silence_from_a_wrong_answer/1,
     a_peer_parked_on_ssu2_reports_ssu2_not_ntcp2/1,
+    a_wedged_dial_is_released_by_its_deadline/1,
     one_stalled_connection_does_not_stop_the_others/1,
     dead_peer_backs_off_then_recovers/1
 ]).
@@ -56,6 +57,13 @@
 %% than merely reach its end. See `arm_handshake/1`.
 -define(OBSERVE_RETRY_MS, 125).
 
+%% The `connecting` deadline the wedged-dial case runs at. Long enough that the
+%% SSU2 park underneath it is unambiguously still in progress when it fires — at
+%% `?OBSERVE_RETRY_MS` the park is ~7.5 s at the sixty resends this case arms, so
+%% the two are an order of magnitude apart and the case cannot be passing because
+%% the park happened to end first.
+-define(DIAL_DEADLINE_MS, 800).
+
 suite() ->
     [].
 
@@ -69,6 +77,7 @@ all() ->
         ssu2_park_on_a_dead_port_is_reported_with_its_reason,
         ssu2_park_separates_silence_from_a_wrong_answer,
         a_peer_parked_on_ssu2_reports_ssu2_not_ntcp2,
+        a_wedged_dial_is_released_by_its_deadline,
         one_stalled_connection_does_not_stop_the_others,
         dead_peer_backs_off_then_recovers
     ].
@@ -85,6 +94,7 @@ init_per_testcase(Case, Config) ->
     ok = arm_ssu2(Case),
     ok = arm_sndbuf(Case),
     ok = arm_handshake(Case),
+    ok = arm_deadline(Case),
     {ok, _} = application:ensure_all_started(?APP),
     [{timetrap, timetrap_for(Case)} | Config].
 
@@ -127,6 +137,27 @@ arm_handshake(a_peer_parked_on_ssu2_reports_ssu2_not_ntcp2) ->
 arm_handshake(_Case) ->
     ok.
 
+%% The dial deadline, taken down to about two seconds.
+%%
+%% The default is above the longest SSU2 leg plus an NTCP2 handshake, which is
+%% over a minute, so a case leaving it alone would assert against a timer it
+%% cannot wait out. Like `arm_handshake/1` this is a production app-env lever an
+%% operator sets, not a mechanism invented for the test — see
+%% `f:i2p_peer:dial_deadline_ms/0`.
+%%
+%% **Set *below* the SSU2 park this case parks on, deliberately.** At
+%% `?OBSERVE_RETRY_MS` and four resends the park is ~500 ms, which is shorter than
+%% the deadline and would end in an ordinary fallback to NTCP2. Widening the park
+%% instead would work too, but then the case would be a long wait rather than a
+%% tight one, and the two arms disagree about which side of the deadline the dial
+%% is on — which is the whole point of the case.
+arm_deadline(a_wedged_dial_is_released_by_its_deadline) ->
+    application:set_env(?APP, handshake_retry_ms, ?OBSERVE_RETRY_MS),
+    application:set_env(?APP, handshake_max_resends, 60),
+    application:set_env(?APP, dial_deadline_ms, ?DIAL_DEADLINE_MS);
+arm_deadline(_Case) ->
+    ok.
+
 %% `prefer_udp`, not `enable_udp`: every case here is about the *preference*, and a
 %% case that wanted the listener without the preference is not testing transport
 %% selection at all.
@@ -141,6 +172,8 @@ arm_ssu2(ssu2_park_on_a_dead_port_is_reported_with_its_reason) ->
 arm_ssu2(ssu2_park_separates_silence_from_a_wrong_answer) ->
     application:set_env(?APP, ssu2, prefer_udp);
 arm_ssu2(a_peer_parked_on_ssu2_reports_ssu2_not_ntcp2) ->
+    application:set_env(?APP, ssu2, prefer_udp);
+arm_ssu2(a_wedged_dial_is_released_by_its_deadline) ->
     application:set_env(?APP, ssu2, prefer_udp);
 arm_ssu2(transport_enable_udp_serves_but_dials_ntcp2) ->
     application:set_env(?APP, ssu2, enable_udp);
@@ -161,6 +194,7 @@ end_per_testcase(_Case, _Config) ->
     ok = application:unset_env(?APP, ntcp2_sndbuf),
     ok = application:unset_env(?APP, handshake_retry_ms),
     ok = application:unset_env(?APP, handshake_max_resends),
+    ok = application:unset_env(?APP, dial_deadline_ms),
     ok.
 
 %% ---------------------------------------------------------------------------
@@ -484,6 +518,79 @@ a_peer_parked_on_ssu2_reports_ssu2_not_ntcp2(_Config) ->
         %% so this case cannot pass by catching a dial a moment into one — the
         %% thing observed above is a bounded wait, not an instant.
         ?assertEqual(1, counter(ssu2_dials_parked) - Before),
+        i2p_peer:stop()
+    after
+        silent_endpoint_stop(Silent),
+        i2p_ntcp2_listener:stop(LB),
+        i2p_ssu2_listener:stop(AL)
+    end.
+
+%% --------------------------------------------------------------------------
+%% A dial that stops reporting
+%% --------------------------------------------------------------------------
+
+%% A peer at `connecting` whose dial never says anything has no way out.
+%%
+%% The dial here is parked on a UDP endpoint that receives the SessionRequest and
+%% answers none of it, which is a *real* dial in a real state — and it is exactly
+%% the shape that used to be unrecoverable, because `f:sweep_peers/1` deliberately
+%% never evicts a `connecting` peer. Before #8V1Z06A the only things that moved a
+%% peer out of `connecting` were the dial's own messages, and a dial that raised
+%% or hung sent none.
+%%
+%% **What makes this about the deadline and not about the park.** The reason on the
+%% event is `dial_deadline`, and nothing else in the tree can produce it. The
+%% alternative ending for this dial — the SSU2 park timing out and falling through
+%% to NTCP2, which is a *working* dial — announces `ssu2_dial_parked` and
+%% `peer_connect_failed` with a park reason instead, and asserts nothing here. The
+%% deadline is armed an order of magnitude below the park underneath it (see
+%% `?DIAL_DEADLINE_MS`), so the two cannot be confused and the case cannot pass by
+%% the park ending first.
+%%
+%% The barrier is the event itself, delivered through `f:events_from/1`'s known
+%% barrier. That makes the counter delta and the absent park assertion real
+%% absences rather than races: everything the work under test announced has been
+%% delivered by the time the list comes back.
+a_wedged_dial_is_released_by_its_deadline(_Config) ->
+    {A, B, _C} = trio(),
+    {AL, APort} = ssu2_listener(A),
+    {ok, LB} = i2p_ntcp2_listener:listen(0, B, self()),
+    Silent = silent_endpoint(),
+    {_SilentPid, _SilentSock, SilentPort} = Silent,
+    try
+        ALocal = ssu2_local(A, i2p_ct_helpers:free_port(), APort),
+        BRI = ssu2_ri_at(listen_port(LB), SilentPort, B),
+        BHash = i2p_router_info:hash(BRI),
+        start_peer(ALocal, [BRI]),
+        Before = counter(dials_escaped),
+        Events = i2p_ct_helpers:events_from(fun() ->
+            ok = i2p_peer:lookup(BHash, exploratory),
+            %% The barrier for this case: a peer reaching `backoff` is a dial that
+            %% has been released, and `events_from/1` then announces its own known
+            %% barrier -- so every event the release produced is in the list below
+            %% by the time it comes back. The window failing the case is what
+            %% makes this a barrier rather than a tolerance, the same pattern as
+            %% `f:await_peer_status/3`.
+            await_peer_status(BHash, backoff, 400)
+        end),
+        ?assertEqual(1, counter(dials_escaped) - Before),
+        %% The reason is what makes this the deadline and not the park, and only
+        %% the deadline can produce it.
+        ?assertMatch(
+            [{peer_connect_failed, BHash, dial_deadline, _}],
+            [E || E = {peer_connect_failed, Hash, _, _} <- Events, Hash =:= BHash]
+        ),
+        %% The negative that says which of the two escapes ran. A park would mean
+        %% the SSU2 leg gave up on its own and the dial carried on to NTCP2 -- a
+        %% working dial, and a different operator fact entirely.
+        ?assertEqual([], park_reasons(Events)),
+        %% And the peer is retried rather than written off: the release is a
+        %% backoff with a retry armed behind it, which is what routing the escape
+        %% through `f:handle_connect_failed/3` buys. A peer left at `connecting`
+        %% with no timer would satisfy every assertion above, so this is a
+        %% separate fact and not a restatement of the deadline.
+        #{attempts := Attempts} = peer_status(BHash),
+        ?assert(Attempts >= 1),
         i2p_peer:stop()
     after
         silent_endpoint_stop(Silent),

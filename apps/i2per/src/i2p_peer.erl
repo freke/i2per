@@ -27,6 +27,14 @@ though the listener is bound. When SSU2 is not preferred (not served, not
 preferred, no listener, or the remote is NTCP2-only) the dial goes straight to
 NTCP2. The live transport is surfaced per peer by `f:status/0`.
 
+**A dial cannot strand a peer.** The dial is spawned unlinked, so a raise on that
+path cannot take the manager down — every send the router makes goes through this
+process — but unlinked is not unobserved. `f:start_dial/3` monitors the dial and
+arms a deadline on it (`f:dial_deadline_ms/0`), so a peer at `connecting` has two
+ways out that do not depend on the dial behaving: its monitor `DOWN`, and the
+deadline. Both release the peer through `f:handle_connect_failed/3`, the same
+path every other terminal dial message takes, and both count `dials_escaped`.
+
 Inbound sessions arrive from the boot listener as `bob`-role connections. The
 ready message carries the dialer's RouterInfo: when the connection's pid does
 not match any peer under our own outbound bookkeeping, the manager registers
@@ -120,6 +128,14 @@ i2p_peer:stop().
 ]).
 
 -define(HANDSHAKE_TIMEOUT, 15000).
+%% Headroom on top of the dial's own legs, for a handshake that is retransmitting
+%% rather than stalled. One NTCP2 budget's worth, so a peer that is merely slow
+%% is retried rather than declared lost.
+-define(DIAL_DEADLINE_MARGIN_MS, 15000).
+%% How long a peer may sit in `connecting` before the manager stops waiting for
+%% its dial to report. Overridable via app env `i2per` -> `dial_deadline_ms`,
+%% which is also how the CT case exercises a bound this long without waiting for
+%% it. The default is derived rather than written down: see `f:dial_deadline_ms/0`.
 -define(MAX_BACKOFF_SECONDS, 300).
 -define(REFRESH_INTERVAL_SECONDS, 300).
 %% How often the bounded structures are swept: `pending_sends` entries past
@@ -441,10 +457,11 @@ handle_cast(stop, State) ->
     _ = cancel_timer(maps:find(discovery_kick_ref, State)),
     _ = cancel_timer(maps:find(sweep_ref, State)),
     lists:foreach(
-        fun({_Hash, #{conn := Conn}}) ->
-            case Conn of
+        fun({_Hash, PeerState}) ->
+            _ = stop_dial(PeerState),
+            case maps:get(conn, PeerState, undefined) of
                 undefined -> ok;
-                _ -> stop_conn(Conn)
+                Conn -> stop_conn(Conn)
             end
         end,
         maps:to_list(Peers)
@@ -499,8 +516,15 @@ handle_info({ssu2_closed, ConnPid, _Reason}, State) ->
     {noreply, handle_conn_down_by_pid(ConnPid, State)};
 handle_info({ntcp2_frame, ConnPid, Payload}, State) ->
     {noreply, handle_frame(ConnPid, Payload, State)};
-handle_info({'DOWN', MonRef, process, _ConnPid, _Reason}, State) ->
-    {noreply, handle_conn_down(MonRef, State)};
+%% A monitored process died. Which one is not in the message — the same `DOWN`
+%% arrives for a connection and for an outbound dial, and a monitor ref is what
+%% tells them apart — so it is resolved here, once. The dial table is checked
+%% first because the two kinds can never share a ref, and because a dial's `DOWN`
+%% is the only one that can arrive while its peer is still `connecting`.
+handle_info({'DOWN', MonRef, process, _Pid, Reason}, State) ->
+    {noreply, handle_down(MonRef, Reason, State)};
+handle_info({timeout, TimerRef, {dial_expired, PeerHash}}, State) ->
+    {noreply, handle_dial_expired(PeerHash, TimerRef, State)};
 handle_info({retry_peer, PeerHash}, State) ->
     {noreply, maybe_connect(PeerHash, State)};
 handle_info(refresh_routerinfo, State) ->
@@ -581,6 +605,13 @@ fresh_sends(Msgs, NowMs, Acc) ->
 %% into a `peers` entry that is gone, and `handle_conn_started/4` answers
 %% `error` for an unknown peer by stopping the connection. So an in-flight dial
 %% would be torn down by its own successful handshake.
+%%
+%% **The rule stands and its reason has not changed**, but the state it protects
+%% is no longer permanent: `f:start_dial/3` gives every dial a monitor and a
+%% deadline, so a `connecting` peer reaches `backoff` on its own. That is what
+%% makes not evicting here a choice about the in-flight dial rather than the only
+%% escape — and it has to stay a choice, because eviction is still the one thing
+%% that breaks the case above.
 %%
 %% `?MAX_PEERS` is a backstop rather than the primary mechanism: a peer in
 %% `backoff` keeps being retried, so it is only ever unreachable-but-retained,
@@ -814,6 +845,18 @@ handle_conn_ready(ConnPid, Transport, State) ->
             State
     end.
 
+%% Which monitored process died is not carried in the `DOWN`. The dial table is
+%% consulted first and the connection path below is left otherwise untouched, so
+%% the only thing this changes for an existing `DOWN` is one failed lookup on a
+%% ref that is not in it.
+handle_down(MonRef, Reason, State) ->
+    case find_peer_by_dial_mon(MonRef, State) of
+        {PeerHash, PeerState} ->
+            handle_dial_down(PeerHash, PeerState, Reason, State);
+        not_found ->
+            handle_conn_down(MonRef, State)
+    end.
+
 handle_conn_down(MonRef, State) ->
     case find_peer_by_mon(MonRef, State) of
         {PeerHash, _PeerState} ->
@@ -925,7 +968,7 @@ maybe_connect_status(none, PeerHash, State) ->
         undefined ->
             State;
         PeerConfig ->
-            spawn(fun() -> init_connect(PeerHash, PeerConfig, maps:get(local, State)) end),
+            Dial = start_dial(PeerHash, PeerConfig, maps:get(local, State)),
             PeerState = #{
                 config => PeerConfig,
                 conn => undefined,
@@ -934,7 +977,8 @@ maybe_connect_status(none, PeerHash, State) ->
                 backoff => 0,
                 attempts => 0,
                 last_attempt => erlang:system_time(second),
-                status => connecting
+                status => connecting,
+                dial => Dial
             },
             put_peer(PeerHash, PeerState, State)
     end;
@@ -946,15 +990,124 @@ maybe_connect_status(backoff, PeerHash, State) ->
     case backoff_elapsed(PeerHash, State) of
         true ->
             {ok, PeerState} = peer_state(PeerHash, State),
-            spawn(fun() ->
-                init_connect(PeerHash, maps:get(config, PeerState), maps:get(local, State))
-            end),
+            Dial = start_dial(PeerHash, maps:get(config, PeerState), maps:get(local, State)),
             Now = erlang:system_time(second),
-            Updated = PeerState#{status := connecting, last_attempt := Now},
+            Updated = PeerState#{status := connecting, last_attempt := Now, dial := Dial},
             put_peer(PeerHash, Updated, State);
         false ->
             State
     end.
+
+%% start_dial/3 — run one outbound dial and return the bookkeeping the manager
+%% needs to know when it stops.
+%%
+%% **`spawn_monitor`, not `spawn`.** The dial is unlinked, deliberately: a raise on
+%% this path must not take the peer manager with it, since every send the router
+%% makes goes through this process. Unlinked is not unobserved, though. The dial
+%% reaches the manager by sending — `{dial_attempt, ...}`, then `{conn_started, ...}`
+%% or `{connect_failed, ...}` — so a dial that *raises* between those sends says
+%% nothing at all, and the two raises this path is one edit away from (`true =
+%% is_pid(Manager)` in `f:attempt_announced/2` and in the SSU2 success arm) leave
+%% the peer at `connecting` with nothing in flight and no way out. `connecting` is
+%% never evicted by `f:sweep_peers/1`, so that is for the life of the process.
+%%
+%% The monitor is the escape: a `DOWN` resolves to its peer by monitor ref, and a
+%% stranded peer is released through the same `f:handle_connect_failed/3` every
+%% other terminal dial message uses.
+%%
+%% **A deadline as well, because a monitor only reports a dial that *ends*.** Every
+%% leg of this dial bounds itself — the SSU2 handshake by its retransmit count,
+%% the introducer leg by `m:i2p_ssu2_conn`'s redirect wait, NTCP2 by
+%% `?HANDSHAKE_TIMEOUT` — so the deadline firing means one of them did not, which
+%% is why it is counted (`dials_escaped`) rather than folded into the ordinary
+%% connect-failure path with no trace.
+%%
+%% `f:start_timer/3` rather than `f:send_after/2` because the ref it returns is
+%% both the cancellable handle and what the message carries: a timer belonging to
+%% a dial that has already been released is then recognisable, and cannot fire
+%% against the next dial for the same peer. Cancelling on release would work today
+%% and break on the first path added that forgets.
+start_dial(PeerHash, PeerConfig, Local) ->
+    {DialPid, MonRef} = spawn_monitor(fun() -> init_connect(PeerHash, PeerConfig, Local) end),
+    TimerRef = erlang:start_timer(dial_deadline_ms(), self(), {dial_expired, PeerHash}),
+    {DialPid, MonRef, TimerRef}.
+
+%% A `DOWN` carrying a dial's monitor ref. Not a connection drop, so it does not
+%% reach `f:handle_conn_down/2` — a peer mid-dial has no connection and no
+%% connection monitor, and a dial that reported nothing at all is not something
+%% that drop path can see.
+handle_dial_down(PeerHash, PeerState, Reason, State) ->
+    State1 = clear_dial(PeerHash, State),
+    case dial_stranded(PeerState) of
+        true ->
+            ok = i2p_stats:add(dials_escaped, 1),
+            handle_connect_failed(PeerHash, {dial_died, Reason}, State1);
+        false ->
+            State1
+    end.
+
+%% `connecting` outlived `f:dial_deadline_ms/0`.
+%%
+%% The ref is matched first, and it is what makes this safe rather than merely
+%% correct in the common case: a peer released early by a failure arms a fresh
+%% deadline on its next dial, and without the match this message would end *that*
+%% dial at the previous dial's deadline — possibly seconds into a healthy SSU2
+%% park, and while it is holding the peer at `connecting` rather than in backoff.
+handle_dial_expired(PeerHash, TimerRef, State) ->
+    case peer_state(PeerHash, State) of
+        {ok, #{dial := {_Pid, _MonRef, TimerRef}} = PeerState} ->
+            case dial_stranded(PeerState) of
+                true ->
+                    ok = i2p_stats:add(dials_escaped, 1),
+                    %% Stop the dial as well as the peer. It has already overrun
+                    %% the sum of its own legs, and leaving it running means it can
+                    %% later hand a connection to a peer now in backoff — which is
+                    %% the exact completion-into-a-dead-entry case the "never evict
+                    %% a connecting peer" rule exists to prevent, reached from the
+                    %% other direction.
+                    stop_dial(PeerState),
+                    handle_connect_failed(PeerHash, dial_deadline, clear_dial(PeerHash, State));
+                false ->
+                    State
+            end;
+        _ ->
+            State
+    end.
+
+%% The one condition that means "a dial was in flight and has gone". `connecting`
+%% on its own is not enough: a peer stays `connecting` after `conn_started` while
+%% the NTCP2 handshake runs, and that one is released by the *connection's* own
+%% monitor through `f:handle_conn_down/2`. A dial that died after handing over a
+%% connection has therefore done its job, and counting it as an escape would put
+%% a "crash" on the counter for a dial that connected.
+dial_stranded(PeerState) ->
+    maps:get(status, PeerState, none) =:= connecting andalso
+        maps:get(conn, PeerState, undefined) =:= undefined.
+
+%% Retire a peer's dial bookkeeping. Safe to call twice — the DOWN and the
+%% deadline can each arrive for a dial the other already released, and neither
+%% may take the peer down over it.
+clear_dial(PeerHash, State) ->
+    case peer_state(PeerHash, State) of
+        {ok, PeerState} ->
+            _ = stop_dial(PeerState),
+            put_peer(PeerHash, PeerState#{dial => undefined}, State);
+        error ->
+            State
+    end.
+
+%% Cancel the deadline and kill the dial process. Unlinked, so the kill is an
+%% ordinary exit signal and the resulting `DOWN` reaches the monitor — which by
+%% then resolves to nothing, since the peer no longer carries the ref.
+stop_dial(#{dial := undefined}) ->
+    ok;
+stop_dial(#{dial := {DialPid, _MonRef, TimerRef}}) ->
+    _ = erlang:cancel_timer(TimerRef),
+    exit(DialPid, kill),
+    ok.
+
+dial_mon(undefined) -> undefined;
+dial_mon({_Pid, MonRef, _TimerRef}) -> MonRef.
 
 init_connect(PeerHash, #{ri := RemoteRI}, Local) ->
     Owner = whereis(?MODULE),
@@ -1786,6 +1939,22 @@ discovery_kick_ms() ->
         _ -> ?FLOODFILL_DISCOVERY_KICK_MS
     end.
 
+%% How long `connecting` is allowed to last.
+%%
+%% **Derived, so it cannot be set below a working dial.** A dial blocks on at most
+%% one SSU2 leg and then on NTCP2, and each of those bounds itself, so the deadline
+%% is their sum plus `?DIAL_DEADLINE_MARGIN_MS` — a number chosen for what a
+%% retransmitting-but-alive handshake needs, not a round figure. The SSU2 term is
+%% asked of the module that owns it rather than copied here, so retuning
+%% `handshake_retry_ms` / `handshake_max_resends` widens this with it; a deadline
+%% written down independently would quietly start cutting short legitimate dials
+%% the moment an operator slowed a handshake down.
+dial_deadline_ms() ->
+    case application:get_env(i2per, dial_deadline_ms) of
+        {ok, Ms} when is_integer(Ms), Ms > 0 -> Ms;
+        _ -> i2p_ssu2_conn:dial_budget_ms() + ?HANDSHAKE_TIMEOUT + ?DIAL_DEADLINE_MARGIN_MS
+    end.
+
 %% Cancel a pending timer found by maps:find/2; a missing key stays `ok`.
 cancel_timer({ok, Ref}) ->
     erlang:cancel_timer(Ref);
@@ -2068,6 +2237,12 @@ enter_backoff(PeerHash, State) ->
     Updated = PeerState#{
         conn := undefined,
         mon := undefined,
+        %% Leaving `connecting` for `backoff` means no dial is in flight, so the
+        %% dial's bookkeeping goes with it. Set here rather than only at the two
+        %% release paths, because a `{connect_failed, ...}` from the dial arrives
+        %% *before* the dial's own `DOWN` — and by then the entry must already
+        %% stop claiming one, or the `DOWN` releases a peer that is retrying.
+        dial := undefined,
         status := backoff,
         backoff := Backoff,
         attempts := Attempts + 1,
@@ -2075,6 +2250,7 @@ enter_backoff(PeerHash, State) ->
     },
     i2p_peer_rep:connect_failed(PeerHash),
     _ = erlang:send_after(Backoff * 1000, self(), {retry_peer, PeerHash}),
+    _ = stop_dial(PeerState),
     %% The interval is returned as well as stored. It is the only figure that
     %% distinguishes a peer being retried aggressively from one the router has
     %% written off, and `f:handle_connect_failed/3` announces it. The other two
@@ -2124,6 +2300,22 @@ find_peer_by_mon(MonRef, #{peers := Peers}) ->
         [
             Hash
          || {Hash, PeerState} <- maps:to_list(Peers), maps:get(mon, PeerState, undefined) =:= MonRef
+        ]
+    of
+        [Hash | _] -> {Hash, maps:get(Hash, Peers)};
+        [] -> not_found
+    end.
+
+%% The same lookup over the *dial* monitor. A dial ref and a connection ref are
+%% distinct by construction — `f:start_dial/3` takes one and `f:handle_conn_started/4`
+%% takes the other, and neither is ever reused — so this cannot shadow a
+%% connection's `DOWN`.
+find_peer_by_dial_mon(MonRef, #{peers := Peers}) ->
+    case
+        [
+            Hash
+         || {Hash, PeerState} <- maps:to_list(Peers),
+            dial_mon(maps:get(dial, PeerState, undefined)) =:= MonRef
         ]
     of
         [Hash | _] -> {Hash, maps:get(Hash, Peers)};
