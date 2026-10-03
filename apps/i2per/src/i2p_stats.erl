@@ -248,15 +248,21 @@ counters() ->
 
         %% %%%%% Our own outbound, undeliverable %%%%%
         %%
-        %% One operator question with two causes, so one section: what did *we*
+        %% One operator question with three causes, so one section: what did *we*
         %% fail to deliver after successfully routing it. The section above is the
         %% opposite -- frames that had nowhere to go at all. An operator needs
         %% both to tell a routing fault from a delivery fault, and they belong
         %% next to each other so the read API presents them as one question
-        %% rather than three counters to correlate by hand.
+        %% rather than four counters to correlate by hand.
         %%
-        %% **Messages, not frames, and the distinction is not cosmetic.** Both are
-        %% counted at the injection point, where a whole I2NP message is about to
+        %% The three are a client message, a lookup request and a lookup reply,
+        %% and **they are not one number**: whoever is left waiting is our user,
+        %% a router that asked us a question, or a router waiting on an answer we
+        %% had. The operator's response differs for each, so the sum of the three
+        %% is not a fact.
+        %%
+        %% **Messages, not frames, and the distinction is not cosmetic.** All three
+        %% are counted at the injection point, where a whole I2NP message is about to
         %% be handed to `m:i2p_tunnel_srv`. No frame exists yet --
         %% `f:outbound_frames/4` runs *after* the tunnel is found, so a message
         %% that fails here was never fragmented at all. Calling either a frame
@@ -273,15 +279,26 @@ counters() ->
         %% route is re-resolved, so these are per-message rates on live paths
         %% rather than incidents.
         client_messages_dropped_no_tunnel,
-        %% The same loss on the other side of the router: a reply we owed another
-        %% router, injected into a lookup outbound tunnel that went away between
-        %% picking it and sending on it. **Its own counter, not a shared one.**
-        %% A lost client send is our user waiting on their own traffic; a lost
-        %% lookup reply is *another router* waiting on an answer we had. One is
-        %% our user's experience, the other is our usefulness to the network, and
-        %% an operator cannot act on the sum. Sharing would also make
-        %% `client_messages_dropped_no_tunnel` a lie by name, which is the same
-        %% category of error as calling it `frames`.
+        %% A DatabaseLookup we owed another router, injected into an exploratory
+        %% outbound tunnel that went away between picking it and sending on it.
+        %%
+        %% **The last of the three injection sites to count anything**, and the
+        %% one whose absence was a hole rather than a missing feature: with the
+        %% client and reply sites charging and this one silent, a query that
+        %% never left was reported as `no_answer` — indistinguishable from a
+        %% query the network simply did not answer, which is the opposite
+        %% diagnosis. `f:send_lookup/4` is exported so a stub can answer the two
+        %% picks `{ok, _}` and the send `error`, since a real manager answers
+        %% `ok` to all three and reaching this branch any other way means racing
+        %% a tunnel retirement. See #G9HZK8F.
+        %%
+        %% Expected to stay at zero: the same two-call window
+        %% `lookup_replies_dropped_no_tunnel` has, which is why all three charge
+        %% at the injection point rather than at the pick.
+        lookup_requests_dropped_no_tunnel,
+        %% A reply we owed another router, on the other side of the router from the
+        %% request above: injected into a lookup outbound tunnel that went away
+        %% between picking it and sending on it.
         %%
         %% Expected to stay at zero, and that is a claim about the code rather
         %% than about traffic: both lookups resolve through the same pool map, so

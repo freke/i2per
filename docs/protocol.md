@@ -1000,7 +1000,12 @@ nearest hop's next-router so the returning STB travels home directly.
 
 Data-phase extraction for foreign outbound tunnels is not implemented in this
 release. The client path below, including pool maintenance, creator injection,
-lease addressing, and end-to-end delivery, is implemented.
+lease addressing, and end-to-end delivery, is implemented. That gap is also
+what keeps the outbound-gateway role reachable from a local caller: with no
+foreign extraction there is no caller outside this router that has to play
+the role, so every creator injection has a process to hand it to. Whoever
+implements extraction inherits a role spread across those callers and will
+have to move it back or add one more.
 
 ### Client tunnels and SAM streams
 
@@ -1012,12 +1017,26 @@ flight (their reply path). Local tunnels expire after 600 s in the sweep.
 `pick_outbound/0` / `pick_inbound/0` hand out random active entries.
 
 **Outbound gateway role.** As creator of an outbound tunnel we are its
-gateway: `send_via_outbound/3` fragments a standard-header I2NP message
-(`m:i2p_tunnel:gateway_all/4`), pre-applies every hop's inverse layer
-(`m:i2p_tunnel:obgw_prep/2`) and sends each frame to hop 1 as type-18
-TunnelData. Fragment delivery instructions decide where the far end routes
-the payload — `{tunnel, GatewayHash, TunnelID}` names a remote inbound
-tunnel's gateway, which is how client streams reach a lease.
+gateway: the message is fragmented (`m:i2p_tunnel:gateway_all/4`), every hop's
+inverse layer is pre-applied (`m:i2p_tunnel:obgw_prep/2`) and each frame goes
+to hop 1 as type-18 TunnelData. Fragment delivery instructions decide where
+the far end routes the payload — `{tunnel, GatewayHash, TunnelID}` names a
+remote inbound tunnel's gateway, which is how client streams reach a lease.
+
+Which process runs that sequence depends on who is sending, and it is the
+point rather than an implementation detail. `outbound_injection/1` reads the
+tunnel map and returns the first hop plus this tunnel's layer keys;
+`inject/3` plays the role. **A client send calls `inject/3` itself**, from the
+connection's own worker, so the tunnel manager's mailbox — shared with transit
+frames for other routers, tunnel builds and the pool ticks — does not carry
+per-frame crypto for our users. **A lookup send stays in the manager** and
+uses `send_via_outbound/3`, which calls the same `inject/3`: the lookup
+orchestrator and the peer manager are singletons rather than connections, and
+the peer manager is the process every send path in the router goes through.
+Both charge a send that finds no active tunnel, in three separate counters —
+`client_messages_dropped_no_tunnel`, `lookup_requests_dropped_no_tunnel` and
+`lookup_replies_dropped_no_tunnel` — because a lost client send, a lost query
+and a lost answer are three different things to be lost.
 
 **End-to-end garlic (`i2p_client`).** Stream bytes travel as one
 LOCAL-delivery clove carrying an I2NP type-`31` Data message, Noise-N wrapped

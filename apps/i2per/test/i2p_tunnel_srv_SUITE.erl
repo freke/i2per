@@ -44,6 +44,9 @@
     e2e_garlic_delivered_to_stream_session/1,
     send_via_outbound_roundtrip_single/1,
     send_via_outbound_roundtrip_multi/1,
+    outbound_injection_roundtrip/1,
+    client_sends_are_not_gated_by_each_other/1,
+    an_unrecognised_request_takes_the_manager_down/1,
     transit_denial_reports_capacity/1,
     transit_denial_reports_duplicate_receive_id/1,
     transit_denial_reports_build_budget_drained/1,
@@ -94,6 +97,9 @@ all() ->
         e2e_garlic_delivered_to_stream_session,
         send_via_outbound_roundtrip_single,
         send_via_outbound_roundtrip_multi,
+        outbound_injection_roundtrip,
+        client_sends_are_not_gated_by_each_other,
+        an_unrecognised_request_takes_the_manager_down,
         transit_denial_reports_capacity,
         transit_denial_reports_duplicate_receive_id,
         transit_denial_reports_build_budget_drained,
@@ -1670,21 +1676,37 @@ e2e_garlic_delivered_to_stream_session(_Config) ->
 %%%%%%%%% Outbound gateway send path %%%%%%%%%
 
 %% A real outbound tunnel is built through the full OTBRM round-trip; the
-%% activated entry's layer keys drive a `send_via_outbound` whose wire frames
-%% are captured at the (mock) peer, then every participant hop decrypts its
-%% layer locally and the standard-header message reassembles exactly.
+%% activated entry's layer keys drive a send whose wire frames are captured at
+%% the (mock) peer, then every participant hop decrypts its layer locally and
+%% the standard-header message reassembles exactly.
+%%
+%% **Run over both entry points, because they must produce identical bytes.**
+%% `Send` is the only difference between them and it is the whole of what
+%% #G9HZK8F changed: the manager-side `f:send_via_outbound/3` the lookup paths
+%% use, and the caller-side `f:inject/3` a client connection uses. Identical
+%% wire output is the property -- a client whose frames differed by one byte
+%% would be a client no far end could open.
 send_via_outbound_roundtrip_single(_Config) ->
-    run_outbound_roundtrip(<<16#AB:16, "hello tunnel">>).
+    run_outbound_roundtrip(<<"hello tunnel">>, fun manager_send/2).
 
 send_via_outbound_roundtrip_multi(_Config) ->
-    run_outbound_roundtrip(crypto:strong_rand_bytes(3000)).
+    run_outbound_roundtrip(crypto:strong_rand_bytes(3000), fun manager_send/2).
 
-run_outbound_roundtrip(Payload) ->
-    [Local | Hops] = [make_router() || _ <- lists:seq(1, 4)],
-    lists:foreach(
-        fun(R) -> store_netdb(maps:get(ri, R)) end,
-        [Local | Hops]
-    ),
+outbound_injection_roundtrip(_Config) ->
+    run_outbound_roundtrip(crypto:strong_rand_bytes(3000), fun caller_send/2).
+
+manager_send(TunID, StdMsg) ->
+    i2p_tunnel_srv:send_via_outbound(TunID, local, StdMsg).
+
+%% The client path, played by hand rather than through `m:i2p_client:send_wire/2`,
+%% which wraps its own destination-addressed garlic first. This case is about
+%% the tunnel frames; `i2p_client_tests` covers the wrapping.
+caller_send(TunID, StdMsg) ->
+    {ok, Injection} = i2p_tunnel_srv:outbound_injection(TunID),
+    i2p_tunnel_srv:inject(Injection, local, StdMsg).
+
+run_outbound_roundtrip(Payload, Send) ->
+    {Local, Hops} = local_with_hops(),
     {Pid, _Local} = start_tunnel_srv(Local),
     try
         Inbound = build_an_inbound(Local, Hops),
@@ -1692,14 +1714,8 @@ run_outbound_roundtrip(Payload) ->
         HopKeys = maps:get(layers, Entry),
         ?assertEqual(length(Hops), length(HopKeys)),
 
-        StdMsg =
-            i2p_i2np:encode_std(#{
-                type => 11,
-                msg_id => <<1, 2, 3, 4>>,
-                expiration_ms => 60000,
-                body => Payload
-            }),
-        ok = i2p_tunnel_srv:send_via_outbound(TunID, local, StdMsg),
+        StdMsg = std_msg(Payload),
+        ok = Send(TunID, StdMsg),
 
         %% The number of frames is decided by the pure fragmentation
         {ExpectedFrames, _} = i2p_tunnel:gateway_all(TunID, local, undefined, StdMsg),
@@ -1707,56 +1723,220 @@ run_outbound_roundtrip(Payload) ->
         ?assertEqual(length(ExpectedFrames), length(Wires)),
 
         %% Play every participant hop on each captured wire frame
-        Plains =
-            lists:map(
-                fun(Wire) ->
-                    Final =
-                        lists:foldl(
-                            fun(Hop, M) ->
-                                {ok, M1} =
-                                    i2p_tunnel:process_tunnel_data(M, Hop, TunID, <<0, 0, 0, 0>>),
-                                M1
-                            end,
-                            Wire,
-                            HopKeys
-                        ),
-                    <<_:32/big, IV:16/binary, Plain:1008/binary>> = Final,
-                    {Plain, IV}
-                end,
-                Wires
-            ),
-
-        FragLists =
-            lists:map(
-                fun({Plain, IV}) ->
-                    {ok, Fs, _} = i2p_tunnel:parse_tunnel_data(Plain, IV, #{}),
-                    Fs
-                end,
-                Plains
-            ),
-        AllFrags = lists:append(FragLists),
-        [First] = [F || F <- AllFrags, maps:get(type, F) =:= first],
-        ?assertEqual(local, maps:get(delivery, First)),
-        Rebuilt =
-            case [F || F <- AllFrags, maps:get(type, F) =:= follow_on] of
-                [] ->
-                    maps:get(data, First);
-                FollowOns ->
-                    Ordered =
-                        [
-                            maps:get(data, F)
-                         || N <- lists:seq(1, length(FollowOns)),
-                            F <- FollowOns,
-                            maps:get(frag_num, F) =:= N
-                        ],
-                    iolist_to_binary([maps:get(data, First) | Ordered])
-            end,
-        ?assertEqual(StdMsg, Rebuilt),
+        ?assertEqual(StdMsg, rebuild_at_far_end(Wires, HopKeys, TunID)),
         ?assert(is_process_alive(whereis(i2p_tunnel_srv)))
     after
         unregister_peer(),
         stop_tunnel_srv(Pid)
     end.
+
+%% ---------------------------------------------------------------------------
+%% Neither client's send waits on the other's, or on the manager's other work
+%% ---------------------------------------------------------------------------
+%%
+%% Determined by suspension rather than by timing, because timing cannot show
+%% this. Both senders take their injection while the manager is healthy -- that
+%% call is a map read, and it is the only one either of them makes -- and then
+%% the manager is *suspended*. Every frame that arrives after that has been
+%% framed, layered and handed over by a caller, because the manager cannot run
+%% anything at all.
+%%
+%% Under the arrangement this replaced, where `f:send_via_outbound/3` did the
+%% framing inside the manager, both senders block until CT's 30 s timetrap and
+%% the case fails. It cannot pass by accident, which a two-session timing
+%% comparison could: interleaving favourably would satisfy a rate assertion
+%% while the work was still serialised.
+%%
+%% **What this does not prove:** that two senders *overlap* rather than merely
+%% both completing. That is not observable without a hostile scheduler, and it
+%% is not the property worth having. What is proven is that neither send is
+%% gated by a shared process at all -- and the only shared process in this
+%% arrangement is the one that is suspended. `outbound_injection_roundtrip`
+%% pins the other half: the work is `inject/3`, called by the sender.
+client_sends_are_not_gated_by_each_other(_Config) ->
+    {Local, Hops} = local_with_hops(),
+    {Pid, _Local} = start_tunnel_srv(Local),
+    try
+        Inbound = build_an_inbound(Local, Hops),
+        #{tun_id := TunID, entry := Entry} = build_an_outbound(Hops, Inbound),
+        HopKeys = maps:get(layers, Entry),
+
+        %% Each sender pins its own outbound tunnel, exactly as a route does.
+        {ok, Injection} = i2p_tunnel_srv:outbound_injection(TunID),
+
+        PayloadA = <<"first session's bytes">>,
+        PayloadB = crypto:strong_rand_bytes(400),
+        MsgA = std_msg(PayloadA),
+        MsgB = std_msg(PayloadB),
+
+        true = erlang:suspend_process(Pid),
+        try
+            TagA = spawn_sender(fun() -> i2p_tunnel_srv:inject(Injection, local, MsgA) end),
+            TagB = spawn_sender(fun() -> i2p_tunnel_srv:inject(Injection, local, MsgB) end),
+            %% Barriers, not a deadline: each `{sent, Tag}` is sent by that
+            %% sender *after* its inject/3 returned, and message order from one
+            %% process to another is the runtime's to keep, not a hope.
+            ok = await_sender(TagA),
+            ok = await_sender(TagB),
+
+            %% One frame each: both payloads fit a single 1008-byte plaintext
+            %% fragment, so the count is a fact about fragmentation and not a
+            %% race against it.
+            Wires = receive_frames(2, []),
+            %% Arrival order belongs to the scheduler, so the two messages are
+            %% compared as a set. Sorting the rebuilt binaries is deterministic
+            %% and the two are distinct, so this is not a weaker claim than an
+            %% ordered comparison -- it is the same claim without the race.
+            Rebuilt = [rebuild_at_far_end([W], HopKeys, TunID) || W <- Wires],
+            ?assertEqual(lists:sort([MsgA, MsgB]), lists:sort(Rebuilt))
+        after
+            %% `resume_process/1` answers `true` for a process that is not
+            %% suspended, so this runs whether or not the assertions above
+            %% reached it -- the manager must not be left suspended for the
+            %% next case.
+            _ = erlang:resume_process(Pid)
+        end,
+        ?assert(is_process_alive(whereis(i2p_tunnel_srv)))
+    after
+        unregister_peer(),
+        stop_tunnel_srv(Pid)
+    end.
+
+local_with_hops() ->
+    [Local | Hops] = [make_router() || _ <- lists:seq(1, 4)],
+    lists:foreach(fun(R) -> store_netdb(maps:get(ri, R)) end, [Local | Hops]),
+    {Local, Hops}.
+
+%% An unrecognised request takes the manager down, loudly, and says which one.
+%%
+%% This clause used to answer `ok` to anything it did not recognise. That is
+%% survivable until a request changes shape: a caller not threaded through then
+%% *silently succeeds*, so a client send that never happened is
+%% indistinguishable from one that did. This is the same defect class as the
+%% two false-claim tickets on this board, and #G9HZK8F's own entry point change
+%% is what made it a live landmine rather than a theoretical one.
+%%
+%% Asserting that the *process* dies, rather than that the callback raises,
+%% because the dying is what reaches an operator. The manager is a `permanent`
+%% child, so the supervisor restarts it and the pool rebuilds — loudly, and
+%% having lost every tunnel, which is the right price for a caller invoking a
+%% request that does not exist.
+an_unrecognised_request_takes_the_manager_down(_Config) ->
+    {Local, _Hops} = local_with_hops(),
+    {Pid, _Local} = start_tunnel_srv(Local),
+    %% The manager is linked to this process, so its death arrives here as an
+    %% exit signal too. Trapping for the length of the case is what lets the
+    %% case *observe* the death rather than be killed by it.
+    Trapping = process_flag(trap_exit, true),
+    Ref = erlang:monitor(process, Pid),
+    try
+        %% Provoked deliberately: the exit is the assertion, so it is caught
+        %% rather than allowed to fail the case. What must not happen is a
+        %% reply -- that is the whole claim.
+        %% `i2p_tunnel_srv` by name, not `?MODULE`: the manager registers under
+        %% its own name, and this suite is `i2p_tunnel_srv_SUITE`. A call to
+        %% `?MODULE` would exit on `noproc` and never reach the manager at all
+        %% -- which would make this case pass for the wrong reason.
+        ?assertMatch({'EXIT', _}, catch gen_server:call(i2p_tunnel_srv, no_such_request)),
+        receive
+            {'DOWN', Ref, process, Pid, Reason} ->
+                ?assertMatch({i2p_tunnel_srv, unhandled_call, no_such_request}, Reason)
+        after 5000 ->
+            erlang:error({manager_survived_an_unrecognised_request, Pid})
+        end
+    after
+        process_flag(trap_exit, Trapping)
+    end.
+
+std_msg(Payload) ->
+    i2p_i2np:encode_std(#{
+        type => 11,
+        %% A fresh message ID per message, as `m:i2p_client` does: two sends on
+        %% one tunnel must not be able to collide on a fixed fixture value, and
+        %% nothing here depends on the ID being reproducible.
+        msg_id => crypto:strong_rand_bytes(4),
+        expiration_ms => 60000,
+        body => Payload
+    }).
+
+%% spawn_sender/1 — a stand-in for a connection's own worker: it plays the
+%% outbound-gateway role and then says so. Reports failure rather than dying
+%% quietly, so a broken inject/3 surfaces as this case's failure and not as a
+%% missing message.
+spawn_sender(Send) ->
+    TestPid = self(),
+    Tag = make_ref(),
+    _ = spawn(fun() ->
+        Result =
+            try
+                Send()
+            catch
+                Class:Reason -> {raised, Class, Reason}
+            end,
+        TestPid ! {sent, Tag, Result}
+    end),
+    Tag.
+
+await_sender(Tag) ->
+    receive
+        {sent, Tag, ok} ->
+            ok;
+        {sent, Tag, Other} ->
+            erlang:error({client_send_failed, Tag, Other})
+    after 5000 ->
+        %% Reached only if the sender is blocked inside inject/3, which is the
+        %% defect: a named error rather than a case that hangs until the timetrap.
+        erlang:error({client_send_blocked, Tag})
+    end.
+
+%% rebuild_at_far_end/3 — play every participant hop on each captured wire
+%% frame, then reassemble the fragments. This is the far end's half, run
+%% locally: what the hops would recover is what the sender's crypto produced.
+rebuild_at_far_end(Wires, HopKeys, TunID) ->
+    Plains =
+        lists:map(
+            fun(Wire) ->
+                Final =
+                    lists:foldl(
+                        fun(Hop, M) ->
+                            {ok, M1} =
+                                i2p_tunnel:process_tunnel_data(M, Hop, TunID, <<0, 0, 0, 0>>),
+                            M1
+                        end,
+                        Wire,
+                        HopKeys
+                    ),
+                <<_:32/big, IV:16/binary, Plain:1008/binary>> = Final,
+                {Plain, IV}
+            end,
+            Wires
+        ),
+    FragLists =
+        lists:map(
+            fun({Plain, IV}) ->
+                {ok, Fs, _} = i2p_tunnel:parse_tunnel_data(Plain, IV, #{}),
+                Fs
+            end,
+            Plains
+        ),
+    AllFrags = lists:append(FragLists),
+    [First] = [F || F <- AllFrags, maps:get(type, F) =:= first],
+    ?assertEqual(local, maps:get(delivery, First)),
+    Rebuilt =
+        case [F || F <- AllFrags, maps:get(type, F) =:= follow_on] of
+            [] ->
+                maps:get(data, First);
+            FollowOns ->
+                Ordered =
+                    [
+                        maps:get(data, F)
+                     || N <- lists:seq(1, length(FollowOns)),
+                        F <- FollowOns,
+                        maps:get(frag_num, F) =:= N
+                    ],
+                iolist_to_binary([maps:get(data, First) | Ordered])
+        end,
+    Rebuilt.
 
 %% build_an_outbound/2 — drive one of our own outbound builds through the full
 %% OTBRM: the OBEP wraps the reply in an Existing-Session garlic to the last

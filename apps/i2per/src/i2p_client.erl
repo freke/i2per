@@ -7,10 +7,9 @@ Pure helpers shared by the SAM bridge and the tunnel manager's client paths.
 A sender resolves a remote destination to its freshest unexpired lease
 (`f:pick_lease/1`), wraps raw stream bytes into a destination-addressed
 garlic message (`f:wrap_payload/2`), and injects the result into one of its
-outbound tunnels via `m:i2p_tunnel_srv:send_via_outbound/3` naming the
-lease's gateway and tunnel ID. The receiver opens the arriving garlic with
-the destination's ECIES private key (`f:unwrap_payload/2`) and feeds the
-bytes to the owning session.
+outbound tunnels (`f:send_wire/2`) naming the lease's gateway and tunnel ID.
+The receiver opens the arriving garlic with the destination's ECIES private
+key (`f:unwrap_payload/2`) and feeds the bytes to the owning session.
 
 ## Usage
 
@@ -19,7 +18,10 @@ bytes to the owning session.
 {ok, Body} = i2p_client:wrap_payload(DestPub, <<"hello">>),
 StdMsg = i2p_i2np:encode_std(#{type => 11, msg_id => ID,
                                expiration_ms => 60000, body => Body}),
-ok = i2p_tunnel_srv:send_via_outbound(TunID, {tunnel, Gateway, TunnelID}, StdMsg).
+%% The caller plays the outbound-gateway role itself, so the framing and the
+%% inverse-layer crypto cost the tunnel manager nothing.
+{ok, Injection} = i2p_tunnel_srv:outbound_injection(TunID),
+ok = i2p_tunnel_srv:inject(Injection, {tunnel, Gateway, TunnelID}, StdMsg).
 ```
 """.
 -export([
@@ -181,6 +183,14 @@ for the route's destination and inject it into the pinned outbound tunnel
 toward the lease. A vanished tunnel drops the packet; the connection's resend
 machinery recovers it, so this returns `ok` either way and does not propagate.
 
+**The work runs in the caller.** `m:i2p_tunnel_srv:outbound_injection/1` is
+asked only which tunnel to play the outbound-gateway role on, and answers
+before any framing happens; `f:inject/3` then does the fragmentation and the
+inverse-layer crypto in this process. Two client sends therefore do not
+serialise behind one another, and neither waits on transit frames for other
+routers or on a tunnel build -- the tunnel manager's mailbox is shared with
+all of that.
+
 **The drop is counted, not silent.** `m:i2p_stats` records it as
 `client_messages_dropped_no_tunnel`, which is the companion to
 `transit_frames_dropped_no_route`: that one is a frame this router could not
@@ -202,8 +212,8 @@ send_wire(#{out_tid := OutTid, gw := Gw, tid := Tid, dest_pub := DestPub}, Wire)
             expiration_ms => 60000,
             body => GarlicBody
         }),
-    case i2p_tunnel_srv:send_via_outbound(OutTid, {tunnel, Gw, Tid}, StdMsg) of
-        ok -> ok;
+    case i2p_tunnel_srv:outbound_injection(OutTid) of
+        {ok, Injection} -> i2p_tunnel_srv:inject(Injection, {tunnel, Gw, Tid}, StdMsg);
         error -> i2p_stats:add(client_messages_dropped_no_tunnel, 1)
     end.
 
