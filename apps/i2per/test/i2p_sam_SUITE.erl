@@ -22,6 +22,7 @@
 -export([
     sam_hello/1,
     sam_listener_binds_loopback/1,
+    a_batch_of_inbound_sessions_is_not_accepted_one_per_second/1,
     sam_session_limit_rejects_new_child/1,
     sam_dest_generate/1,
     session_create_transient/1,
@@ -52,6 +53,13 @@
 %% longer time budget for the streaming handshake round trips.
 -define(GROUP_B, [stream_handshake, full_duplex, forward_e2e]).
 
+%% The accept-path batch and its budget, matching the NTCP2 pair in
+%% `i2p_ntcp2_conn_SUITE`. Six against two seconds: the defect's floor is
+%% (N-1) seconds, so the bound is under half of what one-per-second admission
+%% needs for six -- and not a tolerance that happens to clear the real behaviour.
+-define(ACCEPT_BATCH, 6).
+-define(ACCEPT_BUDGET_MS, 2000).
+
 suite() ->
     [{timetrap, 120000}].
 
@@ -59,6 +67,7 @@ all() ->
     [
         sam_hello,
         sam_listener_binds_loopback,
+        a_batch_of_inbound_sessions_is_not_accepted_one_per_second,
         sam_session_limit_rejects_new_child,
         sam_dest_generate,
         session_create_transient,
@@ -163,6 +172,144 @@ sam_listener_binds_loopback(_Config) ->
     after
         ok = i2p_sam_listener:stop(Listener)
     end.
+
+%% --------------------------------------------------------------------------
+%% The accept path
+%% --------------------------------------------------------------------------
+
+%% A batch of inbound sessions is accepted as a batch.
+%%
+%% The defect: the accept loop polled its control messages on a **one-second**
+%% receive timeout and only called `f:gen_tcp:accept/2` when that timeout expired,
+%% so it took at most one inbound session per second no matter how many were
+%% waiting. Six simultaneous connections took 6.06 s to drain, read from the kernel's
+%% accept queue -- the rate was exactly the timeout, not a load effect. On NTCP2 that
+%% is a peer set that rebuilds one peer per second; on SAM it is the rate a *client*
+%% sees, since an application opens a connection per session.
+%%
+%% The bound is a batch, asserted as one. Six connections are opened at the same
+%% instant and all six `HELLO` replies have to arrive inside ?ACCEPT_BUDGET_MS, so a
+%% regression that admitted five immediately and the sixth a second later fails on
+%% the sixth rather than passing on the five. Against the defect the floor is (N-1)
+%% seconds -- the last of N cannot be accepted before the Nth tick -- so with N = 6
+%% that is 5 s against a 2 s bound, and the bound is not a tolerance that happens to
+%% sit above the real behaviour: it is under half of what the defect needed.
+%%
+%% **What the batch is made of, and why a raw connect is the right thing here.** Each
+%% client connects, sends `HELLO VERSION` and reads the reply. That is a stronger
+%% witness than a child count: the reply can only exist if a session was started, the
+%% socket was transferred, the session set `{active, once}`, read the line and parsed
+%% it. A bare `f:gen_tcp:connect` would prove the kernel completed a handshake, which
+%% is not the claim, and a session count on its own would be satisfied by sessions
+%% that cannot read. Six clients and six replies is also six *distinct* sessions -- a
+%% session owns one socket, so a session that answered two clients does not exist.
+%%
+%% The session count is read too, and against the number of replies rather than
+%% against ?ACCEPT_BATCH alone, so "six clients were answered" and "six sessions
+%% exist" are one claim stated twice rather than two claims that can drift.
+%%
+%% The control-message assertion is the part that is easy to lose while fixing the
+%% throttle, so it is here rather than in a case of its own. The asker is a separate
+%% process that asks while the batch is in flight, which is the only moment the
+%% question means anything: a fix that moved the accept back into the process that
+%% answers control messages would leave it blocked. It cannot pass slowly --
+%% `f:i2p_sam_listener:port/1` has no bound of its own, so the case's deadline is the
+%% bound, and a control path stuck behind the accept surfaces here as a wrong answer
+%% rather than as a hang. See #YJ0DSAT.
+a_batch_of_inbound_sessions_is_not_accepted_one_per_second(_Config) ->
+    Port = i2p_ct_helpers:free_port(),
+    {ok, Listener} = i2p_sam_listener:listen(#{port => Port, local => undefined}),
+    %% Bound before the `try`, because the `after` has to reach it: a client held
+    %% by a `try`-bound variable is unreachable from the `after`, so a failure
+    %% anywhere in the body would leave six of them holding sockets for the rest of
+    %% the run.
+    Dialers = [say_hello(Port, self()) || _ <- lists:seq(1, ?ACCEPT_BATCH)],
+    try
+        Deadline = erlang:monotonic_time(millisecond) + ?ACCEPT_BUDGET_MS,
+        Asker = ask_port(self(), Listener),
+        ?ACCEPT_BATCH = length(Dialers),
+        Replies = collect_replies(?ACCEPT_BATCH, Deadline, []),
+        ?ACCEPT_BATCH = length(Replies),
+        %% Every one is a real HELLO REPLY, not merely N replies of some shape.
+        ?assertEqual(
+            [],
+            [R || R <- Replies, binary:match(R, <<"HELLO REPLY RESULT=OK">>) =:= nomatch]
+        ),
+        ?assertEqual(length(Replies), i2p_sam_sup:session_count()),
+        {asked, Port} = take_asked(Asker, Deadline)
+    after
+        %% The clients are released in the `after`, so their sessions are still live
+        %% for the count above even if an assertion above it has already failed. A
+        %% client that exited on its own would close its socket, its session would
+        %% exit with it, and the count would be a race against six process exits --
+        %% which is how the first version of this case read 1.
+        [Dialer ! finish || Dialer <- Dialers],
+        ok = i2p_sam_listener:stop(Listener)
+    end,
+    ok.
+
+%% One client, in its own process, so all ?ACCEPT_BATCH of them reach the listen
+%% socket at the same moment rather than as a queue of sequential handshakes -- a
+%% sequential loop would measure a rate the client, not the accept path, was setting.
+%%
+%% **The client waits to be released.** It has to: a client that returned from this
+%% fun would drop its socket, the session would see `{tcp_closed, _}` and exit, and
+%% the case's session count would be a race against six process exits rather than a
+%% reading. Holding the socket open until the case has looked is what makes
+%% `f:session_count/0` mean six live sessions. Releasing them in the `after` is what
+%% keeps them from outliving the case.
+%%
+%% `Parent` is captured by the caller rather than read inside the spawned fun:
+%% `self()` there is the client, and a reply sent to the client is a reply nobody is
+%% waiting for.
+say_hello(Port, Parent) ->
+    spawn(fun() ->
+        {ok, Sock} = connect_sam(Port),
+        send_cmd(Sock, <<"HELLO VERSION MIN=3.1 MAX=3.1">>),
+        Parent ! {hello_reply, recv_line(Sock)},
+        receive
+            finish -> ok = gen_tcp:close(Sock)
+        end
+    end).
+
+%% The asker, with the parent captured by the caller for the reason `say_hello/2`
+%% gives.
+ask_port(Parent, Listener) ->
+    spawn(fun() ->
+        Parent ! {asked, i2p_sam_listener:port(Listener)}
+    end).
+
+%% The whole batch against one deadline, so the bound is on the batch rather than per
+%% connection -- a bound per connection would let the sixth wait five seconds behind
+%% five fast ones and still pass.
+collect_replies(N, Deadline, Acc) ->
+    case length(Acc) of
+        N ->
+            lists:reverse(Acc);
+        _ ->
+            collect_replies_next(N, Deadline, Acc)
+    end.
+
+collect_replies_next(N, Deadline, Acc) ->
+    receive
+        {hello_reply, Reply} ->
+            collect_replies(N, Deadline, [Reply | Acc])
+    after remaining_ms(Deadline) ->
+        erlang:error({accept_batch_incomplete, length(Acc)})
+    end.
+
+%% The asked answer, or the same failure as the batch: a control message that has not
+%% come back by the time the batch did is part of the same defect.
+take_asked(Asker, Deadline) ->
+    receive
+        {asked, Answer} ->
+            {asked, Answer}
+    after remaining_ms(Deadline) ->
+        erlang:error({control_message_unanswered, Asker})
+    end.
+
+remaining_ms(Deadline) ->
+    erlang:max(0, Deadline - erlang:monotonic_time(millisecond)).
 
 sam_session_limit_rejects_new_child(_Config) ->
     application:set_env(?APP, max_sam_sessions, 0),

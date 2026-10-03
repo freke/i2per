@@ -19,11 +19,36 @@ their child specs through `listener_child/1` and `session_child/1`.
 In the persistent (operator) boot the supervisor is started with the router's
 local keys (`f:start_link/1`) and binds one boot listener on the `sam_port`
 app env; explicit/test boots start it empty and bind listeners on demand.
+
+## The cap, and what admits a session
+
+`max_sam_sessions` is enforced by `m:i2p_admission`, one instance of which is
+a child of this supervisor — a **separate** instance from the two peer-connection
+admissions, and deliberately so. A SAM session is a client connection an
+operator is waiting on by hand, while the bursts the peer caps exist for are
+floodfill replication and post-restart peer-set rebuilds. One shared admission
+process would put every one of those handshakes in front of that operator's
+session; three instances never wait on each other.
+
+`f:session_count/0` counts this supervisor's `session` children, which is what
+the limit bounds. It used to count the `i2p_sam_sessions` ETS rows instead, which
+is a different number: a session writes its row *after* it is started, so one in
+that window counted against nothing, and concurrent accepts could exceed the cap
+by the number of sessions mid-registration. Counting children is also what lets
+all three caps be counted the same way and pinned by the same case.
+
+It is not a `m:global` lock, and the reason `m:i2p_admission` gives is the
+important one: `global:trans/2` is a shared lock rather than a mutex, so every
+concurrent accept ran the count-then-start anyway.
 """.
 
 -behaviour(supervisor).
 
 -define(DEFAULT_MAX_SESSIONS, 32).
+
+%% The admission process `f:start_session/1` goes through. Named so the resource
+%% it guards is in the supervision tree and answerable to a `whereis/1`.
+-define(ADMISSION, i2p_sam_admission).
 
 -export([
     start_link/0,
@@ -33,7 +58,6 @@ app env; explicit/test boots start it empty and bind listeners on demand.
     start_session/1,
     session_count/0,
     session_limit/0,
-    session_limit_reached/0,
     stream_conn_child/1,
     start_stream_conn/1
 ]).
@@ -91,27 +115,38 @@ session_child(Args) ->
 -doc """
 Admit and start one SAM session under the configured active-session limit.
 
-The admission check and `supervisor:start_child/2` are serialized with a node
-lock so simultaneous accepts cannot exceed the limit. Output is the normal
-`supervisor:start_child/2` result, or `{error, session_limit}`.
+The count and the `m:supervisor:start_child/2` that follows it are one operation
+in `m:i2p_admission`, so simultaneous accepts cannot exceed the limit. Output is
+the normal `supervisor:start_child/2` result, or `{error, session_limit}`.
 """.
 -spec start_session(supervisor:child_spec()) ->
     {ok, pid()} | {ok, pid(), term()} | {error, term()}.
 start_session(ChildSpec) ->
-    global:trans(
-        {?MODULE, session_admission},
-        fun() ->
-            case session_limit_reached() of
-                true -> {error, session_limit};
-                false -> supervisor:start_child(?MODULE, ChildSpec)
-            end
-        end
-    ).
+    i2p_admission:admit(?ADMISSION, ChildSpec).
 
--doc "Return the number of active SAM sessions.".
+-doc """
+Return the number of live SAM sessions.
+
+The `session` children of this supervisor, which is what `f:session_limit/0`
+bounds. Not the `i2p_sam_sessions` ETS rows: those are written by each session
+after it starts, so they are a later and smaller number. Zero when this
+supervisor is not running.
+""".
 -spec session_count() -> non_neg_integer().
 session_count() ->
-    length(client_sessions()).
+    case whereis(?MODULE) of
+        undefined ->
+            0;
+        Sup ->
+            length([
+                Id
+             || {Id, Pid, _Type, _Modules} <- supervisor:which_children(Sup),
+                is_pid(Pid),
+                is_tuple(Id),
+                tuple_size(Id) > 0,
+                element(1, Id) =:= session
+            ])
+    end.
 
 -doc """
 Return the maximum number of active SAM sessions.
@@ -127,10 +162,18 @@ session_limit() ->
         _ -> ?DEFAULT_MAX_SESSIONS
     end.
 
--doc "Whether a new SAM session would exceed the configured limit.".
--spec session_limit_reached() -> boolean().
-session_limit_reached() ->
-    session_count() >= session_limit().
+%% `count` and `limit` are read per admission, not captured at boot, so an
+%% operator who changes `max_sam_sessions` changes it for the next accept, and a
+%% zero -- the emergency fail-closed switch -- works without a restart.
+admission_child() ->
+    i2p_admission:child_spec(#{
+        name => ?ADMISSION,
+        supervisor => ?MODULE,
+        count => fun session_count/0,
+        limit => fun session_limit/0,
+        refused => session_limit,
+        refused_counter => sam_sessions_refused_limit
+    }).
 
 -doc """
 A `temporary` worker child spec for one streaming connection process
@@ -316,11 +359,12 @@ init([Local]) ->
     _EtsTid = ets:new(?MODULE, [named_table, public, {read_concurrency, true}]),
     {ok,
         {#{strategy => one_for_one, intensity => 10, period => 10}, [
+            admission_child(),
             listener_child(boot_listener(Local))
         ]}};
 init([]) ->
     _EtsTid = ets:new(?MODULE, [named_table, public, {read_concurrency, true}]),
-    {ok, {#{strategy => one_for_one, intensity => 10, period => 10}, []}}.
+    {ok, {#{strategy => one_for_one, intensity => 10, period => 10}, [admission_child()]}}.
 
 %%%%%%% %%% Internal %%%%%%%
 

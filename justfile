@@ -8,66 +8,91 @@ default:
 compile:
     rebar3 compile
 
-# Run unit tests with coverage
-test: eunit ct
+# %%%%% The three test layers %%%%%
+#
+# The tree separates by what is being tested, and the recipes are named after
+# that rather than after a CI tier:
+#
+#   proper       properties over generated inputs   -- `*_prop_tests.erl`
+#   smoke-test   the whole router, every push        -- unit + most of CT
+#   test         everything, no time limit           -- `main`, and locally
+#
+# The layer boundary is `scripts/eunit-modules.sh` for eunit/PropEr and
+# `scripts/ct-suites.sh` for CT. Neither list lives here, because a list in two
+# places drifts and a drifted list is a gate that quietly stops running
+# something.
 
-eunit:
-    rebar3 as test eunit --cover
+# %%%%% proper: property-based, on main and on request %%%%%
+#
+# 3 modules, 16 properties, **measured at 0.23s**. They are not in the smoke tier
+# for a reason that is not their runtime: they are the layer whose value is
+# statistical, so a fixed-seed failure is not reproducible by re-running the
+# suite, and a random input found on a push is a bug report that arrives before
+# anyone can reproduce it. They run on `main`, where a red is investigated rather
+# than re-rolled, and locally by name.
+#
+# `just test` includes them, so "run everything" means everything.
+#
+# Run the property tests (3 modules, 16 properties).
+proper:
+    rebar3 as test eunit --module="$(bash scripts/eunit-modules.sh prop)"
 
-# %%%%% The PR tier %%%%%
+# %%%%% smoke-test: every push, under five minutes %%%%%
 #
-# What a pull request runs. **Measured 2026-10-02 at ~55s** -- eunit 13s plus
-# 41s for 100 CT cases -- against ~221s for `just check`.
+# lint + the 935 unit cases + **211 of the 224 CT cases** across 23 of the 25
+# suites. Measured at **~92s here** (79s CT, 10s eunit, 3s lint).
 #
-# The gate stops at its first failure, so a *red* run already reports in seconds.
-# This recipe is for the other case: a green run you would otherwise wait ten
-# minutes to learn about.
+# **This is a partition of the tree, not a hand-picked list.** Every suite except
+# the two in `slow` runs. A new suite is in tomorrow's smoke run unless someone
+# deliberately puts it in `slow`, which inverts the usual failure: with a named
+# list, the edit that adds a suite is the moment someone decides it does not
+# matter yet.
 #
-# **Lint is in it, `doc` is not.** Formatting costs ~1s and is a thing a PR gets
-# wrong; the ExDoc build is a few seconds of work nobody is waiting on, and `main`
-# builds it.
+# What it covers: boot, both transports, the tunnel path, SAM, streaming, the
+# address book, reseed, the NetDb server, the peer lifecycle, and the read API.
+# What it does not, stated rather than implied: `i2p_peer_transport_SUITE`
+# (protocol-mandated connect timeouts) and `i2p_ssu2_e2e_SUITE` (22,000 real
+# datagrams through a live session). Together 50s here, ~125s on a runner -- more
+# than the whole budget, for two suites whose failures are about waiting rather
+# than behaviour. A push that breaks one goes green here and red on `main`.
 #
-# **This is not the gate, and it is not named as if it were.** 6 of 25 CT suites,
-# so a PR touching SAM, streaming, addressbook, reseed, netdb-srv or a
-# peer-lifecycle suite can go green and break `main`. That is the price of a
-# one-minute signal, paid deliberately rather than by accident; `main` runs
-# everything. Why these six, and exactly what is given up, is argued in
-# `scripts/ct-suites.sh` next to the list itself.
+# Dialyzer is deliberately **not** here. It analyses source, not tests, so its
+# answer does not depend on which suites ran, and 49s of a 5-minute budget is
+# better spent on tests. It runs on every push in the `compat` job's shadow.
 #
-# No `--cover`: this is for turnaround, and the aggregate report is
-# `just coverage`'s business. `--sname` for the same reason as `ct` below.
-#
-# The PR tier: all 940 eunit cases plus 100 CT ones, in about 55s
-check-fast: lint
-    rebar3 as test eunit
-    rebar3 ct --sname i2per_ct --suite="$(bash scripts/ct-suites.sh fast)"
+# The push tier: lint, the unit tests, and most of the CT suites.
+smoke-test: lint
+    rebar3 as test eunit --module="$(bash scripts/eunit-modules.sh unit)"
+    rebar3 ct --sname i2per_ct --suite="$(bash scripts/ct-suites.sh smoke)"
 
-# Run the full suite (eunit + ct) with coverage and render the merged report
-coverage:
+# %%%%% test: everything, no time limit %%%%%
+#
+# lint + doc + all 951 eunit (935 unit + 16 property) + all 224 CT + the merged
+# coverage report. Measured at **~4 minutes here**; `main` runs it unattended.
+#
+# **`--cover` on both halves, because `just cover` is the only thing that reads
+# the aggregate.** Coverdata is per-`rebar3` process, so the eunit half and the CT
+# half have to be produced by one run of each in the same profile to merge.
+#
+# Run everything: lint, docs, all eunit, all PropEr, all CT, coverage.
+test: lint doc
     rebar3 as test do eunit --cover, ct --cover --sname i2per_ct
     rebar3 cover
 
-# Run Common Test suites (--sname gives the whole CT node a fixed dist name so
-# apps/i2per_status/test/i2per_status_SUITE.erl can spawn a `peer` router;
-# --cover so `just check` still produces the ct.coverdata half of the aggregate)
-ct:
-    rebar3 ct --cover --sname i2per_ct
-
 # %%%%% The slow tier %%%%%
 #
-# `i2p_ssu2_e2e_SUITE`'s receive-window case drives 22,000 real encrypted
-# datagrams through a live session pair: 15s here, and the suite measured
-# **5m52s** alone on a GitHub runner -- about 14x slower than the rest of CT,
-# which is only ~2.5x slower. Nine testcases out of 223 were taking six of the
-# gate's 8m21s of CT, in *both* jobs, so one suite was setting the critical path
-# for the whole pipeline.
+# The two suites too slow for every push: `i2p_ssu2_e2e_SUITE`, whose
+# receive-window case drives 22,000 real encrypted datagrams through a live
+# session pair, and `i2p_peer_transport_SUITE`, a cluster of connection-timeout
+# and backoff cases. Both are protocol-mandated waiting rather than behaviour, and
+# together they are ~50s here and ~125s on a runner.
 #
-# It is here so it can be run *alone* when it is the thing being worked on. CI
-# does not: `main` runs all 223 and a pull request runs the six above.
+# **For working on them, not for CI.** `main` runs them as part of `just test`;
+# the point of this recipe is to run one of them alone while changing it, so a
+# 20-minute feedback loop does not come from re-running 23 other suites.
 #
 # **No `--cover`.** Coverdata is per-`rebar3 ct`-process and this is a
-# single-suite run for development, not an aggregate. Measured at 2s of 43s --
-# worth dropping, not worth a report nobody reads.
+# single-tier run for development, not an aggregate.
 
 # The slow suites alone. For working on the receive window, not for CI.
 ct-slow:
@@ -87,6 +112,8 @@ repeat suite n:
 
 # Run the external i2pd interoperability suite. This is an explicit opt-in and
 # is not part of the hermetic check gate.
+#
+# Run the i2pd interoperability suite against a live router.
 interop:
     scripts/interop_i2pd.sh
 
@@ -97,12 +124,21 @@ bench-siphash:
 # Live-network smoke: boot a throwaway router and emit the network observables
 # (peers / dialed / netdb_router_info_growth / transit_relayed_tunnels) as JSON.
 # Hermetic by default (self-seed, offline); pass --live for a real join from a
-# routable host. Not part of check.
-smoke flags="":
+# routable host.
+#
+# **Named `live-smoke`, not `smoke`.** `smoke` reads as "the quick test tier",
+# and this is the opposite: it boots a real router, and with `--live` it joins
+# the real network. Two recipes where the quicker-sounding one is the dangerous
+# one is how somebody runs the wrong thing in CI. Not part of `test`.
+#
+# Boot a throwaway router and print its network observables as JSON.
+live-smoke flags="":
     escript scripts/live_smoke.escript {{flags}}
 
 # Build the prod relx release tarball + MANIFEST into dist/ (run via devenv;
 # requires rebar3/erl on PATH — see scripts/build-release.sh)
+#
+# Build the relx release tarball into dist/.
 release:
     bash scripts/build-release.sh
 
@@ -139,5 +175,12 @@ status:
 commit message:
     jj commit -m "{{message}}"
 
-# Run all quality checks
+# Run all quality checks: formatting, generated documentation, and every test.
+#
+# **An alias for `test`, kept because the release notes, the ADRs and the README
+# all say `just check`.** Renaming it would mean editing every one of those for
+# no gain, and two names for one command is cheaper than a stale reference to a
+# name that no longer exists. `test` is the primary spelling because that is what
+# the recipe *does*.
+# Run all quality checks: formatting, docs, and every test.
 check: lint doc test

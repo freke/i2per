@@ -315,7 +315,7 @@ sweep_does_not_rederive_the_recency_order_test() ->
         %% the call has not happened yet rather than because it did not happen.
         ?assertEqual([], drain(Tracer))
     after
-        untrace(Tracer)
+        untrace(Self, Tracer)
     end.
 
 %% ---- tracing -----------------------------------------------------------------
@@ -340,10 +340,25 @@ drain(Tracer) ->
         erlang:error(tracer_never_drained)
     end.
 
-%% `erlang:trace/3` raises `badarg` on an already-exited tracer, so turning tracing
-%% off needs a catch.
-untrace(Tracer) ->
-    try erlang:trace(Tracer, false, [call]) of
+%% Turn the trace off on **both** ends, and stop the tracer.
+%%
+%% **The traced process is `Self`, not `Tracer`.** This used to untrace only the
+%% tracer, which disables tracing *on the tracer* and leaves the traced worker
+%% still traced with a tracer that has exited. Under eunit that worker is shared
+%% by every module in the tier, so the next module that traces itself gets
+%% `badarg` -- `can only have one tracer per process` -- for a fault two
+%% directories away.
+%%
+%% The `catch` is not defensive programming: `erlang:trace/3` raises `badarg`
+%% when the process has already exited, which is a normal race in a teardown.
+untrace(Self, Tracer) ->
+    _ = safe_untrace(Self),
+    _ = safe_untrace(Tracer),
+    exit(Tracer, kill),
+    ok.
+
+safe_untrace(Pid) ->
+    try erlang:trace(Pid, false, [call]) of
         _ -> ok
     catch
         _:_ -> ok
