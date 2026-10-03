@@ -35,7 +35,14 @@ job, by sampling twice and subtracting. Nothing here computes one.
 
 %% Bumped whenever a key is added. Not bumped for a value change, because a
 %% value change is not allowed: see the additive-only contract above.
--define(VIEW_VERSION, 1).
+%%
+%% 2 added `connecting` inside the `peers` map. The top-level key set did not
+%% change, so `f:view_keys/0` and this stay in step — but a consumer reading
+%% `peers` is being handed a shape it has not seen, and the version is what
+%% tells it so. The rule above says a value change is not allowed rather than
+%% unbumpable, which is why this is a new key and `other` still counts
+%% connecting peers: the alternative would have changed what `other` means.
+-define(VIEW_VERSION, 2).
 
 %% `underspecs` is off for the read API's two functions, deliberately, and this
 %% is the one place in the tree where that is the right call.
@@ -75,7 +82,11 @@ different fault from "counting, and the value is zero".
         boot_time := integer() | undefined,
         counters := #{atom() => non_neg_integer()},
         identity := binary(),
-        peers := #{connected => non_neg_integer(), other => non_neg_integer()},
+        peers := #{
+            connected := non_neg_integer(),
+            connecting := non_neg_integer(),
+            other := non_neg_integer()
+        },
         tunnels :=
             #{
                 outbound := non_neg_integer(),
@@ -138,25 +149,46 @@ view_keys() ->
 identity_b64(Hash) when byte_size(Hash) =:= 32 ->
     base64:encode(Hash).
 
-%% aggregate_peers/1 — collapse per-peer states into two buckets.
+%% aggregate_peers/1 — collapse per-peer states into their buckets.
 %% Exported so the pure aggregation can be unit-tested without a live router.
 -doc """
 Collapse the map returned by `f:i2p_peer:status/0` into
-`#{connected, other}` counters.
+`#{connected, connecting, other}` counters.
 
 Input: the peer-status map as returned by `i2p_peer:status/0`. Only peers
-whose status map says `connected` count as connected; everything else — idle,
-failed, excluded — lands in `other`.
+whose status map says `connected` count as connected; every other state —
+connecting, backoff, idle, failed, excluded — counts as `other`, and the subset
+of those with a dial in flight is counted again as `connecting`.
+
+**`connecting` is a subset of `other`, not a replacement for part of it.** A
+caller wanting the backoff count is `other - connecting`, which is worth stating
+because the alternative reading — three disjoint buckets — would silently change
+what `other` means for a consumer reading version 1 of this map, and the
+additive-only rule above forbids exactly that. `other` keeps counting everything
+that is not connected; `connecting` is a newer, finer question asked of the same
+peers.
 """.
--spec aggregate_peers(map()) -> #{connected => non_neg_integer(), other => non_neg_integer()}.
+-spec aggregate_peers(map()) ->
+    #{
+        connected => non_neg_integer(),
+        connecting => non_neg_integer(),
+        other => non_neg_integer()
+    }.
 aggregate_peers(PeerStatus) ->
     lists:foldl(
         fun
             (#{status := connected}, Acc) ->
-                maps:update_with(connected, fun(N) -> N + 1 end, 1, Acc);
+                bump(connected, Acc);
+            (#{status := connecting}, Acc) ->
+                bump(other, bump(connecting, Acc));
             (_, Acc) ->
-                maps:update_with(other, fun(N) -> N + 1 end, 1, Acc)
+                bump(other, Acc)
         end,
-        #{connected => 0, other => 0},
+        #{connected => 0, connecting => 0, other => 0},
         maps:values(PeerStatus)
     ).
+
+%% One bucket, one peer. `maps:update_with/4` rather than a `+ 1` on a `maps:get`
+%% so the seed carries every key the shape promises, in one place.
+bump(Bucket, Acc) ->
+    maps:update_with(Bucket, fun(N) -> N + 1 end, 1, Acc).

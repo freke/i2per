@@ -136,7 +136,7 @@ dist_view_keys_agree_with_the_consumers_key_set(Config) ->
     %% so: a mismatch here is a consumer built against a different read API, and
     %% the honest response is a version report rather than a key diff.
     View = erpc:call(RNode, i2p_status_data, view, [], 5000),
-    ?assertEqual(1, maps:get(version, View)),
+    ?assertEqual(2, maps:get(version, View)),
     %% The list the view actually returned, so a router that returns `view_keys/0`
     %% and a view that disagrees cannot both be satisfied by one of them.
     ?assertEqual(lists:sort(maps:keys(View)), lists:sort(RouterKeys)),

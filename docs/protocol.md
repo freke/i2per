@@ -1591,6 +1591,29 @@ connected over TCP and left a UDP stall behind. The other three reasons —
 `{session_admission_failed, _}` — are the introducer leg, so they only appear on
 the firewalled-remote path.
 
+#### Seeing a park while it is happening
+
+The counter and the event are reported *after* a park ends. A park is up to ~10s
+direct and up to ~60s through an introducer, and for that whole time the peer is
+still `connecting` — so the read API has to describe the attempt in progress, not
+only its outcome.
+
+`i2p_peer:status/0` reports `transport` as **the transport being attempted**, and
+the dialing process announces each attempt to the manager as it makes it. Before
+this, `transport` was only ever the value the peer entry was created with —
+`ntcp2`, the fallback — so a peer parked mid-SSU2 reported the fallback as though
+it had already happened, for the entire park.
+
+`last_attempt` (unix seconds) is the companion field. `connecting` at
+`attempts = 0` is what a healthy dial looks like five milliseconds in, so the
+attempt count cannot say a dial is stuck; the *age* of `last_attempt` can.
+
+In the aggregated read API, `peers` is `#{connected, connecting, other}`.
+`connecting` is a **subset** of `other`, not a bucket carved out of it: `other`
+still counts every peer that is not connected, so a consumer reading version 1 of
+the map gets the same number it always did. The backoff count is therefore
+`other - connecting`. See #X7BP9G1.
+
 #### Handshake sequence
 
 ```mermaid
