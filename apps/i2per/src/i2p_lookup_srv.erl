@@ -11,7 +11,10 @@ Flow for one pending key:
 2. Otherwise up to three floodfill candidates closest to the key are queried
    in turn. Each query is a DatabaseLookup carrying our inbound-tunnel reply
    address (`f:i2p_i2np:db_lookup_via_tunnel/5`) delivered `{router, FF}`
-   through an outbound tunnel (`f:i2p_tunnel_srv:send_via_outbound/3`).
+   through an outbound tunnel (`f:i2p_tunnel_srv:send_via_outbound/3`). The
+   lookup paths stay in the tunnel manager rather than playing the role
+   themselves: this orchestrator and `m:i2p_peer` are singletons, not
+   connections.
 3. Replies arrive inside that inbound tunnel and are routed here by
    `m:i2p_tunnel_srv`: a DatabaseStore resolves the waiters, a
    DatabaseSearchReply contributes its closer-peer list to the chase queue.
@@ -31,9 +34,10 @@ SAM STREAM CONNECT uses this to resolve uncached destinations.
     find_ls/2,
     find_ri/1,
     find_ri/2,
+    send_lookup/4,
     stop/0
 ]).
--export_type([lookup_failed_reason/0, lookup_options/0]).
+-export_type([lookup_failed_reason/0, lookup_options/0, pending/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 -define(ATTEMPT_TIMEOUT_MS, 4000).
@@ -311,10 +315,30 @@ next_target(Key, P) ->
             end
     end.
 
-%% send_lookup/3 — one DatabaseLookup toward Target through the tunnels.
+%% send_lookup/4 — one DatabaseLookup toward Target through the tunnels.
 %% Lookups prefer the short exploratory pool so client towers stay free
 %% for streams; when no tunnel is active the timer simply re-arms via
 %% attempt/2 until the deadline fails the lookup.
+%%
+%% **A send that finds no tunnel is counted, and it is the last of the three
+%% injection sites that was not.** The other two charge in the caller
+%% (`client_messages_dropped_no_tunnel` in `m:i2p_client`,
+%% `lookup_replies_dropped_no_tunnel` in `m:i2p_peer`), so without this one a
+%% lookup that never left looked identical to a lookup nobody answered -- which
+%% is the distinction `t:lookup_failed_reason/0` exists to draw. `attempt/2`
+%% discards this function's answer at the call site, so the count has to happen
+%% here or not at all.
+%%
+%% Exported for the same reason `m:i2p_peer:reply_via_outbound/3` is, and the
+%% same reason it is needed rather than merely convenient: the condition needs
+%% the two picks to answer `{ok, _}` and the send to answer `error`, and those
+%% are three separate calls. A real tunnel manager holding a real tunnel answers
+%% `ok` to all three, so reaching this branch means retiring a tunnel inside the
+%% window -- a race no test should depend on. Calling it against a stub that
+%% answers per request is the only way to put a red case on the line that
+%% changed rather than a green one on the give-up path beside it.
+-spec send_lookup(pending(), i2p_crypto:hash(), i2p_crypto:hash(), i2p_crypto:hash()) ->
+    ok | error.
 send_lookup(P, Key, Target, OurHash) ->
     case i2p_tunnel_srv:pick_lookup_inbound() of
         {ok, RecvTid, _InEntry} ->
@@ -323,11 +347,35 @@ send_lookup(P, Key, Target, OurHash) ->
             StdBin = std_binary(Msg),
             case i2p_tunnel_srv:pick_lookup_outbound() of
                 {ok, OutTid, _OutEntry} ->
-                    i2p_tunnel_srv:send_via_outbound(OutTid, {router, Target}, StdBin);
+                    send_lookup_wire(OutTid, {router, Target}, StdBin);
                 error ->
                     error
             end;
         error ->
+            error
+    end.
+
+%% send_lookup_wire/3 — the injection, with its one counted failure mode. The
+%% two-step pick-then-send means the tunnel can be retired in between, so
+%% `error` here is a real condition and not a theoretical one.
+%%
+%% **The answer is returned as well as counted.** `f:add/2` answers `ok`, so
+%% letting it stand in for the branch's value would quietly widen this
+%% function's contract from `ok | error` to `ok` -- and the two callers of that
+%% answer would stop being able to tell a delivered query from a lost one. The
+%% count is a side effect on the loss, never a replacement for the answer.
+%%
+%% The delivery is always `{router, Hash}`: a DatabaseLookup names a floodfill
+%% or a chase peer, and there is no inbound tunnel of ours for the far end to
+%% inject into. No `-spec` here because this module specs no internal helper,
+%% and the one that would fit — a standard-header message is at least 64 bits
+%% — describes `f:i2p_i2np:encode_std/1` rather than this function.
+send_lookup_wire(OutTid, Delivery, StdBin) ->
+    case i2p_tunnel_srv:send_via_outbound(OutTid, Delivery, StdBin) of
+        ok ->
+            ok;
+        error ->
+            ok = i2p_stats:add(lookup_requests_dropped_no_tunnel, 1),
             error
     end.
 

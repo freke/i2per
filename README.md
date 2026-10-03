@@ -119,8 +119,8 @@ after that:
 | recipe | runs | when |
 | --- | --- | --- |
 | `just proper` | 2 modules, 11 properties over generated inputs | `main`, and on request |
-| `just smoke-test` | lint, 958 unit cases, 211 of 224 CT cases | **every push** |
-| `just test` | lint, docs, dialyzer, all 969 eunit, all 224 CT | `main` |
+| `just smoke-test` | lint, 961 unit cases, 215 of 233 CT cases | **every push** |
+| `just test` | lint, docs, dialyzer, all 972 eunit, all 233 CT | `main` |
 
 Measured at **91s** for `just smoke-test` and **205s** for `just test` on a
 developer machine. The smoke tier is under five minutes on a GitHub runner.

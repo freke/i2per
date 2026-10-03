@@ -44,7 +44,7 @@ proper:
 
 # %%%%% smoke-test: every push, under five minutes %%%%%
 #
-# lint + the 958 unit cases + **211 of the 224 CT cases** across 23 of the 25
+# lint + the 961 unit cases + **215 of the 233 CT cases** across 23 of the 25
 # suites. Measured at **~92s here** (79s CT, 10s eunit, 3s lint).
 #
 # **This is a partition of the tree, not a hand-picked list.** Every suite except
@@ -72,7 +72,7 @@ smoke-test: lint
 
 # %%%%% test: everything, no time limit %%%%%
 #
-# lint + doc + all 969 eunit (958 unit + 11 property) + all 224 CT + the merged
+# lint + doc + all 972 eunit (961 unit + 11 property) + all 233 CT + the merged
 # coverage report. Measured at **~4 minutes here**; `main` runs it unattended.
 #
 # **`--cover` on both halves, because `just cover` is the only thing that reads
