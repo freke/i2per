@@ -167,9 +167,50 @@ doc:
 shell:
     rebar3 shell
 
-# Clean build artifacts
+# %%%%% clean: derived state, and evidence %%%%%
+#
+# Two recipes, because `_build` holds two kinds of thing and only one of them is
+# junk. Compiled beams are derived -- the next `just test` makes them again in
+# seconds. A CT run directory is evidence: it is what you read when a suite
+# fails, and `ct.latest.log` and `all_runs.html` are rewritten from whatever run
+# dirs are still there. So `clean` drops the beams and the dead runs and keeps the
+# last one; `clean-all` drops the lot.
+#
+# **`clean` reaches into the test profile, because `rebar3 clean` does not.**
+# With no `--profile`, `rebar_prv_clean` hands `default` to `rebar_prv_as` and
+# cleans that profile only -- so on its own it deleted 4 KB of symlinks here and
+# left every test-profile beam in place. Both profiles are named explicitly,
+# because a recipe called `clean` that leaves the next compile nothing to do is
+# not what anyone typing it means. Deps are not named (`--all` would take them
+# too): they cost a fetch, not a compile, and they are not ours.
+#
+# **The old runs are pruned, not all of them.** 460 `ct_run.*` directories, 7.5 GB
+# here at ~90 MB each, and neither rebar3 nor CT ever deletes one, so they are the
+# largest thing in the tree by an order of magnitude. The newest survives: it is
+# the run being read right now, and the one the log index points at. The index's
+# links to the pruned runs dangle until the next `rebar3 ct` rewrites it.
+#
+# **What neither recipe touches.** `dist/` -- a release tarball costs a container
+# build to produce and may be about to be published. `data/` -- a router identity
+# and a server-tunnel private key, so removing it means a reseed and a new
+# identity, not a rebuild. `.devenv` -- that is the toolchain, not this project's
+# output, and it costs more to rebuild than everything these two recipes delete.
+
+# Drop the beams and the dead CT runs, keeping the newest run and the coverage.
 clean:
     rebar3 clean
+    rebar3 as test clean
+    ls -dt _build/test/logs/ct_run.* 2>/dev/null | tail -n +2 | xargs rm -rf
+    rm -rf *dump
+
+# Drop everything derived: `_build` whole -- beams, every CT run, the coverdata,
+# the PLT -- plus the generated ExDoc site and any crash dump. `just compile` and
+# `just doc` bring the tree back; `just dialyzer` rebuilds the PLT, which is the
+# slow part of the rebuild and the reason this is not the everyday recipe.
+# Wipe every derived thing: `_build`, the generated docs, and any crash dump.
+clean-all:
+    rm -rf _build
+    rm -rf doc
     rm -rf *dump
 
 # %%%%% gh: authenticate, once %%%%%

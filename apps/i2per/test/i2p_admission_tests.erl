@@ -250,6 +250,35 @@ an_admission_process_is_restarted_after_dying_test() ->
         end)
     end).
 
+%% **The input the case above cannot produce, produced on demand.**
+%%
+%% `i2p_ntcp2_sup` allows five restarts in ten seconds, so a single kill always
+%% comes back and the wait above always terminates. The case that matters is the
+%% one where it does not: a supervisor that has spent its restart intensity stops
+%% starting the child, the registered name is never claimed again, and a wait with
+%% no bound on it sits there for the life of the node. That is a real state of a
+%% real supervisor rather than a hypothetical one -- it is where a `permanent`
+%% child that keeps crashing puts its supervisor, which then terminates with
+%% `reached_max_restart_intensity` -- and the only reason it never reached the
+%% report is that nothing in the suite ever put a supervisor in it.
+%%
+%% So this asks for that state rather than waiting for it to happen by accident,
+%% and asserts the wait **gives up naming what it gave up on**. A helper that
+%% reports is the whole ticket; one that returns a pid it never verified would
+%% pass this case for the wrong reason.
+a_supervisor_that_gives_up_is_reported_not_waited_test() ->
+    Name = i2p_admission_tests_gives_up,
+    {ok, Sup} = i2p_admission_tests_sup:start_link(Name),
+    %% Unlinked for the reason `with_sup/2` documents: this supervisor's exit
+    %% reason is `reached_max_restart_intensity`, and a linked eunit test process
+    %% does not survive that. The fixture is expected to die on its own, so there
+    %% is no teardown to write -- which is also why the case ends where it does.
+    true = unlink(Sup),
+    Old = whereis(Name),
+    ?assert(is_pid(Old)),
+    exit(Old, kill),
+    ?assertError({admission_process_never_restarted, Name, Old}, await_restart(Name, Old)).
+
 %%% %%%%% %%% The cap case, once %%%%% %%%
 
 %% The whole concurrency case for one resource: start the supervisor, set the
@@ -358,16 +387,40 @@ admit_within(Sup, Start) ->
 %% The supervisor restarts a `permanent` child, so the new pid exists as soon as
 %% the old one is gone. Polled rather than assumed, because "restarted" and "the
 %% name still points at a dead process" are different answers.
+%%
+%% **Bounded, because a poll that cannot fail is not a poll.** A supervisor past
+%% its restart intensity stops starting the child, and then the name is never
+%% claimed again for the life of the node. An unbounded loop does not report that:
+%% it hangs, and a hung case names no supervisor, no bound and no assertion -- so
+%% the one input that says the thing under test is broken produces the one output
+%% that cannot say so. `a_supervisor_that_gives_up_is_reported_not_waited_test/0`
+%% is that input, so the bound is exercised rather than asserted in a comment.
 await_restart(Name, OldPid) ->
+    await_restart(Name, OldPid, erlang:monotonic_time(millisecond) + ?BOUND_MS).
+
+%% **A pid that is not `OldPid` is the answer, and there is no other one.** Two
+%% answers are "not yet", and they are the same one: `undefined` is the ordinary
+%% middle of a restart, and `OldPid` is the short window before the name has been
+%% unregistered. Telling them apart is the only reason a kill of an already-dead
+%% pid was here, and a second `exit/2` does not shorten that window -- the name is
+%% released by the dying process, not by anything this one does to it.
+await_restart(Name, OldPid, Deadline) ->
     case whereis(Name) of
-        OldPid ->
-            exit(OldPid, kill),
-            await_restart(Name, OldPid);
-        undefined ->
+        Pid when is_pid(Pid), Pid =/= OldPid -> Pid;
+        _NotYet -> retry_restart(Name, OldPid, Deadline)
+    end.
+
+%% Read from one clock rather than counted in sleeps, so a scheduler that grants
+%% this process less time than the sleep it asked for cannot stretch the bound
+%% without limit -- which is the failure a `?BOUND_MS` decremented by a millisecond
+%% per pass has, and the reason the bound is a deadline rather than a counter.
+retry_restart(Name, OldPid, Deadline) ->
+    case Deadline - erlang:monotonic_time(millisecond) of
+        Remaining when Remaining > 0 ->
             timer:sleep(1),
-            await_restart(Name, OldPid);
-        Pid ->
-            Pid
+            await_restart(Name, OldPid, Deadline);
+        _Expired ->
+            erlang:error({admission_process_never_restarted, Name, OldPid})
     end.
 
 %%% %%%%% %%% Standing up a supervisor, and a child to admit %%%%% %%%
