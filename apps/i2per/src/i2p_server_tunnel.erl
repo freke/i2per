@@ -280,6 +280,11 @@ open_relay(
                     Pending = maps:put(Conn, Relay, maps:get(pending, State)),
                     State#{pending := Pending};
                 {error, _Reason} ->
+                    %% A refusal at `max_stream_connections` lands here too, and
+                    %% the socket is closed either way: the SYN is unanswered, so
+                    %% the sender retries. The local service keeps its listener
+                    %% either way — what it loses is one in-flight stream, not the
+                    %% ability to accept the next one.
                     ok = gen_tcp:close(Sock),
                     State
             end;

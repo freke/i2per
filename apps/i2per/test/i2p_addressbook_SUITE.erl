@@ -10,21 +10,28 @@
 -export([
     hosts_txt_roundtrip/1,
     naming_lookup_via_book/1,
-    subscription_fetch/1
+    subscription_fetch/1,
+    a_refused_fetch_does_not_take_the_fetcher_down/1
 ]).
 
 -define(APP, i2per).
 -define(RECV_ID, 700).
 
 all() ->
-    [hosts_txt_roundtrip, naming_lookup_via_book, subscription_fetch].
+    [
+        hosts_txt_roundtrip,
+        naming_lookup_via_book,
+        subscription_fetch,
+        a_refused_fetch_does_not_take_the_fetcher_down
+    ].
 
 init_per_testcase(Case, Config) ->
     Timeout =
         case Case of
             hosts_txt_roundtrip -> 10_000;
             naming_lookup_via_book -> 15_000;
-            subscription_fetch -> 25_000
+            subscription_fetch -> 25_000;
+            a_refused_fetch_does_not_take_the_fetcher_down -> 15_000
         end,
     [{timetrap, Timeout} | Config].
 
@@ -139,6 +146,91 @@ subscription_fetch(_Config) ->
         kill_sam_sup(),
         stop_book(),
         app_teardown()
+    end.
+
+%% --------------------------------------------------------------------------
+%% The cap, on the fetch path
+%% --------------------------------------------------------------------------
+
+%% **This is the third of the three `f:i2p_sam_sup:start_stream_conn/1` call
+%% sites, and the only one that could not survive a refusal.**
+%%
+%% `f:i2p_addressbook_subs:start_http_conn/3` matched `{ok, Conn} = ...`. The other
+%% two call sites -- the SAM STREAM CONNECT path and the server-tunnel relay path --
+%% were already a `case` with an answer for `{error, _}`, so a cap on streaming
+%% connections cost them a refused dial. Here it raised `{badmatch, {error,
+%% stream_limit}}` inside the fetcher, taking down the process that also owns the
+%% refresh timer for every *other* subscription: one router at its stream cap
+%% would have stopped all of them, silently, until the next router start.
+%%
+%% The cap is at zero and the fetch is a subscription whose route resolves, so the
+%% refusal is certain rather than racy. What is asserted is that the fetcher is
+%% **still running** and still answering -- the pipeline must move on to the next
+%% subscription, and the process must survive to do it.
+a_refused_fetch_does_not_take_the_fetcher_down(_Config) ->
+    setup_app(),
+    process_flag(trap_exit, true),
+    Site = i2p_keys:generate_with_privkeys(),
+    SiteIdent = maps:get(identity, Site),
+    SiteB64 = i2p_keys:encode_b64(i2p_keys:dest_blob(Site)),
+    NowSec = erlang:system_time(second),
+    LS =
+        i2p_leaset:build(
+            SiteIdent,
+            NowSec,
+            7,
+            [#{gateway => get(local_hash), tunnel_id => 4321, end_date => (NowSec + 3600) * 1000}],
+            maps:get(sign_priv, Site)
+        ),
+    added = i2p_netdb_srv:store_ls(LS, NowSec),
+
+    start_sam_sup(),
+    %% A second subscription after the refused one: it is what proves the
+    %% pipeline moved on rather than merely not crashing.
+    Other = i2p_keys:generate_with_privkeys(),
+    OtherB64 = i2p_keys:encode_b64(i2p_keys:dest_blob(Other)),
+    Subs = [
+        #{host => <<"capped.i2p">>, dest_b64 => SiteB64},
+        #{host => <<"after.i2p">>, dest_b64 => OtherB64}
+    ],
+    application:set_env(?APP, addressbook, #{subscriptions => Subs}),
+    start_book(undefined),
+    {ok, Fetcher} = i2p_addressbook_subs:start_link(#{subscriptions => Subs}),
+    put(site_crypto_privs, [maps:get(crypto_priv, Site)]),
+
+    MRef = erlang:monitor(process, Fetcher),
+    application:set_env(?APP, max_stream_connections, 0),
+    try
+        ok = i2p_addressbook_subs:fetch_now(),
+        %% The refusal is synchronous inside the fetcher, so a `DOWN` here would
+        %% be the badmatch. Asserted as an absence after a gen_server:call, which
+        %% is a barrier: the fetch has been handled by the time it answers.
+        assert_fetcher_alive(Fetcher, MRef),
+        ok = i2p_addressbook_subs:fetch_now(),
+        assert_fetcher_alive(Fetcher, MRef),
+        %% And nothing was admitted against the cap it refused at.
+        0 = i2p_sam_sup:stream_conn_count()
+    after
+        erlang:demonitor(MRef, [flush]),
+        application:unset_env(?APP, max_stream_connections),
+        catch i2p_addressbook_subs:stop(),
+        kill_sam_sup(),
+        stop_book(),
+        app_teardown()
+    end.
+
+%% The liveness assertion, named so the failure says what was being claimed. A
+%% `gen_server:call` to a process that has just died exits the caller, so the bare
+%% match on `ok` above already turns a badmatch into a failed case; this makes the
+%% case *name* the defect rather than reporting an exit from an unrelated-looking
+%% line.
+assert_fetcher_alive(Fetcher, MRef) ->
+    receive
+        {'DOWN', MRef, process, Fetcher, Reason} ->
+            ct:fail({fetcher_died_at_the_stream_cap, Reason})
+    after 0 ->
+        true = is_process_alive(Fetcher),
+        ok
     end.
 
 %% --------------------------------------------------------------------------

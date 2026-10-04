@@ -20,35 +20,53 @@ In the persistent (operator) boot the supervisor is started with the router's
 local keys (`f:start_link/1`) and binds one boot listener on the `sam_port`
 app env; explicit/test boots start it empty and bind listeners on demand.
 
-## The cap, and what admits a session
+## Two caps, and two admission processes
 
-`max_sam_sessions` is enforced by `m:i2p_admission`, one instance of which is
-a child of this supervisor — a **separate** instance from the two peer-connection
-admissions, and deliberately so. A SAM session is a client connection an
-operator is waiting on by hand, while the bursts the peer caps exist for are
-floodfill replication and post-restart peer-set rebuilds. One shared admission
-process would put every one of those handshakes in front of that operator's
-session; three instances never wait on each other.
+This supervisor owns **two** bounded resources, and each has its own
+`m:i2p_admission` instance as a `permanent` child:
 
-`f:session_count/0` counts this supervisor's `session` children, which is what
-the limit bounds. It used to count the `i2p_sam_sessions` ETS rows instead, which
+| resource | key | admission process | refusal |
+|---|---|---|---|
+| SAM sessions | `max_sam_sessions` | `i2p_sam_admission` | `{error, session_limit}` |
+| streaming connections | `max_stream_connections` | `i2p_stream_admission` | `{error, stream_limit}` |
+
+**Two instances rather than one, for the reason the first three caps are three.**
+A SAM session is a client connection an operator is waiting on by hand — a
+handshake budget — while a streaming connection is a socket, a window pair and a
+demux row, and the count that drives it is set by *remote* peers: a STREAM
+ACCEPT destination invites any number of inbound streams. One admission process
+would put every one of those inbound streams in front of the operator's session.
+Separate mailboxes never wait on each other.
+
+`f:session_count/0` and `f:stream_conn_count/0` both count this supervisor's
+children, tagged `session` and `stream_conn`, which is what the limits bound.
+The session count used to count the `i2p_sam_sessions` ETS rows instead, which
 is a different number: a session writes its row *after* it is started, so one in
 that window counted against nothing, and concurrent accepts could exceed the cap
 by the number of sessions mid-registration. Counting children is also what lets
-all three caps be counted the same way and pinned by the same case.
+all four caps be counted the same way and pinned by the same case.
 
-It is not a `m:global` lock, and the reason `m:i2p_admission` gives is the
-important one: `global:trans/2` is a shared lock rather than a mutex, so every
-concurrent accept ran the count-then-start anyway.
+Neither admission is a `m:global` lock, and the reason `m:i2p_admission` gives
+is the important one: `global:trans/2` is a shared lock rather than a mutex, so
+every concurrent accept ran the count-then-start anyway.
 """.
 
 -behaviour(supervisor).
 
 -define(DEFAULT_MAX_SESSIONS, 32).
 
-%% The admission process `f:start_session/1` goes through. Named so the resource
-%% it guards is in the supervision tree and answerable to a `whereis/1`.
+%% Streaming connections are cheaper per unit than a session (no handshake state)
+%% and more numerous (one per stream, and a STREAM ACCEPT destination can be sent
+%% any number of them), so the default is several times the session cap rather
+%% than the same number. It is still a bound: each one holds a window of 8 packets
+%% in flight, a demux row, and -- on the server-tunnel path -- a TCP socket.
+-define(DEFAULT_MAX_STREAM_CONNS, 128).
+
+%% The admission processes `f:start_session/1` and `f:start_stream_conn/1` go
+%% through. Named so the resource each guards is in the supervision tree and
+%% answerable to a `whereis/1`.
 -define(ADMISSION, i2p_sam_admission).
+-define(STREAM_ADMISSION, i2p_stream_admission).
 
 -export([
     start_link/0,
@@ -59,7 +77,9 @@ concurrent accept ran the count-then-start anyway.
     session_count/0,
     session_limit/0,
     stream_conn_child/1,
-    start_stream_conn/1
+    start_stream_conn/1,
+    stream_conn_count/0,
+    stream_conn_limit/0
 ]).
 -export([init/1]).
 
@@ -118,6 +138,10 @@ Admit and start one SAM session under the configured active-session limit.
 The count and the `m:supervisor:start_child/2` that follows it are one operation
 in `m:i2p_admission`, so simultaneous accepts cannot exceed the limit. Output is
 the normal `supervisor:start_child/2` result, or `{error, session_limit}`.
+
+This counts SAM sessions only. A session that has gone on to open streaming
+connections is bounded separately, by `max_stream_connections` — a client that
+opened one session is not thereby entitled to an unbounded number of streams.
 """.
 -spec start_session(supervisor:child_spec()) ->
     {ok, pid()} | {ok, pid(), term()} | {error, term()}.
@@ -175,6 +199,19 @@ admission_child() ->
         refused_counter => sam_sessions_refused_limit
     }).
 
+%% The same shape for the second bounded resource this supervisor owns, and the
+%% same per-admission read of `count` and `limit` so an operator change to
+%% `max_stream_connections` applies to the next stream rather than the next boot.
+stream_admission_child() ->
+    i2p_admission:child_spec(#{
+        name => ?STREAM_ADMISSION,
+        supervisor => ?MODULE,
+        count => fun stream_conn_count/0,
+        limit => fun stream_conn_limit/0,
+        refused => stream_limit,
+        refused_counter => stream_conns_refused_limit
+    }).
+
 -doc """
 A `temporary` worker child spec for one streaming connection process
 (`m:i2p_stream_conn`).
@@ -191,14 +228,61 @@ stream_conn_child(Opts) ->
     }.
 
 -doc """
-Start a streaming connection under this supervisor.
+Admit and start one streaming connection under the configured limit.
 
-Output: `{ok, Pid}` of the new `m:i2p_stream_conn` process; its death is
-never restarted.
+Output: `{ok, Pid}` of the new `m:i2p_stream_conn` process; its death is never
+restarted. Or `{error, stream_limit}` when `max_stream_connections` is already
+reached, charged to the `stream_conns_refused_limit` counter.
+
+**Every caller must handle the refusal**, because the count is driven by remote
+peers rather than by anything local. Three sites create these: the SAM STREAM
+CONNECT path (a client is waiting on a SAM reply, so it gets
+`STREAM STATUS RESULT=CANT_REACH`), the STREAM ACCEPT path and the server-tunnel
+relay path (both an unsolicited inbound SYN with no client to answer, so the SYN
+is dropped and the sender retries).
 """.
 -spec start_stream_conn(map()) -> {ok, pid()} | {error, term()}.
 start_stream_conn(Opts) ->
-    supervisor:start_child(?MODULE, stream_conn_child(Opts)).
+    i2p_admission:admit(?STREAM_ADMISSION, stream_conn_child(Opts)).
+
+-doc """
+Return the number of live streaming connections.
+
+The `stream_conn` children of this supervisor, which is what
+`f:stream_conn_limit/0` bounds. Zero when this supervisor is not running.
+""".
+-spec stream_conn_count() -> non_neg_integer().
+stream_conn_count() ->
+    case whereis(?MODULE) of
+        undefined ->
+            0;
+        Sup ->
+            length([
+                Id
+             || {Id, Pid, _Type, _Modules} <- supervisor:which_children(Sup),
+                is_pid(Pid),
+                is_tuple(Id),
+                tuple_size(Id) > 0,
+                element(1, Id) =:= stream_conn
+            ])
+    end.
+
+-doc """
+Return the maximum number of live streaming connections.
+
+The default is 128 and can be overridden with the `max_stream_connections`
+application setting. A zero value is an emergency fail-closed switch that
+rejects all new streaming connections, inbound and outbound alike.
+
+Read on every admission rather than at boot, so an operator can lower the cap on
+a router that is already at it without a restart.
+""".
+-spec stream_conn_limit() -> non_neg_integer().
+stream_conn_limit() ->
+    case application:get_env(i2per, max_stream_connections) of
+        {ok, Value} when is_integer(Value), Value >= 0 -> Value;
+        _ -> ?DEFAULT_MAX_STREAM_CONNS
+    end.
 
 -doc """
 A `temporary` worker child spec for the SAM TCP listener.
@@ -360,11 +444,16 @@ init([Local]) ->
     {ok,
         {#{strategy => one_for_one, intensity => 10, period => 10}, [
             admission_child(),
+            stream_admission_child(),
             listener_child(boot_listener(Local))
         ]}};
 init([]) ->
     _EtsTid = ets:new(?MODULE, [named_table, public, {read_concurrency, true}]),
-    {ok, {#{strategy => one_for_one, intensity => 10, period => 10}, [admission_child()]}}.
+    {ok,
+        {#{strategy => one_for_one, intensity => 10, period => 10}, [
+            admission_child(),
+            stream_admission_child()
+        ]}}.
 
 %%%%%%% %%% Internal %%%%%%%
 

@@ -21,6 +21,7 @@ live_network = false
 max_ntcp2_connections = 64
 max_sam_sessions = 32
 max_ssu2_sessions = 32
+max_stream_connections = 128
 ntcp2_keepalive_interval_ms = 60000
 log_level = notice           # one of the eight OTP levels, hot
 caps.bandwidth = L
@@ -400,6 +401,7 @@ coerce_scalar(K, V) when
     K =:= <<"max_ntcp2_connections">>;
     K =:= <<"max_sam_sessions">>;
     K =:= <<"max_ssu2_sessions">>;
+    K =:= <<"max_stream_connections">>;
     K =:= <<"ntcp2_keepalive_interval_ms">>
 ->
     coerce_pos_int(env_key(K), V);
@@ -435,6 +437,7 @@ env_key(<<"tunnel_build_rate">>) -> tunnel_build_rate;
 env_key(<<"max_ntcp2_connections">>) -> max_ntcp2_connections;
 env_key(<<"max_sam_sessions">>) -> max_sam_sessions;
 env_key(<<"max_ssu2_sessions">>) -> max_ssu2_sessions;
+env_key(<<"max_stream_connections">>) -> max_stream_connections;
 env_key(<<"ntcp2_keepalive_interval_ms">>) -> ntcp2_keepalive_interval_ms.
 
 %% An ini value arrives as a binary and a level is an atom, so the name is matched

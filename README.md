@@ -215,6 +215,7 @@ tunnel_build_rate = 1
 max_ntcp2_connections = 64
 max_sam_sessions = 32
 max_ssu2_sessions = 32
+max_stream_connections = 128
 
 [tunnel_pool]
 outbound = 3

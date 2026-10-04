@@ -423,6 +423,7 @@ loggable_config_keys() ->
         max_ntcp2_connections,
         max_sam_sessions,
         max_ssu2_sessions,
+        max_stream_connections,
         net_id,
         ntcp2_keepalive_interval_ms,
         ntcp2_published,
