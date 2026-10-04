@@ -26,6 +26,7 @@
     stop_reports_only_after_the_accept_path_has_stopped/1,
     wedged_accept_path_is_reported_rather_than_claimed_stopped/1,
     sam_session_limit_rejects_new_child/1,
+    stream_conn_limit_rejects_new_child/1,
     sam_dest_generate/1,
     session_create_transient/1,
     session_create_explicit_dest/1,
@@ -85,6 +86,7 @@ all() ->
         stop_reports_only_after_the_accept_path_has_stopped,
         wedged_accept_path_is_reported_rather_than_claimed_stopped,
         sam_session_limit_rejects_new_child,
+        stream_conn_limit_rejects_new_child,
         sam_dest_generate,
         session_create_transient,
         session_create_explicit_dest,
@@ -489,6 +491,33 @@ sam_session_limit_rejects_new_child(_Config) ->
             i2p_sam_sup:start_session(i2p_sam_sup:session_child(#{}))
     after
         application:unset_env(?APP, max_sam_sessions)
+    end.
+
+%% The streaming-connection cap, in the suite where the SAM supervisor is started
+%% for real rather than stood up by a unit fixture. What it adds over the case
+%% above is that the refusal comes back through `f:start_stream_conn/1` -- the
+%% function all three production call sites use -- from a supervisor that is also
+%% holding live SAM sessions, listeners and the ETS registries the real call sites
+%% read.
+%%
+%% **Scope: the refusal, not the independence.** That a stream cap says nothing
+%% about sessions is pinned in the unit tier, by
+%% `stream_conn_cap_does_not_bound_sessions_test/0` in `i2p_admission_tests`,
+%% where a session can actually be started cheaply. Here the equivalent assertion
+%% would mean booting a real `i2p_sam_session`, which needs a client destination
+%% and a socket -- so it would test that module rather than the cap. What is
+%% asserted instead is the count staying at zero, which is the half that would fail
+%% if a refusal were ever charged as a live connection.
+stream_conn_limit_rejects_new_child(_Config) ->
+    application:set_env(?APP, max_stream_connections, 0),
+    try
+        {error, stream_limit} = i2p_sam_sup:start_stream_conn(#{}),
+        0 = i2p_sam_sup:stream_conn_count(),
+        %% The session cap is a different key and a different admission process,
+        %% so the stream cap being at zero does not make it so.
+        ?assert(i2p_sam_sup:session_limit() > 0)
+    after
+        application:unset_env(?APP, max_stream_connections)
     end.
 
 sam_hello(_Config) ->

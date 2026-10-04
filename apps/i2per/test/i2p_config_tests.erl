@@ -131,6 +131,7 @@ rate_limit_scalars_coerced_test() ->
                 "max_ntcp2_connections = 64\n"
                 "max_sam_sessions = 32\n"
                 "max_ssu2_sessions = 16\n"
+                "max_stream_connections = 128\n"
                 "ntcp2_keepalive_interval_ms = 60000\n"
             >>
         ),
@@ -140,6 +141,7 @@ rate_limit_scalars_coerced_test() ->
     ?assert(lists:member({max_ntcp2_connections, 64}, Pairs)),
     ?assert(lists:member({max_sam_sessions, 32}, Pairs)),
     ?assert(lists:member({max_ssu2_sessions, 16}, Pairs)),
+    ?assert(lists:member({max_stream_connections, 128}, Pairs)),
     ?assert(lists:member({ntcp2_keepalive_interval_ms, 60000}, Pairs)).
 
 rate_limit_non_positive_rejected_test() ->
@@ -151,6 +153,7 @@ rate_limit_non_positive_rejected_test() ->
                 "max_ntcp2_connections = 0\n"
                 "max_sam_sessions = -1\n"
                 "max_ssu2_sessions = 0\n"
+                "max_stream_connections = 0\n"
             >>
         ),
     ?assertMatch({error, {bad_value, _, _}}, i2p_config:validate(Raw)).

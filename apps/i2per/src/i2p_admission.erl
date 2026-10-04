@@ -5,9 +5,10 @@ Admits a supervised child under a limit, and owns the check that makes the limit
 hold.
 
 One instance per bounded resource — NTCP2 connections, SSU2 sessions, SAM
-sessions — and each is a child of the very supervisor whose children it admits.
-`f:admit/2` is the whole API: hand it a child spec and it answers with what
-`m:supervisor:start_child/2` would have answered, or `{error, Refused}`.
+sessions, streaming connections — and each is a child of the very supervisor whose
+children it admits. `f:admit/2` is the whole API: hand it a child spec and it
+answers with what `m:supervisor:start_child/2` would have answered, or
+`{error, Refused}`.
 
 ## The cap is a count-then-start, and that is the only reason this exists
 
@@ -89,16 +90,23 @@ not hold, and the reason is the section above this one.
 
 ## One instance per resource, and why not one for all of them
 
-The three caps bound three different things — handshake state, handshake state,
-and client sockets — behind three separate configuration keys, so they were
-never one number. What *was* shared was the wait. Under a single admission
-process, a floodfill burst bringing in a wave of new peers queues ahead of an
-operator's SAM session, which is the one connection an operator is waiting on by
-hand.
+The caps bound different things — handshake state, handshake state, client
+sessions, and streaming sockets with their window pairs — behind separate
+configuration keys, so they were never one number. What *was* shared was the
+wait. Under a single admission process, a floodfill burst bringing in a wave of
+new peers queues ahead of an operator's SAM session, which is the one connection
+an operator is waiting on by hand. And a remote peer sending inbound streams to a
+STREAM ACCEPT destination would queue there too, which is a caller nobody on this
+node asked for.
 
-Separate instances have separate mailboxes, so the three never wait on each
-other. A peer dial that loses a race to the cap now loses it against other peer
-dials, and a SAM session is admitted at its own rate.
+Separate instances have separate mailboxes, so they never wait on each other. A
+peer dial that loses a race to the cap now loses it against other peer dials, a
+SAM session is admitted at its own rate, and an inbound stream competes only with
+other inbound streams.
+
+**Two of the four live in one supervisor.** `i2p_sam_sup` owns SAM sessions *and*
+streaming connections, so it has two admission children; `f:child_spec/1` names
+each child after the instance it starts, which is what makes that possible.
 
 ## Usage
 
@@ -145,11 +153,17 @@ quietly gone missing is worse than a router that declines to start, so a crash
 here is the supervisor's to notice rather than something the resource carries on
 without. And because nothing is held, a restart costs nothing and has nothing to
 rebuild — see the module doc.
+
+**The child id is the configured name**, which is what lets one supervisor own
+several admissions: `i2p_sam_sup` guards SAM sessions and streaming connections
+with two instances, and a fixed id would be a duplicate child name — a boot
+failure rather than a working router. The name is already the identity `f:admit/2`
+is given, so using it here adds no second copy of anything to keep in step.
 """.
 -spec child_spec(config()) -> supervisor:child_spec().
-child_spec(Config) ->
+child_spec(#{name := Name} = Config) ->
     #{
-        id => admission,
+        id => Name,
         start => {?MODULE, start_link, [Config]},
         restart => permanent,
         shutdown => 5000,

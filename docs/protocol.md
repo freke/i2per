@@ -1317,6 +1317,17 @@ signed SYN-ACK arrives; a failed or 15-second-timed-out handshake reports
 `CANT_REACH`. An inbound SYN for a pending `STREAM ACCEPT` spawns the
 accept-role connection, answers the handshake, and pairs the socket.
 
+**The streaming-connection cap.** `max_stream_connections` (default 128) bounds
+live streaming connections router-wide, not per session: one client that has
+opened a session is not thereby entitled to an unbounded number of streams
+through it. A refused outbound `STREAM CONNECT` reports
+`STREAM STATUS RESULT=CANT_REACH`, since that is already what an unresolvable
+route means to a client. A refused inbound SYN is dropped without a reply —
+there is no client to answer, and the sending peer retries. The cap is read on
+every admission, so lowering it takes effect on the next stream without a
+restart, and `0` refuses all of them. Each refusal increments
+`stream_conns_refused_limit`.
+
 ### SU3 reseed files
 
 The bootstrap envelope: an HTTPS-fetched, RSA-signed container whose zip

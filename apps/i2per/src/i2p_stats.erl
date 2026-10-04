@@ -363,12 +363,13 @@ counters() ->
 
         %% %%%%% Connections and sessions refused at a cap %%%%%
         %%
-        %% **Three counters for one operator question: which of my three caps am
-        %% I hitting?** They are not one shared total because the three bounds
-        %% different things and are fixed by three different keys, so a single
+        %% **Four counters for one operator question: which of my four caps am
+        %% I hitting?** They are not one shared total because the four bound
+        %% different things and are fixed by four different keys, so a single
         %% number cannot be acted on — the fix for a SAM session refused at
         %% `max_sam_sessions` is nothing like the fix for a peer connection
-        %% refused at `max_ntcp2_connections`.
+        %% refused at `max_ntcp2_connections`, and neither is like a streaming
+        %% connection refused at `max_stream_connections`.
         %%
         %% Expected to stay at zero. A non-zero value is not a fault in itself:
         %% the cap did its job. It is the evidence that the cap is the thing
@@ -389,6 +390,11 @@ counters() ->
         ntcp2_connections_refused_limit,
         ssu2_sessions_refused_limit,
         sam_sessions_refused_limit,
+        %% A refused streaming connection, and the one refusal here whose count is
+        %% driven by remote peers rather than by a local dial: a STREAM ACCEPT
+        %% destination invites any number of inbound streams, so this is the rate
+        %% that says a router is being sent more streams than it will hold.
+        stream_conns_refused_limit,
 
         %% %%%%% Tunnel lifecycle %%%%%
         %%
