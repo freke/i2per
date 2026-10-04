@@ -139,20 +139,25 @@ Returns `ok` once the accept path **cannot produce another session**, which is a
 stronger statement than "the listening socket has been closed" and is what this
 function waits for. See the shutdown section of the module doc.
 
-Two failures are raised rather than swallowed, and they are different conditions
-so they are named differently:
+**One failure is raised, and it is the condition that matters:**
+`{accept_path_did_not_stop, Listener}` — the listener answered, and its answer was
+that it could not confirm. Its acceptor would not finish, so it is still possible
+for a queued connection to become a session.
+`m:i2p_ntcp2_listener:stop/1` raises the same shape for the same reason, and
+#YJ0DSAT — which asks whether the two listeners answer the same question the same
+way — is settled on that point: the *outcome* protocol is one shape.
 
-- **`{accept_path_did_not_stop, Listener}`** — the listener answered, and its
-  answer was that it could not confirm. Its acceptor would not finish, so it is
-  still possible for a queued connection to become a session. Not
-  `m:i2p_ntcp2_listener`'s `{listener_unanswered, _, _}`, which says the opposite:
-  there the listener is missing, here the listener is present and honest.
-- **`{listener_unanswered, Listener, stop}`** — nothing came back at all within
-  `?STOP_TIMEOUT_MS`, which is the listener itself being wedged rather than its
-  acceptor.
+**The other way of not answering is reported differently here, and that is
+#YJ0DSAT's criterion 2 rather than a settled choice.** Nothing came back at all
+within `?STOP_TIMEOUT_MS`, which is the listener itself being wedged rather than
+its acceptor, so this module raises `{listener_unanswered, Listener, stop}`;
+`m:i2p_ntcp2_listener:stop/1` kills a silent listener and answers `ok` instead,
+because a kill restores the invariant. Both are bounded, and they are not
+interchangeable answers to one question, so the two are left saying which is
+which rather than pretending to be one.
 
-Raising is the honest answer in both, because `ok` here would be the exact claim
-this function exists to stop making.
+Raising is the honest answer in the first case, because `ok` there would be the
+exact claim this function exists to stop making.
 
 A listener that is **already dead** answers `ok`, immediately, by monitor rather
 than by waiting: the listening socket is owned by that process, so its death
@@ -287,14 +292,14 @@ control_loop(BoundPort, ListenIP, ListenSock, MRef, Acceptor) ->
 %%    never there, so the reply is unconditional and the caller's monitor branch
 %%    is left meaning exactly one thing.
 %%
-%%    `{stopped, Ref}` and **not** the `{stop, Ref, stopped}` that
-%%    `m:i2p_ntcp2_listener` uses for the same question. The two listeners
-%%    multiplex their control messages differently -- NTCP2 funnels all three
-%%    through one `f:control/2` and so tags the reply with the question, while
-%%    this module has a function per question and each matches its own shape --
-%%    and the two shapes are not interchangeable. `#YJ0DSAT` asks whether they
-%%    should be unified; this ticket needed a second answer tag for a second
-%%    outcome, which is recorded there rather than settled here.
+%%    `{stopped, Ref}` and *not* the `{stop, Ref, stopped}` that
+%%    `m:i2p_ntcp2_listener` used to send for the same question. The question tag
+%%    was there because all three control messages shared one `f:control/2`; that
+%%    listener now keeps its own receive too, so the two answer the same question
+%%    with the same shape. #YJ0DSAT asked whether they should be unified, and
+%%    #AAYXPQK is where it was: one outcome protocol, two tags, no question tag.
+%%    What is still open there is the *timeout* answer, which the paragraph in
+%%    `f:stop/1` covers.
 %%
 %% Established sessions are children of the same supervisor and are not touched by
 %% any of this.

@@ -71,22 +71,39 @@ peer sends in that window.
 A listener that is closing deliberately **announces it and then closes the
 listening socket**, and this process ends on the announcement: the socket close
 wakes the blocked `f:gen_tcp:accept/1`, the loop comes back round, `f:stopping/0`
-answers, and it exits `normal`. The announcement is read at the top of every pass
+answers, and it exits `normal`. Both callers do it in that order —
+`m:i2p_sam_listener:shutdown/5` and `m:i2p_ntcp2_listener:shutdown/5` — because
+closing the socket under the outstanding `f:gen_tcp:accept/1` makes the driver
+answer `{error, einval}` rather than `{error, closed}`, and only the announcement
+says which of the two this is. The announcement is read at the top of every pass
 rather than only from the error branch, so a connection this process had already
 taken and was busy with does not turn into one more `accept` on a socket that has
 been declared finished — which is the case the listener on the other end is
 actually waiting for.
 
-The socket can also go without an announcement, which is the listener dying rather
-than closing: then `f:gen_tcp:accept/1` answers `{error, closed}` and the exit is
-`normal` anyway.
+So a listener's *death* is not what shuts this down. It is one of three ways this
+process ends, and the only one that carries no information about why:
+
+- **announced close** — the ordinary end, and the only one a listener chooses.
+  The socket close is what makes it possible, and the announcement is what makes
+  it recognisable.
+- **socket gone without one** — the listener died rather than closing, so a kill
+  takes the socket with it. `f:gen_tcp:accept/1` answers `{error, closed}`, which
+  is the other ordinary end and stays one: a kill is not an accept failure, and
+  nothing can be accepted in either case.
+- **a real accept failure** — a resource limit or a driver error, which is
+  `{accept_failed, _}` and a crash report.
 
 The other direction is each listener's to hold — it monitors this process and ends
 with it, so an acceptor that crashed cannot leave behind a live listener pid that
 has quietly stopped accepting, with every caller of its `port/1` still reporting a
 port nothing is listening on. That monitor is also what lets
-`m:i2p_sam_listener:stop/1` answer for a shutdown that actually finished rather
-than for one that was requested.
+`m:i2p_sam_listener:stop/1` and `m:i2p_ntcp2_listener:stop/1` answer for a shutdown
+that actually finished rather than for one that was requested: both wait for the
+`'DOWN'` this section is about, and both report a stop they could not confirm
+rather than one they could. The wait is the price of that claim, and it is the only
+reason either listener closes its socket explicitly instead of letting it close
+with the process.
 """.
 
 -export([start_link/2]).
