@@ -25,7 +25,9 @@
     send_does_not_wait_on_the_connection/1,
     a_peer_that_stops_reading_ends_the_connection/1,
     an_inbound_burst_does_not_delay_a_send/1,
-    a_batch_of_inbound_connections_is_not_accepted_one_per_second/1
+    a_batch_of_inbound_connections_is_not_accepted_one_per_second/1,
+    stop_reports_only_after_the_accept_path_has_stopped/1,
+    wedged_accept_path_is_reported_rather_than_claimed_stopped/1
 ]).
 
 -define(APP, i2per).
@@ -51,6 +53,17 @@
 -define(ACCEPT_BATCH, 6).
 -define(ACCEPT_BUDGET_MS, 2000).
 
+%% The shutdown group's one figure that is not obvious. ?STOP_QUEUE is how many
+%% connections sit in the kernel's accept queue while the acceptor is suspended --
+%% enough that the accept path is plainly able to produce a responder, not one
+%% that might.
+%%
+%% The bound on this case's own wait is ?TIMEOUT, the suite-wide one, and it is
+%% *not* what decides whether `f:stop/1` is honest: that is `?STOP_TIMEOUT_MS` in
+%% the module under test, which is a third of it, so this case can only ever be red
+%% for a reason the module owns.
+-define(STOP_QUEUE, 4).
+
 suite() ->
     [{timetrap, 30000}].
 
@@ -69,7 +82,9 @@ all() ->
         send_does_not_wait_on_the_connection,
         a_peer_that_stops_reading_ends_the_connection,
         an_inbound_burst_does_not_delay_a_send,
-        a_batch_of_inbound_connections_is_not_accepted_one_per_second
+        a_batch_of_inbound_connections_is_not_accepted_one_per_second,
+        stop_reports_only_after_the_accept_path_has_stopped,
+        wedged_accept_path_is_reported_rather_than_claimed_stopped
     ].
 
 init_per_testcase(transport_bytes_are_counted, Config) ->
@@ -788,6 +803,212 @@ take_asked(Asker, Deadline) ->
 
 remaining_ms(Deadline) ->
     erlang:max(0, Deadline - erlang:monotonic_time(millisecond)).
+
+%% --------------------------------------------------------------------------
+%% The shutdown contract
+%% --------------------------------------------------------------------------
+
+%% `f:i2p_ntcp2_listener:stop/1` reports that the listener stopped, and the report
+%% is only worth having if it is true when it arrives.
+%%
+%% **The defect.** The reply was sent first and `exit(normal)` second, and the
+%% listening socket closed as a consequence of the process exiting -- so between
+%% the two, the answer had arrived and the socket was still open. A connection
+%% already sitting in the kernel's accept queue could still be taken by
+%% `m:i2p_tcp_acceptor`, and `f:i2p_ntcp2_listener:start_bob/3` could still run: a
+%% `f:supervisor:start_child/2` starting a responder that **dials out to a peer**,
+%% after a caller had been told nothing further would happen. That last clause is
+%% what separates this listener from SAM's, where the same ordering handed out a
+%% session and could hit `max_sam_sessions`. Closing the socket explicitly before
+%% answering fixes the ordering; waiting for the acceptor's `'DOWN'` is what makes
+%% it true for a connection the acceptor had already taken, which a socket close
+%% cannot reach.
+%%
+%% **What this case proves, and what it does not.** The `false = is_process_alive(Acceptor)`
+%% is the claim: the acceptor's exit is ordered before the reply, so by the time
+%% this process reads the reply the acceptor is gone, and the assertion is a
+%% barrier rather than a wait -- everything before the reply has already happened.
+%% The acceptor is the only process that calls `f:start_bob/3`, so a dead acceptor
+%% is not a weaker version of "no responder will start" but the whole of it. The
+%% `econnrefused` below is the same fact seen from the socket: nothing can be
+%% accepted at all once the reply is in hand.
+%%
+%% It is a positive case and it is **not** what kills the defect. Under the old
+%% ordering the acceptor also died quickly, just not before the reply -- so this
+%% case would usually have passed. `f:wedged_accept_path_is_reported_rather_than_claimed_stopped/1`
+%% is the one that rejects the old code, and this case is here because the
+%% guarantee is worth stating positively as well as negatively.
+stop_reports_only_after_the_accept_path_has_stopped(_Config) ->
+    {Bob, Alice} = pair(),
+    {ok, Listener} = i2p_ntcp2_listener:listen(0, Bob, self()),
+    Acceptor = acceptor_of(Listener),
+    Port = listen_port(Listener),
+    %% One real inbound connection first, so "the accept path is finished" is not
+    %% vacuously true of a listener that never accepted anything.
+    {ok, CA} = i2p_ntcp2_conn:connect(ri_at(Port, Bob), Alice, #{}),
+    {CB, _} = await_ready(),
+    try
+        Stopper = ask_stop(self(), Listener),
+        ok = take_stop_reply(Stopper),
+        false = is_process_alive(Acceptor),
+        %% Closing the listener stops future accepts and nothing else: the two
+        %% established connections are children of the same supervisor and are
+        %% untouched by the shutdown. Asserted because "stopped" is easy to
+        %% over-read as "gone", and this module doc promises it is not.
+        true = is_process_alive(CA),
+        true = is_process_alive(CB),
+        {error, econnrefused} = connect_ntcp(Port)
+    after
+        [ok = i2p_ntcp2_conn:stop(Conn) || Conn <- [CA, CB]],
+        i2p_ntcp2_listener:stop(Listener)
+    end,
+    ok.
+
+%% The same guarantee from the other side: a stop that cannot confirm is reported
+%% as a stop that could not confirm.
+%%
+%% **Why the acceptor is suspended rather than the case waiting.** Closing the
+%% listening socket ends an acceptor blocked in `f:gen_tcp:accept/1` -- that is what
+%% `{error, closed}` means -- so a case that merely queued connections and called
+%% `f:stop/1` would see the acceptor finish and could not tell an ordered reply
+%% from a lucky one. `f:erlang:suspend_process/1` holds the accept path still:
+%% while it is suspended the listener has no way to learn that its acceptor is
+%% done, so it cannot honestly answer, and `f:stop/1` must say so rather than
+%% report `ok`.
+%%
+%% **`f:sys:suspend/1` does not work here**, for the reason
+%% `f:i2p_sam_SUITE:wedged_accept_path_is_reported_rather_than_claimed_stopped/1`
+%% records: `f:gen_tcp:accept/1` is a *selective* receive for `{inet_async, _, _}`,
+%% so a `{system, _, _}` message never matches it and the call times out.
+%% `f:erlang:suspend_process/1` is scheduler-level and does not care what the
+%% process is waiting for: it simply is not scheduled, which is the property the
+%% case needs -- the accept path can neither make progress nor be asked whether it
+%% has. Scheduling is all that is taken away.
+%%
+%% **This is the case that rejects the old code**, and the two outcomes are three
+%% orders of magnitude apart rather than merely different: the old `f:stop/1`
+%% returned `ok` in microseconds because it answered before doing anything, and
+%% this one waits out `?ACCEPTOR_EXIT_TIMEOUT_MS` and raises. Nothing here is a
+%% race, and nothing here is a tolerance that happens to clear the real behaviour.
+%%
+%% **The queued connections are what make the refusal correct rather than merely
+%% cautious.** They are completed by the kernel and sitting in the accept queue, so
+%% "the accept path can still produce a responder" is true at the moment
+%% `f:stop/1` is called -- the listener is refusing to answer a question it cannot
+%% yet answer, not inventing a failure. They are closed in the `after`, because a
+%% client holding a socket into the next case is exactly the kind of cross-case
+%% leak that turns one failure into several.
+wedged_accept_path_is_reported_rather_than_claimed_stopped(_Config) ->
+    {Bob, _Alice} = pair(),
+    {ok, Listener} = i2p_ntcp2_listener:listen(0, Bob, self()),
+    Acceptor = acceptor_of(Listener),
+    Port = listen_port(Listener),
+    %% Nothing has been accepted yet, so "no responder was started" below is a
+    %% count against zero rather than against a baseline this case chose.
+    0 = i2p_ntcp2_sup:connection_count(),
+    ok = suspend(Acceptor),
+    Clients = queue_connections(Port, ?STOP_QUEUE),
+    %% Armed before the stop, and read in the `after`. The acceptor's exit is the
+    %% barrier that makes the count below a reading rather than a race: a monitor
+    %% set on an already-dead process answers immediately, so there is no race here
+    %% either.
+    MRef = erlang:monitor(process, Acceptor),
+    try
+        %% Read through `f:answered/1` rather than `?assertError` for the reason
+        %% the accept-batch case at the end of this module gives for the same
+        %% helper: a raise is a term to match here, not a control-flow event to
+        %% catch, and matching it keeps this file's style of bare matches.
+        {'EXIT', {{accept_path_did_not_stop, Listener}, _}} =
+            answered(fun() -> i2p_ntcp2_listener:stop(Listener) end)
+    after
+        %% The acceptor is resumed before the clients are closed, so the socket
+        %% close reached a live accept loop rather than a frozen one -- and the
+        %% announcement is in its mailbox, so it exits `normal` at the top of the
+        %% loop without taking a single queued connection.
+        ok = resume(Acceptor),
+        normal = await_down(MRef, Acceptor),
+        0 = i2p_ntcp2_sup:connection_count(),
+        none = responder_announced(),
+        [gen_tcp:close(C) || C <- Clients]
+    end,
+    ok.
+
+%% The listener's only other linked *process* is its acceptor;
+%% `f:proc_lib:start_link/3` in `f:init/3` may or may not leave it linked to the
+%% supervisor that started it, and `f:i2p_tcp_acceptor:start_link/2` links the
+%% acceptor to it either way. The listening socket is linked too and is not a
+%% process, so it is filtered out rather than assumed away -- and the supervisor is
+%% filtered rather than subtracted, so this does not depend on which release
+%% `f:proc_lib` left the link in place.
+%%
+%% Matching on *exactly one other process* rather than searching for the acceptor
+%% is deliberate. The module's whole shutdown argument rests on there being one
+%% acceptor to wait for, so a listener that grew a second linked process would make
+%% `f:shutdown/5` wait on the wrong one -- and a case that went looking for an
+%% acceptor by module name would find one anyway, and hide that.
+acceptor_of(Listener) ->
+    Sup = whereis(i2p_ntcp2_sup),
+    {links, Links} = erlang:process_info(Listener, links),
+    [Acceptor] = [Pid || Pid <- Links, is_pid(Pid), Pid =/= Sup],
+    Acceptor.
+
+%% Matched rather than discarded: a suspension that did not take would leave the
+%% case asserting against a live accept loop, which is the old code's behaviour,
+%% and the case would then pass for the wrong reason.
+suspend(Pid) ->
+    true = erlang:suspend_process(Pid),
+    ok.
+
+resume(Pid) ->
+    true = erlang:resume_process(Pid),
+    ok.
+
+await_down(MRef, Pid) ->
+    receive
+        {'DOWN', MRef, process, Pid, Reason} -> Reason
+    after ?TIMEOUT ->
+        erlang:error({acceptor_never_exited, Pid})
+    end.
+
+%% Whether a responder announced itself to this process, read at the instant the
+%% acceptor is known to be gone.
+%%
+%% **The `after 0` is a fact and not a wait**, which is what makes it a barrier
+%% rather than a tolerance: the acceptor that is the only caller of
+%% `f:start_bob/3` has been observed to exit, so nothing can announce later, and
+%% this case's baseline was zero connections, so there is no responder that
+%% announced earlier and might announce late. Both halves are what remove the
+%% word "yet" from that sentence.
+responder_announced() ->
+    receive
+        {ntcp2_ready, Conn, _RemoteRI} -> {announced, Conn}
+    after 0 ->
+        none
+    end.
+
+%% Connect without reading, and hold. Nothing is read because nothing should ever
+%% arrive: these clients exist to sit in the accept queue, and a client that sent a
+%% byte would be answered by a responder -- which is the thing the case is about,
+%% so a reply here would be a failure rather than a convenience.
+queue_connections(Port, N) ->
+    [Sock || {ok, Sock} <- [connect_ntcp(Port) || _ <- lists:seq(1, N)]].
+
+connect_ntcp(Port) ->
+    gen_tcp:connect("127.0.0.1", Port, [binary, {packet, raw}, {active, false}], 5000).
+
+%% `Parent` is captured by the caller rather than read inside the fun: `self()`
+%% there is the stopper, and a reply sent to the stopper is a reply nobody is
+%% waiting for. Spawned rather than called directly so the case's own process is
+%% free to observe the mailbox while `f:stop/1` runs inside it.
+ask_stop(Parent, Listener) ->
+    spawn(fun() -> Parent ! {stop_reply, i2p_ntcp2_listener:stop(Listener)} end).
+
+take_stop_reply(Stopper) ->
+    receive
+        {stop_reply, Reply} -> Reply
+    after ?TIMEOUT ->
+        erlang:error({stop_never_answered, Stopper})
+    end.
 
 %% --------------------------------------------------------------------------
 %% Connection-suite helpers
