@@ -164,21 +164,23 @@ acceptor had already taken can still become a responder. `m:i2p_sam_listener` ra
 the same shape for the same reason: #YJ0DSAT asks whether the two listeners should
 answer the same question the same way, and they now do.
 
-**The other way of not answering is reported rather than raised**, and the
-asymmetry is the point. A listener that says *nothing at all* within
+**The other way of not answering is reported rather than raised**, and that is the
+asymmetry worth naming. A listener that says *nothing at all* within
 `?STOP_TIMEOUT_MS` is not answering at all, so there is no claim of it to
 contradict — and killing it restores the invariant rather than leaving it broken,
 because it owns the listening socket: a live listener that has stopped answering is
 a port that keeps accepting after this function reported that it stopped, and a
 listener that cannot answer a stop request cannot be reasoned about as anything
-else. The same trade `f:i2p_ntcp2_conn:stop/1` makes, and for the same reason — an
-exported function's wait is bounded rather than open.
+else. So a silent listener is killed and `ok` is returned. The same trade
+`f:i2p_ntcp2_conn:stop/1` makes, and for the same reason — an exported function's
+wait is bounded rather than open. `m:i2p_sam_listener:stop/1` makes it too, so this
+is the one answer on either side that is reached by acting rather than by asking.
 
-A listener that is **already dead** answers `ok`, immediately, by monitor rather
-than by waiting: the listening socket is owned by that process, so its death
-closed the socket and its acceptor's `f:gen_tcp:accept/1` could accept nothing
-more. This is also why the listener always answers — a reply that can go missing
-cannot be told apart from a listener that was never there.
+`ok` is also the right answer for a listener that is **already dead**, immediately,
+by monitor rather than by waiting, and for the reason the kill gives: the listening
+socket died with it and its acceptor was killed with it. This is also why the
+listener always answers — a reply that can go missing cannot be told apart from a
+listener that was never there.
 """.
 -spec stop(pid()) -> ok.
 stop(Listener) ->

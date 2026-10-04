@@ -81,16 +81,28 @@ taken and was busy with does not turn into one more `accept` on a socket that ha
 been declared finished — which is the case the listener on the other end is
 actually waiting for.
 
-So a listener's *death* is not what shuts this down. It is one of three ways this
-process ends, and the only one that carries no information about why:
+So a listener's *death* is not what shuts this down. It is one of four ways this
+process ends, and the only one that carries information about why:
 
 - **announced close** — the ordinary end, and the only one a listener chooses.
   The socket close is what makes it possible, and the announcement is what makes
   it recognisable.
 - **socket gone without one** — the listener died rather than closing, so a kill
   takes the socket with it. `f:gen_tcp:accept/1` answers `{error, closed}`, which
-  is the other ordinary end and stays one: a kill is not an accept failure, and
-  nothing can be accepted in either case.
+  is an ordinary end and stays one: a kill is not an accept failure, and nothing
+  can be accepted in either case.
+- **killed along the link** — the same condition arriving by the other route, and
+  usually arriving first. This process does not trap exits, so a `killed` signal
+  propagating from the listener terminates it outright and there is no
+  `f:gen_tcp:accept/1` return left to classify at all. Both
+  `m:i2p_sam_listener:stop/1` and `m:i2p_ntcp2_listener:stop/1` take this route
+  deliberately when a listener will not answer a stop, which is what makes it a
+  reachable end rather than a theoretical one. Measured on this tree at OTP 28:
+  `killed` in eight runs out of eight, the link signal beating the driver's
+  `{inet_async, _, _}` — which is the order the runtime does it in, since a dying
+  process's ports are closed before its exit signals go out. Both reasons are the
+  same fact seen from either side, and neither reaches the `{accept_failed, _}`
+  branch below, which is the only thing the classification exists to get right.
 - **a real accept failure** — a resource limit or a driver error, which is
   `{accept_failed, _}` and a crash report.
 

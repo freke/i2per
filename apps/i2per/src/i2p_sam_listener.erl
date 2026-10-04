@@ -36,8 +36,40 @@ option.
 Which means the three control messages are now answered by a process that is not
 blocked, which is what the timeout used to be for. The loop below has no timeout
 clause at all: there is nothing left to poll for, so each message is answered when
-it arrives. The bound that matters is the one `f:stop/1` carries, and it is not a
-synchronisation — see the shutdown section below.
+it arrives.
+
+**So the bounds moved to the callers, which is where they belong.** A wait that a
+process cannot reach is not a bound: before #YJ0DSAT the only bounded waits in this
+listener were *inside* the loop that answered the questions, and the two questions a
+caller asks most often -- what port are you on, where are you bound -- had a
+`receive` with no timeout clause at all. Each exported function now bounds its own
+wait, and `?CONTROL_TIMEOUT_MS` and `?STOP_TIMEOUT_MS` are the two figures. Neither
+is a synchronisation: the control loop does nothing but answer, so both are
+guarantees about a hung process and both are generous by orders of magnitude for
+that reason. `f:stop/1` waits out the listener's own bound as well, because it asks
+for a stronger answer -- see the shutdown section below.
+
+## The two listeners answer the same question the same way
+
+`m:i2p_ntcp2_listener` is the other caller of `m:i2p_tcp_acceptor`, and it owns a
+listening socket and answers for it in exactly the terms set out here. #YJ0DSAT
+asked whether the two should agree, and they do -- on all three functions and on
+both sides of each bound:
+
+- **a listener that answers** sends `{stopped, Ref}` or `{stop_failed, Ref}`, with
+  no question tag, and the caller turns the second into
+  `{accept_path_did_not_stop, Listener}`. #AAYXPQK is where this was settled;
+- **a listener that cannot answer a control question** raises
+  `{listener_unanswered, Listener, port}` or `{listener_unanswered, Listener,
+  address}` -- an unknown port is a fact worth raising over rather than a value to
+  invent;
+- **a listener that cannot answer `f:stop/1` at all** is killed, and `ok` is
+  returned, because a kill restores the invariant this function exists to protect:
+  the listener owns the listening socket, so nothing accepts afterwards.
+
+That last one is the only place the answer is reached by acting rather than by
+asking, and both modules say so rather than leaving the pair to look like one
+convention followed without thought.
 
 ## What `f:stop/1` promises, and what it takes to keep that promise
 
@@ -81,6 +113,18 @@ ok = i2p_sam_listener:stop(Listener).
 
 -export([listen/1, port/1, address/1, stop/1, start_link/1, init/1]).
 
+%% How long a caller of `f:port/1` or `f:address/1` waits for its answer. These are
+%% exported functions whose caller has no other way to find out whether the listener
+%% is there, so an unbounded receive is a caller that never comes back -- and the
+%% listener being unreachable is ordinary, because a supervisor restart of the boot
+%% listener is. Generous by orders of magnitude against what it is actually
+%% measuring: the control loop does nothing but answer, so this is a guarantee about
+%% a hung process, not a synchronisation.
+%%
+%% `f:stop/1` does **not** use this figure: it asks for a stronger answer, so it
+%% waits out the listener's own bound as well -- see `?STOP_TIMEOUT_MS`.
+-define(CONTROL_TIMEOUT_MS, 1000).
+
 %% How long the listener waits for its acceptor to reach the end of its accept
 %% loop once the listening socket is closed. The acceptor is blocked in
 %% `f:gen_tcp:accept/1` while it waits for a connection, so closing the socket is
@@ -96,7 +140,8 @@ ok = i2p_sam_listener:stop(Listener).
 %% ordinary case and answers before it, and a caller bound at the same figure
 %% would sometimes fire first and report a stop that was about to succeed. This
 %% one is the outer guarantee -- the *listener* is not answering at all, which is a
-%% different condition and is reported as one.
+%% different condition and is treated as one by killing it rather than reporting it.
+%% See the `after` clause in `f:stop/1`.
 -define(STOP_TIMEOUT_MS, 2000).
 
 -doc """
@@ -110,26 +155,36 @@ Output: `{ok, Pid}`.
 listen(#{local := _Local} = Opts) ->
     supervisor:start_child(i2p_sam_sup, i2p_sam_sup:listener_child(Opts)).
 
--doc "The bound local port of the listener.".
+-doc """
+The bound local port of the listener.
+
+Raises `{listener_unanswered, Listener, port}` if the listener cannot answer within
+`?CONTROL_TIMEOUT_MS`, or is already gone. See the module doc on the two listeners
+answering the same question the same way.
+""".
 -spec port(pid()) -> inet:port_number().
 port(Listener) ->
-    Ref = make_ref(),
-    Listener ! {port, self(), Ref},
-    receive
-        {port, Ref, P} -> P
+    case control(Listener, port) of
+        {ok, Port} ->
+            Port;
+        no_answer ->
+            error({listener_unanswered, Listener, port})
     end.
 
 -doc """
 Return the local address on which the listener is bound.
 
 Input: a listener pid. Output: the bound IP address.
+
+Raises `{listener_unanswered, Listener, address}` on the same terms as `f:port/1`.
 """.
 -spec address(pid()) -> inet:ip_address().
 address(Listener) ->
-    Ref = make_ref(),
-    Listener ! {address, self(), Ref},
-    receive
-        {address, Ref, Address} -> Address
+    case control(Listener, address) of
+        {ok, Address} ->
+            Address;
+        no_answer ->
+            error({listener_unanswered, Listener, address})
     end.
 
 -doc """
@@ -143,27 +198,32 @@ function waits for. See the shutdown section of the module doc.
 `{accept_path_did_not_stop, Listener}` — the listener answered, and its answer was
 that it could not confirm. Its acceptor would not finish, so it is still possible
 for a queued connection to become a session.
-`m:i2p_ntcp2_listener:stop/1` raises the same shape for the same reason, and
-#YJ0DSAT — which asks whether the two listeners answer the same question the same
-way — is settled on that point: the *outcome* protocol is one shape.
+`m:i2p_ntcp2_listener:stop/1` raises the same shape for the same reason.
 
-**The other way of not answering is reported differently here, and that is
-#YJ0DSAT's criterion 2 rather than a settled choice.** Nothing came back at all
-within `?STOP_TIMEOUT_MS`, which is the listener itself being wedged rather than
-its acceptor, so this module raises `{listener_unanswered, Listener, stop}`;
-`m:i2p_ntcp2_listener:stop/1` kills a silent listener and answers `ok` instead,
-because a kill restores the invariant. Both are bounded, and they are not
-interchangeable answers to one question, so the two are left saying which is
-which rather than pretending to be one.
+**The other way of not answering is reported rather than raised, and that is the
+asymmetry worth naming.** A listener that says *nothing at all* within
+`?STOP_TIMEOUT_MS` is not answering at all, so there is no claim of it to contradict
+— and killing it restores the invariant rather than leaving it broken, because it
+owns the listening socket. Raising there would report a fault and leave the fault in
+place: the port would go on accepting after this function had told its caller that
+nothing further would happen, and the caller would have no way to make that true
+except by killing the listener itself. So a silent listener is killed and `ok` is
+returned. `m:i2p_ntcp2_listener:stop/1` makes the same trade for the same reason, and
+for the same reason this is the only answer on either side that is reached by acting
+rather than by asking.
 
-Raising is the honest answer in the first case, because `ok` there would be the
-exact claim this function exists to stop making.
+That kill is a *sufficient* stop rather than merely a plausible one, and it is worth
+being exact about why, because the socket close alone is not the whole of it: the
+listener's death closes the listening socket, which ends a blocked
+`f:gen_tcp:accept/1`; and the acceptor is **linked** to the listener, so it does not
+merely find its accept failing — it is killed outright, which also covers the one
+case a socket close cannot reach, an acceptor already inside `f:start_session/2`.
 
-A listener that is **already dead** answers `ok`, immediately, by monitor rather
-than by waiting: the listening socket is owned by that process, so its death
-closed the socket and its acceptor's `f:gen_tcp:accept/1` could accept nothing
-more. This is also why the listener always answers — a reply that can go missing
-cannot be told apart from a listener that was never there.
+`ok` is also the right answer for a listener that is **already dead**, immediately,
+by monitor rather than by waiting, and for the reason the kill gives: the listening
+socket died with it and its acceptor was killed with it. This is also why the
+listener always answers — a reply that can go missing cannot be told apart from a
+listener that was never there.
 """.
 -spec stop(pid()) -> ok.
 stop(Listener) ->
@@ -182,8 +242,13 @@ stop(Listener) ->
             %% close is. Not a timeout, so not an error: nothing can be accepted.
             ok
     after ?STOP_TIMEOUT_MS ->
+        %% The listener is alive and has said nothing for longer than its own
+        %% shutdown bound plus this one, so it is not going to. `catch` because it
+        %% may have died in the same instant the bound expired -- which is the same
+        %% condition reached two ways, and one answer for both is the point.
         erlang:demonitor(MRef, [flush]),
-        erlang:error({listener_unanswered, Listener, stop})
+        _ = catch exit(Listener, kill),
+        ok
     end.
 
 -doc false.
@@ -251,6 +316,43 @@ control_loop(BoundPort, ListenIP, ListenSock, MRef, Acceptor) ->
             exit({acceptor_gone, Reason})
     end.
 
+%% %%%%%%% %%% Asking, and not answering %%%%%%% %%%
+
+%% Ask the listener one of the two questions it answers from a value it already
+%% holds, and wait, bounded, for the answer.
+%%
+%% Placed next to the loop it questions rather than next to its two callers,
+%% because the pairing is the point: every clause in the receive above has exactly
+%% one counterpart here, and reading them together is how a question tag, an answer
+%% tag or a bound going missing becomes visible.
+%%
+%% Output `{ok, Answer}` with whatever the listener sent back, or `no_answer` if the
+%% bound passed with neither an answer nor a `'DOWN'`. The monitor is what makes a
+%% listener that is already dead a fast answer rather than a full second of waiting
+%% for a reply that was never coming; `[flush]` is what keeps a listener that
+%% answered and then died from leaking a `'DOWN'` into the caller.
+%%
+%% `f:stop/1` does not come through here: it needs a second answer, and a question
+%% this generic cannot tell apart from an answer to a question it is not asking.
+%% See `f:shutdown/5`.
+%%
+%% Both callers of what is left raise over a missing answer, because an unknown port
+%% is a bug worth raising over rather than a value to invent.
+control(Listener, Question) ->
+    Ref = make_ref(),
+    MRef = erlang:monitor(process, Listener),
+    Listener ! {Question, self(), Ref},
+    receive
+        {Question, Ref, Answer} ->
+            erlang:demonitor(MRef, [flush]),
+            {ok, Answer};
+        {'DOWN', MRef, process, Listener, _Reason} ->
+            no_answer
+    after ?CONTROL_TIMEOUT_MS ->
+        erlang:demonitor(MRef, [flush]),
+        no_answer
+    end.
+
 %% %%%%%%% %%% Stopping, and what the answer means %%%%%%% %%%
 
 %% **The close comes first, and the answer comes last, and the acceptor is waited
@@ -297,9 +399,10 @@ control_loop(BoundPort, ListenIP, ListenSock, MRef, Acceptor) ->
 %%    was there because all three control messages shared one `f:control/2`; that
 %%    listener now keeps its own receive too, so the two answer the same question
 %%    with the same shape. #YJ0DSAT asked whether they should be unified, and
-%%    #AAYXPQK is where it was: one outcome protocol, two tags, no question tag.
-%%    What is still open there is the *timeout* answer, which the paragraph in
-%%    `f:stop/1` covers.
+%%    #AAYXPQK is where the outcome protocol was: one shape, two tags, no question
+%%    tag. The *timeout* answers were the other half of that question, and they
+%%    came together with `f:control/2` below -- both listeners now kill a silent
+%%    listener and answer `ok`, which is the module doc's third bullet.
 %%
 %% Established sessions are children of the same supervisor and are not touched by
 %% any of this.

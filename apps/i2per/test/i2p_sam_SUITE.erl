@@ -25,6 +25,8 @@
     a_batch_of_inbound_sessions_is_not_accepted_one_per_second/1,
     stop_reports_only_after_the_accept_path_has_stopped/1,
     wedged_accept_path_is_reported_rather_than_claimed_stopped/1,
+    control_question_to_a_wedged_listener_raises_rather_than_waiting/1,
+    stop_kills_a_wedged_listener_and_answers_ok/1,
     sam_session_limit_rejects_new_child/1,
     stream_conn_limit_rejects_new_child/1,
     sam_dest_generate/1,
@@ -75,6 +77,36 @@
 -define(STOP_QUEUE, 4).
 -define(STOP_REPLY_MS, 10000).
 
+%% The two reasons an acceptor may end when its listener is **killed** rather than
+%% announcing a close, and why both are ordinary.
+%%
+%% A kill reaches the acceptor along two independent routes at once, and which one
+%% lands first is a race between a link signal and a driver message -- so neither
+%% can be asserted, and asserting either would be a flaky case:
+%%
+%% * the listening socket is owned by the listener, so its death ends the blocked
+%%   `f:gen_tcp:accept/1` with `{error, closed}`, which `m:i2p_tcp_acceptor` reads as
+%%   the ordinary end and exits `normal` on;
+%% * the acceptor is linked to the listener, and it does not trap exits, so the
+%%   `killed` exit signal propagating along that link ends it outright.
+%%
+%% What the pair rules out is the thing worth catching: `{accept_failed, _}`, which
+%% is what this exit reason would be if the module misread a dead socket as an
+%% accept failure. That is a crash report on a path the router takes deliberately,
+%% so the assertion is membership rather than equality, and the comment above is
+%% what makes the weaker form legible.
+%%
+%% **Measured, not assumed: on this tree it is always `killed`.** Eight consecutive
+%% runs, eight `killed` — the link signal beats the driver's `{inet_async, _, _}`
+%% every time, which is what one would expect from the order the runtime does it
+%% in (the dying process's ports are closed before its exit signals go out, so the
+%% socket is gone first and the message announcing it is the slower of the two).
+%% That is a race won eight times, not a guarantee, and the assertion does not
+%% pretend otherwise: a future OTP that delivered the driver message first would
+%% produce `normal` here and this case would stay green, which is the correct
+%% outcome for a difference that carries no information.
+-define(ORDINARY_ACCEPTOR_ENDS, [normal, killed]).
+
 suite() ->
     [{timetrap, 120000}].
 
@@ -85,6 +117,8 @@ all() ->
         a_batch_of_inbound_sessions_is_not_accepted_one_per_second,
         stop_reports_only_after_the_accept_path_has_stopped,
         wedged_accept_path_is_reported_rather_than_claimed_stopped,
+        control_question_to_a_wedged_listener_raises_rather_than_waiting,
+        stop_kills_a_wedged_listener_and_answers_ok,
         sam_session_limit_rejects_new_child,
         stream_conn_limit_rejects_new_child,
         sam_dest_generate,
@@ -231,9 +265,9 @@ sam_listener_binds_loopback(_Config) ->
 %% process that asks while the batch is in flight, which is the only moment the
 %% question means anything: a fix that moved the accept back into the process that
 %% answers control messages would leave it blocked. It cannot pass slowly --
-%% `f:i2p_sam_listener:port/1` has no bound of its own, so the case's deadline is the
-%% bound, and a control path stuck behind the accept surfaces here as a wrong answer
-%% rather than as a hang. See #YJ0DSAT.
+%% `f:i2p_sam_listener:port/1` answers or raises after its own bound, so a control
+%% path stuck behind the accept surfaces here as a wrong answer rather than as a
+%% late one. See #YJ0DSAT.
 a_batch_of_inbound_sessions_is_not_accepted_one_per_second(_Config) ->
     Port = i2p_ct_helpers:free_port(),
     {ok, Listener} = i2p_sam_listener:listen(#{port => Port, local => undefined}),
@@ -424,6 +458,126 @@ wedged_accept_path_is_reported_rather_than_claimed_stopped(_Config) ->
     end,
     ok.
 
+%% --------------------------------------------------------------------------
+%% A listener that cannot answer, and what a caller is told
+%% --------------------------------------------------------------------------
+
+%% A control question has a bound, so a listener that cannot answer produces an
+%% error rather than a caller that never comes back.
+%%
+%% **The defect.** `f:port/1` and `f:address/1` had a `receive` with no timeout
+%% clause at all, so a listener that was gone, wedged or exiting left the caller
+%% waiting with no upper bound on it. #EP6SRK1 made this reachable rather than
+%% merely possible: before it the listener polled its control messages on a
+%% one-second receive timeout and so answered a question from inside the accept
+%% path, and after it the accept moved to a process of its own and the control
+%% loop became a pure answer-when-read loop. The right shape, and a control path
+%% with no bound in it at all — a caller with no bound, rather than one that waits
+%% at most a second.
+%%
+%% **Why the listener is suspended rather than merely absent.** A dead listener is
+%% answered immediately from the monitor, so `f:stop/1`'s existing `'DOWN'` clause
+%% already covers it and there is nothing here to demonstrate. A *wedged* one is
+%% the condition the bound exists for, and `f:erlang:suspend_process/1` is the only
+%% way to produce one deterministically: the message is queued and the listener
+%% never reads it, so the answer cannot arrive by any route short of the bound. `f:sys:suspend/1` would not work, for the reason
+%% `f:wedged_accept_path_is_reported_rather_than_claimed_stopped/1` records about
+%% the acceptor — this listener spends its life inside a `receive`, so a `{system,
+%% _, _}` message does reach it, but suspending it through `f:sys` leaves it unable
+%% to answer `f:sys:resume/2` either, and the case could not put it back.
+%%
+%% **What is asserted, and what is not.** The raise shape is asserted for both
+%% questions, since a bound added to one and not the other is the shape of this
+%% defect. That the wait is *bounded* is the function's own `after` and not
+%% something an assertion can observe: against the pre-fix code this case does not
+%% fail, it hangs, and the suite's timetrap is what catches it. So the case is
+%% green only because the bound exists, and the red it produces on a regression is
+%% a 120-second timeout rather than a mismatch — which is worth knowing before
+%% someone reads a slow suite as a slow runner.
+%%
+%% The answer each question *would* have had is not asserted, because the listener
+%% is resumed in the `after` and there is no longer a caller to receive it: the two
+%% replies arrive as `{port, Ref, _}` and `{address, Ref, _}` with stale refs in this
+%% process's mailbox. Nothing in this suite matches those tags, so they are inert
+%% rather than merely harmless, and asserting them would be asserting that a wedged
+%% listener eventually answers.
+control_question_to_a_wedged_listener_raises_rather_than_waiting(_Config) ->
+    Port = i2p_ct_helpers:free_port(),
+    {ok, Listener} = i2p_sam_listener:listen(#{port => Port, local => undefined}),
+    ok = suspend(Listener),
+    try
+        ?assertError({listener_unanswered, Listener, port}, i2p_sam_listener:port(Listener)),
+        ?assertError({listener_unanswered, Listener, address}, i2p_sam_listener:address(Listener))
+    after
+        %% Resumed before the stop, so the stop is a stop of a live listener and the
+        %% case is not reading the wedged branch's answer by accident.
+        ok = resume(Listener),
+        ok = i2p_sam_listener:stop(Listener)
+    end,
+    ok.
+
+%% A stop of a listener that will not answer is a stop, not a hang -- and the
+%% `ok` it returns is true by the time it arrives.
+%%
+%% **The defect.** The `after ?STOP_TIMEOUT_MS` branch raised
+%% `{listener_unanswered, Listener, stop}`. The wait was bounded, which is more
+%% than the control questions had, but the *answer* was wrong for the condition:
+%% the listener owns the listening socket, so a listener that is alive and not
+%% answering is a port that is still accepting. Raising there reports a fault and
+%% leaves the fault in place, and the caller has no way to make it true except by
+%% killing the listener itself. `m:i2p_ntcp2_listener:stop/1` makes the other
+%% trade: kill the silent listener, answer `ok`, because a kill restores the
+%% invariant rather than describing it.
+%%
+%% **A kill is a sufficient stop, and the case proves the two halves of that.**
+%% The listening socket is owned by the listener, so the listener's death closes
+%% it -- which is what `?assertEqual({error, econnrefused}, ...)` reads from the
+%% other side. And the acceptor is *linked* to the listener, so it does not merely
+%% find its `accept` failing: it is killed outright, which covers the one case a
+%% socket close cannot reach, an acceptor already inside `f:start_session/2`.
+%% `?ORDINARY_ACCEPTOR_ENDS` is that claim; `f:is_process_alive/1` would be a race
+%% against an asynchronous exit signal, and the exit reason is where the
+%% information is -- see the define for which two, and why neither is the one that
+%% matters.
+%%
+%% **The listener is resumed in the `after`, and it is resumed whether or not it
+%% survived.** A kill reaches a suspended process -- measured, not assumed: the exit
+%% signal resumes it to be killed -- so on a green run there is nothing to resume.
+%% `f:resume_process/1` on a dead process raises, hence the `f:is_process_alive/1`
+%% guard, which is the only place in this suite that does not assert on a live
+%% process.
+%%
+%% **What this case is not.** It does not weaken `f:stop/1`'s ordinary guarantee,
+%% which is the strong one: the `{accept_path_did_not_stop, _}` refusal above is
+%% untouched, and a listener that *can* answer still has to wait for its acceptor.
+%% This is the answer to the condition where it cannot answer at all, and the two
+%% are different conditions rather than a preference between two answers to one.
+stop_kills_a_wedged_listener_and_answers_ok(_Config) ->
+    Port = i2p_ct_helpers:free_port(),
+    {ok, Listener} = i2p_sam_listener:listen(#{port => Port, local => undefined}),
+    Acceptor = acceptor_of(Listener),
+    %% Monitored *before* the stop, which is the whole reason this case reads an
+    %% exit reason at all: a monitor set on an already-dead process answers
+    %% `noproc` immediately, so a helper that monitored at the point of asking would
+    %% report the fact of the exit and nothing about how it happened.
+    ARef = erlang:monitor(process, Acceptor),
+    ok = suspend(Listener),
+    try
+        ok = i2p_sam_listener:stop(Listener),
+        ?assertNot(is_process_alive(Listener)),
+        ?assert(lists:member(take_down(ARef, Acceptor, ?STOP_REPLY_MS), ?ORDINARY_ACCEPTOR_ENDS)),
+        ?assertEqual(
+            {error, econnrefused},
+            gen_tcp:connect("127.0.0.1", Port, [binary, {packet, raw}, {active, false}], 5000)
+        )
+    after
+        case is_process_alive(Listener) of
+            true -> ok = resume(Listener);
+            false -> ok
+        end
+    end,
+    ok.
+
 %% **`f:sys:suspend/1` does not work here, and the reason is worth recording.**
 %% The acceptor spends its life in `f:gen_tcp:accept/1`, which is a *selective*
 %% receive for `{inet_async, _, _}` alone -- a `{system, _, _}` message does not
@@ -447,6 +601,22 @@ suspend(Pid) ->
 resume(Pid) ->
     true = erlang:resume_process(Pid),
     ok.
+
+%% Wait for a process that was monitored *earlier* to be gone, and report why.
+%%
+%% Takes the monitor rather than setting one, and that is the load-bearing part:
+%% `f:erlang:monitor/2` on an already-dead process answers `noproc` immediately, so
+%% a helper that monitored at the point of asking would report the fact of an exit
+%% and nothing about how it happened. Given a monitor taken while the process was
+%% still alive, the reason is the real one.
+take_down(MRef, Pid, TimeoutMs) ->
+    receive
+        {'DOWN', MRef, process, Pid, Reason} ->
+            Reason
+    after TimeoutMs ->
+        erlang:demonitor(MRef, [flush]),
+        erlang:error({never_exited, Pid})
+    end.
 
 %% The listener's only other linked *process* is its acceptor;
 %% `f:proc_lib:start_link/1` in `f:init/1` links it to the supervisor that started
