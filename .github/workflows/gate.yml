@@ -6,7 +6,8 @@
 #   gate      "is this commit good enough to ship?" -- `main` only, and it runs
 #             everything: lint, docs, dialyzer, every eunit, every property,
 #             every CT suite, no time limit.
-#   compat    "can someone run this on another OTP?" -- `main` only.
+#   compat    "can someone run this on another OTP?" -- every pull request and
+#             `main`, but not a push to a feature branch.
 #
 # Separate jobs rather than one job with a matrix, because a matrix of the pinned
 # version answers the compat question with the smoke job's strictness -- which is
@@ -255,9 +256,24 @@ jobs:
   #
   # Starts at one version, the same as devenv, because a matrix nobody has run
   # is a matrix of guesses. Expansion is 1.0.0 material.
+  #
+  # **A pull request or `main`, by ref rather than by event.** Same rule and the
+  # same reason as `full`: the question is about the code, and
+  # `github.event_name` would also let a `workflow_dispatch` -- which a human can
+  # fire on any branch -- run this job. It is *not* the same condition as
+  # `full`'s, because a pull request asks "would this merge cleanly" and an OTP
+  # matrix is part of that answer before the merge rather than after.
+  #
+  # A push to a feature branch is excluded because it asks neither question: it
+  # is someone working, and the run it does get is the five-minute smoke tier.
+  # Left unconditioned, every such push also paid a checkout, an OTP 28 install,
+  # a smoke-tier compile, the unit tier, CT and dialyzer -- so the push tier was
+  # neither the one documented above nor the one anybody would choose if they had
+  # been asked.
   compat:
     name: compat (OTP ${{ matrix.otp }}, warnings relaxed)
     runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/pull/')
     strategy:
       # One version, so this job is reporting rather than surveying. `fail-fast:
       # false` is kept because the day a second version is added, the useful
