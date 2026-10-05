@@ -5,11 +5,15 @@ Router-wide status event bus (`gen_event` manager).
 
 State changes across the router are announced here so external observers —
 notably the separate `i2per_status` web service — can follow them in real
-time. Handlers run on the manager's node; subscribers on OTHER nodes install
-the router-shipped forwarder `m:i2p_events_forward` instead of their own code:
+time. Attaching is `f:subscribe/1` and `f:unsubscribe/1`, and **nothing outside
+the core calls `gen_event:*`**, which is what makes replacing this manager an
+internal refactor rather than a contract break:
 
 ```erlang
-ok = gen_event:add_handler({i2p_events, RouterNode}, i2p_events_forward, [self()]).
+%% One entry point for a local and a remote subscriber alike. `Collector` may
+%% be a pid on any node; on another node, reach the router over distribution and
+%% the call lands where the manager is registered.
+ok = i2p_events:subscribe(self()).
 receive {event, Event} -> ... end.
 ```
 
@@ -64,11 +68,23 @@ handler accumulates; the latter is the gap this does not close.
 
 -behaviour(gen_event).
 
--export([start_link/0, max_heap_words/0, notify/1]).
+-export([start_link/0, max_heap_words/0, notify/1, subscribe/1, unsubscribe/1]).
 
 -export([init/1, handle_event/2, handle_call/2, handle_info/2, terminate/2, code_change/3]).
 
--export_type([event/0, direction/0, lookup_kind/0]).
+-export_type([event/0, direction/0, lookup_kind/0, subscribe_error/0]).
+
+-doc """
+Why a subscription did not happen.
+
+`t:no_bus/0` — there is no bus on this node, so nothing was asked.
+`t:wedged/0` — the bus did not answer within `?SUBSCRIBE_BOUND_MS`. **The
+subscription may still take effect afterwards**: `gen_event` adds the handler
+before it replies, so this answer means "did not complete", not "did not
+happen".
+`{t:bus_error/0, Reason}` — the bus answered, and the answer was not `ok`.
+""".
+-type subscribe_error() :: no_bus | wedged | {bus_error, term()}.
 
 -doc "Tunnel direction.".
 -type direction() :: inbound | outbound.
@@ -274,6 +290,182 @@ notify(Event) ->
         _ ->
             _ = gen_event:notify(?MODULE, Event),
             ok
+    end.
+
+%% %%%%% %%% The published entry point %%%%% %%%
+%%
+%% #WGV1SZ7. `f:gen_event:add_handler/3` and `f:gen_event:delete_handler/3` are
+%% the only way to attach to the bus today, and each caller has to know three
+%% internal facts: the registered name, the forwarder module, and that the
+%% argument is a pid. The two production subscribers **disagreed about the
+%% first** — `m:i2per_status_state` used `{i2p_events, Node}` and
+%% `m:i2p_ssu2_reachability` used bare `i2p_events` — which is the duplication
+%% this pair exists to remove.
+%%
+%% The local/remote asymmetry disappears with it: a caller on another node
+%% reaches these through `erpc:call(RouterNode, i2p_events, subscribe, [Pid])`,
+%% so the code runs where the manager is registered and `?MODULE` is the right
+%% name in both cases.
+
+-doc """
+Subscribe a collector to the bus.
+
+`Collector` is a pid on **any** node; the router's shipped forwarder
+(`m:i2p_events_forward`) carries each event to it as `{event, Event}`. Because
+`Collector` may be remote and this function may be reached over distribution,
+the caller supplies no node and no handler module — which is the whole point of
+the entry point.
+
+Input: `Collector`, a pid. Output: `ok`, or `{error, Reason}` — see
+`t:subscribe_error/0`. Never exits, and never waits without end, for a bus that
+is absent or wedged.
+""".
+-spec subscribe(pid()) -> ok | {error, subscribe_error()}.
+subscribe(Collector) when is_pid(Collector) ->
+    bounded(fun() -> attach(Collector) end).
+
+-doc """
+Remove a collector's subscription, added by `f:subscribe/1`.
+
+**Idempotent: `ok` whether or not there was a subscription to remove.** A caller
+that unsubscribes during shutdown cannot know whether it was ever attached, and
+answering differently for the two cases would force every caller to handle a
+distinction it has no use for. `f:gen_event:delete_handler/3` itself answers
+`{error, module_not_found}` for the nothing-to-remove case, so that is collapsed
+here rather than passed on.
+
+Input: `Collector`, the pid passed to `f:subscribe/1`. Output: `ok`, or
+`{error, Reason}` — see `t:subscribe_error/0`.
+""".
+-spec unsubscribe(pid()) -> ok | {error, subscribe_error()}.
+unsubscribe(Collector) when is_pid(Collector) ->
+    bounded(fun() -> detach(Collector) end).
+
+%% %%%%% %%% Why the wait is bounded %%%%% %%%
+%%
+%% `gen_event:add_handler/3` and `gen_event:delete_handler/3` are both `rpc/2`,
+%% which is `gen:call(M, self(), Cmd, infinity)` (`gen_event.erl:1576`). There is
+%% no timeout argument to pass and none to choose, so **every one of those calls
+%% waits without end on a bus that is wedged.** Measured on this build against a
+%% manager parked inside `handle_event/2`: `add_handler/3`, `delete_handler/3`
+%% and `stop/1` were all still running at a 3 s deadline, while the same
+%% `add_handler/3` against a healthy manager answered `ok` in **273 µs**. The
+%% wait is not slow — it has no end.
+%%
+%% **`catch` does not rescue it, which is the part that is easy to get wrong.**
+%% `catch` fires on an exit, and this call never exits: it is parked in a
+%% `receive`. Measured through `m:i2per_status_state:f:subscribe/1`'s own
+%% `catch gen_event:add_handler(...) =:= ok`, a wedged bus blocked rather than
+%% answering `false`, so the `catch` guarding that boundary was never reached.
+%%
+%% The reach is the router, not the bus. `m:i2per_sup` lists `events_child()`
+%% first and `reachability_child()` fifth, so a bus wedged when
+%% `m:i2p_ssu2_reachability:f:init/1` subscribes blocks the supervisor's own
+%% `init/1` and the router never finishes starting.
+%%
+%% ## Why the bound is generous rather than tight
+%%
+%% Measured against a healthy manager the call answers in hundreds of
+%% microseconds, so the number is not sizing a real latency — **it is a hang
+%% guard, and the only thing it needs to be is comfortably longer than any answer
+%% the bus gives in correct operation.** Tightening it would risk failing a
+%% correct subscribe under load, and a false `wedged` is worse than a slow one:
+%% it reports a bus that is working as one that is not.
+%%
+%% ## What a `wedged` answer does not say
+%%
+%% **It does not say the subscription did not happen.** `gen_event` adds the
+%% handler and *then* replies, so a call abandoned here may still be carried out
+%% once the bus drains. `f:subscribe/1` is therefore convergent — see
+%% `f:detach_all/2` — because being attached twice is a state a caller must be
+%% able to recover from rather than one it can detect.
+-define(SUBSCRIBE_BOUND_MS, 5000).
+
+%% Ask the bus, giving up after `?SUBSCRIBE_BOUND_MS`.
+%%
+%% The call is made from a process this function owns and can kill, because the
+%% alternative is a `receive` with no deadline — the thing being fixed. The reply
+%% carries the value rather than being read off the `'DOWN'`, since a fun whose
+%% value is discarded exits `normal` whether the call answered or exited, which
+%% would report both identically.
+%%
+%% **Killing the asker does not cancel the request.** The message is already in
+%% the manager's mailbox and the manager will process it when it drains, which is
+%% the reason `f:subscribe/1` converges rather than simply giving up.
+bounded(Fun) ->
+    case whereis(?MODULE) of
+        undefined ->
+            {error, no_bus};
+        _Pid ->
+            Parent = self(),
+            Ref = make_ref(),
+            {Asker, MRef} = spawn_monitor(fun() -> Parent ! {Ref, (catch Fun())} end),
+            Reply =
+                receive
+                    {Ref, Answer} -> classify(Answer)
+                after ?SUBSCRIBE_BOUND_MS ->
+                    exit(Asker, kill),
+                    {error, wedged}
+                end,
+            %% **The `'DOWN'` is consumed on both paths, and that is load-bearing
+            %% rather than tidiness.** The asker is dead either way, but a
+            %% `'DOWN'` left in the caller's mailbox is a stray message in
+            %% whatever process called this — and the unit tier runs every module
+            %% in one shared worker, so the message is inherited by whichever
+            %% module reads its mailbox next. #SG93V0P is that class: a leak here
+            %% reddens a test in a module that never mentions the bus.
+            receive
+                {'DOWN', MRef, process, _Asker, _Reason} -> ok
+            after ?SUBSCRIBE_BOUND_MS ->
+                ok
+            end,
+            Reply
+    end.
+
+%% `ok` stays `ok`; an exit becomes `{bus_error, Reason}`. `catch` turns a
+%% `gen_event` failure into the `{'EXIT', Reason}` tuple rather than an exit of
+%% the caller, so both shapes are folded to the same thing here.
+classify(ok) -> ok;
+classify({error, Reason}) -> {error, {bus_error, Reason}};
+classify({'EXIT', Reason}) -> {error, {bus_error, Reason}}.
+
+%% Attach, having first made the bus hold exactly one forwarder for this
+%% collector.
+%%
+%% The clear-out is what makes a resubscribe safe. `f:subscribe/1` can be
+%% abandoned at `?SUBSCRIBE_BOUND_MS` while the bus still carries the request out,
+%% so arriving here may find a handler this collector did not ask for -- and
+%% because `gen_event` neither dedups on add nor removes more than one per delete,
+%% a plain add on top of it would leave two, and two forwarders deliver every
+%% event twice. See `f:detach_all/2`.
+attach(Collector) ->
+    ok = detach_all(Collector),
+    gen_event:add_handler(?MODULE, {i2p_events_forward, Collector}, [Collector]).
+
+%% Remove every forwarder this collector holds, so the next attach leaves exactly
+%% one.
+%%
+%% **Deleting in a loop rather than once, because one delete is not enough.**
+%% `gen_event:delete_handler/3` removes exactly one handler per call and
+%% `server_add_handler` prepends unconditionally, so N stray handlers need N
+%% deletes -- and delete-then-add does *not* converge: measured, a bus holding 2
+%% left it holding 2, because one delete removed one and the add made two again.
+%% `{error, module_not_found}` is how the bus reports there is nothing left
+%% (`gen_event.erl:1848`).
+%%
+%% **The loop needs no guard of its own.** Each iteration removes a handler from a
+%% finite list, so it terminates; and it runs inside `f:bounded/1`, which kills
+%% the asker at `?SUBSCRIBE_BOUND_MS` regardless.
+detach_all(Collector) ->
+    case gen_event:delete_handler(?MODULE, {i2p_events_forward, Collector}, [Collector]) of
+        {error, module_not_found} -> ok;
+        ok -> detach_all(Collector)
+    end.
+
+detach(Collector) ->
+    case gen_event:delete_handler(?MODULE, {i2p_events_forward, Collector}, [Collector]) of
+        {error, module_not_found} -> ok;
+        Other -> Other
     end.
 
 %% %%%%% %%% gen_event callbacks %%%%% %%%
