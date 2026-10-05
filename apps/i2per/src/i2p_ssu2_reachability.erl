@@ -53,7 +53,13 @@ status(AddrType) ->
 
 init([]) ->
     %% Subscribe to the bus so peer-test results keep the decision fresh.
-    _ = gen_event:add_handler(i2p_events, i2p_events_forward, [self()]),
+    %% Through the published entry point (#WGV1SZ7), which is bounded: a bus
+    %% wedged by a subscriber that never returns would otherwise park the
+    %% supervisor's own `init/1` here, and the router would never finish
+    %% starting. A refusal is deliberately not fatal — the reachability decision
+    %% still answers, it just stops tracking new peer tests, and the alternative
+    %% is a router that does not boot at all.
+    _ = i2p_events:subscribe(self()),
     State0 = #{status => maps:from_keys(?FAMILIES, undefined)},
     %% Emit the boot decision now instead of waiting for the first peer test.
     {ok, apply_decision(boot_decision(), State0)}.
@@ -80,7 +86,7 @@ handle_info(_Other, State) ->
     {noreply, State}.
 
 terminate(_Reason, _State) ->
-    _ = catch gen_event:delete_handler(i2p_events, i2p_events_forward, [self()]),
+    _ = i2p_events:unsubscribe(self()),
     ok.
 
 %% ----------------------------------------------------------------------

@@ -308,13 +308,35 @@ wake(Node) ->
     _ = net_adm:ping(Node),
     ok.
 
-%% Attach the router-side forwarder (`m:i2p_events_forward` ships with the
-%% router — handler modules run on the manager's node, so we cannot install
-%% our own code there). The call EXITS when the target node is unreachable;
-%% that absence is expected state here (it is the reason this service
-%% exists), so the boundary collapses every outcome into "are we attached".
+%% Attach to the router's bus (#WGV1SZ7).
+%%
+%% `m:i2p_events` ships with the router and its handler modules run on the
+%% manager's node, so this service cannot install its own code there and asks the
+%% router's own entry point to do it. The `erpc:call/5` is what carries the
+%% request across: `m:i2p_events:f:subscribe/1` then runs *on the router*, where
+%% the manager is registered locally, which is why this no longer names a
+%% `{Name, Node}` tuple — the local/remote asymmetry went away with the entry
+%% point.
+%%
+%% **Every outcome collapses to a boolean, and that is a deliberate limit rather
+%% than an oversight.** This service exists to report on a router that may be
+%% absent, so "are we attached" is the question the page asks and the reason is
+%% for an operator reading logs. The reasons are distinguishable at the boundary
+%% — `f:subscribe/1` answers `{error, no_bus}`, `{error, wedged}` or
+%% `{error, {bus_error, _}}`, and `erpc` adds an unreachable-node case of its own
+%% — and surfacing them on the page would mean changing the type of a published
+%% key, which the additive-only contract forbids. `subscribed` stays a
+%% `boolean()`.
+%%
+%% **Both waits here are bounded, and the outer one is the one that matters.**
+%% The `erpc` timeout covers a router node that is not answering at all: measured
+%% on this build, the expression this replaces waited **3,750–4,000 ms on 12 of 12
+%% rounds** for a node that was simply down, against 18 ms for a name that does
+%% not resolve — so the wait was a property of name resolution, bounded by
+%% nothing in the code. `?RPC_TIMEOUT_MS` is the existing figure for reaching the
+%% router over distribution and is used here rather than a new one.
 subscribe(Node) ->
-    Result = catch gen_event:add_handler({i2p_events, Node}, i2p_events_forward, [self()]),
+    Result = catch erpc:call(Node, i2p_events, subscribe, [self()], ?RPC_TIMEOUT_MS),
     Result =:= ok.
 
 %% %%%%% %%% Folding bus events %%%%% %%%

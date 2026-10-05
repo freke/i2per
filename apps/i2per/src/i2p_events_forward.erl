@@ -10,10 +10,14 @@ bus event as `{event, Event}` messages to any pid.
 
 ## Usage
 
+Subscribers do not call this module, or `gen_event`, at all: they call
+`m:i2p_events:subscribe/1`, which attaches this forwarder on their behalf. It
+stays exported because that entry point names it, and because it is the only way
+to reach a collector on another node without shipping code to the router.
+
 ```erlang
 %% from any connected node:
-ok = gen_event:add_handler({i2p_events, RouterNode},
-                           i2p_events_forward, [self()]).
+ok = erpc:call(RouterNode, i2p_events, subscribe, [self()], 5000).
 receive {event, E} -> ... end
 ```
 """.
