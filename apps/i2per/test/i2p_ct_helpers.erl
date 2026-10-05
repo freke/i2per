@@ -26,6 +26,10 @@
     await/1,
     await/2,
     wait_msg/2,
+    %% Run a self-scheduling `gen_server` callback in a process that is discarded
+    %% afterwards. See `f:in_throwaway/1` for the measurement that makes it
+    %% necessary and the one thing it does not solve.
+    in_throwaway/1,
     events_from/1,
     log_events_from/1,
     project_root/0,
@@ -314,6 +318,66 @@ db_store_block(0, Key, RI) when is_map(RI) ->
 db_store_block(Type, Key, Data) when is_binary(Data) ->
     #{body := Body} = i2p_i2np:db_store(Key, Type, 0, undefined, Data),
     {i2np, 1, 7, 0, Body}.
+
+%% %%%%% Running a callback where its side effects die with it %%%%% %%%
+%%
+%% **The whole unit tier runs in ONE process, and that is the fact this helper
+%% exists to work around.** Measured, not assumed: `rebar3 eunit --module=a,b,c`
+%% passes the module list to a single `f:eunit:test/1` call, and eunit reuses one
+%% worker across it. Two probe modules run through the real gate reported the same
+%% pid -- `<0.535.0>` -- for every test in both. Three *separate*
+%% `f:eunit:test/1` calls give three different pids, so the sharing is a property
+%% of the call, not of eunit: it is the justfile's one `--module=` flag that
+%% creates the shared worker. Common Test is the opposite and needs none of this --
+%% every testcase gets a fresh process and mailbox, which is why the rule below is
+%% about the eunit layer only.
+%%
+%% So a `gen_server` callback called directly in a test schedules into the worker,
+%% and the worker outlives the test. `m:i2per_status_state:handle_info(poll, _)`
+%% re-arms itself every five seconds, so a drain is not a fix: the timer that will
+%% produce the next message is still armed, and waiting long enough to be
+%% conclusive is slower than the whole suite. **A dead process takes its timers
+%% with it**, which is the only thing that is actually true here --
+%% `f:handle_info/2` is written for a process whose lifetime is the gen_server's,
+%% and the test is not that.
+%%
+%% Shared rather than copied per module, because there is already one caller whose
+%% reasoning is worth not losing (`i2per_status_state_tests`) and a second copy of
+%% a helper this particular -- whose own failure mode is a leaked `'DOWN'` -- is
+%% how the two start to differ.
+%%
+%% **What this does not solve.** `erlang:process_info(Pid, timers)` raises `badarg`
+%% at OTP 28, so a process's armed timers cannot be enumerated and there is no
+%% runtime census of them; only a trace on `erlang:send_after/3` can see them, and
+%% that needs the trace installed before the tier starts, which `rebar3 eunit` does
+%% not offer a hook for. The tree-wide check is therefore static --
+%% `i2p_shared_worker_tests` reads the eunit modules and fails on a direct call --
+%% and this helper is the escape hatch that rule points at.
+%%
+%% Both bounds answer, and they are different conditions: `callback_timeout` is a
+%% callback that never returned, `callback_would_not_die` is one that returned and
+%% then stayed alive. The second is the one that matters, because the `'DOWN'`
+%% flush is what keeps this helper from being the leak it prevents.
+-spec in_throwaway(fun(() -> Result)) -> Result.
+in_throwaway(Fun) ->
+    Parent = self(),
+    Ref = make_ref(),
+    {Pid, MRef} = spawn_monitor(fun() -> Parent ! {Ref, catch Fun()} end),
+    Reply =
+        receive
+            {Ref, Result} -> Result
+        after 5000 ->
+            exit({callback_timeout, Pid})
+        end,
+    %% Wait for the process to be gone before returning. It is already dead --
+    %% it answered and exited -- but the `'DOWN'` is still in this mailbox, and
+    %% leaving it there is the same class of leak this helper exists to stop.
+    receive
+        {'DOWN', MRef, process, _Pid, _Reason} -> ok
+    after 5000 ->
+        exit({callback_would_not_die, Pid})
+    end,
+    Reply.
 
 %% Poll `Fun` (a zero-arity predicate) until it returns true or the default
 %% 10-second deadline passes, then fail with error(timeout). No fixed sleeps.
