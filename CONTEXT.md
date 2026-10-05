@@ -136,3 +136,28 @@ succeeded. Cumulative here, counted since the router started.
 **Status view** — a single snapshot of a core's state, fetched in one call by a
 presentation app. A public contract: consumers other than the core depend on it,
 so its shape changes only additively within a version.
+
+## Observability
+
+**The bus** — the router-wide channel on which state changes are announced so
+something outside the core can follow them in real time. The core announces; it
+never interprets and never renders.
+
+**Announce** — to put one state change on the bus. Cheap, best-effort, and never
+allowed to fail the work that reported the change.
+
+**Subscriber** — something that receives announced events. May be in the core or
+in a separate presentation app on another node.
+
+**Notified** — that an event was put on the bus. Counted. Says what the router
+*did*, not what anyone received.
+
+**Delivered** — that an event reached a subscriber. **Not counted anywhere**, and
+knowing why is load-bearing: delivery happens inside the process that fans events
+out, so a count of it would have to be maintained by the thing most likely to
+fail. Notified and delivered are therefore different figures and are not
+interchangeable — a rising notified count says nothing about receipt.
+
+The log is the **witness** where the bus is the instrument: a fact on the bus is
+not also written to the log except at a level that is off by default. That is the
+distinction, and it is a discipline rather than a preference — see ADR 0002.
