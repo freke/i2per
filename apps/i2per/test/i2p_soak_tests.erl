@@ -297,7 +297,183 @@ bytes_mb_and_words_mb_are_different_scales_test() ->
     ?assertEqual("1.00 MB", i2p_soak_census:bytes_mb(1048576)),
     ?assertEqual("1.00 MB", i2p_soak_census:words_mb(131072)).
 
+%% %%%%% %%% %%% Retained heap needs a barrier, not a request %%%%% %%%
+
+%% `erlang:garbage_collect/1` answers `true` once the request has been **sent**.
+%% The collection happens when the target is next scheduled, so a reading taken
+%% straight afterwards samples whatever the target had already collected. Measured
+%% on this build against the router's own processes: `376, 233, 376, 233, 376,
+%% 233` for one process asked to collect six times, and `152022, 101621, 148473,
+%% 101621, 148473` node-wide.
+%%
+%% **There is deliberately no case asserting that oscillation.** It is
+%% load-dependent -- an idle process gets collected before the read and does not
+%% wobble -- so a case pinning it would be red on a quiet runner and green on a
+%% loaded one. The maintainer's rule is that such a case is a defect rather than a
+%% flake to re-roll, so the property tested is the one below: with the barrier,
+%% re-offering the same garbage does not move the reading.
+repeated_dirty_then_collect_leaves_the_reading_unchanged_test() ->
+    Pid = dirty(),
+    try
+        First = heap_after(Pid),
+        Later = [
+            begin
+                dirty_in(Pid),
+                heap_after(Pid)
+            end
+         || _ <- lists:seq(1, 5)
+        ],
+        ?assertEqual(1, length(lists:usort([L - First || L <- Later])))
+    after
+        exit(Pid, kill)
+    end.
+
+%% The barrier must not kill the process it measures, and must not be a
+%% `gen_server:call`: this tree's managers die on an unhandled call, and a
+%% measurement that takes the router down is not a measurement. `i2p_netdb_srv`
+%% is the one that proved it -- a `status` call killed it during the probe that
+%% found this.
+the_collect_barrier_leaves_the_process_alive_test() ->
+    Pid = dirty(),
+    try
+        ok = i2p_soak_census:collect([Pid]),
+        ?assert(is_process_alive(Pid))
+    after
+        exit(Pid, kill)
+    end.
+
+%% A target that cannot answer the barrier -- because it is not a `proc_lib`
+%% process -- must cost the timeout once and then be skipped, not stall the run
+%% and not be silently treated as collected. Measured at 5000 us against a bare
+%% `spawn`, which is why the timeout is 500.
+a_target_that_cannot_answer_costs_one_timeout_test() ->
+    Bare = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    try
+        {Micros, ok} = timer:tc(fun() -> i2p_soak_census:collect([Bare]) end),
+        ?assert(Micros >= 500000),
+        ?assert(Micros < 2000000),
+        ?assert(is_process_alive(Bare))
+    after
+        exit(Bare, kill)
+    end.
+
+%% `f:retained/1` reads only the pids it was given. A reading that swept the node
+%% would be both slower and noisier: `sys:get_status/1` against a kernel process
+%% takes seconds per call and logs `unexpected message` from `erts_trace_cleaner`,
+%% `socket-registry` and the `global_name_server`.
+retained_reads_only_the_pids_it_was_given_test() ->
+    Pid = dirty(),
+    try
+        Census = i2p_soak_census:retained([Pid]),
+        ?assertEqual([Pid], maps:keys(Census))
+    after
+        exit(Pid, kill)
+    end.
+
+%% The offset-binary blind spot, restated for the retained reading: a process
+%% holding a large refc binary reports almost no `total_heap_size`, so a retained
+%% reading that ignored `binary` would report a megabyte-holding process as holding
+%% nothing.
+retained_counts_a_refc_binary_that_heap_alone_cannot_test() ->
+    {Leaker, _Ref} = i2p_soak_selfcheck:seed_leaky_process(self(), ?BYTES),
+    try
+        fill(Leaker),
+        Words = i2p_soak_census:words(i2p_soak_census:retained([Leaker])),
+        %% The binary contributes its full 4 MB in words; the rest is the one-block
+        %% heap the leaker lives on, which is small beside it.
+        ?assertMatch(_ when Words >= ?BYTES div 8, Words),
+        ?assertMatch(_ when Words < ?BYTES div 8 + 4096, Words)
+    after
+        i2p_soak_selfcheck:stop_fixtures([Leaker])
+    end.
+
+%% **The defect this case exists to pin.** `m:i2p_soak_selfcheck`'s leaker used to
+%% bind its binary, measure it with `byte_size/1` and never mention it again, so a
+%% forced collection reclaimed it: the fixture meant to prove a census sees
+%% retention was actually reporting uncollected garbage, and passed every check
+%% built on it because nothing had collected the heap yet.
+%%
+%% `f:retained/1` forces the collection and waits for it, which is what exposed it
+%% -- 4 MB before, 233 words after. Without this case the fixture can go back to
+%% allocating and dropping, and every check that uses it will still be green,
+%% because the binary is still sitting in a heap nobody has collected.
+the_seeded_leaker_retains_rather_than_allocating_and_dropping_test() ->
+    {Leaker, _Ref} = i2p_soak_selfcheck:seed_leaky_process(self(), ?BYTES),
+    try
+        fill(Leaker),
+        Words = i2p_soak_census:words(i2p_soak_census:retained([Leaker])),
+        ?assertMatch(_ when Words >= ?BYTES div 8, Words),
+        %% And it stays that way: a second forced collection must not shrink it,
+        %% which is the difference between holding and having merely allocated.
+        ?assertEqual(Words, i2p_soak_census:words(i2p_soak_census:retained([Leaker])))
+    after
+        i2p_soak_selfcheck:stop_fixtures([Leaker])
+    end.
+
+%% `f:words/1` is the one place the conversion happens: binary bytes are counted
+%% in bytes by `process_info/2` and in words by `total_heap_size`, so adding them
+%% raw would overstate every binary figure eightfold.
+words_converts_off_heap_binary_into_words_test() ->
+    Sample = #{
+        module => x, mailbox => 0, reductions => 0, heap_words => 0, binary_bytes => 8 * 1048576
+    },
+    ?assertEqual(1048576, i2p_soak_census:words(#{p => Sample})).
+
+%% %%%%% %%% %%% ETS %%%%% %%%
+
+%% Named tables only, and a vanished table is skipped rather than recorded as
+%% zero -- absence is not a reading of nothing, which is the reason the census
+%% treats a dead process the same way.
+ets_bytes_reports_named_tables_as_non_negative_test() ->
+    Table = ets:new(i2per_soak_named_probe, [named_table, public]),
+    true = ets:insert(Table, {k, v}),
+    try
+        Bytes = i2p_soak_census:ets_bytes(),
+        ?assert(is_map_key(i2per_soak_named_probe, Bytes)),
+        ?assert(maps:get(i2per_soak_named_probe, Bytes) > 0),
+        ?assert(lists:all(fun(V) -> is_integer(V) andalso V >= 0 end, maps:values(Bytes)))
+    after
+        ets:delete(Table)
+    end.
+
 %% %%%%% %%% %%% Helpers %%%%% %%%
+
+%% A `gen_server` that holds a big referenced binary and, on `dirty`, builds and
+%% drops a larger one. It must be a `gen_server`, not a bare spawn and not a
+%% plain `proc_lib:spawn`: the barrier `f:collect/1` sends a system message, and
+%% only a `proc_lib`/`gen` loop handles those. Verified against the router's own
+%% children -- all such processes -- where `collect/1` takes **2 us**, not a
+%% full timeout.
+dirty() ->
+    {ok, Pid} = i2p_soak_fixture_server:start(),
+    ok = i2p_soak_fixture_server:dirty(Pid),
+    Pid.
+
+dirty_in(Pid) ->
+    i2p_soak_fixture_server:dirty(Pid),
+    ok.
+
+%% The leaker reports **after** allocating, so waiting for the message cannot be
+%% reordered before the allocation it reports -- that is what makes it a barrier
+%% rather than a hope.
+fill(Leaker) ->
+    Leaker ! {fill, ?BYTES},
+    receive
+        {leaky, _Pid, Bytes} -> Bytes
+    end.
+
+heap(Pid) ->
+    {total_heap_size, Words} = erlang:process_info(Pid, total_heap_size),
+    Words.
+
+%% Clamp the fixture with the barrier and return the post-collection reading.
+heap_after(Pid) ->
+    ok = i2p_soak_census:collect([Pid]),
+    heap(Pid).
 
 ok_of(#{ok := Ok}) -> Ok.
 

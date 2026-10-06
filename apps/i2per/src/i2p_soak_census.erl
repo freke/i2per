@@ -57,6 +57,7 @@ that look identical in a single window — see `f:verdict/2`.
 
 -export([census/0, snapshot/0, delta/2, verdict/3, top_consumers/2, top_mailboxes/2]).
 -export([words_mb/1, bytes_mb/1, require_non_empty/1, format_table/1]).
+-export([sample/1, collect/1, retained/1, ets_bytes/0, words/1, retained_words/1]).
 
 -export_type([census/0, sample/0, growth/0, delta/0, verdict/0, retention/0, row/0]).
 
@@ -174,7 +175,7 @@ Output: `{ok, Census}`.
 """.
 -spec census() -> {ok, census()}.
 census() ->
-    read(erlang:processes(), #{}).
+    sample(erlang:processes()).
 
 -spec read([pid()], census()) -> {ok, census()}.
 read([], Acc) ->
@@ -187,7 +188,7 @@ read([Pid | Rest], Acc) ->
             %% is a process that was not there.
             read(Rest, Acc);
         Info ->
-            read(Rest, Acc#{Pid => sample(Info)})
+            read(Rest, Acc#{Pid => reading(Info)})
     end.
 
 %% `maps:from_list/1` on the proplist, because `erlang:process_info/2` returns a
@@ -196,8 +197,8 @@ read([Pid | Rest], Acc) ->
 %% rather than a `proplists:get_value/2` that would quietly default to 0 on a
 %% key the OTP stops sending. See the module doc for the bug this module exists
 %% to make impossible: an absent reading silently becoming a zero.
--spec sample([{atom(), term()}]) -> sample().
-sample(Proplist) ->
+-spec reading([{atom(), term()}]) -> sample().
+reading(Proplist) ->
     Info = maps:from_list(Proplist),
     #{
         module => module_of(maps:get(current_function, Info, undefined)),
@@ -250,6 +251,128 @@ Input: a `t:census/0`. Output: `{ok, Census}` or `{error, empty_census}`.
 -spec require_non_empty(census()) -> {ok, census()} | {error, empty_census}.
 require_non_empty(Census) when map_size(Census) =:= 0 -> {error, empty_census};
 require_non_empty(Census) -> {ok, Census}.
+
+%% %%%%% %%% %%% Retained heap: the reading a bare census cannot give %%%%% %%%
+
+%% Long enough that a busy process is not mistaken for one whose collection
+%% never happened, and short enough that a process which cannot answer the
+%% barrier does not stall the run. Measured on this build: `collect/1` over the
+%% ten processes `m:i2per_sup` holds answers in **2 us** in total, so this is
+%% roughly six orders of magnitude of headroom for a loaded one -- while a target
+%% that cannot answer costs exactly this once per pid, which is the price of not
+%% noticing.
+-define(BARRIER_TIMEOUT_MS, 500).
+
+-doc """
+Read `Pids` into a census, and return it.
+
+**The one reading path.** \`f:census/0\` is this over the whole node, and
+\`f:retained/1\` is this over a named set after a forced collection — so a field
+added to \`f:sample/1\` is a field every caller reads, and there is no second
+place where a reading is taken.
+""".
+-spec sample([pid()]) -> {ok, census()}.
+sample(Pids) ->
+    read(Pids, #{}).
+
+-doc """
+Force a full garbage collection in each of `Pids` and return once it has happened.
+
+**This exists because `erlang:garbage_collect/1` is a request and not a
+barrier.** It answers `true` once the request has been *sent*; the collection
+happens when the target is next scheduled. A census that reads
+`total_heap_size` straight afterwards samples whatever the target had already
+collected, which is not retention.
+
+Measured on this build — force a collection in `m:i2p_tunnel_srv`, churn 1 MB of
+provably-unreachable garbage into it, read immediately. Six samples:
+
+    376, 233, 376, 233, 376, 233
+
+and across the whole node, `152022, 101621, 148473, 101621, 148473`. The
+oscillation is the request landing, or not landing, before the read.
+
+The barrier is `sys:get_status/2`, which is `proc_lib`'s own system message and
+is handled **before** a module's callbacks, so it bypasses `handle_call`
+entirely. That matters because this tree's managers are strict: a `status` call
+to `m:i2p_netdb_srv` **kills it** (measured), so a `gen_server:call` barrier is
+not available in general and would turn a measurement into an outage.
+
+**The pid list is the caller's, and it should be the router's own processes.**
+`sys:get_status/1` against a kernel process does not merely fail: it takes
+seconds per call and logs `unexpected message` from `erts_trace_cleaner`,
+`socket-registry` and the `global_name_server`. Sweeping the whole node is
+therefore both slow and noisy, which is why the whole-node census in
+`f:census/0` stays as it is for the readings that do not need a collection to be
+meaningful.
+
+**The targets must be `proc_lib` processes**, because the barrier *is* a system
+message and only a `proc_lib` loop handles those. Every process this harness reads
+is one -- the supervisor's children and the tunnel manager. A target that cannot
+answer costs `?BARRIER_TIMEOUT_MS` once and is then skipped, so a mistargeted pid
+degrades the reading rather than stalling the run.
+
+Input: the pids. Output: `ok`.
+""".
+-spec collect([pid()]) -> ok.
+collect(Pids) ->
+    lists:foreach(fun(Pid) -> erlang:garbage_collect(Pid) end, Pids),
+    lists:foreach(fun(Pid) -> catch sys:get_status(Pid, ?BARRIER_TIMEOUT_MS) end, Pids),
+    ok.
+
+-doc """
+Read `Pids` after forcing a collection in each, and return their retained heap.
+
+Input: the pids. Output: a `t:census/0` holding only those pids.
+
+**Same reading path as `f:census/0`** (via `f:sample/1`) — what differs is the
+collection in front of it, which is what makes the figure mean *retained* rather
+than *allocated since the last collection*.
+
+For scale on what that is worth: `m:i2p_netdb_srv` reads **609** words before a
+forced collection and **233** after, and #VH7Z0KJ measured the bus manager at
+92,844 against 233 live. The gap is not a rounding error — it is most of the
+figure a bare census would report as retention.
+""".
+-spec retained([pid()]) -> census().
+retained(Pids) ->
+    ok = collect(Pids),
+    {ok, Census} = sample(Pids),
+    Census.
+
+-doc """
+Bytes held in ETS tables, keyed by table name.
+
+**Named tables only.** `ets:info/2` takes an atom, and this node's tables mix
+named ones (`i2per_netdb_routers`, `i2p_ssu2_sessions`, ...) with anonymous ones
+addressed by a reference, for which there is no name to read under. Summing the
+anonymous ones too would be more complete and is deliberately not done: the NetDb
+is the store this harness is about, and a figure that folds in the runtime's own
+tables reports the runtime rather than the router.
+
+A table that disappears between the enumeration and the read is skipped rather
+than recorded as zero, for the reason a dead process is skipped — absence is not
+a reading of nothing.
+""".
+-spec ets_bytes() -> #{atom() => non_neg_integer()}.
+ets_bytes() ->
+    maps:from_list([
+        {Name, Bytes}
+     || Name <- ets:all(),
+        is_atom(Name),
+        Bytes <- [ets_bytes_of(Name)],
+        is_integer(Bytes)
+    ]).
+
+-spec ets_bytes_of(atom()) -> non_neg_integer() | undefined.
+ets_bytes_of(Name) ->
+    try ets:info(Name, memory) of
+        undefined -> undefined;
+        Bytes when is_integer(Bytes) -> Bytes
+    catch
+        %% Gone between `ets:all/0` and this read.
+        error:badarg -> undefined
+    end.
 
 %% %%%%% %%% The comparison %%%%% %%%
 
@@ -393,7 +516,7 @@ the quiet window after the load stopped), and the number of events offered.
 Output: `t:verdict/0`.
 """.
 -spec verdict(delta(), delta(), non_neg_integer()) -> verdict().
-verdict(#{survivors := Loaded}, #{survivors := Drained}, Offered) ->
+verdict(Loaded, Drained, Offered) ->
     Held = retained_words(Loaded),
     Released = retained_words(Drained),
     #{
@@ -405,14 +528,54 @@ verdict(#{survivors := Loaded}, #{survivors := Drained}, Offered) ->
     }.
 
 %% Words retained, summed over the processes read in both snapshots.
-%% `binary_bytes` is divided by 8 so it shares a unit with `heap_words`;
-%% conflating the two would overstate every off-heap figure eightfold.
--spec retained_words(#{pid() => #{module := module(), growth := growth()}}) -> integer().
-retained_words(Survivors) ->
-    lists:sum([
-        maps:get(heap_words, G) + maps:get(binary_bytes, G) div 8
-     || {_, #{growth := G}} <- maps:to_list(Survivors)
-    ]).
+-doc """
+Words a `t:delta/0`'s survivors gained or gave back, summed.
+
+Input: a `t:delta/0`. Output: a signed word count.
+
+**The delta-side twin of `f:words/1`**, and it exists as an accessor because a
+caller comparing two phases needs "how much did the processes that survived both
+readings move" without reaching into the `survivors` map to get it. An `arrived`
+or `departed` pid is not in that sum, because one of the two readings does not
+exist and the absence is not a reading of zero -- the reason `f:delta/2` returns
+three disjoint sets rather than one.
+""".
+-spec retained_words(delta()) -> integer().
+retained_words(#{survivors := Survivors}) ->
+    lists:sum([sample_words(Growth) || {_, #{growth := Growth}} <- maps:to_list(Survivors)]).
+
+-doc """
+Words for one heap-or-growth reading, with off-heap binary folded in correctly.
+
+`binary_bytes` is divided by 8 so it shares a unit with `heap_words`. Conflating
+the two would overstate every off-heap figure eightfold.
+
+**The single formula behind both** `f:words/1` (which sums a census) and
+`f:verdict/3` (which sums a delta's survivors), so the figure a report prints per
+phase and the figure the verdict classifies on cannot drift apart.
+""".
+-spec sample_words(#{heap_words := non_neg_integer(), binary_bytes := non_neg_integer()}) ->
+    integer().
+sample_words(#{heap_words := H, binary_bytes := B}) ->
+    H + B div 8.
+
+-doc """
+Words of memory a census accounts for, summed over every process in it.
+
+**The one place this arithmetic exists**, so a caller that sums a census and the
+verdict that sums a delta cannot drift apart — which is the tree's rule that data
+is never duplicated, applied to a formula rather than a constant.
+
+Off-heap refc-binary memory is divided by 8 so it shares a unit with
+`total_heap_size`. Conflating the two would overstate every binary figure
+eightfold, and a harness that reports eight times the memory it measured is a
+harness nobody believes.
+
+Input: a `t:census/0`. Output: a signed word count.
+""".
+-spec words(census()) -> integer().
+words(Census) ->
+    lists:sum([sample_words(S) || S <- maps:values(Census)]).
 
 -spec classify(integer(), integer()) -> retention().
 classify(Held, _Released) when Held =< 0 ->
