@@ -158,8 +158,8 @@ subscribe_returns_when_the_bus_is_wedged() ->
 %% so this is available before the wedge exists.
 %%
 %% **The `'DOWN'` clause is here so a bus that dies is reported as what it is** --
-%% the heap bound firing on ordinary traffic -- rather than as a handler that
-%% never attached, which would point the reader at the wrong thing.
+%% a death, rather than as a handler that never attached, which would point the
+%% reader at the wrong thing.
 await_wedged_added(Bus, Down) ->
     receive
         {wedged_handler, added, Pid} ->
@@ -313,124 +313,149 @@ manager_callbacks_test() ->
     ?assertEqual(ok, i2p_events:terminate(any, [])),
     ?assertEqual({ok, []}, i2p_events:code_change(0, [], [])).
 
-%%% %%%%% The bound on the manager's heap %%%%% %%%
+%%% %%%%% The backlog gauge %%%%% %%%
 
-%% The bound is in force on the running bus, not merely present in the source.
+%% The manager carries no heap bound, and that is asserted rather than left to the
+%% source.
 %%
-%% **This case exists because the obvious implementation is inert.** `max_heap_size`
-%% in `m:i2per_sup`'s child spec is silently ignored at OTP 28.5 / stdlib 7.3.0.2:
-%% the manager reported `#{size => 0}` and survived a 93,609,153-word heap. A case
-%% that only read the constant would stay green through that. Asserting on the
-%% live process's own `max_heap_size` is what distinguishes "the option reached
-%% the manager" from "a number is written down somewhere".
-manager_reports_its_bound_test() ->
+%% **A case that only read the source would have caught the removal but not the
+%% reason for it.** The bound was removed because measurement showed it could not
+%% fire for the case it was adopted for (a wedged handler never collects, so
+%% `max_heap_size` is never evaluated) and did fire on ordinary load instead (two
+%% producers killed a healthy manager at a queue depth of 487). `m:i2p_events`
+%% carries both measurements. What this case pins is the shape the removal leaves
+%% behind: no limit, and a gauge that reports the backlog instead.
+manager_carries_no_heap_bound_test() ->
     {ok, _} = application:ensure_all_started(i2per),
-    {max_heap_size, #{size := Size}} = process_info(whereis(i2p_events), max_heap_size),
-    ?assertEqual(i2p_events:max_heap_words(), Size).
+    {max_heap_size, Limit} = process_info(whereis(i2p_events), max_heap_size),
+    %% `#{size := 0}` is how the runtime reports "no limit", and it is the same
+    %% value a child-spec key that was silently ignored produced -- so this
+    %% distinguishes "no bound by decision" from "no bound by accident", which
+    %% are the two states that look identical from the source.
+    ?assertEqual(0, maps:get(size, Limit, 0)).
 
-%% A backlog past the bound **kills** the bus rather than letting it keep growing.
+%% The backlog gauge reports the manager's queue depth, and reports it while the
+%% manager is wedged.
 %%
-%% **The GC is forced, and that is the honest shape of the property.** A case that
-%% just queued events and waited for a `'DOWN'` failed, and the reason is the
-%% finding this ticket turned on: `max_heap_size` is evaluated **at garbage
-%% collection**, and a manager parked inside `handle_event/2` performs none —
-%% measured, `minor_gcs` delta **0** while the mailbox grew to 14,400,089 words
-%% (1.2M messages) under a 300,000-word bound, still alive. So a wedged bus does
-%% not hit the bound by itself.
+%% **The wedge is asserted, not assumed.** Without it this case would pass against a
+%% perfectly healthy bus reading 0, which is the same answer for the wrong reason --
+%% so the handler is entered and the queue is grown past the threshold before the
+%% reading is taken.
 %%
-%% The bound is still load-bearing, and this is where it bites: the moment the
-%% manager does collect, the backlog is fatal. `erlang:garbage_collect/1` is the
-%% BIF that makes that happen, so the case asserts the mechanism rather than
-%% asserting a coincidence of scheduler timing — which is what the unwaited
-%% version was doing, and why it was a flake waiting to be born.
-%%
-%% **The wedge is asserted, not assumed.** A backlog only accumulates because the
-%% manager is not reading its mailbox, so the case proves the manager is inside
-%% `handle_event/2` before flooding; otherwise it would pass for the wrong reason.
-bus_past_the_bound_is_killed_rather_than_left_growing_test_() ->
-    {timeout, ?FLOOD_TESTCASE_TIMEOUT_SECONDS, fun bus_past_the_bound_is_killed/0}.
+%% **This is the property the bound could not provide, and it is what makes the
+%% removal safe.** Every `f:gen_event` call is an rpc to the manager, so the
+%% management API is unavailable exactly when an operator needs a reading --
+%% `gen_event:which_handlers/1` and `gen_event:sync_notify/2` were both measured not
+%% answering after 1500ms against a manager parked in `handle_event/2`.
+%% `process_info/2` is a different kind of call: measured answering in **0us** at
+%% every sample while the depth grew past 2.8 million. The gauge is built on the call
+%% that survives the fault, which is the whole reason it can report one.
+backlog_gauge_reports_a_wedged_manager_test_() ->
+    {timeout, ?FLOOD_TESTCASE_TIMEOUT_SECONDS, fun backlog_gauge_reports_a_wedged_manager/0}.
 
-bus_past_the_bound_is_killed() ->
+backlog_gauge_reports_a_wedged_manager() ->
     {ok, _} = application:ensure_all_started(i2per),
     Bus = whereis(i2p_events),
-    ok = gen_event:add_handler(i2p_events, i2p_test_wedged_handler, [self()]),
+    Down = erlang:monitor(process, Bus),
+    ok = gen_event:add_handler(Bus, i2p_test_wedged_handler, [self()]),
+    %% **The handler's pid is stashed in the process dictionary rather than bound
+    %% to a variable, because it has to survive into the `after` clause.** Erlang
+    %% cannot rebind across `try`, and a variable bound inside the body is not
+    %% visible to the `after`. The dictionary is the one mutable thing a test
+    %% process has, and this is what it is for.
+    put(wedged_handler, undefined),
     try
-        Down = erlang:monitor(process, Bus),
         %% One announce drives the manager into `handle_event/2`, which is what
-        %% wedges it. Adding a handler does not call it -- `gen_event` only runs
-        %% `f:init/1` at add time -- so without this event the manager is healthy,
-        %% drains the flood as it arrives, and the case would pass having proved
-        %% nothing about a backlog.
+        %% wedges it. Adding a handler does not call it.
         ok = i2p_events:notify({leaseset_published, crypto:strong_rand_bytes(32)}),
-        _Handler = await_handler(Bus, Down),
-        Flooders = flood_past_the_bound(),
-        try
-            ok = backlogged_past_the_bound(Bus),
-            %% The one line that makes the bound decisive: the manager collects, so
-            %% the bound is evaluated, so the backlog is fatal.
-            true = erlang:garbage_collect(Bus),
-            receive
-                {'DOWN', Down, process, Bus, Reason} ->
-                    ?assertEqual(killed, Reason)
-            after ?FLOOD_DEADLINE_MS ->
-                erlang:error(bus_survived_a_collected_backlog)
-            end
-        after
-            erlang:demonitor(Down, [flush]),
-            [catch exit(P, kill) || P <- Flooders]
-        end
+        put(wedged_handler, await_wedged(Bus, Down)),
+        _Flooders = [spawn(fun() -> flood_announcements(20000) end) || _ <- lists:seq(1, 4)],
+        ok = await_backlogged(Bus, ?FLOOD_DEADLINE_MS),
+        %% The reading the operator would get. Taken through the public entry point
+        %% rather than by reading the queue directly, because the gauge is what the
+        %% read API carries and the two could disagree.
+        Depth = i2p_events:sample_backlog(),
+        ?assert(Depth > queued_events_needed()),
+        ?assertEqual(Depth, maps:get(bus_backlog, i2p_stats:gauges())),
+        %% And it is carried in the read API under `gauges`, beside the counters
+        %% rather than inside them. `view/0` itself is not called here: it reaches
+        %% `m:i2p_tunnel_srv` through a `gen_server:call`, which this module does not
+        %% start, and the wedge under test is exactly the condition under which a
+        %% caller must not be made to wait on the bus. `m:i2p_read_api_SUITE` asserts
+        %% `view/0`'s keys against `view_keys/0` on a whole router, and this asserts
+        %% the gauge the read API would carry.
+        ?assert(lists:member(gauges, i2p_status_data:view_keys()))
     after
+        %% **Release the handler, or the bus stays wedged for the rest of the tier.**
+        %% The eunit tier runs every module in one shared worker, so a manager left
+        %% parked in `handle_event/2` makes every later `f:gen_event` call in *any*
+        %% module hang -- which is how a defect in this case's cleanup showed up as a
+        %% timeout in `m:i2p_log_tests`, a module that never mentions the bus.
+        erase(wedged_handler),
+        discard_wedged_bus(Bus, Down),
         ensure_bus_back()
     end.
 
-%% Queue far past the bound and report the manager's own view of the damage.
+%% Kill a wedged bus and wait for it to actually be gone.
 %%
-%% **Asserted rather than assumed, because the flood is asynchronous.** The
-%% producers are spawned and this returns the moment they are running, not the
-%% moment the last message has landed, so a case that trusted that moment would be
-%% asserting on a partially-queued mailbox — the same unsoundness as asserting on
-%% an incomplete call list. `f:backlogged_past_the_bound/1` is the barrier.
-backlogged_past_the_bound(Bus) ->
+%% **Killing rather than releasing, and the released handler is why.** Releasing lets
+%% the handler return -- and it is *still attached*, so the next queued event wedges
+%% it again. The flood behind it is what remains, so the manager re-wedges before it
+%% ever reaches the queue's end and the bus never drains. A case that waited for a
+%% drain that cannot happen was a 40s timeout pretending to be a cleanup step.
+%%
+%% `f:ensure_bus_back/0` then restarts it, which is also the honest outcome: the
+%% bus has been wedged on purpose, and a fresh one comes back with no handlers -- the
+%% same silent detach the removed heap bound used to cause. Waiting on the `'DOWN'`
+%% is what makes this deterministic rather than a race with the next case.
+discard_wedged_bus(Bus, Down) ->
+    exit(Bus, kill),
+    receive
+        {'DOWN', Down, process, Bus, killed} ->
+            ok;
+        {'DOWN', Down, process, Bus, Reason} ->
+            erlang:error({bus_died_with_an_unexpected_reason, Reason})
+    after ?FLOOD_DEADLINE_MS ->
+        erlang:error(bus_survived_being_killed)
+    end.
+
+%% Announce `N` events.
+%%
+%% **`catch` is not defensive coding here, it is the expected outcome.** The manager
+%% is wedged, so `f:gen_event:notify/2` is a cast to a live process and does not
+%% raise; the `catch` covers the window in which it dies under us and the name is
+%% gone. A producer that outlived the bus would otherwise crash and take the case's
+%% own error report with it.
+flood_announcements(N) ->
+    Hash = crypto:strong_rand_bytes(32),
+    _ =
+        catch [
+            catch i2p_events:notify({leaseset_published, Hash})
+         || _ <- lists:seq(1, N)
+        ],
+    ok.
+
+%% Wait until the manager's queue is deeper than `queued_events_needed/0`.
+%%
+%% **A barrier, not a deadline.** `f:i2p_ct_helpers:await/2` polls a state predicate
+%% until a bound, which the standing preference treats as a barrier in disguise, so
+%% this is one: the assertion is about a depth that exists, and the depth is the
+%% evidence rather than a sleep that hopes it arrived.
+await_backlogged(Bus, Deadline) ->
     i2p_ct_helpers:await(
-        fun() -> element(2, process_info(Bus, message_queue_len)) > queued_events_needed() end,
-        ?FLOOD_DEADLINE_MS
+        fun() -> depth_of(Bus) > queued_events_needed() end,
+        Deadline
     ).
 
-%% How many queued events put the manager past `f:max_heap_words/0`.
+depth_of(Bus) ->
+    element(2, process_info(Bus, message_queue_len)).
+
+%% How deep the queue has to be for the reading to be evidence rather than noise.
 %%
-%% From the measured cost of one queued event -- ~12.33 words, see
-%% `m:i2p_events` -- the bound is crossed at roughly 24,000. Rounded up to 30,000
-%% so the assertion is about the backlog being real rather than about arithmetic
-%% landing on exactly the boundary.
+%% Rounded up from the measured ~12.33 words per queued event so the assertion is
+%% about the backlog being real rather than about arithmetic landing on a boundary.
 queued_events_needed() ->
     30000.
-
-%% The flood: eight producers, well past `f:queued_events_needed/0`. `notify/1` is a
-%% cast, so a producer never blocks and all of them finish regardless.
-flood_past_the_bound() ->
-    Hashes = [crypto:strong_rand_bytes(32) || _ <- lists:seq(1, 8)],
-    [
-        spawn(fun() -> [i2p_events:notify({leaseset_published, H}) || _ <- lists:seq(1, 30000)] end)
-     || H <- Hashes
-    ].
-
-%% Wait until the handler reports it has been entered, which is the proof the
-%% manager is parked inside `handle_event/2`.
-%%
-%% **The `'DOWN'` clause is here so a bus that dies before the wedge is reported
-%% as what it is** — a bound that fired on ordinary traffic — rather than as a
-%% handler that never arrived, which would send a reader looking at the wrong thing.
-await_handler(Bus, Down) ->
-    receive
-        {wedged_handler, entered, Pid} ->
-            Pid;
-        {wedged_handler, added, _Pid} ->
-            await_handler(Bus, Down);
-        {'DOWN', Down, process, Bus, Reason} ->
-            erlang:error({bus_died_before_wedging, Reason})
-    after ?FLOOD_DEADLINE_MS ->
-        erlang:error({handler_never_entered, Bus})
-    end.
 
 %% The bus is `permanent`, so the supervisor restarts it — but with zero handlers,
 %% and nothing re-attaches. That silent detach is the documented cost of the bound,

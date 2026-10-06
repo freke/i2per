@@ -53,22 +53,32 @@ first permanent child of the supervisor tree, so while any emitter runs the
 manager is up; discarding rare delivery failures keeps telemetry out of the
 data path instead of crashing working connections over it.
 
-**The manager's heap carries a bound**, `f:max_heap_words/0`, and crossing it kills
-the manager rather than letting the backlog grow without limit. A handler that never
-returns parks the manager inside `server_notify/4`, and the events behind it queue
-unbounded while `events_notified` climbs regardless — a status page silently frozen
-whose counter still moves.
+The manager starts before every subscriber, so a bus that is up is a bus something
+can already attach to. `m:i2per_sup` now lists `stats_child()` ahead of it, which
+changed the *first* claim here without changing the reason: the guarantee that
+matters is that the manager precedes `reachability_child()`, whose `init/1`
+subscribes.
 
-**Read the bound's limit before relying on it: it is evaluated at garbage
-collection, so it does not bound a bus that is already wedged.** That case is
-measured, not suspected — see the note on `?MAX_HEAP_WORDS` below. The bound is a
-defect detector on the manager's own heap, not a bound on the backlog a wedged
-handler accumulates; the latter is the gap this does not close.
+**A handler that never returns parks the manager inside `server_notify/4`,** and the
+events behind it queue without limit while `events_notified` climbs regardless — a
+status page silently frozen whose counter still moves.
+
+**That case is reported rather than bounded.** The backlog depth is sampled by
+`f:sample_backlog/0` and published as the `bus_backlog` gauge in `m:i2p_stats`, so it
+reaches the read API under `i2p_status_data:view/0`'s `gauges` key. The read works on
+a wedged manager — measured at 0us per sample against a depth of 2.8 million —
+because `process_info/2` does not go through the process it describes, while every
+`f:gen_event` call does. A depth alone does not distinguish a backlog from a wedge:
+what identifies the fault is a depth that does not fall, which is the consumer's to
+read.
+
+The manager carries **no** heap bound. One was measured and removed; the note on *Why
+there is no heap bound* below carries the measurements for and against it.
 """.
 
 -behaviour(gen_event).
 
--export([start_link/0, max_heap_words/0, notify/1, subscribe/1, unsubscribe/1]).
+-export([start_link/0, notify/1, subscribe/1, unsubscribe/1, sample_backlog/0]).
 
 -export([init/1, handle_event/2, handle_call/2, handle_info/2, terminate/2, code_change/3]).
 
@@ -149,131 +159,84 @@ lookup service not being running, where there is no key and nothing was asked fo
         i2p_lookup_srv:lookup_failed_reason()}
     | {config_changed, atom(), term()}.
 
-%% %%%%% The bound on the manager's heap %%%%% %%%
+%% %%%%% Why there is no heap bound on the manager %%%%% %%%
 %%
-%% ## What the bound is, and the one thing it does not do
+%% ## It was there, and the measurement said it could not do its job
 %%
-%% **It bounds the manager's heap, and it is a defect detector rather than a
-%% load-shedding valve:** correct operation never approaches it, so crossing it
-%% means something is wrong rather than that we are busy.
+%% The manager used to be spawned with `{max_heap_size, 300000}`, adopted to bound
+%% the backlog a wedged handler accumulates. Two measurements removed it, both on
+%% this build at OTP 28.5 / ERTS 16.4.0.6.
 %%
-%% **It does not bound the backlog behind a wedged handler, and this is the
-%% finding that shaped the whole ticket.** `max_heap_size` is evaluated **at
-%% garbage collection**. A handler that never returns parks the manager inside
-%% `server_notify/4` holding no data, so the manager allocates nothing, performs
-%% no GC, and the bound is never evaluated — while the events behind it queue
-%% unbounded. Measured on this build with this bound in force:
+%% **It could not fire for the case it was adopted for.** `max_heap_size` is
+%% evaluated *at garbage collection*. A handler that never returns parks the
+%% manager inside `server_notify/4` holding no data, so the manager allocates
+%% nothing, never collects, and the bound is never evaluated -- while the events
+%% behind it queue without limit. Measured with the bound in force: 1,200,000
+%% queued events, `total_heap_size` 14,400,089 words against a 300,000-word bound,
+%% still running, `minor_gcs` delta **0**. One `erlang:garbage_collect/1` and the
+%% same bus was killed.
 %%
-%% - 1,200,000 queued events → `total_heap_size` **14,400,089 words** against a
-%%   **300,000-word** bound → **still running**
-%% - `minor_gcs` delta over that flood: **0**
-%% - the same wedged bus, after one `erlang:garbage_collect/1` → **killed**
+%% **And it fired on ordinary load instead.** The number was sized at ~1000x a
+%% "legitimate peak" of 299 words measured with the mailbox *empty at every single
+%% observation*. A loaded manager does not look like that, because the bound is
+%% compared against `total_heap_size`, which measures heap *capacity* -- blocks,
+%% message buffer, stack, off-heap binary arena -- and not live data:
 %%
-%% So the bound is fatal to a backlog *once the manager collects*, and cannot fire
-%% at all for a manager that never will. The two are different claims and only the
-%% first is true of this mechanism. The A/B is what the case
-%% `m:i2p_events_tests` pins, and it is why that case forces a GC instead of
-%% waiting for a kill that a wedged bus will never deliver on its own.
+%% | manager | `total_heap_size` |
+%% |---|---|
+%% | idle | 233 |
+%% | after 400,000 events, fully drained (empty mailbox, status `waiting`) | **92,844** |
+%% | the same manager after one `erlang:garbage_collect/1` | **233** |
 %%
-%% ## Why `spawn_opt` and not the child spec
+%% So a drained manager's live footprint is 233 words while the same manager
+%% reports 92,844 -- 31% of the bound -- of uncollected garbage. Two producers
+%% then killed a *healthy* manager at a queue depth of **487** messages, with no
+%% subscriber attached at all and nothing wedged. Measured capacity is ~1M
+%% events/s, so the real headroom was ~1.6x dispatch capacity, not ~1000x.
 %%
-%% **A `max_heap_size` key in `m:i2per_sup`'s child spec is silently ignored at
-%% OTP 28.5 / stdlib 7.3.0.2, and that was measured rather than believed.** A
-%% `gen_event` child started with `max_heap_size => 2000` reported
-%% `max_heap_size => #{size => 0}` — no limit — and survived a heap of 93,609,153
-%% words. `supervisor.erl` in this stdlib contains no occurrence of the string
-%% `max_heap_size` at all, `child_spec()` has no such key, and an unrecognised key
-%% is not rejected, so a spec carrying one reads exactly like a closed backlog
-%% while bounding nothing. Hence the option is passed here, which is the only
-%% place it reaches the process: `{spawn_opt, [{max_heap_size, N}]}` on
-%% `gen_event:start_link/2` (`gen_event.erl:756`). Two other routes are closed too
-%% — `erlang:process_flag(Pid, max_heap_size, _)` on another process is `badarg`,
-%% and self-setting from `f:init/1` cannot work either, because `gen_event` starts
-%% the manager under `?NO_CALLBACK`, so `f:init/1` is the *event handler* callback
-%% and never runs in the manager's process.
+%% What it bought for all that was a kill that detaches every subscriber silently
+%% and permanently: `m:i2per_sup` restarts the bus with zero handlers and nothing
+%% re-attaches. Protecting against an unreachable case at the price of a reachable
+%% one is a bad trade, so the bound is gone and the backlog is **reported** instead.
 %%
-%% ## How the number was chosen
+%% ## What replaced it: a gauge, not a bound
 %%
-%% From measurement, in this order:
+%% **A handler that wedges the manager is now visible rather than bounded.** The
+%% backlog depth is sampled by `f:sample_backlog/0` and published through
+%% `m:i2p_stats:set_gauge/2` as `bus_backlog`, reaching the read API under
+%% `m:i2p_status_data:view/0`'s `gauges` key.
 %%
-%% - Baseline manager heap: **233 words**.
-%% - One queued `{notify, Event}`: **~12.33 words (~99 bytes)**, from a 20,000-event
-%%   wedge run (246,572 words of heap delta).
-%% - Legitimate peak with `f:notify/1` instrumented across the whole gate:
-%%   **299 words** over 223 CT cases (249 over 972 eunit), with the mailbox
-%%   **empty at every single observation**.
+%% **That is possible because the read does not go through the manager**, which is
+%% the property the bound lacked. Measured on a wedged manager, sampling every
+%% 200ms: `process_info(Pid, message_queue_len)` answered in **0us** every time,
+%% reporting a monotone 936,710 -> 2,803,109. `gen_event:which_handlers/1` -- the
+%% management API -- never answered at all, after 1500ms. So a report of the fault
+%% does not inherit the fault.
 %%
-%% That last fact is why the number is not the peak times a small multiple.
-%% `notify/1` is a cast, so the notifier never waits and correct operation builds
-%% no backlog at all — the peak is baseline plus a message or two in flight.
-%% **The peak cannot size a bound; it only proves the bound sits far from ordinary
-%% running.** The number is set from that distance: ~1000x the measured peak, so
-%% normal running cannot approach it, while a manager that *does* collect with a
-%% real backlog behind it dies immediately.
-%%
-%% **Three different figures, deliberately not interchangeable.** This is
-%% **300,000 words**, which is **2,400,000 bytes**, which is **~24,331 events** at
-%% the measured per-event cost. It bounds *bytes of heap*; the message count is a
-%% derived consequence, not a second limit — and per the paragraph above it is not
-%% even a limit, because an uncollected manager crosses no bound at all.
-%%
-%% ## What crossing it does, which is destructive and deliberate
-%%
-%% The manager is **killed**, and `m:i2per_sup` gives `i2p_events`
-%% `restart => permanent`, so the supervisor restarts it with **zero handlers** and
-%% nothing re-attaches: `m:i2p_ssu2_reachability` subscribes once in its
-%% `f:init/1`, and `m:i2per_status_state` re-subscribes only on `{nodeup, Node}`,
-%% which a restart on a live node never produces. Both detach silently and
-%% permanently.
-%%
-%% That is accepted rather than worked around, on the maintainer's standing rule
-%% that volatile data is volatile by design and its loss is not a defect: `m:i2p_stats`
-%% is a visualizer over counters that die with their process, and a restart of
-%% anything upstream is a smaller version of an event the system already handles
-%% deliberately. **A silent detach is the real cost, and it is why the log records
-%% matter:** the supervisor's report carries the size at death, so the bound firing
-%% is in the log even though the detach itself is not.
--define(MAX_HEAP_WORDS, 300000).
+%% **Depth alone does not say "wedged", and this should not pretend otherwise.**
+%% 300 messages for 10ms is ordinary traffic; the fault is a depth that does not
+%% fall. Reading that is the consumer's job -- `m:i2per_status_derive` already
+%% compares consecutive readings -- and it is deliberately not done here, because
+%% deciding what counts as stuck is the operator's policy rather than the core's.
 
 -doc """
-Start the manager.
+Start the manager, and the backlog sampler.
 
 Registered locally as `i2p_events`; called only by `m:i2per_sup` as the first
 child of the tree. Output: the usual `gen_event` start result.
 
-The manager is spawned with `max_heap_size` set to `f:max_heap_words/0`, which is
-why the bound lives here and not in the supervisor's child spec — a child-spec key
-is silently ignored at this OTP. The note on `?MAX_HEAP_WORDS` above carries both
-that measurement and the bound's real reach.
+**No `max_heap_size` on the manager, deliberately.** See *Why there is no heap
+bound* above for the two measurements that removed it and what replaced it.
 """.
 -spec start_link() -> {ok, pid()} | {error, term()}.
 start_link() ->
-    gen_event:start_link(
-        {local, ?MODULE}, [{spawn_opt, [{max_heap_size, ?MAX_HEAP_WORDS}]}]
-    ).
-
--doc """
-The manager's heap bound in **words**, as passed to `max_heap_size`.
-
-Exported so a case can assert the bound is actually in force on the running bus
-rather than inferring it from a source constant, and so the unit of the number is
-stated in one place. 300,000 words is ~2.4 MB and, at the measured cost of one
-queued event, ~24,000 events — three different figures, of which this is the one
-the runtime is actually given.
-
-**What it bounds, precisely:** the manager's own heap, evaluated at garbage
-collection. It does not bound the backlog a wedged handler accumulates, because
-such a manager never collects. See the note on `?MAX_HEAP_WORDS` for the
-measurement.
-""".
--spec max_heap_words() -> pos_integer().
-max_heap_words() ->
-    ?MAX_HEAP_WORDS.
-
-%% dialyzer reads through to the literal 300000 and calls the spec a supertype,
-%% which is true and useless here: the value is the point of the function, and
-%% narrowing the return type to the constant would put the number in two places.
--dialyzer({nowarn_function, [max_heap_words/0]}).
+    case gen_event:start_link({local, ?MODULE}) of
+        {ok, Pid} ->
+            ok = start_sampler(),
+            {ok, Pid};
+        Other ->
+            Other
+    end.
 
 -doc """
 Announce a status change.
@@ -290,6 +253,98 @@ notify(Event) ->
         _ ->
             _ = gen_event:notify(?MODULE, Event),
             ok
+    end.
+
+%% %%%%% %%% The backlog gauge %%%%% %%%
+%%
+%% ## What replaced the heap bound
+%%
+%% **A handler that wedges the manager is now visible rather than bounded.** The
+%% backlog depth is sampled by `f:sample_backlog/0` and published through
+%% `m:i2p_stats:set_gauge/2` as `bus_backlog`, reaching the read API under
+%% `m:i2p_status_data:view/0`'s `gauges` key.
+%%
+%% **The read works on a wedged manager, which is the property the bound lacked.**
+%% Every `f:gen_event` call is an rpc to the manager, so all of them are unavailable
+%% exactly when an operator needs a reading; `process_info/2` is a different kind of
+%% call. Measured on a manager parked inside `handle_event/2`, sampled every 200ms:
+%% `process_info(Pid, message_queue_len)` answered in **0us** every time, reporting
+%% a monotone 936,710 -> 2,803,109, while `gen_event:which_handlers/1` never
+%% answered at all after 1500ms. So a report of a wedged bus does not inherit the
+%% wedge -- and that is why the sampler is a separate process, because the manager
+%% is the thing that stops answering.
+%%
+%% ## Why the sampler is a linked spawn and not a child spec
+%%
+%% **The lifetime is the manager's, and linking gets it for free.** When the bus
+%% dies the sampler dies with it, and the supervisor's restart brings a new one. A
+%% child spec would need its own restart strategy for a process whose only reason to
+%% exist is reading a pid the manager owns.
+%%
+%% **5s is a measured choice, not a round number.** A depth sampled slower than the
+%% bus drains measures nothing -- the manager drains a 300,000-message flood in about
+%% a second -- and one sampled faster pays a `persistent_term` put per tick, which
+%% rehashes every term in the system. 5s is above the drain time and far below any
+%% interval an operator would call a freeze.
+
+%% How often the backlog gauge is refreshed. See the note above.
+-define(BACKLOG_TICK_MS, 5000).
+
+-doc """
+Sample the manager's queue depth, publish it, and emit it.
+
+Input: none. Output: the depth, as a non-negative integer.
+
+**Returns `0` when the manager is not running**, which is what the gauge should show
+rather than an error: there is no backlog when there is no bus.
+""".
+-spec sample_backlog() -> non_neg_integer().
+sample_backlog() ->
+    Depth = depth(),
+    ok = i2p_stats:set_gauge(bus_backlog, Depth),
+    %% Emitted so a future consumer attaches rather than polls. Nothing in this tree
+    %% attaches yet, and that is deliberate: the event is the seam, not a feature.
+    %% `telemetry:execute/3` with no handler attached is close to free.
+    _ = telemetry:execute([i2per, i2p_events], #{backlog => Depth}, #{}),
+    Depth.
+
+-spec start_sampler() -> ok.
+%% Sample once before waiting, so the gauge is populated from the moment the bus
+%% is up rather than after a full tick.
+%%
+%% **A gauge that is absent for its first tick is a fault a reader cannot tell from
+%% a fault it is meant to reveal.** `m:i2p_stats:gauges/0` reports a gauge it has
+%% never seen as *absent*, which is the correct distinction from "measured, and
+%% zero" -- but on the bus that means the read API carries no backlog figure at all
+%% for the first 5 seconds of the router's life, and a consumer polling at startup
+%% would see nothing. One immediate sample costs one `persistent_term` put at boot
+%% and makes the key's absence mean what it is supposed to mean: the sampler died.
+start_sampler() ->
+    _ = spawn_link(fun sample_loop/0),
+    _ = sample_backlog(),
+    ok.
+
+sample_loop() ->
+    receive
+        stop -> ok
+    after ?BACKLOG_TICK_MS ->
+        _ = sample_backlog(),
+        sample_loop()
+    end.
+
+%% `undefined` and `catch` rather than a bare match, because the manager can die
+%% between the `whereis` above and this read. Reporting that as depth 0 would make
+%% a dead bus look like a healthy idle one, which is the one thing this gauge exists
+%% to distinguish.
+depth() ->
+    case whereis(?MODULE) of
+        undefined ->
+            0;
+        Pid ->
+            case catch process_info(Pid, message_queue_len) of
+                {message_queue_len, N} -> N;
+                _ -> 0
+            end
     end.
 
 %% %%%%% %%% The published entry point %%%%% %%%
@@ -358,8 +413,8 @@ unsubscribe(Collector) when is_pid(Collector) ->
 %% `catch gen_event:add_handler(...) =:= ok`, a wedged bus blocked rather than
 %% answering `false`, so the `catch` guarding that boundary was never reached.
 %%
-%% The reach is the router, not the bus. `m:i2per_sup` lists `events_child()`
-%% first and `reachability_child()` fifth, so a bus wedged when
+%% The reach is the router, not the bus. `m:i2per_sup` lists `stats_child()` then
+%% `events_child()` ahead of `reachability_child()`, so a bus wedged when
 %% `m:i2p_ssu2_reachability:f:init/1` subscribes blocks the supervisor's own
 %% `init/1` and the router never finishes starting.
 %%

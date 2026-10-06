@@ -58,7 +58,12 @@ init_per_group(dist, Config) ->
         peer:start(#{
             %% No `host`: an IP would leak dots into a -sname and break it.
             name => i2per_status_dist_router,
-            args => ["-pa", ebin_dir()],
+            %% `-pa` takes ONE path per flag. A list as the second element adds one
+            %% directory, not several — which is why the list comprehension below
+            %% repeats the flag instead of concatenating the paths.
+            args => lists:append(
+                lists:map(fun(Dir) -> ["-pa", Dir] end, [ebin_dir() | dep_ebin_dirs()])
+            ),
             wait_boot => 30_000
         }),
     boot_remote_router(RNode),
@@ -234,6 +239,67 @@ ebin_dir() ->
     case filelib:is_dir(filename:join(RepoRoot, "_build/test/lib/i2per/ebin")) of
         true -> filename:join(RepoRoot, "_build/test/lib/i2per/ebin");
         false -> filename:join(BeamDir, "../../../lib/i2per/ebin")
+    end.
+
+%% Every dependency's `ebin`, for the peer router node.
+%%
+%% **`i2per`'s own directory is not enough.** The router node is started with a
+%% single `-pa`, and `f:application:ensure_all_started/1` on the remote node needs a
+%% `.app` file for *every* application in `i2per.app.src`'s `applications` list --
+%% so a dependency that is only in the build tree and not on the peer node's path
+%% fails the whole boot with `{no such file or directory, "telemetry.app"}`.
+%%
+%% Derived by walking `_build/test/lib/` rather than hardcoded, so a dependency
+%% added to `rebar.config` is found without editing a test. The one-app assumption
+%% this tree has today is checked rather than assumed: a dependency that is not a
+%% direct child of `lib/` would be missed silently, so that case fails loudly.
+dep_ebin_dirs() ->
+    LibDir = build_lib_dir(),
+    %% `file:list_dir/1` can answer `enoent`, and `lists:sort/1` on that is a
+    %% `function_clause` rather than a diagnosable failure -- so the listing is
+    %% matched first and the error reported as what it is.
+    case file:list_dir(LibDir) of
+        {ok, Names} ->
+            Deps = [
+                filename:join(LibDir, Name)
+             || Name <- lists:sort(Names),
+                %% rebar3's own scratch directory, not a dependency.
+                Name =/= ".rebar3",
+                Name =/= "i2per",
+                Name =/= "i2per_status"
+            ],
+            case [D || D <- Deps, filelib:is_dir(D)] of
+                [] ->
+                    ct:pal("no dependency directories under ~s", [LibDir]),
+                    [];
+                Found ->
+                    [filename:join(D, "ebin") || D <- Found]
+            end;
+        {error, Reason} ->
+            ct:pal("cannot list ~s: ~p", [LibDir, Reason]),
+            []
+    end.
+
+%% The build tree's `lib/` directory, found from where this suite's beams are.
+%%
+%% **Two layouts exist and only one of them is a source path.** Run from the source
+%% tree the beams are in `apps/i2per_status/test`; under `rebar3 ct` they are copied
+%% to `_build/test/lib/i2per_status/test`. Anchoring on `code:which(?MODULE)/../..`
+%% walks up three levels from either, which lands on the repo root in the first case
+%% and on `_build/test` in the second -- so the two cases are probed rather than
+%% assumed, the same way `ebin_dir/0` does it.
+build_lib_dir() ->
+    BeamDir = filename:dirname(code:which(?MODULE)),
+    Candidates = [
+        filename:join(BeamDir, "../../../lib"),
+        filename:join(BeamDir, "../../..")
+    ],
+    case [C || C <- Candidates, filelib:is_dir(C)] of
+        [LibDir | _] ->
+            LibDir;
+        [] ->
+            ct:pal("no lib/ directory found from ~s", [BeamDir]),
+            filename:join(BeamDir, "../../../lib")
     end.
 
 now_ms() ->

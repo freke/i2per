@@ -59,7 +59,16 @@ ok = i2p_stats:add(events_notified, 1),
 
 -behaviour(gen_server).
 
--export([start_link/0, add/2, snapshot/0, uptime_ms/0, boot_time/0, counters/0]).
+-export([
+    start_link/0,
+    add/2,
+    set_gauge/2,
+    snapshot/0,
+    gauges/0,
+    uptime_ms/0,
+    boot_time/0,
+    counters/0
+]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
@@ -472,6 +481,58 @@ snapshot() ->
     end.
 
 -doc """
+Set a live value, replacing any previous reading of the same name.
+
+Input: a name and a number. Output: `ok`, or `ok` when this process is not running.
+
+**Gauges are not counters, and the two are deliberately not interchangeable.** A
+counter accumulates and is read by differencing it between two readings; a gauge is
+a value at an instant and is overwritten. The one place the tree needs a live value
+is the bus's queue depth -- see `m:i2p_events:sample_backlog/0` -- and folding it
+into `f:counters/0` would break that array's one invariant: a counter that goes
+backwards is indistinguishable from a router restarting, which is exactly the
+ambiguity `f:add/2` refuses to create by rejecting a negative amount. A queue depth
+falls every time the bus catches up, so it cannot live there.
+
+**The write is a `persistent_term` put and that is a real cost.** `persistent_term`
+rehashes every term in the system on each write, which is why this exists at all
+rather than being free: it is cheap to *read*, which is the direction that happens
+on every status request and on every telemetry consumer. So the rule is one write
+per gauge per sampling interval and no more -- a gauge written from a packet path
+would be a defect. `f:i2p_events:sample_backlog/0` writes once per tick.
+
+Returns `ok` when the process is not running, for the same reason `f:add/2` does:
+telemetry must not be able to crash a working connection.
+""".
+-spec set_gauge(atom(), number()) -> ok.
+set_gauge(Name, Value) when is_number(Value) ->
+    case state() of
+        undefined ->
+            ok;
+        #{gauges := Gauges} = State ->
+            persistent_term:put(?PT_KEY, State#{gauges => Gauges#{Name => Value}})
+    end.
+
+-doc """
+Every live value, by name.
+
+Output: a map from gauge name to its most recent reading. A gauge is reported
+whether or not it has ever been set, so a consumer distinguishes "not measured yet"
+(the name is absent) from "measured, and zero" (present, value zero) -- the same
+distinction `f:snapshot/0` makes for counters. Empty when this process is not
+running.
+
+**Reading is one `persistent_term` fetch**, the same fetch `f:counters/0` needs, so
+a consumer that wants both pays one indirection rather than two.
+""".
+-spec gauges() -> #{atom() => number()}.
+gauges() ->
+    case state() of
+        undefined -> #{};
+        #{gauges := Gauges} -> Gauges
+    end.
+
+-doc """
 Milliseconds since the router's stats process started.
 
 Output: a non-negative integer, or `0` when this process is not running. Derived
@@ -511,6 +572,9 @@ init([]) ->
         ref => Ref,
         names => Names,
         index => maps:from_list(lists:zip(Names, lists:seq(1, length(Names)))),
+        %% Live values, kept beside the counters rather than inside them. See
+        %% `f:set_gauge/2` for why the two cannot be one array.
+        gauges => #{},
         boot_wall => erlang:system_time(millisecond),
         boot_mono => erlang:monotonic_time(millisecond)
     },

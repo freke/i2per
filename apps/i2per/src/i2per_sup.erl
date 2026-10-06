@@ -52,8 +52,14 @@ init([]) ->
     report_started_as(LocalSeeds),
     Children =
         [
-            events_child(),
+            %% Counter home before the bus, deliberately. `i2p_events:start_link/0`
+            %% samples the backlog gauge once before its first tick so the figure
+            %% exists from boot rather than after one interval -- and that sample is
+            %% a documented no-op while this process is absent. The other order left
+            %% the read API carrying no backlog at all for the first tick, with an
+            %% absent gauge indistinguishable from a sampler that had died.
             stats_child(),
+            events_child(),
             config_srv_child(),
             peer_rep_child(),
             reachability_child()
@@ -232,7 +238,10 @@ vsn() ->
         undefined -> "unknown"
     end.
 
-%% First child: the status event bus every other component announces on.
+%% The status event bus every other component announces on. Early, and ahead of
+%% everything that subscribes: `m:i2p_ssu2_reachability` attaches in its `init/1`,
+%% so a bus that is not yet up would block the supervisor rather than delay a
+%% subscription.
 events_child() ->
     #{
         id => i2p_events,
@@ -243,10 +252,10 @@ events_child() ->
         modules => [i2p_events]
     }.
 
-%% Second child, and early on purpose: the counter home. Nothing here blocks on
-%% it — `i2p_stats:add/2` is a no-op while it is absent — but the counters a
-%% transport increments on its first packet should not be the ones lost to a
-%% start order.
+%% First child: the counter home. Nothing blocks on it — `i2p_stats:add/2` and
+%% `i2p_stats:set_gauge/2` are no-ops while it is absent — but the counters a
+%% transport increments on its first packet should not be the ones lost to a start
+%% order, and the bus samples its backlog gauge once at startup.
 stats_child() ->
     #{
         id => i2p_stats,
