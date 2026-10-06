@@ -147,7 +147,22 @@ live-smoke flags="":
 release:
     bash scripts/build-release.sh
 
-# Run static analysis
+# %%%%% dialyzer: static analysis, and a release gate %%%%%
+#
+# **In `just check` as well as runnable alone**, because it used to be reachable
+# only by name while the README, the release notes and the map's Notes all listed
+# it as a gate. A check named `check` that skips one of the three static checks is
+# a gate whose coverage a reader has to guess at. See the note on `check` for why
+# it is ordered before `test`.
+#
+# **The `warnings` list is deliberately narrow** — `unmatched_returns`,
+# `error_handling`, `underspecs` — and **not** `unknown`. `unknown` is what the
+# core's cross-application calls would trip on any time a dependency is not in the
+# PLT, so the gate would fail on a well-typed call rather than on a defect, and a
+# gate that reports a lie is worse than an absent one. `plt_extra_apps` is what
+# keeps a real dependency analysable instead.
+#
+# Run static analysis (~49s here, cached against the PLT after the first run).
 dialyzer:
     rebar3 dialyzer
 
@@ -251,12 +266,27 @@ status:
 commit message:
     jj commit -m "{{message}}"
 
-# Run all quality checks: formatting, generated documentation, and every test.
+# Run all quality checks: formatting, generated docs, dialyzer, and every test.
 #
-# **An alias for `test`, kept because the release notes, the ADRs and the README
-# all say `just check`.** Renaming it would mean editing every one of those for
-# no gain, and two names for one command is cheaper than a stale reference to a
-# name that no longer exists. `test` is the primary spelling because that is what
-# the recipe *does*.
-# Run all quality checks: formatting, docs, and every test.
-check: lint doc test
+# **An alias for `test` plus `dialyzer`, kept because the release notes, the ADRs
+# and the README all say `just check`.** Renaming it would mean editing every one
+# of those for no gain, and two names for one command is cheaper than a stale
+# reference to a name that no longer exists. `test` is the primary spelling
+# because that is what the recipe *does*.
+#
+# **Dialyzer is here, and it used not to be.** `check` was `lint doc test` and
+# `test` was `lint doc` + eunit + CT, so nothing reachable from `check` invoked
+# dialyzer at all -- a recipe named `check` that skipped one of the three static
+# checks, while the README and the release notes listed it as a gate. The cost of
+# naming it was that a `plt_extra_apps` entry could be deleted and `check` would
+# stay green while dialyzer went red: the PLT is built from this project's own
+# applications, so a dep the core calls into becomes an unknown function, and only
+# the analysis says so.
+#
+# **Ordered before `test` deliberately.** Dialyzer reads source and does not depend
+# on which suites ran, so it can answer first and fail a run before the ~4 minutes
+# of eunit and CT spend themselves on a build that was never going to be analysed
+# anyway. It costs ~49s here against `test`'s ~4 minutes.
+#
+# Run all quality checks: formatting, docs, dialyzer, and every test.
+check: lint doc dialyzer test

@@ -229,6 +229,12 @@ jobs:
       - name: just dialyzer
         # `main` only, where there is time for it. It analyses source, not tests,
         # so its answer does not depend on which CT tier ran.
+        #
+        # **Invoked directly rather than through `just check`, which now includes
+        # dialyzer.** This step runs after `just test`, so taking it through
+        # `check` would run the tests a second time; the ordering here is also why
+        # `check` puts dialyzer *before* `test` locally — a type error should fail
+        # the gate before it spends four minutes on suites.
         run: devenv shell -- just dialyzer
 
   # %%%%% The compatibility job %%%%%

@@ -128,8 +128,9 @@ From the repository root — where the pinned environment is already on `PATH`:
 ```sh
 just smoke-test   # the push tier: lint, unit tests, most of the CT suites
 just test         # everything: lint, docs, all eunit, all CT, coverage
+just check        # the release gate: `just test` plus dialyzer
 just proper       # the property tests alone (also inside `just test`)
-just dialyzer     # static analysis
+just dialyzer     # static analysis alone (also inside `just check`)
 just live-smoke   # boot a throwaway router and print its network observables
 just doc          # regenerate the local ExDoc site in doc/
 ```
@@ -163,8 +164,12 @@ The tier boundaries are derived from the tree by `scripts/ct-suites.sh` (CT) and
 `scripts/eunit-modules.sh` (eunit/PropEr), so a new suite is in tomorrow's smoke
 run by default rather than by an edit someone has to remember.
 
-`just test` and `just dialyzer` are the release gates. `just check` is an alias
-for `just test`. `doc/` is generated output and is not committed. The repository
+`just check` is the release gate: `erlfmt`, the generated docs, dialyzer, and
+every test. It is an alias for `just test` plus `just dialyzer`, and dialyzer is
+run before the tests because it reads source and does not depend on which suites
+ran — so a type error fails the gate in ~49s rather than after the ~4 minutes of
+eunit and CT. Dialyzer is separately runnable because the `compat` CI job invokes
+it on its own. `doc/` is generated output and is not committed. The repository
 test suite is part of the release quality process.
 
 ## Run the packaged release

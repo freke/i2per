@@ -110,10 +110,10 @@ inputs.
 - `just doc` generates the ExDoc site and catches malformed documentation
   attributes.
 - `just dialyzer` checks the documented types and specifications against the
-  implementation.
+  implementation. It is also part of `just check`, run before the tests.
 
 The tier boundaries are derived from the tree by `scripts/ct-suites.sh` and
 `scripts/eunit-modules.sh`, so a new suite is in the next smoke run by default.
-`just check` is an alias for `just test`.
+`just check` is an alias for `just test` plus `just dialyzer`.
 
 The `doc/` directory is generated output. Never commit it.
