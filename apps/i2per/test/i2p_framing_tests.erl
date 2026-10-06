@@ -224,8 +224,68 @@ empty_payload_roundtrips_test() ->
     ?assertEqual({ok, <<>>, Sip1}, i2p_framing:decrypt_frame(Key, 0, Frame, Sip)).
 
 %%% --------------------------------------------------------------------------
-%%% Helpers
+%%% The message counter crosses 2^16
 %%% --------------------------------------------------------------------------
+%%
+%% `encrypt_frame/4` used to raise `function_clause` at message number 65536,
+%% because the nonce it called took `0..65535`. Both ends of a live NTCP2
+%% connection walk that counter once per frame, so a session died on the 65536th
+%% frame **in each direction** and, from outside, read as a peer that had
+%% dropped. The bound was the defect; #R8WNYK3 carries the measurement.
+%%
+%% What matters at the boundary is not that the number is *accepted* — a widened
+%% guard accepts anything. It is that three frames either side of 2^16 are
+%% genuinely different ciphertexts under the same key. That is the property
+%% "the session must ratchet" was standing in for, and here it holds without a
+%% rekey: the counter is 8 bytes, so the nonce moves.
+%%
+%% Two assertions, and the second is what stops the first being a tautology:
+%%
+%%   - the same payload sealed at 65535 and at 65536 under one key is two
+%%     different ciphertexts. Equal ciphertexts would be the same key under the
+%%     same nonce, which is the keystream reuse the whole counter exists to
+%%     prevent;
+%%   - the frame sealed at 65536 does **not** open under 65535's nonce. A counter
+%%     that had silently wrapped to zero would still round-trip a sender and
+%%     receiver that wrapped together, so only this pins that the counter
+%%     continued rather than restarted.
+%%
+%% The SipHash state chains across all of them, so this also walks three frames
+%% through the real length state rather than reusing one.
+
+counter_crosses_65536_without_reusing_a_nonce_test() ->
+    #{k_ab := K, sip_ab := Sip0} = i2p_framing:data_phase_keys(
+        crypto:strong_rand_bytes(32), crypto:strong_rand_bytes(32)
+    ),
+    Payload = <<"the same payload every time">>,
+    {F65535, Sip1} = i2p_framing:encrypt_frame(K, 65535, Payload, Sip0),
+    {F65536, Sip2} = i2p_framing:encrypt_frame(K, 65536, Payload, Sip1),
+    {F65537, _Sip3} = i2p_framing:encrypt_frame(K, 65537, Payload, Sip2),
+
+    %% All three round-trip on the SipHash state each one left behind.
+    ?assertMatch({ok, Payload, _}, i2p_framing:decrypt_frame(K, 65535, F65535, Sip0)),
+    ?assertMatch({ok, Payload, _}, i2p_framing:decrypt_frame(K, 65536, F65536, Sip1)),
+    ?assertMatch({ok, Payload, _}, i2p_framing:decrypt_frame(K, 65537, F65537, Sip2)),
+
+    %% Different nonce in, different keystream out — including across the
+    %% boundary, which is the frame the old guard refused to produce at all.
+    ?assertNotEqual(sealed(F65535), sealed(F65536)),
+    ?assertNotEqual(sealed(F65536), sealed(F65537)),
+
+    %% And the counter continued rather than restarted: the frame at 65536 does
+    %% not open under the previous message number.
+    ?assertEqual(error, i2p_framing:decrypt_frame(K, 65535, F65536, Sip1)),
+    ?assertEqual(error, i2p_framing:decrypt_frame(K, 65536, F65536, Sip0)).
+
+%% --------------------------------------------------------------------------
+%% Helpers
+%% --------------------------------------------------------------------------
+
+%% The ciphertext body of a frame, without its obfuscated length prefix, so a
+%% comparison of two sealed frames is a comparison of keystream rather than of
+%% the SipHash mask that also differs between them.
+sealed(<<_ObfLen:16/big, Sealed/binary>>) ->
+    Sealed.
 
 %% The one sip state the boundary cases share. Zero key and IV rather than a
 %% generated one: these cases are about payload *size*, and a fixed state keeps

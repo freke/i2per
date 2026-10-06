@@ -59,6 +59,33 @@ direction key `k_ab` (Alice→Bob) or `k_ba` (Bob→Alice) with no associated
 data and a counter nonce: 4 zero bytes + 8-byte little-endian message number
 (`i2p_crypto:es_nonce/1`), starting at 0.
 
+**The message number is 64 bits wide, and there is no rekey.** This is worth
+stating because the nonce looks like it could be smaller. It is not: the
+counter occupies the whole 8-byte low half of the nonce, so it runs
+`0..2^64 - 2`, and the NTCP2 specification's own rule for it is *"Maximum value
+is 2**64 - 2. Connection must be dropped and restarted after it reaches that
+value. The value 2**64 - 1 must never be sent."* One direction key is held for
+the life of the connection and the counter is what keeps the nonce unique under
+it — there is no key schedule partway through a session to rekey into.
+
+The practical consequence: **a session is not bounded at 65536 frames**, and
+nothing in the tree treats it as though it were. A bound that stopped there
+would be safe (no nonce repeats) but wrong, and this tree previously had one —
+`i2p_crypto:es_nonce/1` accepted `0..65535` on the belief that the session "must
+ratchet thereafter", so a live connection died with a `function_clause` raised
+out of a crypto helper on the 65536th frame **in each direction**, which read
+from outside as a peer that had dropped. Widening the bound creates no keystream
+reuse: the only value that collides with the nonce at 0 is 2^64, which is not
+representable and which a strictly incrementing counter cannot reach. See
+#R8WNYK3.
+
+The bound is enforced in `i2p_crypto:es_nonce/1` rather than in the connection,
+because the one value the specification forbids is precisely the one that
+function exists to keep off the wire. A counter that reached 2^64 - 1 is a defect
+in whatever increments it, so it raises; it does not get a bus event or a log
+line, because a fault that should be impossible is a bug to fix rather than a
+runtime condition to instrument.
+
 **Frame contents.** The plaintext is zero or more blocks, each a 1-byte type
 and a 2-byte big-endian length:
 

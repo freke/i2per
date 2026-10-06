@@ -164,7 +164,7 @@ frame_roundtrip_prop() ->
         proper:quickcheck(
             ?FORALL(
                 {Key, Sip, MsgNum, Payload},
-                {binary(32), sip_state_gen(), integer(0, 65535), payload_gen()},
+                {binary(32), sip_state_gen(), msg_num_gen(), payload_gen()},
                 begin
                     {Frame, Sip1} = i2p_framing:encrypt_frame(Key, MsgNum, Payload, Sip),
                     byte_size(Frame) =:= 18 + byte_size(Payload) andalso
@@ -265,6 +265,41 @@ blocks_roundtrip_prop() ->
 %% purpose.** It gives up draws for coverage of a boundary a draw cannot reach, and
 %% its cost is fixed and known -- 65536 recoveries per state, one SipHash each --
 %% rather than decided by a lottery.
+
+%% %%%%% The message number, and why this generator was the reason the bug hid %%%%%
+%%
+%% `msg_num_gen` used to be `integer(0, 65535)`, which matched the *old*
+%% `f:i2p_crypto:es_nonce/1` bound rather than the protocol's. That is why
+%% #R8WNYK3's boundary was invisible here: the generator drew from inside the
+%% range the bug lived in, so every frame it built was one the old code could seal.
+%%
+%% The protocol's range is `0..2^64 - 2` — the counter is the nonce's whole 8-byte
+%% low half, so a session is not bounded at 2^16 frames (see `m:i2p_ntcp2_conn`'s
+%% module doc). Widening to `integer(0, 16#FFFFFFFFFFFFFFFE)` alone would fix that
+%% and reintroduce it at a larger scale: 100 draws from a 2^64 range never reach the
+%% neighbourhood of 2^16. So the distribution is **weighted rather than merely
+%% widened** — most draws are the handful of values where a counter's behaviour
+%% could plausibly change shape, and they are *named* rather than sampled, so they
+%% are guaranteed to be tested instead of expected to turn up.
+%%
+%% The list is the whole reason this is worth a generator of its own:
+%%
+%%   - `0` and `1` are the first two frames of every session.
+%%   - `65535` / `65536` are either side of the boundary the defect was found at,
+%%     and `65537` is the first frame past it.
+%%   - `2^64 - 2` is the largest value the nonce accepts, and the largest any
+%%     counter may reach before the specification says the connection is dropped.
+%%
+%% The two open ranges underneath are for the shape rather than for the points:
+%% one over the region the defect lived in, one over everything.
+-define(MSG_NUM_EDGE_VALUES, [0, 1, 65534, 65535, 65536, 65537, 16#FFFFFFFFFFFFFFFE]).
+
+msg_num_gen() ->
+    frequency([
+        {4, elements(?MSG_NUM_EDGE_VALUES)},
+        {1, integer(0, 65537)},
+        {1, integer(0, 16#FFFFFFFFFFFFFFFE)}
+    ]).
 
 %% Comfortably past the NTCP2 data-packet boundary, so single-frame and
 %% multi-packet payloads are both still generated.
