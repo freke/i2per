@@ -216,6 +216,30 @@ live-smoke flags="":
 soak flags="":
     escript scripts/soak.escript --window {{soak_window}} --quiet {{soak_quiet}} --rate {{soak_rate}} --burst {{soak_burst}} --cycles {{soak_cycles}} --port {{soak_port}} {{flags}}
 
+# %%%%% soak-tunnel: the tunnel and transit paths, that #KF1MX96 opened %%%%%
+#
+# The counterpart to `just soak`. The existing soak reported flat retention in a
+# run where **every tunnel counter read zero**; this one builds real inbound and
+# outbound tunnels and relays real transit frames, and refuses to pass when those
+# counters do not move. Same discipline: a diagnostic, not a tier; every knob
+# named and bounded; refused rather than clamped when out of bounds.
+#
+#   just soak-tunnel
+#   just soak_tunnel_window=60000 soak_tunnel_phases=4 soak-tunnel
+soak-tunnel flags="":
+    escript scripts/soak_tunnels.escript --warm {{soak_tunnel_warm}} --window {{soak_tunnel_window}} --quiet {{soak_tunnel_quiet}} --phases {{soak_tunnel_phases}} --rate {{soak_tunnel_rate}} --burst {{soak_tunnel_burst}} --hops {{soak_tunnel_hops}} --port {{soak_tunnel_port}} --top {{soak_tunnel_top}} {{flags}}
+
+# The tunnel soak's parameters, as overridable variables.
+soak_tunnel_warm := "10000"
+soak_tunnel_window := "10000"
+soak_tunnel_quiet := "4000"
+soak_tunnel_phases := "3"
+soak_tunnel_rate := "50"
+soak_tunnel_burst := "10"
+soak_tunnel_hops := "3"
+soak_tunnel_port := "39447"
+soak_tunnel_top := "5"
+
 # The soak's parameters, as overridable variables. Named for the escript's flags
 # and kept next to the recipe so the two cannot drift.
 soak_window := "15000"

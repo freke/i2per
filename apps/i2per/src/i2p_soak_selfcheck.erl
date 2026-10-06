@@ -106,6 +106,12 @@ function cannot return is the same drift as a duplicated constant, only quieter.
 %% exactly this; the check asks whether the census found a big one.
 -define(LEAK_BYTES, 4 * 1024 * 1024).
 
+%% The process-dictionary key the leaker stores its binary under. It is the
+%% reference the runtime can trace across a collection, so it is what keeps the
+%% binary retained -- see `f:hold/1`, which used to rely on a loop variable and
+%% retained nothing.
+-define(HELD, soak_held_binary).
+
 %% %%%%% %%% %%% The run %%%%% %%%
 
 -doc """
@@ -294,9 +300,36 @@ await_fill(Parent, Bytes) ->
         {fill, Bytes} ->
             Held = binary:copy(<<0>>, Bytes),
             Parent ! {leaky, self(), byte_size(Held)},
-            receive
-                stop -> ok
-            end
+            hold(Held)
+    end.
+
+%% Keep the binary **referenced** for as long as the fixture lives, which is the
+%% difference between retention and a bare allocation.
+%%
+%% **This was a real defect, and only a forced collection exposed it.** `Held` used
+%% to be bound, measured with `byte_size/1` and then never mentioned again, so the
+%% compiler was free to treat it as dead across the following `receive`. Until a
+%% collection ran there was no difference to see -- so the fixture was reporting
+%% uncollected garbage as a leak-shaped finding, and every check built on it
+%% passed because nothing had collected the heap yet.
+%%
+%% Then `m:i2p_soak_census:f:retained/1` arrived, forcing a full collection and
+%% waiting for it, and the same fixture measured **233 words** where it had been
+%% counting as 4 MB.
+%%
+%% **What actually keeps it alive is the difference worth recording.** Measured on
+%% this build: neither a tail-recursive helper that re-uses the binary nor a bare
+%% argument threaded through a loop survives a collection -- the compiler trims
+%% those, because after a `receive` the runtime can only trace values that are
+%% reachable, and neither frame is. What does retain, across every OTP, is a
+%% reference the runtime itself can trace: a **process dictionary entry** (`put`).
+%% That is why `f:hold/1` uses one. Reaching for "a variable in a loop is surely
+%% enough" is what this defect was.
+-spec hold(binary()) -> ok.
+hold(Held) ->
+    put(?HELD, Held),
+    receive
+        stop -> ok
     end.
 
 -doc """
