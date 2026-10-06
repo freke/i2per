@@ -65,15 +65,22 @@ job, by sampling twice and subtracting. Nothing here computes one.
 Aggregate router status.
 
 Output: a map with the read API's `version`, the router's uptime and boot time,
-the cumulative counters from `m:i2p_stats`, our identity (base64
-destination-style hash encoding of the router hash), and the peer, tunnel, netdb
-and SAM-session counts. Read-only; safe to call from any process on any
-connected node via `erpc`.
+the cumulative counters and the live gauges from `m:i2p_stats`, our identity
+(base64 destination-style hash encoding of the router hash), and the peer,
+tunnel, netdb and SAM-session counts. Read-only; safe to call from any process
+on any connected node via `erpc`.
 
-The uptime and counters distinguish their own faults: when the router's stats
-process is not running, `counters` is empty, `uptime_ms` is `0` and
-`boot_time` is `undefined`. Those mean "nothing is counting", which is a
+The uptime, counters and gauges distinguish their own faults: when the router's
+stats process is not running, `counters` and `gauges` are empty, `uptime_ms` is
+`0` and `boot_time` is `undefined`. Those mean "nothing is counting", which is a
 different fault from "counting, and the value is zero".
+
+**`counters` and `gauges` are not the same thing and a consumer must not treat
+them as one.** A counter accumulates and is read by differencing two readings; a
+gauge is an instant's value and is overwritten. Putting a gauge in `counters`
+would break it, because a counter that goes backwards is indistinguishable from
+a router restarting. `bus_backlog` — the bus manager's queue depth — is the
+reason the two are separate.
 """.
 -spec view() ->
     #{
@@ -81,6 +88,10 @@ different fault from "counting, and the value is zero".
         uptime_ms := non_neg_integer(),
         boot_time := integer() | undefined,
         counters := #{atom() => non_neg_integer()},
+        %% Live values as of the last sample, beside the cumulative `counters`
+        %% rather than inside them: a gauge falls where a counter cannot. See
+        %% `m:i2p_stats:set_gauge/2`. `bus_backlog` is the only gauge today.
+        gauges := #{atom() => number()},
         identity := binary(),
         peers := #{
             connected := non_neg_integer(),
@@ -120,7 +131,8 @@ view() ->
                 map_size(maps:get(exploratory_in, Tunnels, #{}))
         },
         netdb => #{ri => i2p_netdb_srv:count(), ls => i2p_netdb_srv:ls_count()},
-        sessions => length(i2p_sam_sup:client_sessions())
+        sessions => length(i2p_sam_sup:client_sessions()),
+        gauges => i2p_stats:gauges()
     }.
 
 -doc """
@@ -136,6 +148,7 @@ view_keys() ->
     [
         boot_time,
         counters,
+        gauges,
         identity,
         netdb,
         peers,

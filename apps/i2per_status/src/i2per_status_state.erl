@@ -462,6 +462,7 @@ known_view_keys() ->
     [
         boot_time,
         counters,
+        gauges,
         identity,
         netdb,
         peers,
