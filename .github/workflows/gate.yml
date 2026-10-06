@@ -22,17 +22,25 @@
 # smoke job plus `compat`, because a PR is asking "would this merge cleanly" and
 # an OTP matrix is part of that answer before the merge rather than after.
 #
-# `main` runs **everything**: lint, docs, dialyzer, 951 eunit (935 unit + 16
-# property), all 224 CT across all 25 suites.
+# `main` runs **everything**: lint, docs, dialyzer, every eunit module
+# including the property layer, every CT suite.
 #
 # **What the smoke tier costs, measured not estimated.** 79s of CT and 10s of
-# eunit here, across 23 of the 25 suites and 211 of the 224 CT cases. The
-# `gate (pinned toolchain)` job on this workflow's last pull-request run took
-# **162s** on a runner for a smaller payload, which puts the smoke job at roughly
-# 4-5 minutes against a 5-minute budget. **That margin is thin and the figure is
-# extrapolated, so it is stated rather than asserted** -- the first push that runs
-# this workflow should be read for its real wall time, and the partition widened
-# or narrowed on the measurement rather than on this paragraph.
+# eunit here, across every suite but the slow two. The `gate (pinned toolchain)`
+# job on this workflow's last pull-request run took **162s** on a runner for a
+# smaller payload, which puts the smoke job at roughly 4-5 minutes against a
+# 5-minute budget. **That margin is thin and the figure is extrapolated, so it is
+# stated rather than asserted** -- the first push that runs this workflow should
+# be read for its real wall time, and the partition widened or narrowed on the
+# measurement rather than on this paragraph.
+#
+# **Case counts are not written down here, and this file used to be full of
+# them.** It claimed 951 eunit across 935 unit and 16 property, and 224 CT --
+# every one of them wrong when written, and rebar3 prints the totals it actually
+# ran. A figure in a workflow comment cannot be checked against the run it
+# describes, which is the same defect as a second copy of anything else. The
+# `Report the tiers` step below prints the partition from the scripts that derive
+# it, so the number in the log is never older than the log. #STMC7NC.
 #
 # **What the smoke tier does not run, stated rather than implied.** Two suites:
 # `i2p_peer_transport_SUITE` (protocol-mandated connect timeouts and backoff) and
@@ -162,9 +170,10 @@ jobs:
           echo "::endgroup::"
 
       - name: just smoke-test
-        # lint + the 935 unit cases + 211 CT cases. Invoked through `just` rather
-        # than spelled out here so CI and a developer run the same list: a gate
-        # that is written twice is a gate that is checked once.
+        # lint + every unit module + every CT suite but the slow two. Invoked
+        # through `just` rather than spelled out here so CI and a developer run
+        # the same list: a gate that is written twice is a gate that is checked
+        # once.
         #
         # `--sname` is inside the recipe, because `apps/i2per_status_SUITE` spawns
         # a `peer` router node and fails loudly without a dist-enabled CT node.
@@ -207,8 +216,8 @@ jobs:
         run: nix profile install nixpkgs#devenv
 
       - name: just test
-        # lint + docs + 951 eunit (935 unit + 16 property) + all 224 CT + the
-        # merged coverage report. Unattended, so the time is not a cost.
+        # lint + docs + every eunit module + every CT suite + the merged coverage
+        # report. Unattended, so the time is not a cost.
         #
         # **The property layer runs here and not in `smoke`, deliberately.** They
         # are 0.23s of work, so runtime is not the reason. The reason is that a
@@ -318,7 +327,7 @@ jobs:
 
       - name: eunit (unit tier)
         # The unit layer only. This job's question is "does it run on this OTP",
-        # and 935 in-process cases answer that; the property layer adds a
+        # and the in-process cases answer that; the property layer adds a
         # randomised dimension that would make a version difference look like a
         # flake.
         run: rebar3 as test eunit --module="$(bash scripts/eunit-modules.sh unit)"

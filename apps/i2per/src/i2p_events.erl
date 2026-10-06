@@ -85,14 +85,15 @@ there is no heap bound* below carries the measurements for and against it.
 -export_type([event/0, direction/0, lookup_kind/0, subscribe_error/0]).
 
 -doc """
-Why a subscription did not happen.
+Why a subscription did not happen. Each cause is a member of the union below,
+so it is written as the atom it is rather than as a link to a type.
 
-`t:no_bus/0` — there is no bus on this node, so nothing was asked.
-`t:wedged/0` — the bus did not answer within `?SUBSCRIBE_BOUND_MS`. **The
+`no_bus` — there is no bus on this node, so nothing was asked.
+`wedged` — the bus did not answer within `?SUBSCRIBE_BOUND_MS`. **The
 subscription may still take effect afterwards**: `gen_event` adds the handler
 before it replies, so this answer means "did not complete", not "did not
 happen".
-`{t:bus_error/0, Reason}` — the bus answered, and the answer was not `ok`.
+`{bus_error, Reason}` — the bus answered, and the answer was not `ok`.
 """.
 -type subscribe_error() :: no_bus | wedged | {bus_error, term()}.
 

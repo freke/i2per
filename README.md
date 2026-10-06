@@ -142,9 +142,13 @@ after that:
 
 | recipe | runs | when |
 | --- | --- | --- |
-| `just proper` | 2 modules, 11 properties over generated inputs | `main`, and on request |
-| `just smoke-test` | lint, 974 unit cases, 223 of 241 CT cases | **every push** |
-| `just test` | lint, docs, dialyzer, all 985 eunit, all 241 CT | `main` |
+| `just proper` | the property modules, over generated inputs | `main`, and on request |
+| `just smoke-test` | lint, every unit module, every CT suite but the slow two | **every push** |
+| `just test` | lint, docs, dialyzer, every eunit module, every CT suite | `main` |
+
+Case totals are not written down here on purpose: `rebar3` prints the number of
+tests each run executed, and a figure kept in prose is a second copy of it that
+no run checks.
 
 Measured at **91s** for `just smoke-test` and **205s** for `just test` on a
 developer machine. The smoke tier is under five minutes on a GitHub runner.

@@ -404,7 +404,7 @@ alone.
 
 A delta of 0 is the only passing answer. Anything else means the harness left the
 node dirty, and a harness that dirties the node cannot measure the next run.
-`m:i2p_soak_tests` measures **both** halves of this — with the stop, and without —
+`i2p_soak_tests` measures **both** halves of this — with the stop, and without —
 so that a flat count is known to be a result rather than a decoration.
 """.
 -spec reconnect_cycle(opts()) -> integer().

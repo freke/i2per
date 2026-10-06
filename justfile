@@ -36,28 +36,34 @@ compile:
 
 # %%%%% proper: property-based, on main and on request %%%%%
 #
-# 2 modules, 11 properties, **measured at 0.19s**. They are not in the smoke tier
-# for a reason that is not their runtime: they are the layer whose value is
+# Sub-second in practice, and deliberately **not in the smoke tier** for a
+# reason that is not their runtime: they are the layer whose value is
 # statistical, so a fixed-seed failure is not reproducible by re-running the
 # suite, and a random input found on a push is a bug report that arrives before
 # anyone can reproduce it. They run on `main`, where a red is investigated rather
 # than re-rolled, and locally by name.
 #
-# The count fell from 16 because five of them could not fail: `just proper`
-# running 11 properties that each reject a plausible mutant is worth more than
-# 16 where one is a restatement of the code it calls. #M3VTQBV is what removed
-# them, and the mutants it used are in that ticket's `Solution:` comment.
+# This tier shrank because five properties could not fail: a property module set
+# where each one rejects a plausible mutant is worth more than a larger set where
+# one is a restatement of the code it calls. #M3VTQBV is what removed them, and
+# the mutants it used are in that ticket's `Solution:` comment. **How many there
+# are now is a property of the tree, not a fact to record here** — `rebar3` prints
+# the total on every run, and `bash scripts/eunit-modules.sh prop` prints the
+# module list, so a number in this comment would be a second copy that no run
+# checks. #STMC7NC removed them.
 #
 # `just test` includes them, so "run everything" means everything.
 #
-# Run the property tests (2 modules, 11 properties).
+# Run the property modules `scripts/eunit-modules.sh prop` finds.
 proper:
     rebar3 as test eunit --module="$(bash scripts/eunit-modules.sh prop)"
 
 # %%%%% smoke-test: every push, under five minutes %%%%%
 #
-# lint + the 974 unit cases + **223 of the 241 CT cases** across 23 of the 25
-# suites. Measured at **~92s here** (79s CT, 10s eunit, 3s lint).
+# lint + every unit module + **every CT suite except the two in `slow`**.
+# Measured at **~92s here** (79s CT, 10s eunit, 3s lint) — a wall-clock claim
+# about the budget, not a count, and the one number here that cannot be derived
+# by a script. `rebar3` prints the case totals it actually ran.
 #
 # **This is a partition of the tree, not a hand-picked list.** Every suite except
 # the two in `slow` runs. A new suite is in tomorrow's smoke run unless someone
@@ -77,15 +83,17 @@ proper:
 # answer does not depend on which suites ran, and 49s of a 5-minute budget is
 # better spent on tests. It runs on every push in the `compat` job's shadow.
 #
-# The push tier: lint, the unit tests, and most of the CT suites.
+# The push tier: lint, the unit tests, and every CT suite but the slow two.
 smoke-test: lint
     rebar3 as test eunit --module="$(bash scripts/eunit-modules.sh unit)"
     rebar3 ct --sname i2per_ct --suite="$(bash scripts/ct-suites.sh smoke)"
 
 # %%%%% test: everything, no time limit %%%%%
 #
-# lint + doc + all 985 eunit (974 unit + 11 property) + all 241 CT + the merged
-# coverage report. Measured at **~4 minutes here**; `main` runs it unattended.
+# lint + doc + **every** eunit module, unit and property + **every** CT suite +
+# the merged coverage report. Measured at **~4 minutes here**; `main` runs it
+# unattended. The case totals are printed by `rebar3` on every run, which is why
+# none of them is written down here.
 #
 # **`--cover` on both halves, because `just cover` is the only thing that reads
 # the aggregate.** Coverdata is per-`rebar3` process, so the eunit half and the CT
@@ -251,7 +259,13 @@ format:
 lint:
     erlfmt -c apps/*/src/*.erl apps/*/test/*.erl
 
-# Generate the umbrella ExDoc site into `doc/` (also run by `check`)
+# Generate the umbrella ExDoc site into `doc/` (also run by `check`).
+#
+# **This step can fail, and it used not to.** `scripts/gen-docs.sh` passes ExDoc
+# `--warnings-as-errors`; ExDoc otherwise prints a `warning:` per dead
+# documentation reference and still exits 0, so this recipe once reported four
+# of them and returned success — a gate reporting a defect in its own subject.
+# #STMC7NC is what made it a gate.
 doc:
     bash scripts/gen-docs.sh
 
