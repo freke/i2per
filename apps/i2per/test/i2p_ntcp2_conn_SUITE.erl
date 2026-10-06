@@ -27,7 +27,8 @@
     an_inbound_burst_does_not_delay_a_send/1,
     a_batch_of_inbound_connections_is_not_accepted_one_per_second/1,
     stop_reports_only_after_the_accept_path_has_stopped/1,
-    wedged_accept_path_is_reported_rather_than_claimed_stopped/1
+    wedged_accept_path_is_reported_rather_than_claimed_stopped/1,
+    more_than_65536_frames_survive_in_each_direction/1
 ]).
 
 -define(APP, i2per).
@@ -64,6 +65,29 @@
 %% for a reason the module owns.
 -define(STOP_QUEUE, 4).
 
+%% --------------------------------------------------------------------------
+%% The message counter crossing 2^16
+%% --------------------------------------------------------------------------
+%%
+%% How many frames each direction is flooded with, and the hang guard around it.
+%%
+%% ?FRAMES_PER_DIRECTION is **2^16 + 1**, the minimum that distinguishes the
+%% defect from a fix: message number 65536 is the one that raised, so 65536
+%% frames stop one short of the boundary and 65537 is the first count at which a
+%% connection has been asked to send the frame that killed it. Written as the
+%% number rather than computed, so the case and its reason cannot drift together.
+%%
+%% ?FRAME_BUDGET_MS is a **hang guard, not a tolerance and not an assertion about
+%% elapsed time**: reaching it fails the case and names which direction stalled
+%% and how far it got. The flood is ~1.4 MB each way over loopback and measures
+%% **~2s** on the machine this was written on, so 20s is an order of magnitude
+%% above it and about 4x the ~5s the whole smoke tier's CT costs scale to on a CI
+%% runner. It is set **below** the suite's 30s timetrap on purpose, so the guard
+%% is what fires and the failure is an error term naming the stall rather than a
+%% CT kill that says only that time ran out.
+-define(FRAMES_PER_DIRECTION, 65537).
+-define(FRAME_BUDGET_MS, 20000).
+
 suite() ->
     [{timetrap, 30000}].
 
@@ -84,7 +108,8 @@ all() ->
         an_inbound_burst_does_not_delay_a_send,
         a_batch_of_inbound_connections_is_not_accepted_one_per_second,
         stop_reports_only_after_the_accept_path_has_stopped,
-        wedged_accept_path_is_reported_rather_than_claimed_stopped
+        wedged_accept_path_is_reported_rather_than_claimed_stopped,
+        more_than_65536_frames_survive_in_each_direction
     ].
 
 init_per_testcase(transport_bytes_are_counted, Config) ->
@@ -124,12 +149,29 @@ init_per_testcase(idle_reap, Config) ->
     {ok, _} = application:ensure_all_started(?APP),
     ok = application:set_env(?APP, idle_timeout_ms, 300),
     Config;
+init_per_testcase(more_than_65536_frames_survive_in_each_direction, Config) ->
+    {ok, _} = application:ensure_all_started(?APP),
+    %% The flood's whole claim is a frame count, so nothing else may spend a
+    %% message number. A keepalive is a payload through the very same
+    %% `send_payload/4`, so one firing would consume a counter value the case
+    %% does not know about and put the boundary a frame earlier than the case
+    %% believes — which is a weaker test, not a stronger one. The default is 60s
+    %% and the case finishes well inside that, but "never fires in practice" is
+    %% the same hope `transport_bytes_are_counted` already stopped relying on, so
+    %% the precondition is pinned here instead. Read when a connection arms its
+    %% timer, which is after this returns.
+    ok = application:set_env(?APP, ntcp2_keepalive_interval_ms, 600_000),
+    Config;
 init_per_testcase(shared_helpers_roundtrip, Config) ->
     Config;
 init_per_testcase(_Case, Config) ->
     {ok, _} = application:ensure_all_started(?APP),
     Config.
 
+end_per_testcase(more_than_65536_frames_survive_in_each_direction, _Config) ->
+    ok = application:unset_env(?APP, ntcp2_keepalive_interval_ms),
+    application:stop(?APP),
+    ok;
 end_per_testcase(transport_bytes_are_counted, _Config) ->
     ok = application:unset_env(?APP, ntcp2_keepalive_interval_ms),
     application:stop(?APP),
@@ -1008,6 +1050,167 @@ take_stop_reply(Stopper) ->
         {stop_reply, Reply} -> Reply
     after ?TIMEOUT ->
         erlang:error({stop_never_answered, Stopper})
+    end.
+
+%% --------------------------------------------------------------------------
+%% The message counter crosses 2^16
+%% --------------------------------------------------------------------------
+
+%% A session survives more than 2^16 frames in each direction
+%%
+%% **The defect.** `i2p_crypto:es_nonce/1` took `0..65535`, so message number
+%% 65536 fell into a clause that was not there and the connection process died
+%% with a `function_clause` raised out of a crypto helper. The send direction
+%% seeds `msg => 0` when the data phase starts and increments per frame; the
+%% receive direction is the inbound side of the same counter and feeds the same
+%% function. A session died on exactly the 65536th frame, and **it did not look
+%% like a crash on the wire** — the peer manager saw a disconnect and backed
+%% off, so from outside a healthy router looked like one that had dropped a peer.
+%% See #R8WNYK3.
+%%
+%% **Both directions in one case, because they are one defect.** The ticket asks
+%% for the receive path to be covered by the same case rather than assumed from
+%% the send path, and that is because they really are the same counter: fixing
+%% one without the other leaves half the bug live and this case stays green. So
+%% the pair is flooded in both directions at once and each is counted separately.
+%%
+%% **What is asserted, and why each part says more than the one before it.**
+%% Per direction, every frame arrived carrying the sequence number it was sent
+%% with. So the flood is not merely counted — a count is satisfied by one frame
+%% counted many times, or by a duplicated one — and not merely ordered, which is
+%% what a TCP byte stream gives you for free; ordering is asserted because the
+%% framing state is this module's, and a reordering or re-numbering bug there is
+%% invisible at the socket. Reading frame N is also the barrier: it cannot arrive
+%% before the N-1 before it, so having read it says the sender wrote all
+%% ?FRAMES_PER_DIRECTION and therefore ran its counter past 65536 without dying.
+%%
+%% Then the pair is still alive **and still carrying traffic** — one more frame
+%% each way after the flood. A connection that stopped at the boundary without
+%% dying would satisfy every count above; only using the session afterwards shows
+%% it survived rather than merely did not crash.
+%%
+%% **The flood runs in its own processes**, one per direction, for the reason
+%% `f:fill_until_stalled/2` records: a loop in the case itself would enqueue its
+%% frames and return while the connection was still working through them, which
+%% is a race dressed up as a bound. Here the case's own receive loop *is* the
+%% drain, so feeder and reader run concurrently by construction — the case cannot
+%% read a frame the feeder has not already put on the wire.
+%%
+%% **Neither direction waits for the other.** Both are drained from one mailbox,
+%% because this process owns both connections and one `f:receive/2` pattern
+%% matches either. A case that drained one direction to exhaustion before looking
+%% at the other would stall the side it was not reading.
+more_than_65536_frames_survive_in_each_direction(_Config) ->
+    {Bob, Alice} = pair(),
+    {ok, Listener} = i2p_ntcp2_listener:listen(0, Bob, self()),
+    try
+        {ok, CA} = i2p_ntcp2_conn:connect(ri_at(listen_port(Listener), Bob), Alice, #{}),
+        {CB, _} = await_ready(),
+        %% Armed before either flood starts, so a connection that died inside one
+        %% cannot be missed as a `noproc` DOWN. The DOWN is what turns "the last
+        %% frame never arrived" into "the connection died" instead of a bare
+        %% timeout.
+        MRefA = erlang:monitor(process, CA),
+        MRefB = erlang:monitor(process, CB),
+        Conns = #{CA => 1, CB => 1},
+        Feeders = [
+            spawn(fun() -> feed_numbered(Conn, 1, ?FRAMES_PER_DIRECTION) end)
+         || Conn <- [CA, CB]
+        ],
+        try
+            Done = drain_numbered(Conns, 2 * ?FRAMES_PER_DIRECTION),
+            %% Each direction's figure is ?FRAMES_PER_DIRECTION + 1, because
+            %% `Seen` is the *next* sequence number expected rather than a count
+            %% of the frames read, so the count is one less.
+            #{CA := PastA, CB := PastB} = Done,
+            ?FRAMES_PER_DIRECTION = PastA - 1,
+            ?FRAMES_PER_DIRECTION = PastB - 1,
+            %% A DOWN is read as a fact rather than waited for, and that is sound
+            %% here rather than merely convenient: both the frame announcements
+            %% and the monitor DOWN come from the connection, and the runtime
+            %% orders one sender's signals. So a connection that exited cannot
+            %% have its DOWN still in flight once the case has read the last
+            %% frame it sent. `f:is_process_alive/1` below would answer the same
+            %% question; the DOWN is checked too because it says *why*, which is
+            %% the difference between a boundary failure and an ordinary drop.
+            [false = down(MRef) || MRef <- [MRefA, MRefB]],
+            true = is_process_alive(CA),
+            true = is_process_alive(CB),
+            ok = i2p_ntcp2_conn:send(CA, <<"past the boundary">>),
+            ok = i2p_ntcp2_conn:send(CB, <<"and back again">>),
+            <<"past the boundary">> = receive_frame(CB),
+            <<"and back again">> = receive_frame(CA)
+        after
+            [exit(Feeder, kill) || Feeder <- Feeders]
+        end
+    after
+        i2p_ntcp2_listener:stop(Listener)
+    end.
+
+%% Hand over `Left` frames numbered from `Seq`, one per `f:send/2` call, so every
+%% frame is its own message number and the reader can tell arrival order from
+%% arrival count. A batched send would be a single frame carrying many payloads
+%% and would walk the counter once, which is the opposite of what this case is
+%% about.
+%%
+%% **The countdown is what makes the count exact.** The first version of this ran
+%% `feed_numbered(Conn, Seq, Last)` with `Last =< Seq` as the base clause, which
+%% stops one short of its own argument: it sent frames 1..?FRAMES_PER_DIRECTION - 1
+%% and so never sent the frame carrying message number 65536 — the one the whole
+%% case exists to send. The case then drained 2 x 65536 frames and waited out its
+%% budget looking for a frame that had never been asked for, which reads exactly
+%% like the defect it was written to reject. Counting down what is left to send
+%% has no off-by-one to hide in.
+%%
+%% Counting **up** in the payload is what lets one expected-next figure per
+%% direction stand for both properties: a frame that arrives out of order fails
+%% against it, and a frame that never arrives leaves the flood short of its total.
+feed_numbered(_Conn, _Seq, 0) ->
+    ok;
+feed_numbered(Conn, Seq, Left) ->
+    ok = i2p_ntcp2_conn:send(Conn, <<Seq:32/little>>),
+    feed_numbered(Conn, Seq + 1, Left - 1).
+
+%% Drain both directions at once until every frame has arrived, and report how
+%% far each got.
+%%
+%% The base clause is checked **before** the receive, because the last frame
+%% counted has already arrived by the time `Remaining` reaches zero — a receive
+%% first would block on a frame that is never coming, which is a hang dressed as
+%% a wait.
+%%
+%% The progress figure is per connection rather than one total, so a direction
+%% that stalled reports its own count instead of hiding behind the other. A
+%% connection that dies mid-flood ends the drain with its exit reason, which is
+%% the difference between "the boundary killed it" and "the drain gave up".
+drain_numbered(Conns, 0) ->
+    Conns;
+drain_numbered(Conns, Remaining) ->
+    receive
+        {ntcp2_frame, Conn, <<Seq:32/little>>} when is_map_key(Conn, Conns) ->
+            case maps:get(Conn, Conns) of
+                Seq ->
+                    drain_numbered(Conns#{Conn := Seq + 1}, Remaining - 1);
+                Expected ->
+                    erlang:error({frame_out_of_order, Conn, {expected, Expected}, {got, Seq}})
+            end;
+        {ntcp2_frame, Conn, Payload} ->
+            erlang:error({unexpected_frame, Conn, Payload});
+        {'DOWN', _MRef, process, Conn, Reason} ->
+            erlang:error({connection_died_mid_flood, Conn, Reason})
+    after ?FRAME_BUDGET_MS ->
+        erlang:error({flood_stalled, {frames_read, maps:map(fun(_C, Seen) -> Seen - 1 end, Conns)}})
+    end.
+
+%% A monitor that has already fired, read as a fact rather than waited for. The
+%% caller's comment is why the `after 0` cannot miss one: the DOWN and the frames
+%% come from the same process, so it is ordered after every frame that process
+%% sent. Waiting for a DOWN here would hang the case rather than fail it.
+down(MRef) ->
+    receive
+        {'DOWN', MRef, process, _Pid, _Reason} -> true
+    after 0 ->
+        false
     end.
 
 %% --------------------------------------------------------------------------

@@ -13,6 +13,22 @@ authenticates each one, threading the SipHash IV and message counter.
 SipHash state, current message number, residual buffer), so the owning process
 holds one value per direction and never re-derives frame boundaries itself.
 
+## The message number, and why receive has to cross 2^16 too
+
+The `msg` field is the inbound half of the connection's per-direction counter,
+and it is **64 bits wide** — the whole 8-byte low half of the counter nonce, so
+`0..2^64 - 2`. See `m:i2p_crypto:es_nonce/1` for the bound and `m:i2p_ntcp2_conn`
+for the send half that has to agree with it.
+
+It is worth being explicit that this is a separate obligation rather than a
+mirror of the send side, because they are the same defect seen twice. A session
+that *receives* 65536 frames used to fail exactly as one that sent 65536 did, so
+a fix applied only to the sender would have left half the bug live — and a test
+written only against the send path would have stayed green. The receive path is
+therefore covered by the same case as the send path:
+`i2p_ntcp2_conn_SUITE`'s `more_than_65536_frames_survive_in_each_direction/1`
+floods a live pair past the boundary in both directions at once.
+
 ## Usage
 
 ```erlang

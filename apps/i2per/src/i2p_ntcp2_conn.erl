@@ -81,6 +81,37 @@ socket bound above ends the case where the peer is the one not reading. A sweep
 over connection queue lengths in the peer manager would close the remainder, and
 is not worth a per-connection timer until a send rate makes it matter.
 
+## The message counter, and why a session is not capped at 65536 frames
+
+NTCP2's data phase holds one direction key for the life of the connection and
+gives each frame a counter nonce: 4 zero bytes plus the message number as an
+8-byte little-endian integer (`m:i2p_crypto:es_nonce/1`). **That counter is 64
+bits wide**, so it runs `0..2^64 - 2` and the specification's rule for it is
+*"Connection must be dropped and restarted after it reaches that value"* — not a
+rekey. There is no key schedule partway through an NTCP2 session to ratchet
+into, and none is needed: a nonce under a fixed key is unique for as long as the
+counter does not repeat, and a strictly incrementing counter over 64 bits does
+not repeat.
+
+This matters here because **both** directions walk one such counter, and they
+walk it independently: the send side seeds `msg => 0` here when the data phase
+starts and increments per frame in `send_payload/4`, and the receive side is the
+inbound half of the same counter, held by `m:i2p_stream`. So the two are one
+change and one case — `i2p_ntcp2_conn_SUITE`'s
+`more_than_65536_frames_survive_in_each_direction/1` floods a live pair past the
+boundary in both directions at once.
+
+This module used to bound that counter at 65535 by way of the nonce function,
+and the consequence was a connection process dying with a `function_clause`
+raised out of a crypto helper on the 65536th frame. It was not a visible crash:
+the peer manager observed a disconnect and backed off, so a healthy router looked
+like one that had dropped a peer. **A counter that reached the specified maximum
+still raises**, in `i2p_crypto:es_nonce/1` — the forbidden value is the one that
+function exists to keep off the wire — and it raises rather than announcing,
+because a counter at 2^64 - 1 is a defect in whatever increments it and not a
+runtime condition to instrument. That is 2^48 times further off than the bound
+this defect had.
+
 ## Usage
 
 ```erlang

@@ -789,14 +789,30 @@ zero_nonce() ->
 The Existing Session counter nonce for message number `N`.
 
 The first 4 bytes are zero and the last 8 bytes are the message number in
-little-endian order. `N` is at most 65535; the session must ratchet
-thereafter.
+little-endian order, so **the counter is 64 bits wide** and `N` runs
+`0..2^64 - 2`.
 
-Input: `N` — the message number in the current chain, `0..65535`.
+That width is the specification's, not a choice this tree made. NTCP2 states
+*"Last eight bytes are the counter, little-endian encoded. Maximum value is
+2**64 - 2. Connection must be dropped and restarted after it reaches that
+value. The value 2**64 - 1 must never be sent"*
+([NTCP2](https://i2p.net/en/docs/specs/ntcp2/), "Authenticated Encryption"), and
+the data phase *"n starts at 0 and increments for each frame in that
+direction"* under one direction key for the life of the connection. There is no
+rekey in NTCP2 and none is needed: a nonce under a fixed key is unique for as
+long as the counter does not repeat, and an 8-byte little-endian field repeats
+only after 2^64 increments.
+
+The bound is enforced here rather than left to the caller, because the value the
+spec says must never be sent is the one value this function exists to keep away
+from the wire. Raising on it is the whole response: a counter that reached 2^64 -
+1 is a defect in whatever increments it, not a condition to accommodate.
+
+Input: `N` — the message number in the current chain, `0..2^64 - 2`.
 Output: a 12-byte nonce.
 """.
--spec es_nonce(0..65535) -> nonce().
-es_nonce(N) when N >= 0, N =< 65535 ->
+-spec es_nonce(0..16#FFFFFFFFFFFFFFFE) -> nonce().
+es_nonce(N) when N >= 0, N =< 16#FFFFFFFFFFFFFFFE ->
     <<0:32, N:64/little-unsigned>>.
 
 -doc """
