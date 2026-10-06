@@ -26,8 +26,9 @@ that *receives* 65536 frames used to fail exactly as one that sent 65536 did, so
 a fix applied only to the sender would have left half the bug live — and a test
 written only against the send path would have stayed green. The receive path is
 therefore covered by the same case as the send path:
-`i2p_ntcp2_conn_SUITE`'s `more_than_65536_frames_survive_in_each_direction/1`
-floods a live pair past the boundary in both directions at once.
+`i2p_ntcp2_conn_SUITE`'s `a_session_is_alive_and_speaking_at_frame_70000/1`
+floods a live pair past the boundary in both directions at once, and asserts
+both ends are still alive at a frame far beyond it.
 
 ## Usage
 
