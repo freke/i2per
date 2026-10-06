@@ -161,3 +161,18 @@ interchangeable — a rising notified count says nothing about receipt.
 The log is the **witness** where the bus is the instrument: a fact on the bus is
 not also written to the log except at a level that is off by default. That is the
 distinction, and it is a discipline rather than a preference — see ADR 0002.
+
+**Retention** — memory a structure keeps once the work that filled it is over. It
+is the figure a soak reports, and it has two causes that look identical inside a
+single window:
+
+- *traffic-proportional retention* — it grew with the traffic offered and gave the
+  memory back when the traffic stopped. Bounded by construction.
+- *traffic-independent caching* — it grew with nothing offered, so something other
+  than the traffic filled it.
+
+Neither is a leak, and that distinction is the point: a slope is a slope, and
+calling one a *leak* claims the structure is unbounded, which a pair of snapshots
+cannot show. Retention is measured in **memory rather than in reductions** for the
+same reason — reductions only ever accumulate, so whether a process gave its
+consumption back is not a question they can answer.
