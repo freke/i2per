@@ -21,6 +21,18 @@ compile:
 # `scripts/ct-suites.sh` for CT. Neither list lives here, because a list in two
 # places drifts and a drifted list is a gate that quietly stops running
 # something.
+#
+# %%%%% And two things deliberately outside all three %%%%%
+#
+# **`live-smoke` and `soak` are diagnostics, not tiers.** Neither is in
+# `smoke-test`, `test` or `check`, and the reason is a stability claim neither
+# can support: `live-smoke` boots a real router and with `--live` joins the real
+# network, and `soak` reports on a bounded window of a router's own growth. A
+# tier is a claim about what is *known good*; a window in which nothing grew that
+# we can see is not that, and promoting either into the gate would make a green
+# run assert a stability the window cannot reach. They are run by name, on
+# purpose -- and `soak` exiting non-zero when its instrument cannot demonstrate it
+# detects a known fault is a reason to run it, not a reason to make it a gate.
 
 # %%%%% proper: property-based, on main and on request %%%%%
 #
@@ -139,6 +151,71 @@ bench-siphash:
 # Boot a throwaway router and print its network observables as JSON.
 live-smoke flags="":
     escript scripts/live_smoke.escript {{flags}}
+
+# %%%%% soak: bounded load, and a verdict about what the numbers support %%%%%
+#
+# Like `live-smoke`, and for the same reason, this is a diagnostic and not a tier:
+# it is not in `smoke-test`, `test` or `check`, and the reason is in the tier note
+# at the top of this file.
+#
+# **Every parameter is named and bounded, and none has a default chosen for you.**
+# `--rate` outside 1..20000 is refused rather than clamped, because a clamped
+# rate would let you believe you asked for a million events a second and got the
+# ceiling. An unbounded generator measures the generator: the first version of
+# this harness offered bursts separated by `erlang:yield/0`, drove refc binaries
+# to 11 GB in under ten seconds, and reported a number that had nothing to do with
+# the router.
+#
+# What it reports, and what each part is for:
+#
+#   self_checks  Three faults are seeded into the node and the harness has to
+#                notice each one. A run whose instrument cannot demonstrate it
+#                detects a known fault has measured nothing, so a failed check
+#                fails the run -- non-zero exit -- rather than annotating it.
+#   verdict      traffic_proportional, traffic_independent, or inconclusive.
+#                It cannot say "leak": two snapshots cannot show a structure is
+#                unbounded, and a slope is a slope. It classifies on **retained
+#                memory**, not reductions -- reductions are monotonic, so a
+#                reduction-based classifier can never reach its negative branch
+#                and would answer `traffic_independent` every single run.
+#   fixture_delta  Processes left behind by the reconnect cycle. 0 is the only
+#                passing answer. `restart => temporary` children are never reaped
+#                by their supervisor, so a reconnect that opens a fresh child
+#                without stopping the old one leaks the subtree -- measured here at
+#                2 processes per cycle.
+#
+# What it does **not** exercise is stated in `m:i2p_soak`'s module doc rather
+# than implied: not the tunnel or transit paths under real load (#KF1MX96), not
+# live-network behaviour without `--live`, and not crash recovery.
+#
+# **The knobs are top-level `:=` variables, not recipe parameters**, because just
+# cannot override a recipe parameter from the command line -- `just soak
+# rate=2000` silently passes the literal string `rate=2000` as a positional
+# argument, and the run then dies in the parser. Variables *before* the recipe name
+# are the spelling that works, and it is worth the extra lines to have a knob that
+# is actually a knob:
+#
+#   just soak
+#   just soak_rate=2000 soak_window=60000 soak
+#
+# Extra escript flags go through `flags=` as **one quoted argument**. `just soak
+# --live` fails (`justfile does not contain recipe --live`), and `--` is not a
+# passthrough here either; what works is:
+#
+#   just soak "--live"
+#
+# Soak a throwaway router: `just soak`, or `just soak_rate=2000 soak`.
+soak flags="":
+    escript scripts/soak.escript --window {{soak_window}} --quiet {{soak_quiet}} --rate {{soak_rate}} --burst {{soak_burst}} --cycles {{soak_cycles}} --port {{soak_port}} {{flags}}
+
+# The soak's parameters, as overridable variables. Named for the escript's flags
+# and kept next to the recipe so the two cannot drift.
+soak_window := "15000"
+soak_quiet := "5000"
+soak_rate := "500"
+soak_burst := "50"
+soak_cycles := "5"
+soak_port := "39446"
 
 # Build the prod relx release tarball + MANIFEST into dist/ (run via devenv;
 # requires rebar3/erl on PATH — see scripts/build-release.sh)
