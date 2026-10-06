@@ -107,8 +107,11 @@ inputs.
   It runs on `main`.
 - `just proper` runs the property tests alone, for when a counterexample is what
   you are chasing.
-- `just doc` generates the ExDoc site and catches malformed documentation
-  attributes.
+- `just doc` generates the ExDoc site and **fails** on a documentation
+  reference that resolves to nothing. ExDoc prints a `warning:` for each one and
+  otherwise exits 0, so `scripts/gen-docs.sh` passes `--warnings-as-errors`;
+  without it the step reported dead cross-references and returned success. It is
+  in `just check` and `just test` through both.
 - `just dialyzer` checks the documented types and specifications against the
   implementation. It is also part of `just check`, run before the tests.
 

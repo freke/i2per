@@ -43,7 +43,7 @@ corrupt the very census the soak reads next.
 
 ## How the failure is demonstrated
 
-Each check takes its inputs, so `m:i2p_soak_selfcheck_tests` drives the same
+Each check takes its inputs, so `i2p_soak_selfcheck_tests` drives the same
 functions with a **deliberately broken** census and asserts `ok =:= false`. A
 check nobody has seen fail is a comment with a function around it.
 
@@ -157,7 +157,7 @@ downstream of it reports zero findings because it has nothing to look at — so
 this fails rather than reporting that nothing was found.
 
 Give it `#{}` and it fails: that is the shape the broken harness produced, and
-`m:i2p_soak_selfcheck_tests` asserts it.
+`i2p_soak_selfcheck_tests` asserts it.
 """.
 -spec census_not_empty(i2p_soak_census:census()) -> check().
 census_not_empty(Census) ->
