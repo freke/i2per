@@ -28,7 +28,7 @@
     a_batch_of_inbound_connections_is_not_accepted_one_per_second/1,
     stop_reports_only_after_the_accept_path_has_stopped/1,
     wedged_accept_path_is_reported_rather_than_claimed_stopped/1,
-    more_than_65536_frames_survive_in_each_direction/1
+    a_session_is_alive_and_speaking_at_frame_70000/1
 ]).
 
 -define(APP, i2per).
@@ -71,21 +71,39 @@
 %%
 %% How many frames each direction is flooded with, and the hang guard around it.
 %%
-%% ?FRAMES_PER_DIRECTION is **2^16 + 1**, the minimum that distinguishes the
-%% defect from a fix: message number 65536 is the one that raised, so 65536
-%% frames stop one short of the boundary and 65537 is the first count at which a
-%% connection has been asked to send the frame that killed it. Written as the
-%% number rather than computed, so the case and its reason cannot drift together.
+%% ?FRAMES_PER_DIRECTION is **70000**, and the round number is the point rather
+%% than a convenience. The boundary this case exists to cross is `2^16`, and a
+%% figure like 65537 is *past* it but does not look it: a reader has to decompose
+%% it (2^16 + 1) and read the case's comment to learn that the number means
+%% anything at all. 70000 states the claim on its own — this session is alive
+%% and speaking ~4500 frames beyond the boundary — so the figure is readable in
+%% the case name, in this constant, and in the failure message, which is what
+%% makes the case's intent legible without its prose.
+%%
+%% **65537 is the minimum that distinguishes the defect from a fix, and 70000
+%% keeps that property rather than trading it.** Message number 65536 is the one
+%% that raised, so any count at or above 65537 asks the connection to send the
+%% frame that killed it; 70000 is such a count, so the case still goes red
+%% against the old bound. It is written as the literal rather than computed from
+%% `2^16`, so the case and its reason cannot drift together.
+%%
+%% **What 70000 does not buy, stated so nobody credits it with catching it.** A
+%% second increment site in the data phase would walk the counter twice as fast,
+%% and no figure in this range notices: at 65537 frames a doubled counter
+%% reaches 131074 and at 70000 it reaches 140000, both comfortably inside
+%% `2^64 - 2`. This case is about the boundary the counter *had*, not about the
+%% rate it increments at.
 %%
 %% ?FRAME_BUDGET_MS is a **hang guard, not a tolerance and not an assertion about
 %% elapsed time**: reaching it fails the case and names which direction stalled
-%% and how far it got. The flood is ~1.4 MB each way over loopback and measures
-%% **~2s** on the machine this was written on, so 20s is an order of magnitude
+%% and how far it got. The flood is ~1.5 MB each way over loopback (70k frames
+%% of a 4-byte payload) and measures **1.6s** on the machine this was written
+%% on, so 20s is an order of magnitude
 %% above it and about 4x the ~5s the whole smoke tier's CT costs scale to on a CI
 %% runner. It is set **below** the suite's 30s timetrap on purpose, so the guard
 %% is what fires and the failure is an error term naming the stall rather than a
 %% CT kill that says only that time ran out.
--define(FRAMES_PER_DIRECTION, 65537).
+-define(FRAMES_PER_DIRECTION, 70000).
 -define(FRAME_BUDGET_MS, 20000).
 
 suite() ->
@@ -109,7 +127,7 @@ all() ->
         a_batch_of_inbound_connections_is_not_accepted_one_per_second,
         stop_reports_only_after_the_accept_path_has_stopped,
         wedged_accept_path_is_reported_rather_than_claimed_stopped,
-        more_than_65536_frames_survive_in_each_direction
+        a_session_is_alive_and_speaking_at_frame_70000
     ].
 
 init_per_testcase(transport_bytes_are_counted, Config) ->
@@ -149,7 +167,7 @@ init_per_testcase(idle_reap, Config) ->
     {ok, _} = application:ensure_all_started(?APP),
     ok = application:set_env(?APP, idle_timeout_ms, 300),
     Config;
-init_per_testcase(more_than_65536_frames_survive_in_each_direction, Config) ->
+init_per_testcase(a_session_is_alive_and_speaking_at_frame_70000, Config) ->
     {ok, _} = application:ensure_all_started(?APP),
     %% The flood's whole claim is a frame count, so nothing else may spend a
     %% message number. A keepalive is a payload through the very same
@@ -168,7 +186,7 @@ init_per_testcase(_Case, Config) ->
     {ok, _} = application:ensure_all_started(?APP),
     Config.
 
-end_per_testcase(more_than_65536_frames_survive_in_each_direction, _Config) ->
+end_per_testcase(a_session_is_alive_and_speaking_at_frame_70000, _Config) ->
     ok = application:unset_env(?APP, ntcp2_keepalive_interval_ms),
     application:stop(?APP),
     ok;
@@ -1053,10 +1071,18 @@ take_stop_reply(Stopper) ->
     end.
 
 %% --------------------------------------------------------------------------
-%% The message counter crosses 2^16
+%% The message counter crosses 2^16, and the session is still speaking
 %% --------------------------------------------------------------------------
 
-%% A session survives more than 2^16 frames in each direction
+%% A session is alive and speaking at frame 70000, in each direction
+%%
+%% **The claim is liveness at a named frame**, not merely survival past a number
+%% nobody wrote down. See #GY414M9: this case and the fix it guards assert
+%% different things on purpose. The fix's case asks *how* the router gets past
+%% the boundary; this one asks only that it gets there and is still talking. A
+%% session cap at 65535 would satisfy both, and a silent counter reset satisfies
+%% only this one — which is the reason it is worth having separately rather than
+%% folded into the fix's coverage.
 %%
 %% **The defect.** `i2p_crypto:es_nonce/1` took `0..65535`, so message number
 %% 65536 fell into a clause that was not there and the connection process died
@@ -1100,7 +1126,7 @@ take_stop_reply(Stopper) ->
 %% because this process owns both connections and one `f:receive/2` pattern
 %% matches either. A case that drained one direction to exhaustion before looking
 %% at the other would stall the side it was not reading.
-more_than_65536_frames_survive_in_each_direction(_Config) ->
+a_session_is_alive_and_speaking_at_frame_70000(_Config) ->
     {Bob, Alice} = pair(),
     {ok, Listener} = i2p_ntcp2_listener:listen(0, Bob, self()),
     try
@@ -1125,17 +1151,26 @@ more_than_65536_frames_survive_in_each_direction(_Config) ->
             #{CA := PastA, CB := PastB} = Done,
             ?FRAMES_PER_DIRECTION = PastA - 1,
             ?FRAMES_PER_DIRECTION = PastB - 1,
+            %% **The liveness assertion, stated at the named frame rather than
+            %% left to the reader to infer.** `alive_at_frame/3` names 70000 in its
+            %% own failure term, so a red run says which frame the session failed
+            %% to reach rather than reporting a bare `false` against a
+            %% `is_process_alive/1` call whose expected value is nowhere in the
+            %% message. This is the criterion #GY414M9 asks for, and it is why
+            %% this is a named function rather than two inline assertions: the
+            %% intent has to survive into the failure message, and an inline
+            %% `true = is_process_alive(CA)` does not carry it.
+            ok = alive_at_frame(CA, ?FRAMES_PER_DIRECTION, send),
+            ok = alive_at_frame(CB, ?FRAMES_PER_DIRECTION, recv),
             %% A DOWN is read as a fact rather than waited for, and that is sound
             %% here rather than merely convenient: both the frame announcements
             %% and the monitor DOWN come from the connection, and the runtime
             %% orders one sender's signals. So a connection that exited cannot
             %% have its DOWN still in flight once the case has read the last
-            %% frame it sent. `f:is_process_alive/1` below would answer the same
-            %% question; the DOWN is checked too because it says *why*, which is
-            %% the difference between a boundary failure and an ordinary drop.
+            %% frame it sent. The DOWN is checked too because it says *why*,
+            %% which is the difference between a boundary failure and an ordinary
+            %% drop — `alive_at_frame/3` above only says that it is not alive.
             [false = down(MRef) || MRef <- [MRefA, MRefB]],
-            true = is_process_alive(CA),
-            true = is_process_alive(CB),
             ok = i2p_ntcp2_conn:send(CA, <<"past the boundary">>),
             ok = i2p_ntcp2_conn:send(CB, <<"and back again">>),
             <<"past the boundary">> = receive_frame(CB),
@@ -1200,6 +1235,29 @@ drain_numbered(Conns, Remaining) ->
             erlang:error({connection_died_mid_flood, Conn, Reason})
     after ?FRAME_BUDGET_MS ->
         erlang:error({flood_stalled, {frames_read, maps:map(fun(_C, Seen) -> Seen - 1 end, Conns)}})
+    end.
+
+%% The assertion this ticket exists for: **this connection is alive, having
+%% spoken `Frame` frames in `Dir`.**
+%%
+%% The named frame is in the failure term on purpose. `true =
+%% is_process_alive(Conn)` is a perfectly good assertion whose failure says only
+%% `false` — a reader has to go and find which connection, in which direction,
+%% at which frame it gave up. Here the frame is the claim, so the frame is what
+%% the failure reports:
+%%
+%%     {session_not_alive_at_frame, Pid, send, 70000}
+%%
+%% `Dir` is `send` for the connection whose counter walked as it wrote the flood
+%% and `recv` for the one whose counter walked as it read the other end's. Both
+%% are asserted, because they are two counters on one connection and a fix that
+%% touched only one of them leaves the other to die here.
+alive_at_frame(Conn, Frame, Dir) ->
+    case is_process_alive(Conn) of
+        true ->
+            ok;
+        false ->
+            erlang:error({session_not_alive_at_frame, Conn, Dir, Frame})
     end.
 
 %% A monitor that has already fired, read as a fact rather than waited for. The

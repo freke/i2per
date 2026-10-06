@@ -98,8 +98,9 @@ walk it independently: the send side seeds `msg => 0` here when the data phase
 starts and increments per frame in `send_payload/4`, and the receive side is the
 inbound half of the same counter, held by `m:i2p_stream`. So the two are one
 change and one case — `i2p_ntcp2_conn_SUITE`'s
-`more_than_65536_frames_survive_in_each_direction/1` floods a live pair past the
-boundary in both directions at once.
+`a_session_is_alive_and_speaking_at_frame_70000/1` floods a live pair past the
+boundary in both directions at once, and asserts both ends are still alive at a
+frame far beyond it.
 
 This module used to bound that counter at 65535 by way of the nonce function,
 and the consequence was a connection process dying with a `function_clause`
