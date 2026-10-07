@@ -4,6 +4,13 @@ All notable changes to i2per are recorded here. Versions follow the OTP
 applications' own `{vsn, ...}`; the release tag is `v` + that version, and
 CI refuses a tag that disagrees.
 
+## [0.2.0] — 2026-10-07
+
+Promotes [`v0.2.0-rc1`](https://github.com/freke/i2per/releases/tag/v0.2.0-rc1)
+unchanged in behaviour: the tag carries the same tree plus this version bump and
+the 0.2.0 documentation pass. The change list below is the release's; the
+release candidate is the same release before the version was final.
+
 ## [0.2.0-rc1] — 2026-10-07
 
 **Operable: a release an operator who did not write it can run, and see.**

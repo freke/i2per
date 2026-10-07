@@ -81,7 +81,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Resolve the tag being published
-        # `github.ref` is `refs/tags/v0.2.0-rc1` on a push, and the dispatch
+        # `github.ref` is `refs/tags/v0.2.0` on a push, and the dispatch
         # input otherwise. Split into tag and version so the source_ref export
         # and the deployment description cannot name a different thing than
         # was built.
