@@ -487,7 +487,7 @@ reseed_runs_after_live_opt_in(Config) ->
     Dir = i2p_ct_helpers:temp_data_dir(Config),
     Port = i2p_ct_helpers:free_port(),
     Ris = [remote_ri(4800), remote_ri(4801)],
-    Su3Port = serve_su3(sign_ris(Ris)),
+    {Su3Port, Su3Srv} = i2p_ct_helpers:serve_su3(sign_ris(Ris)),
     try
         application:set_env(?APP, data_dir, Dir),
         application:set_env(?APP, seeds, [dummy_seed()]),
@@ -530,6 +530,7 @@ reseed_runs_after_live_opt_in(Config) ->
         )
     after
         application:stop(?APP),
+        i2p_ct_helpers:stop_su3_server(Su3Srv),
         application:unset_env(?APP, data_dir),
         application:unset_env(?APP, seeds),
         application:unset_env(?APP, port),
@@ -1264,33 +1265,6 @@ sign_ris(Ris) ->
     ],
     {ok, {_Name, ZipBin}} = zip:create("i2pseeds.zip", Entries, [memory]),
     i2p_su3:encode(<<"1789000000">>, <<"test-signer">>, ZipBin, Priv).
-
-serve_su3(Su3) ->
-    {ok, Listen} = gen_tcp:listen(0, [
-        {ip, {127, 0, 0, 1}},
-        binary,
-        {active, false},
-        {reuseaddr, true}
-    ]),
-    {ok, P} = inet:port(Listen),
-    spawn(fun() -> serve_once(Listen, Su3) end),
-    P.
-
-serve_once(Listen, Su3) ->
-    {ok, Sock} = gen_tcp:accept(Listen, 15_000),
-    {ok, _Request} = gen_tcp:recv(Sock, 0, 15_000),
-    Response = [
-        <<"HTTP/1.1 200 OK\r\n">>,
-        <<"Content-Type: application/octet-stream\r\n">>,
-        <<"Content-Length: ">>,
-        integer_to_binary(byte_size(Su3)),
-        <<"\r\n">>,
-        <<"Connection: close\r\n\r\n">>,
-        Su3
-    ],
-    ok = gen_tcp:send(Sock, Response),
-    gen_tcp:close(Sock),
-    gen_tcp:close(Listen).
 
 reseed_url(Port) ->
     lists:flatten(io_lib:format("http://127.0.0.1:~b/", [Port])).
