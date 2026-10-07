@@ -59,7 +59,16 @@ ok = i2p_stats:add(events_notified, 1),
 
 -behaviour(gen_server).
 
--export([start_link/0, add/2, snapshot/0, uptime_ms/0, boot_time/0, counters/0]).
+-export([
+    start_link/0,
+    add/2,
+    set_gauge/2,
+    snapshot/0,
+    gauges/0,
+    uptime_ms/0,
+    boot_time/0,
+    counters/0
+]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
@@ -95,6 +104,29 @@ counters() ->
         %% figure, but it is the one that answers "is anything instrumented
         %% yet", which is the first question when a status page looks empty.
         events_notified,
+
+        %% %%%%% Blocks we received and did not handle %%%%%
+        %%
+        %% **Every SSU2 Data block that reached the peer manager and matched no
+        %% handler**, counted once each. The count is remote-driven and
+        %% undeduplicated: a peer that sends nothing but blocks we do not handle
+        %% moves this as fast as it can transmit.
+        %%
+        %% This is the total that `ssu2_block_unhandled` used to be. The event
+        %% carried it by being emitted per block, and that made the announce rate
+        %% a function of what a remote peer chose to send -- which matters
+        %% because a wedged `gen_event` handler parks the manager and every event
+        %% queued behind it sits in the manager's mailbox. The flood rate *was*
+        %% the backlog rate. The event is now announced once per peer and kind;
+        %% this carries what it stopped carrying. See #HPH59JN.
+        %%
+        %% A counter rather than an event for the same reason as every other rate
+        %% here: this is a steady state on a router being sent junk, and an event
+        %% per 1028-byte block would drown the bus.
+        %%
+        %% Read alongside the per-peer log warning, which says *which* peer. This
+        %% says how much, and neither figure answers for the other.
+        ssu2_blocks_unhandled,
 
         %% %%%%% Bytes at the transport boundary %%%%%
         %%
@@ -182,6 +214,33 @@ counters() ->
         %% is blocked", which is the one an operator can act on. See #1Q4JREN.
         ssu2_dials_parked,
 
+        %% %%%%% Dials that stopped reporting %%%%%
+        %%
+        %% **A peer had to be released from `connecting` because its dial never
+        %% said what happened.** Expected to stay at zero. It counts three
+        %% situations that are one operator fact — a dial that produced no
+        %% outcome — and the bus event of the same moment carries which:
+        %% `{dial_died, _}` for a dial process that ended (abnormally, or normally
+        %% having sent nothing), `dial_deadline` for one that outlived
+        %% `f:i2p_peer:dial_deadline_ms/0`.
+        %%
+        %% This is not a connect failure, and the distinction is the point. Every
+        %% leg of a dial bounds itself — the SSU2 handshake by its retransmit
+        %% count, the introducer leg by `f:i2p_ssu2_conn`'s redirect wait, NTCP2
+        %% by its handshake timeout — and each reports when it gives up, so
+        %% `peer_connect_failed` is a statement about the remote. A dial that goes
+        %% silent is a statement about *this* router: a raise on the dial path, or
+        %% a blocking call that stopped honouring its own bound. Before these
+        %% escapes existed the symptom was a peer at `connecting` for the life of
+        %% the process, which `f:sweep_peers/1` deliberately never evicts, so the
+        %% router would carry on as though that peer were still being dialled.
+        %%
+        %% One counter rather than two, because the two causes are not separately
+        %% actionable and would only be told apart by eye. A non-zero value is the
+        %% evidence that the backstop is what ended a dial, which is what makes it
+        %% worth looking at rather than a healthy router's normal life. See #8V1Z06A.
+        dials_escaped,
+
         %% %%%%% Bytes carried for other routers %%%%%
         %%
         %% **These are wire bytes, not client bytes, and the difference is not an
@@ -221,15 +280,21 @@ counters() ->
 
         %% %%%%% Our own outbound, undeliverable %%%%%
         %%
-        %% One operator question with two causes, so one section: what did *we*
+        %% One operator question with three causes, so one section: what did *we*
         %% fail to deliver after successfully routing it. The section above is the
         %% opposite -- frames that had nowhere to go at all. An operator needs
         %% both to tell a routing fault from a delivery fault, and they belong
         %% next to each other so the read API presents them as one question
-        %% rather than three counters to correlate by hand.
+        %% rather than four counters to correlate by hand.
         %%
-        %% **Messages, not frames, and the distinction is not cosmetic.** Both are
-        %% counted at the injection point, where a whole I2NP message is about to
+        %% The three are a client message, a lookup request and a lookup reply,
+        %% and **they are not one number**: whoever is left waiting is our user,
+        %% a router that asked us a question, or a router waiting on an answer we
+        %% had. The operator's response differs for each, so the sum of the three
+        %% is not a fact.
+        %%
+        %% **Messages, not frames, and the distinction is not cosmetic.** All three
+        %% are counted at the injection point, where a whole I2NP message is about to
         %% be handed to `m:i2p_tunnel_srv`. No frame exists yet --
         %% `f:outbound_frames/4` runs *after* the tunnel is found, so a message
         %% that fails here was never fragmented at all. Calling either a frame
@@ -246,15 +311,26 @@ counters() ->
         %% route is re-resolved, so these are per-message rates on live paths
         %% rather than incidents.
         client_messages_dropped_no_tunnel,
-        %% The same loss on the other side of the router: a reply we owed another
-        %% router, injected into a lookup outbound tunnel that went away between
-        %% picking it and sending on it. **Its own counter, not a shared one.**
-        %% A lost client send is our user waiting on their own traffic; a lost
-        %% lookup reply is *another router* waiting on an answer we had. One is
-        %% our user's experience, the other is our usefulness to the network, and
-        %% an operator cannot act on the sum. Sharing would also make
-        %% `client_messages_dropped_no_tunnel` a lie by name, which is the same
-        %% category of error as calling it `frames`.
+        %% A DatabaseLookup we owed another router, injected into an exploratory
+        %% outbound tunnel that went away between picking it and sending on it.
+        %%
+        %% **The last of the three injection sites to count anything**, and the
+        %% one whose absence was a hole rather than a missing feature: with the
+        %% client and reply sites charging and this one silent, a query that
+        %% never left was reported as `no_answer` — indistinguishable from a
+        %% query the network simply did not answer, which is the opposite
+        %% diagnosis. `f:send_lookup/4` is exported so a stub can answer the two
+        %% picks `{ok, _}` and the send `error`, since a real manager answers
+        %% `ok` to all three and reaching this branch any other way means racing
+        %% a tunnel retirement. See #G9HZK8F.
+        %%
+        %% Expected to stay at zero: the same two-call window
+        %% `lookup_replies_dropped_no_tunnel` has, which is why all three charge
+        %% at the injection point rather than at the pick.
+        lookup_requests_dropped_no_tunnel,
+        %% A reply we owed another router, on the other side of the router from the
+        %% request above: injected into a lookup outbound tunnel that went away
+        %% between picking it and sending on it.
         %%
         %% Expected to stay at zero, and that is a claim about the code rather
         %% than about traffic: both lookups resolve through the same pool map, so
@@ -296,12 +372,13 @@ counters() ->
 
         %% %%%%% Connections and sessions refused at a cap %%%%%
         %%
-        %% **Three counters for one operator question: which of my three caps am
-        %% I hitting?** They are not one shared total because the three bounds
-        %% different things and are fixed by three different keys, so a single
+        %% **Four counters for one operator question: which of my four caps am
+        %% I hitting?** They are not one shared total because the four bound
+        %% different things and are fixed by four different keys, so a single
         %% number cannot be acted on — the fix for a SAM session refused at
         %% `max_sam_sessions` is nothing like the fix for a peer connection
-        %% refused at `max_ntcp2_connections`.
+        %% refused at `max_ntcp2_connections`, and neither is like a streaming
+        %% connection refused at `max_stream_connections`.
         %%
         %% Expected to stay at zero. A non-zero value is not a fault in itself:
         %% the cap did its job. It is the evidence that the cap is the thing
@@ -322,6 +399,11 @@ counters() ->
         ntcp2_connections_refused_limit,
         ssu2_sessions_refused_limit,
         sam_sessions_refused_limit,
+        %% A refused streaming connection, and the one refusal here whose count is
+        %% driven by remote peers rather than by a local dial: a STREAM ACCEPT
+        %% destination invites any number of inbound streams, so this is the rate
+        %% that says a router is being sent more streams than it will hold.
+        stream_conns_refused_limit,
 
         %% %%%%% Tunnel lifecycle %%%%%
         %%
@@ -399,6 +481,58 @@ snapshot() ->
     end.
 
 -doc """
+Set a live value, replacing any previous reading of the same name.
+
+Input: a name and a number. Output: `ok`, or `ok` when this process is not running.
+
+**Gauges are not counters, and the two are deliberately not interchangeable.** A
+counter accumulates and is read by differencing it between two readings; a gauge is
+a value at an instant and is overwritten. The one place the tree needs a live value
+is the bus's queue depth -- see `m:i2p_events:sample_backlog/0` -- and folding it
+into `f:counters/0` would break that array's one invariant: a counter that goes
+backwards is indistinguishable from a router restarting, which is exactly the
+ambiguity `f:add/2` refuses to create by rejecting a negative amount. A queue depth
+falls every time the bus catches up, so it cannot live there.
+
+**The write is a `persistent_term` put and that is a real cost.** `persistent_term`
+rehashes every term in the system on each write, which is why this exists at all
+rather than being free: it is cheap to *read*, which is the direction that happens
+on every status request and on every telemetry consumer. So the rule is one write
+per gauge per sampling interval and no more -- a gauge written from a packet path
+would be a defect. `f:i2p_events:sample_backlog/0` writes once per tick.
+
+Returns `ok` when the process is not running, for the same reason `f:add/2` does:
+telemetry must not be able to crash a working connection.
+""".
+-spec set_gauge(atom(), number()) -> ok.
+set_gauge(Name, Value) when is_number(Value) ->
+    case state() of
+        undefined ->
+            ok;
+        #{gauges := Gauges} = State ->
+            persistent_term:put(?PT_KEY, State#{gauges => Gauges#{Name => Value}})
+    end.
+
+-doc """
+Every live value, by name.
+
+Output: a map from gauge name to its most recent reading. A gauge is reported
+whether or not it has ever been set, so a consumer distinguishes "not measured yet"
+(the name is absent) from "measured, and zero" (present, value zero) -- the same
+distinction `f:snapshot/0` makes for counters. Empty when this process is not
+running.
+
+**Reading is one `persistent_term` fetch**, the same fetch `f:counters/0` needs, so
+a consumer that wants both pays one indirection rather than two.
+""".
+-spec gauges() -> #{atom() => number()}.
+gauges() ->
+    case state() of
+        undefined -> #{};
+        #{gauges := Gauges} -> Gauges
+    end.
+
+-doc """
 Milliseconds since the router's stats process started.
 
 Output: a non-negative integer, or `0` when this process is not running. Derived
@@ -438,6 +572,9 @@ init([]) ->
         ref => Ref,
         names => Names,
         index => maps:from_list(lists:zip(Names, lists:seq(1, length(Names)))),
+        %% Live values, kept beside the counters rather than inside them. See
+        %% `f:set_gauge/2` for why the two cannot be one array.
+        gauges => #{},
         boot_wall => erlang:system_time(millisecond),
         boot_mono => erlang:monotonic_time(millisecond)
     },

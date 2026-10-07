@@ -63,15 +63,34 @@ layer, and forwarded as TunnelData toward the creator.
 
 ## Outbound gateway role
 
-As the creator of an active outbound tunnel we are its outbound gateway:
-`f:send_via_outbound/3` fragments a standard-header I2NP message into
-plaintext frames (`m:i2p_tunnel:gateway_all/4`), pre-applies every hop's
-inverse layer (`m:i2p_tunnel:obgw_prep/2`), and sends each frame to the
-first hop as type-18 TunnelData. After each participant hop adds its own
-layer on forward, the plaintext pops out at the remote endpoint. The
-fragment delivery instructions carried in the frames decide where the far
-end routes the payload — `{tunnel, GatewayHash, TunnelID}` names a remote
-inbound tunnel's gateway, which is how client streams reach a lease.
+As the creator of an active outbound tunnel we are its outbound gateway: a
+standard-header I2NP message is fragmented into plaintext frames
+(`m:i2p_tunnel:gateway_all/4`), every hop's inverse layer is pre-applied
+(`m:i2p_tunnel:obgw_prep/2`), and each frame goes to the first hop as
+type-18 TunnelData. After each participant hop adds its own layer on
+forward, the plaintext pops out at the remote endpoint. The fragment
+delivery instructions carried in the frames decide where the far end routes
+the payload — `{tunnel, GatewayHash, TunnelID}` names a remote inbound
+tunnel's gateway, which is how client streams reach a lease.
+
+**The manager reads the map; the process that plays the role does the work.**
+There are two entry points, and they differ only in which process runs the
+crypto:
+
+- **A client send takes the role itself.** `f:outbound_injection/1` reads the
+  tunnel map and returns the first hop plus this tunnel's layer keys;
+  `f:inject/3` then runs the whole sequence in the calling connection's own
+  process. Two client sends no longer serialise inside one mailbox, and
+  neither is gated by transit frames for other routers or by a tunnel build.
+- **A lookup send stays here.** `m:i2p_lookup_srv` and
+  `m:i2p_peer:reply_via_outbound/3` are singletons rather than connections —
+  and `m:i2p_peer` is the process every send path in the router goes through,
+  the worst possible host for a per-connection workload. They use
+  `f:send_via_outbound/3`, which is the same role played in the manager.
+
+`f:inject/3` is the one implementation; `f:send_via_outbound/3` calls it. So
+the wire output cannot drift between the two, and a change to the framing
+lands in both.
 
 ## Local inbound endpoint
 
@@ -162,6 +181,8 @@ ok = i2p_tunnel_srv:stop().
     pick_exploratory_in/0,
     pick_lookup_outbound/0,
     pick_lookup_inbound/0,
+    outbound_injection/1,
+    inject/3,
     send_via_outbound/3,
     publish_lease_set/2,
     publish_lease_set/3,
@@ -174,6 +195,7 @@ ok = i2p_tunnel_srv:stop().
 -export_type([
     tunnel_srv_state/0,
     send_delivery/0,
+    outbound_injection/0,
     pending_build/0,
     pending_inbound/0,
     tunnel_entry/0,
@@ -289,6 +311,29 @@ inbound tunnel (the client-stream path to a remote lease).
     local
     | {router, i2p_crypto:hash()}
     | {tunnel, i2p_crypto:hash(), 0..16#FFFFFFFF}.
+
+-doc """
+Everything a caller needs to inject one I2NP message into one of our outbound
+tunnels, and nothing it does not: the tunnel's ID, its first hop, and its
+per-hop inverse layer keys. Obtained from `f:outbound_injection/1`, consumed by
+`f:inject/3`.
+
+**An unfinished send, deliberately.** `{ok, Injection}` says the tunnel was
+active at the moment the injection was taken; it does not say the message
+reached the first hop, because it has not been fragmented yet. A caller that
+reads it as a completed send is wrong — and the gap is the point. Running the
+framing and the inverse-layer crypto in the caller's own process is what keeps
+a client send out of the manager's mailbox, so the answer has to arrive before
+the work rather than after it.
+
+`tunnel_id` is carried rather than echoed by the caller so that the ID the
+frames are stamped with cannot drift from the ID the layer keys belong to.
+""".
+-type outbound_injection() :: #{
+    tunnel_id := 0..16#FFFFFFFF,
+    hop1 := i2p_crypto:hash(),
+    layers := [i2p_tunnel:layer_keys()]
+}.
 
 %%%%%%% %%% Public API %%%%%%%
 
@@ -433,8 +478,71 @@ pick_lookup_inbound() ->
     gen_server:call(?MODULE, pick_lookup_inbound).
 
 -doc """
+Take out an injection into one of our active outbound tunnels, leaving the
+work to the caller.
+
+This is the client send path, and the split is the point: the manager reads
+its own map and answers, and the caller's process does the framing and the
+inverse-layer crypto. Two client sends therefore no longer serialise inside
+the manager, and neither is gated by the transit frames and tunnel builds it
+also handles.
+
+`Delivery` and `StdMsg` are deliberately **not** arguments. Nothing about
+taking the injection depends on them, so passing them would suggest the
+manager had done something with them by the time it answers.
+
+Input: `TunnelID` — the tunnel's first-hop receive ID (as returned by
+`f:pick_outbound/0`).
+Output: `{ok, t:outbound_injection/0}` to be handed to `f:inject/3`, or
+`error` when no outbound tunnel with that ID is active. **`error` is the
+answer at the moment it was taken**, and the tunnel can be retired
+immediately afterwards — the caller owns what happens next, including
+counting a message it could not inject.
+""".
+-spec outbound_injection(0..16#FFFFFFFF) -> {ok, outbound_injection()} | error.
+outbound_injection(TunnelID) ->
+    gen_server:call(?MODULE, {outbound_injection, TunnelID}).
+
+-doc """
+Play the outbound-gateway role for one message, in the calling process.
+
+Fragments `StdMsg` into plaintext frames carrying the far-end delivery
+instructions (`m:i2p_tunnel:gateway_all/4`), pre-applies every hop's inverse
+layer so plaintext emerges at the remote endpoint after each participant hop
+re-encrypts its own layer (`m:i2p_tunnel:obgw_prep/2`), and hands each frame
+to the first hop as type-18 TunnelData
+(`m:i2p_tunnel_relay:send_tunnel_data/2`).
+
+Input: `Injection` — from `f:outbound_injection/1`; `Delivery` — where the
+far end routes the reassembled payload (`t:send_delivery/0`); `StdMsg` — the
+full standard 16-byte-header I2NP message, typically a garlic message.
+Output: `ok` once every frame is handed to the peer manager. Fragment
+numbering restarts per message — follow-on frames carry their own message ID,
+so reassembly at the far end is unaffected.
+
+**The `ok` means "every frame was handed over", not "the message arrived".**
+Frames for a hop this router has no RouterInfo for are dropped and counted as
+`transit_frames_dropped_no_route` by the peer manager, which owns
+reconnection; there is no delivery acknowledgement to return here.
+""".
+-spec inject(outbound_injection(), send_delivery(), binary()) -> ok.
+inject(#{tunnel_id := TunnelID, hop1 := Hop1Hash, layers := Layers}, Delivery, StdMsg) ->
+    Frames = outbound_frames(TunnelID, Delivery, StdMsg, Layers),
+    lists:foreach(
+        fun(Frame) -> i2p_tunnel_relay:send_tunnel_data(Hop1Hash, Frame) end,
+        Frames
+    ).
+
+-doc """
 Inject a standard-header I2NP message into one of our active outbound
-tunnels (we act as its outbound gateway).
+tunnels (we act as its outbound gateway), **in the manager**.
+
+The lookup path: `m:i2p_lookup_srv` and `m:i2p_peer:reply_via_outbound/3`
+are singletons rather than connections, so there is no per-connection worker
+to hand the work to — and `m:i2p_peer` is the process every send path in the
+router goes through, which is the worst possible host for it. A client send
+has a connection behind it and uses `f:outbound_injection/1` plus
+`f:inject/3` instead; both run the same code.
 
 Input: `TunnelID` — the tunnel's first-hop receive ID (as returned by
 `f:pick_outbound/0`); `Delivery` — where the far end routes the reassembled
@@ -443,9 +551,7 @@ reach a remote lease); `StdMsg` — the full standard 16-byte-header I2NP
 message, typically a garlic message.
 
 Output: `ok` once every frame is handed to the peer manager; `error` when
-no outbound tunnel with that ID is active. Fragment numbering restarts per
-message — follow-on frames carry their own message ID, so reassembly at the
-far end is unaffected.
+no outbound tunnel with that ID is active.
 """.
 -spec send_via_outbound(0..16#FFFFFFFF, send_delivery(), binary()) -> ok | error.
 send_via_outbound(TunnelID, Delivery, StdMsg) ->
@@ -570,20 +676,18 @@ handle_call(
     pick_lookup_inbound, _From, #{exploratory_in := ExploratoryIn, inbound := Inbound} = State
 ) ->
     {reply, fallback_pick(ExploratoryIn, Inbound), State};
+handle_call({outbound_injection, TunID}, _From, State) ->
+    {reply, injection_for(TunID, find_outbound(State, TunID)), State};
 handle_call({send_via_outbound, TunID, Delivery, StdMsg}, _From, State) ->
-    case find_outbound(State, TunID) of
-        {ok, #{router_hashes := [Hop1Hash | _], layers := Layers}} ->
-            Frames = outbound_frames(TunID, Delivery, StdMsg, Layers),
-            lists:foreach(
-                fun(Frame) -> i2p_tunnel_relay:send_tunnel_data(Hop1Hash, Frame) end,
-                Frames
-            ),
-            {reply, ok, State};
-        error ->
-            {reply, error, State}
-    end;
-handle_call(_Request, _From, State) ->
-    {reply, ok, State}.
+    {reply, send_over(injection_for(TunID, find_outbound(State, TunID)), Delivery, StdMsg), State};
+handle_call(Request, _From, _State) ->
+    %% Raising, and not a plausible reply. This used to answer `ok` to anything
+    %% it did not recognise, which made a request-shape change that missed a
+    %% caller *silently succeed* — the same defect class as the two
+    %% false-claim tickets on this board, and a live landmine under exactly
+    %% that change. A `permanent` child crashing is the loud outcome; the
+    %% alternative was a caller believing a send happened.
+    exit({i2p_tunnel_srv, unhandled_call, Request}).
 
 handle_cast(build_outbound, State) ->
     {noreply, i2p_tunnel_build:do_build_outbound(State)};
@@ -657,6 +761,32 @@ find_outbound(#{tunnels := Tunnels, exploratory := Exploratory}, TunID) ->
         {ok, _} = Ok -> Ok;
         error -> maps:find(TunID, Exploratory)
     end.
+
+%% injection_for/2 — narrow a resolved entry to what the outbound-gateway role
+%% actually reads: the first hop, and this tunnel's inverse layer keys. The
+%% tunnel ID rides along so the caller cannot stamp frames with an ID the keys
+%% do not belong to.
+%%
+%% **Reads the map and nothing else.** No framing, no crypto, no per-frame
+%% send — that is the whole reason `f:inject/3` exists, and anything added to
+%% this clause puts a client send's work back on the manager's clock.
+-spec injection_for(0..16#FFFFFFFF, {ok, tunnel_entry()} | error) ->
+    {ok, outbound_injection()} | error.
+injection_for(TunnelID, {ok, #{router_hashes := [Hop1 | _], layers := Layers}}) ->
+    {ok, #{tunnel_id => TunnelID, hop1 => Hop1, layers => Layers}};
+injection_for(_TunnelID, error) ->
+    error.
+
+%% send_over/3 — the outbound-gateway role played in this process, for the
+%% lookup paths that stay here. One caller by decision rather than by
+%% accident: `m:i2p_lookup_srv` and `m:i2p_peer` are singletons, so there is no
+%% per-connection worker to hand the work to.
+-spec send_over({ok, outbound_injection()} | error, send_delivery(), binary()) ->
+    ok | error.
+send_over({ok, Injection}, Delivery, StdMsg) ->
+    inject(Injection, Delivery, StdMsg);
+send_over(error, _Delivery, _StdMsg) ->
+    error.
 
 %% outbound_frames/4 — build the wire frames for a creator injection into
 %% one of our own outbound tunnels: fragment into plaintext frames carrying

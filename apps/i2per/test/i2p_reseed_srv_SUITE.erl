@@ -69,7 +69,7 @@ reseed_worker_fills_netdb(_Config) ->
         ri => i2p_router_info:build(Identity, erlang:system_time(millisecond), [Addr], Opts, Seed)
     },
     Ris = [remote_ri(4800), remote_ri(4801)],
-    Port = serve_su3(sign(Ris)),
+    {Port, Su3Srv} = i2p_ct_helpers:serve_su3(sign(Ris)),
     {ok, NetDb} = i2p_netdb_srv:start_link(),
     {ok, Peer} = i2p_peer:start_link(Local, []),
     {ok, Worker} = i2p_reseed_srv:start_link(#{
@@ -97,7 +97,8 @@ reseed_worker_fills_netdb(_Config) ->
         2 = i2p_netdb_srv:count()
     after
         gen_server:stop(Peer),
-        gen_server:stop(NetDb)
+        gen_server:stop(NetDb),
+        i2p_ct_helpers:stop_su3_server(Su3Srv)
     end.
 
 await_stored(Hash, T0) ->
@@ -182,33 +183,6 @@ remote_ri(Port) ->
     Addr = i2p_router_info:ntcp2_address(<<"127.0.0.1">>, Port, StaticPub, IV),
     Opts = #{<<"netId">> => <<"2">>, <<"router.version">> => <<"0.9.74">>},
     i2p_router_info:build(Identity, erlang:system_time(millisecond), [Addr], Opts, Seed).
-
-serve_su3(Su3) ->
-    {ok, Listen} = gen_tcp:listen(0, [
-        {ip, {127, 0, 0, 1}},
-        binary,
-        {active, false},
-        {reuseaddr, true}
-    ]),
-    {ok, Port} = inet:port(Listen),
-    spawn(fun() -> serve_once(Listen, Su3) end),
-    Port.
-
-serve_once(Listen, Su3) ->
-    {ok, Sock} = gen_tcp:accept(Listen, 10_000),
-    {ok, _Request} = gen_tcp:recv(Sock, 0, 10_000),
-    Response = [
-        <<"HTTP/1.1 200 OK\r\n">>,
-        <<"Content-Type: application/octet-stream\r\n">>,
-        <<"Content-Length: ">>,
-        integer_to_binary(byte_size(Su3)),
-        <<"\r\n">>,
-        <<"Connection: close\r\n\r\n">>,
-        Su3
-    ],
-    ok = gen_tcp:send(Sock, Response),
-    gen_tcp:close(Sock),
-    gen_tcp:close(Listen).
 
 url(Port) ->
     lists:flatten(io_lib:format("http://127.0.0.1:~b/", [Port])).

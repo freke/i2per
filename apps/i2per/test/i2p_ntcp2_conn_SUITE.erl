@@ -25,7 +25,10 @@
     send_does_not_wait_on_the_connection/1,
     a_peer_that_stops_reading_ends_the_connection/1,
     an_inbound_burst_does_not_delay_a_send/1,
-    a_batch_of_inbound_connections_is_not_accepted_one_per_second/1
+    a_batch_of_inbound_connections_is_not_accepted_one_per_second/1,
+    stop_reports_only_after_the_accept_path_has_stopped/1,
+    wedged_accept_path_is_reported_rather_than_claimed_stopped/1,
+    a_session_is_alive_and_speaking_at_frame_70000/1
 ]).
 
 -define(APP, i2per).
@@ -51,6 +54,58 @@
 -define(ACCEPT_BATCH, 6).
 -define(ACCEPT_BUDGET_MS, 2000).
 
+%% The shutdown group's one figure that is not obvious. ?STOP_QUEUE is how many
+%% connections sit in the kernel's accept queue while the acceptor is suspended --
+%% enough that the accept path is plainly able to produce a responder, not one
+%% that might.
+%%
+%% The bound on this case's own wait is ?TIMEOUT, the suite-wide one, and it is
+%% *not* what decides whether `f:stop/1` is honest: that is `?STOP_TIMEOUT_MS` in
+%% the module under test, which is a third of it, so this case can only ever be red
+%% for a reason the module owns.
+-define(STOP_QUEUE, 4).
+
+%% --------------------------------------------------------------------------
+%% The message counter crossing 2^16
+%% --------------------------------------------------------------------------
+%%
+%% How many frames each direction is flooded with, and the hang guard around it.
+%%
+%% ?FRAMES_PER_DIRECTION is **70000**, and the round number is the point rather
+%% than a convenience. The boundary this case exists to cross is `2^16`, and a
+%% figure like 65537 is *past* it but does not look it: a reader has to decompose
+%% it (2^16 + 1) and read the case's comment to learn that the number means
+%% anything at all. 70000 states the claim on its own — this session is alive
+%% and speaking ~4500 frames beyond the boundary — so the figure is readable in
+%% the case name, in this constant, and in the failure message, which is what
+%% makes the case's intent legible without its prose.
+%%
+%% **65537 is the minimum that distinguishes the defect from a fix, and 70000
+%% keeps that property rather than trading it.** Message number 65536 is the one
+%% that raised, so any count at or above 65537 asks the connection to send the
+%% frame that killed it; 70000 is such a count, so the case still goes red
+%% against the old bound. It is written as the literal rather than computed from
+%% `2^16`, so the case and its reason cannot drift together.
+%%
+%% **What 70000 does not buy, stated so nobody credits it with catching it.** A
+%% second increment site in the data phase would walk the counter twice as fast,
+%% and no figure in this range notices: at 65537 frames a doubled counter
+%% reaches 131074 and at 70000 it reaches 140000, both comfortably inside
+%% `2^64 - 2`. This case is about the boundary the counter *had*, not about the
+%% rate it increments at.
+%%
+%% ?FRAME_BUDGET_MS is a **hang guard, not a tolerance and not an assertion about
+%% elapsed time**: reaching it fails the case and names which direction stalled
+%% and how far it got. The flood is ~1.5 MB each way over loopback (70k frames
+%% of a 4-byte payload) and measures **1.6s** on the machine this was written
+%% on, so 20s is an order of magnitude
+%% above it and about 4x the ~5s the whole smoke tier's CT costs scale to on a CI
+%% runner. It is set **below** the suite's 30s timetrap on purpose, so the guard
+%% is what fires and the failure is an error term naming the stall rather than a
+%% CT kill that says only that time ran out.
+-define(FRAMES_PER_DIRECTION, 70000).
+-define(FRAME_BUDGET_MS, 20000).
+
 suite() ->
     [{timetrap, 30000}].
 
@@ -69,7 +124,10 @@ all() ->
         send_does_not_wait_on_the_connection,
         a_peer_that_stops_reading_ends_the_connection,
         an_inbound_burst_does_not_delay_a_send,
-        a_batch_of_inbound_connections_is_not_accepted_one_per_second
+        a_batch_of_inbound_connections_is_not_accepted_one_per_second,
+        stop_reports_only_after_the_accept_path_has_stopped,
+        wedged_accept_path_is_reported_rather_than_claimed_stopped,
+        a_session_is_alive_and_speaking_at_frame_70000
     ].
 
 init_per_testcase(transport_bytes_are_counted, Config) ->
@@ -109,12 +167,29 @@ init_per_testcase(idle_reap, Config) ->
     {ok, _} = application:ensure_all_started(?APP),
     ok = application:set_env(?APP, idle_timeout_ms, 300),
     Config;
+init_per_testcase(a_session_is_alive_and_speaking_at_frame_70000, Config) ->
+    {ok, _} = application:ensure_all_started(?APP),
+    %% The flood's whole claim is a frame count, so nothing else may spend a
+    %% message number. A keepalive is a payload through the very same
+    %% `send_payload/4`, so one firing would consume a counter value the case
+    %% does not know about and put the boundary a frame earlier than the case
+    %% believes — which is a weaker test, not a stronger one. The default is 60s
+    %% and the case finishes well inside that, but "never fires in practice" is
+    %% the same hope `transport_bytes_are_counted` already stopped relying on, so
+    %% the precondition is pinned here instead. Read when a connection arms its
+    %% timer, which is after this returns.
+    ok = application:set_env(?APP, ntcp2_keepalive_interval_ms, 600_000),
+    Config;
 init_per_testcase(shared_helpers_roundtrip, Config) ->
     Config;
 init_per_testcase(_Case, Config) ->
     {ok, _} = application:ensure_all_started(?APP),
     Config.
 
+end_per_testcase(a_session_is_alive_and_speaking_at_frame_70000, _Config) ->
+    ok = application:unset_env(?APP, ntcp2_keepalive_interval_ms),
+    application:stop(?APP),
+    ok;
 end_per_testcase(transport_bytes_are_counted, _Config) ->
     ok = application:unset_env(?APP, ntcp2_keepalive_interval_ms),
     application:stop(?APP),
@@ -788,6 +863,413 @@ take_asked(Asker, Deadline) ->
 
 remaining_ms(Deadline) ->
     erlang:max(0, Deadline - erlang:monotonic_time(millisecond)).
+
+%% --------------------------------------------------------------------------
+%% The shutdown contract
+%% --------------------------------------------------------------------------
+
+%% `f:i2p_ntcp2_listener:stop/1` reports that the listener stopped, and the report
+%% is only worth having if it is true when it arrives.
+%%
+%% **The defect.** The reply was sent first and `exit(normal)` second, and the
+%% listening socket closed as a consequence of the process exiting -- so between
+%% the two, the answer had arrived and the socket was still open. A connection
+%% already sitting in the kernel's accept queue could still be taken by
+%% `m:i2p_tcp_acceptor`, and `f:i2p_ntcp2_listener:start_bob/3` could still run: a
+%% `f:supervisor:start_child/2` starting a responder that **dials out to a peer**,
+%% after a caller had been told nothing further would happen. That last clause is
+%% what separates this listener from SAM's, where the same ordering handed out a
+%% session and could hit `max_sam_sessions`. Closing the socket explicitly before
+%% answering fixes the ordering; waiting for the acceptor's `'DOWN'` is what makes
+%% it true for a connection the acceptor had already taken, which a socket close
+%% cannot reach.
+%%
+%% **What this case proves, and what it does not.** The `false = is_process_alive(Acceptor)`
+%% is the claim: the acceptor's exit is ordered before the reply, so by the time
+%% this process reads the reply the acceptor is gone, and the assertion is a
+%% barrier rather than a wait -- everything before the reply has already happened.
+%% The acceptor is the only process that calls `f:start_bob/3`, so a dead acceptor
+%% is not a weaker version of "no responder will start" but the whole of it. The
+%% `econnrefused` below is the same fact seen from the socket: nothing can be
+%% accepted at all once the reply is in hand.
+%%
+%% It is a positive case and it is **not** what kills the defect. Under the old
+%% ordering the acceptor also died quickly, just not before the reply -- so this
+%% case would usually have passed. `f:wedged_accept_path_is_reported_rather_than_claimed_stopped/1`
+%% is the one that rejects the old code, and this case is here because the
+%% guarantee is worth stating positively as well as negatively.
+stop_reports_only_after_the_accept_path_has_stopped(_Config) ->
+    {Bob, Alice} = pair(),
+    {ok, Listener} = i2p_ntcp2_listener:listen(0, Bob, self()),
+    Acceptor = acceptor_of(Listener),
+    Port = listen_port(Listener),
+    %% One real inbound connection first, so "the accept path is finished" is not
+    %% vacuously true of a listener that never accepted anything.
+    {ok, CA} = i2p_ntcp2_conn:connect(ri_at(Port, Bob), Alice, #{}),
+    {CB, _} = await_ready(),
+    try
+        Stopper = ask_stop(self(), Listener),
+        ok = take_stop_reply(Stopper),
+        false = is_process_alive(Acceptor),
+        %% Closing the listener stops future accepts and nothing else: the two
+        %% established connections are children of the same supervisor and are
+        %% untouched by the shutdown. Asserted because "stopped" is easy to
+        %% over-read as "gone", and this module doc promises it is not.
+        true = is_process_alive(CA),
+        true = is_process_alive(CB),
+        {error, econnrefused} = connect_ntcp(Port)
+    after
+        [ok = i2p_ntcp2_conn:stop(Conn) || Conn <- [CA, CB]],
+        i2p_ntcp2_listener:stop(Listener)
+    end,
+    ok.
+
+%% The same guarantee from the other side: a stop that cannot confirm is reported
+%% as a stop that could not confirm.
+%%
+%% **Why the acceptor is suspended rather than the case waiting.** Closing the
+%% listening socket ends an acceptor blocked in `f:gen_tcp:accept/1` -- that is what
+%% `{error, closed}` means -- so a case that merely queued connections and called
+%% `f:stop/1` would see the acceptor finish and could not tell an ordered reply
+%% from a lucky one. `f:erlang:suspend_process/1` holds the accept path still:
+%% while it is suspended the listener has no way to learn that its acceptor is
+%% done, so it cannot honestly answer, and `f:stop/1` must say so rather than
+%% report `ok`.
+%%
+%% **`f:sys:suspend/1` does not work here**, for the reason
+%% `f:i2p_sam_SUITE:wedged_accept_path_is_reported_rather_than_claimed_stopped/1`
+%% records: `f:gen_tcp:accept/1` is a *selective* receive for `{inet_async, _, _}`,
+%% so a `{system, _, _}` message never matches it and the call times out.
+%% `f:erlang:suspend_process/1` is scheduler-level and does not care what the
+%% process is waiting for: it simply is not scheduled, which is the property the
+%% case needs -- the accept path can neither make progress nor be asked whether it
+%% has. Scheduling is all that is taken away.
+%%
+%% **This is the case that rejects the old code**, and the two outcomes are three
+%% orders of magnitude apart rather than merely different: the old `f:stop/1`
+%% returned `ok` in microseconds because it answered before doing anything, and
+%% this one waits out `?ACCEPTOR_EXIT_TIMEOUT_MS` and raises. Nothing here is a
+%% race, and nothing here is a tolerance that happens to clear the real behaviour.
+%%
+%% **The queued connections are what make the refusal correct rather than merely
+%% cautious.** They are completed by the kernel and sitting in the accept queue, so
+%% "the accept path can still produce a responder" is true at the moment
+%% `f:stop/1` is called -- the listener is refusing to answer a question it cannot
+%% yet answer, not inventing a failure. They are closed in the `after`, because a
+%% client holding a socket into the next case is exactly the kind of cross-case
+%% leak that turns one failure into several.
+wedged_accept_path_is_reported_rather_than_claimed_stopped(_Config) ->
+    {Bob, _Alice} = pair(),
+    {ok, Listener} = i2p_ntcp2_listener:listen(0, Bob, self()),
+    Acceptor = acceptor_of(Listener),
+    Port = listen_port(Listener),
+    %% Nothing has been accepted yet, so "no responder was started" below is a
+    %% count against zero rather than against a baseline this case chose.
+    0 = i2p_ntcp2_sup:connection_count(),
+    ok = suspend(Acceptor),
+    Clients = queue_connections(Port, ?STOP_QUEUE),
+    %% Armed before the stop, and read in the `after`. The acceptor's exit is the
+    %% barrier that makes the count below a reading rather than a race: a monitor
+    %% set on an already-dead process answers immediately, so there is no race here
+    %% either.
+    MRef = erlang:monitor(process, Acceptor),
+    try
+        %% Read through `f:answered/1` rather than `?assertError` for the reason
+        %% the accept-batch case at the end of this module gives for the same
+        %% helper: a raise is a term to match here, not a control-flow event to
+        %% catch, and matching it keeps this file's style of bare matches.
+        {'EXIT', {{accept_path_did_not_stop, Listener}, _}} =
+            answered(fun() -> i2p_ntcp2_listener:stop(Listener) end)
+    after
+        %% The acceptor is resumed before the clients are closed, so the socket
+        %% close reached a live accept loop rather than a frozen one -- and the
+        %% announcement is in its mailbox, so it exits `normal` at the top of the
+        %% loop without taking a single queued connection.
+        ok = resume(Acceptor),
+        normal = await_down(MRef, Acceptor),
+        0 = i2p_ntcp2_sup:connection_count(),
+        none = responder_announced(),
+        [gen_tcp:close(C) || C <- Clients]
+    end,
+    ok.
+
+%% The listener's only other linked *process* is its acceptor;
+%% `f:proc_lib:start_link/3` in `f:init/3` may or may not leave it linked to the
+%% supervisor that started it, and `f:i2p_tcp_acceptor:start_link/2` links the
+%% acceptor to it either way. The listening socket is linked too and is not a
+%% process, so it is filtered out rather than assumed away -- and the supervisor is
+%% filtered rather than subtracted, so this does not depend on which release
+%% `f:proc_lib` left the link in place.
+%%
+%% Matching on *exactly one other process* rather than searching for the acceptor
+%% is deliberate. The module's whole shutdown argument rests on there being one
+%% acceptor to wait for, so a listener that grew a second linked process would make
+%% `f:shutdown/5` wait on the wrong one -- and a case that went looking for an
+%% acceptor by module name would find one anyway, and hide that.
+acceptor_of(Listener) ->
+    Sup = whereis(i2p_ntcp2_sup),
+    {links, Links} = erlang:process_info(Listener, links),
+    [Acceptor] = [Pid || Pid <- Links, is_pid(Pid), Pid =/= Sup],
+    Acceptor.
+
+%% Matched rather than discarded: a suspension that did not take would leave the
+%% case asserting against a live accept loop, which is the old code's behaviour,
+%% and the case would then pass for the wrong reason.
+suspend(Pid) ->
+    true = erlang:suspend_process(Pid),
+    ok.
+
+resume(Pid) ->
+    true = erlang:resume_process(Pid),
+    ok.
+
+await_down(MRef, Pid) ->
+    receive
+        {'DOWN', MRef, process, Pid, Reason} -> Reason
+    after ?TIMEOUT ->
+        erlang:error({acceptor_never_exited, Pid})
+    end.
+
+%% Whether a responder announced itself to this process, read at the instant the
+%% acceptor is known to be gone.
+%%
+%% **The `after 0` is a fact and not a wait**, which is what makes it a barrier
+%% rather than a tolerance: the acceptor that is the only caller of
+%% `f:start_bob/3` has been observed to exit, so nothing can announce later, and
+%% this case's baseline was zero connections, so there is no responder that
+%% announced earlier and might announce late. Both halves are what remove the
+%% word "yet" from that sentence.
+responder_announced() ->
+    receive
+        {ntcp2_ready, Conn, _RemoteRI} -> {announced, Conn}
+    after 0 ->
+        none
+    end.
+
+%% Connect without reading, and hold. Nothing is read because nothing should ever
+%% arrive: these clients exist to sit in the accept queue, and a client that sent a
+%% byte would be answered by a responder -- which is the thing the case is about,
+%% so a reply here would be a failure rather than a convenience.
+queue_connections(Port, N) ->
+    [Sock || {ok, Sock} <- [connect_ntcp(Port) || _ <- lists:seq(1, N)]].
+
+connect_ntcp(Port) ->
+    gen_tcp:connect("127.0.0.1", Port, [binary, {packet, raw}, {active, false}], 5000).
+
+%% `Parent` is captured by the caller rather than read inside the fun: `self()`
+%% there is the stopper, and a reply sent to the stopper is a reply nobody is
+%% waiting for. Spawned rather than called directly so the case's own process is
+%% free to observe the mailbox while `f:stop/1` runs inside it.
+ask_stop(Parent, Listener) ->
+    spawn(fun() -> Parent ! {stop_reply, i2p_ntcp2_listener:stop(Listener)} end).
+
+take_stop_reply(Stopper) ->
+    receive
+        {stop_reply, Reply} -> Reply
+    after ?TIMEOUT ->
+        erlang:error({stop_never_answered, Stopper})
+    end.
+
+%% --------------------------------------------------------------------------
+%% The message counter crosses 2^16, and the session is still speaking
+%% --------------------------------------------------------------------------
+
+%% A session is alive and speaking at frame 70000, in each direction
+%%
+%% **The claim is liveness at a named frame**, not merely survival past a number
+%% nobody wrote down. See #GY414M9: this case and the fix it guards assert
+%% different things on purpose. The fix's case asks *how* the router gets past
+%% the boundary; this one asks only that it gets there and is still talking. A
+%% session cap at 65535 would satisfy both, and a silent counter reset satisfies
+%% only this one — which is the reason it is worth having separately rather than
+%% folded into the fix's coverage.
+%%
+%% **The defect.** `i2p_crypto:es_nonce/1` took `0..65535`, so message number
+%% 65536 fell into a clause that was not there and the connection process died
+%% with a `function_clause` raised out of a crypto helper. The send direction
+%% seeds `msg => 0` when the data phase starts and increments per frame; the
+%% receive direction is the inbound side of the same counter and feeds the same
+%% function. A session died on exactly the 65536th frame, and **it did not look
+%% like a crash on the wire** — the peer manager saw a disconnect and backed
+%% off, so from outside a healthy router looked like one that had dropped a peer.
+%% See #R8WNYK3.
+%%
+%% **Both directions in one case, because they are one defect.** The ticket asks
+%% for the receive path to be covered by the same case rather than assumed from
+%% the send path, and that is because they really are the same counter: fixing
+%% one without the other leaves half the bug live and this case stays green. So
+%% the pair is flooded in both directions at once and each is counted separately.
+%%
+%% **What is asserted, and why each part says more than the one before it.**
+%% Per direction, every frame arrived carrying the sequence number it was sent
+%% with. So the flood is not merely counted — a count is satisfied by one frame
+%% counted many times, or by a duplicated one — and not merely ordered, which is
+%% what a TCP byte stream gives you for free; ordering is asserted because the
+%% framing state is this module's, and a reordering or re-numbering bug there is
+%% invisible at the socket. Reading frame N is also the barrier: it cannot arrive
+%% before the N-1 before it, so having read it says the sender wrote all
+%% ?FRAMES_PER_DIRECTION and therefore ran its counter past 65536 without dying.
+%%
+%% Then the pair is still alive **and still carrying traffic** — one more frame
+%% each way after the flood. A connection that stopped at the boundary without
+%% dying would satisfy every count above; only using the session afterwards shows
+%% it survived rather than merely did not crash.
+%%
+%% **The flood runs in its own processes**, one per direction, for the reason
+%% `f:fill_until_stalled/2` records: a loop in the case itself would enqueue its
+%% frames and return while the connection was still working through them, which
+%% is a race dressed up as a bound. Here the case's own receive loop *is* the
+%% drain, so feeder and reader run concurrently by construction — the case cannot
+%% read a frame the feeder has not already put on the wire.
+%%
+%% **Neither direction waits for the other.** Both are drained from one mailbox,
+%% because this process owns both connections and one `f:receive/2` pattern
+%% matches either. A case that drained one direction to exhaustion before looking
+%% at the other would stall the side it was not reading.
+a_session_is_alive_and_speaking_at_frame_70000(_Config) ->
+    {Bob, Alice} = pair(),
+    {ok, Listener} = i2p_ntcp2_listener:listen(0, Bob, self()),
+    try
+        {ok, CA} = i2p_ntcp2_conn:connect(ri_at(listen_port(Listener), Bob), Alice, #{}),
+        {CB, _} = await_ready(),
+        %% Armed before either flood starts, so a connection that died inside one
+        %% cannot be missed as a `noproc` DOWN. The DOWN is what turns "the last
+        %% frame never arrived" into "the connection died" instead of a bare
+        %% timeout.
+        MRefA = erlang:monitor(process, CA),
+        MRefB = erlang:monitor(process, CB),
+        Conns = #{CA => 1, CB => 1},
+        Feeders = [
+            spawn(fun() -> feed_numbered(Conn, 1, ?FRAMES_PER_DIRECTION) end)
+         || Conn <- [CA, CB]
+        ],
+        try
+            Done = drain_numbered(Conns, 2 * ?FRAMES_PER_DIRECTION),
+            %% Each direction's figure is ?FRAMES_PER_DIRECTION + 1, because
+            %% `Seen` is the *next* sequence number expected rather than a count
+            %% of the frames read, so the count is one less.
+            #{CA := PastA, CB := PastB} = Done,
+            ?FRAMES_PER_DIRECTION = PastA - 1,
+            ?FRAMES_PER_DIRECTION = PastB - 1,
+            %% **The liveness assertion, stated at the named frame rather than
+            %% left to the reader to infer.** `alive_at_frame/3` names 70000 in its
+            %% own failure term, so a red run says which frame the session failed
+            %% to reach rather than reporting a bare `false` against a
+            %% `is_process_alive/1` call whose expected value is nowhere in the
+            %% message. This is the criterion #GY414M9 asks for, and it is why
+            %% this is a named function rather than two inline assertions: the
+            %% intent has to survive into the failure message, and an inline
+            %% `true = is_process_alive(CA)` does not carry it.
+            ok = alive_at_frame(CA, ?FRAMES_PER_DIRECTION, send),
+            ok = alive_at_frame(CB, ?FRAMES_PER_DIRECTION, recv),
+            %% A DOWN is read as a fact rather than waited for, and that is sound
+            %% here rather than merely convenient: both the frame announcements
+            %% and the monitor DOWN come from the connection, and the runtime
+            %% orders one sender's signals. So a connection that exited cannot
+            %% have its DOWN still in flight once the case has read the last
+            %% frame it sent. The DOWN is checked too because it says *why*,
+            %% which is the difference between a boundary failure and an ordinary
+            %% drop — `alive_at_frame/3` above only says that it is not alive.
+            [false = down(MRef) || MRef <- [MRefA, MRefB]],
+            ok = i2p_ntcp2_conn:send(CA, <<"past the boundary">>),
+            ok = i2p_ntcp2_conn:send(CB, <<"and back again">>),
+            <<"past the boundary">> = receive_frame(CB),
+            <<"and back again">> = receive_frame(CA)
+        after
+            [exit(Feeder, kill) || Feeder <- Feeders]
+        end
+    after
+        i2p_ntcp2_listener:stop(Listener)
+    end.
+
+%% Hand over `Left` frames numbered from `Seq`, one per `f:send/2` call, so every
+%% frame is its own message number and the reader can tell arrival order from
+%% arrival count. A batched send would be a single frame carrying many payloads
+%% and would walk the counter once, which is the opposite of what this case is
+%% about.
+%%
+%% **The countdown is what makes the count exact.** The first version of this ran
+%% `feed_numbered(Conn, Seq, Last)` with `Last =< Seq` as the base clause, which
+%% stops one short of its own argument: it sent frames 1..?FRAMES_PER_DIRECTION - 1
+%% and so never sent the frame carrying message number 65536 — the one the whole
+%% case exists to send. The case then drained 2 x 65536 frames and waited out its
+%% budget looking for a frame that had never been asked for, which reads exactly
+%% like the defect it was written to reject. Counting down what is left to send
+%% has no off-by-one to hide in.
+%%
+%% Counting **up** in the payload is what lets one expected-next figure per
+%% direction stand for both properties: a frame that arrives out of order fails
+%% against it, and a frame that never arrives leaves the flood short of its total.
+feed_numbered(_Conn, _Seq, 0) ->
+    ok;
+feed_numbered(Conn, Seq, Left) ->
+    ok = i2p_ntcp2_conn:send(Conn, <<Seq:32/little>>),
+    feed_numbered(Conn, Seq + 1, Left - 1).
+
+%% Drain both directions at once until every frame has arrived, and report how
+%% far each got.
+%%
+%% The base clause is checked **before** the receive, because the last frame
+%% counted has already arrived by the time `Remaining` reaches zero — a receive
+%% first would block on a frame that is never coming, which is a hang dressed as
+%% a wait.
+%%
+%% The progress figure is per connection rather than one total, so a direction
+%% that stalled reports its own count instead of hiding behind the other. A
+%% connection that dies mid-flood ends the drain with its exit reason, which is
+%% the difference between "the boundary killed it" and "the drain gave up".
+drain_numbered(Conns, 0) ->
+    Conns;
+drain_numbered(Conns, Remaining) ->
+    receive
+        {ntcp2_frame, Conn, <<Seq:32/little>>} when is_map_key(Conn, Conns) ->
+            case maps:get(Conn, Conns) of
+                Seq ->
+                    drain_numbered(Conns#{Conn := Seq + 1}, Remaining - 1);
+                Expected ->
+                    erlang:error({frame_out_of_order, Conn, {expected, Expected}, {got, Seq}})
+            end;
+        {ntcp2_frame, Conn, Payload} ->
+            erlang:error({unexpected_frame, Conn, Payload});
+        {'DOWN', _MRef, process, Conn, Reason} ->
+            erlang:error({connection_died_mid_flood, Conn, Reason})
+    after ?FRAME_BUDGET_MS ->
+        erlang:error({flood_stalled, {frames_read, maps:map(fun(_C, Seen) -> Seen - 1 end, Conns)}})
+    end.
+
+%% The assertion this ticket exists for: **this connection is alive, having
+%% spoken `Frame` frames in `Dir`.**
+%%
+%% The named frame is in the failure term on purpose. `true =
+%% is_process_alive(Conn)` is a perfectly good assertion whose failure says only
+%% `false` — a reader has to go and find which connection, in which direction,
+%% at which frame it gave up. Here the frame is the claim, so the frame is what
+%% the failure reports:
+%%
+%%     {session_not_alive_at_frame, Pid, send, 70000}
+%%
+%% `Dir` is `send` for the connection whose counter walked as it wrote the flood
+%% and `recv` for the one whose counter walked as it read the other end's. Both
+%% are asserted, because they are two counters on one connection and a fix that
+%% touched only one of them leaves the other to die here.
+alive_at_frame(Conn, Frame, Dir) ->
+    case is_process_alive(Conn) of
+        true ->
+            ok;
+        false ->
+            erlang:error({session_not_alive_at_frame, Conn, Dir, Frame})
+    end.
+
+%% A monitor that has already fired, read as a fact rather than waited for. The
+%% caller's comment is why the `after 0` cannot miss one: the DOWN and the frames
+%% come from the same process, so it is ordered after every frame that process
+%% sent. Waiting for a DOWN here would hang the case rather than fail it.
+down(MRef) ->
+    receive
+        {'DOWN', MRef, process, _Pid, _Reason} -> true
+    after 0 ->
+        false
+    end.
 
 %% --------------------------------------------------------------------------
 %% Connection-suite helpers

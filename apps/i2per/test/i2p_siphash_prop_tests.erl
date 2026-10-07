@@ -3,38 +3,37 @@
 %% Property tests for the pure-Erlang SipHash-2-4 implementation.
 %%
 %% Invariants under test:
-%%   - hash/2 and hash_128/1 digests stay in their 64-bit word bounds and the
-%%     *_le variants always produce 8/16 bytes
 %%   - the *_le byte layout is little-endian: an independent LSB-first fold
-%%     over the bytes recovers the integer digest (catches endianness bugs)
+%%     over the bytes recovers the integer digest, which also pins the output
+%%     sizes at 8 and 16 bytes (catches endianness bugs)
 %%   - a single-bit change to the data or the key changes both the 64-bit and
 %%     the 128-bit digest (bit sensitivity)
 %%   - distinct inputs produce distinct 64-bit digests under a fixed key
 %%     (collision-immunity shape)
+%%
+%% %%%%% What is deliberately not here %%%%%
+%%
+%% There is no property asserting that the digests are in bounds and that the
+%% `_le` variants are 8 and 16 bytes. There was one, and it could not fail: an
+%% XOR of four masked values is masked, so "the digest is below 2^64" follows
+%% from the constructor, and `<<X:64/little-unsigned>>` is 8 bytes by
+%% definition. A mismatch would have been a compile error, not a test failure.
+%%
+%% Worse, it was blind to both ways this module can actually be wrong. Laying the
+%% digest out big-endian instead of little leaves it in bounds and 8 bytes long,
+%% so that property stayed green while `hash_le_endianness_prop_test` went red
+%% and the router masked every frame length with the wrong bytes. And dropping
+%% the `b = 0xff` finalisation block yields a wrong digest for every input while
+%% staying in bounds and correctly sized -- green on all six properties here,
+%% caught only by the reference vectors in `i2p_siphash_tests`.
+%%
+%% The two endianness properties below are what make the bounds claim testable:
+%% `le_decode/3` consumes exactly 8 and exactly 16 bytes and compares the folded
+%% integer to `hash/2`, so size and layout fall out of an equality rather than
+%% being asserted separately.
 
 -include_lib("proper/include/proper.hrl").
 -include_lib("eunit/include/eunit.hrl").
-
-digest_bounds_prop_test() ->
-    ?assertEqual(
-        true,
-        proper:quickcheck(
-            ?FORALL(
-                {Data, Key},
-                {var_binary(), binary(16)},
-                begin
-                    D64 = i2p_siphash:hash(Data, Key),
-                    {W1, W2} = i2p_siphash:hash_128(Data, Key),
-                    D64 < 1 bsl 64 andalso
-                        W1 < 1 bsl 64 andalso
-                        W2 < 1 bsl 64 andalso
-                        byte_size(i2p_siphash:hash_le(Data, Key)) =:= 8 andalso
-                        byte_size(i2p_siphash:hash_128_le(Data, Key)) =:= 16
-                end
-            ),
-            [{numtests, 200}]
-        )
-    ).
 
 hash_le_endianness_prop_test() ->
     ?assertEqual(

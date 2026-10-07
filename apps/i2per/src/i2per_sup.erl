@@ -15,9 +15,10 @@ starts with a boot listener bound on the configured local port (owner
 `m:i2p_peer`), so the router can accept inbound connections when its RouterInfo
 publishes that endpoint. A firewalled boot still binds the local listener for
 outbound handshakes but publishes the cost-14 non-published RouterInfo form.
-When app env `i2per` -> `ssu2_enabled` is also set, the SSU2 supervisor starts
-with a UDP boot listener on the configured SSU2 port and the RouterInfo
-advertises the SSU2 address. In explicit test mode, app env `i2per` ->
+When app env `i2per` -> `ssu2` serves UDP
+(`f:i2p_identity:ssu2_available/0`), the SSU2 supervisor starts with a UDP boot
+listener on the configured SSU2 port and the RouterInfo advertises the SSU2
+address. In explicit test mode, app env `i2per` ->
 `i2p_peer` supplies the identity and seeds directly, and no listener is bound
 because the test owns its listeners.
 
@@ -51,8 +52,14 @@ init([]) ->
     report_started_as(LocalSeeds),
     Children =
         [
-            events_child(),
+            %% Counter home before the bus, deliberately. `i2p_events:start_link/0`
+            %% samples the backlog gauge once before its first tick so the figure
+            %% exists from boot rather than after one interval -- and that sample is
+            %% a documented no-op while this process is absent. The other order left
+            %% the read API carrying no backlog at all for the first tick, with an
+            %% absent gauge indistinguishable from a sampler that had died.
             stats_child(),
+            events_child(),
             config_srv_child(),
             peer_rep_child(),
             reachability_child()
@@ -141,7 +148,7 @@ render_listen(Local, listen) ->
 
 %% The NTCP2 address out of the published set, with its host and port.
 %%
-%% A RouterInfo can publish several addresses, so an `ssu2_enabled` boot carries an
+%% A RouterInfo can publish several addresses, so a UDP-serving boot carries an
 %% NTCP2 and an SSU2 one and the list is not length one. NTCP2 is named
 %% specifically: it is the transport `listen` means here, and an operator reading
 %% "listen=" wants the transport the router dials peers over, not the peer-test one.
@@ -231,7 +238,10 @@ vsn() ->
         undefined -> "unknown"
     end.
 
-%% First child: the status event bus every other component announces on.
+%% The status event bus every other component announces on. Early, and ahead of
+%% everything that subscribes: `m:i2p_ssu2_reachability` attaches in its `init/1`,
+%% so a bus that is not yet up would block the supervisor rather than delay a
+%% subscription.
 events_child() ->
     #{
         id => i2p_events,
@@ -242,10 +252,10 @@ events_child() ->
         modules => [i2p_events]
     }.
 
-%% Second child, and early on purpose: the counter home. Nothing here blocks on
-%% it — `i2p_stats:add/2` is a no-op while it is absent — but the counters a
-%% transport increments on its first packet should not be the ones lost to a
-%% start order.
+%% First child: the counter home. Nothing blocks on it — `i2p_stats:add/2` and
+%% `i2p_stats:set_gauge/2` are no-ops while it is absent — but the counters a
+%% transport increments on its first packet should not be the ones lost to a start
+%% order, and the bus samples its backlog gauge once at startup.
 stats_child() ->
     #{
         id => i2p_stats,
@@ -352,15 +362,16 @@ ntcp2_sup_children({ok, Local, _Seeds, listen}) ->
 ntcp2_sup_children(_LocalSeeds) ->
     [ntcp2_sup_child()].
 
-%% The SSU2 supervisor: a plain supervisor child unless transport wiring is
-%% enabled (app env `i2per` -> `ssu2_enabled`), and in the persistent boot it
+%% The SSU2 supervisor: a plain supervisor child unless the setting *serves* UDP
+%% (app env `i2per` -> `ssu2`, see `f:i2p_identity:ssu2_available/0`), and in the
+%% persistent boot it
 %% additionally binds a UDP listener on the published SSU2 port (owner
 %% `m:i2p_peer`) that accepts inbound sessions. The supervisor remains a child
 %% when SSU2 is disabled so the session registry ETS tables exist for code
 %% paths that consult them. The listener and outbound selection come online
 %% only when enabled.
 ssu2_sup_children(_LocalSeeds = {ok, Local, _Seeds, listen}) ->
-    case i2p_identity:ssu2_enabled() of
+    case i2p_identity:ssu2_available() of
         true ->
             {ok, #{host := Host, port := Port}} =
                 i2p_router_info:ssu2_address_options(maps:get(ri, Local)),

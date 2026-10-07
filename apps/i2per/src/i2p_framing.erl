@@ -20,7 +20,12 @@ This module implements:
   frame the IV advances to the previous frame's SipHash-2-4 output, and the
   mask is the two least-significant bytes of that output.
 - Frame encryption/decryption: ChaCha20-Poly1305 (via `m:i2p_crypto`) under a
-  direction key with a zero-AD, counter-based nonce.
+  direction key with a zero-AD, counter-based nonce. The counter is **64 bits
+  wide** — the nonce's whole 8-byte low half — so a direction key is held for the
+  life of a connection and the counter is what keeps every nonce under it unique.
+  It runs `0..2^64 - 2` and does not repeat; there is no rekey in NTCP2 and none
+  is needed. See `f:i2p_crypto:es_nonce/1` for the bound and `m:i2p_ntcp2_conn`
+  for the two directions that walk it.
 - The nested block format (`t:block/0`): a 1-byte type and 2-byte big-endian
   length, where type 254 is padding (always last) and types 0..4 are
   datetime, options, RouterInfo, I2NP message and termination.
@@ -132,13 +137,17 @@ data_phase_keys(Ck, H) ->
 Encrypt `Payload` into a frame for the current message `MsgNum`.
 
 Input: `Key` — the direction cipher key (`k_ab` or `k_ba`); `MsgNum` — the
-message number in this direction, starting at 0 (the nonce's low 8 bytes,
-little-endian, first 4 bytes zero); `Payload` — 0-65519 bytes of plaintext;
-`Sip` — the current SipHash state.
+message number in this direction, starting at 0, bounded by the nonce it feeds
+at `0..2^64 - 2` (the counter's whole 8-byte low half, little-endian);
+`Payload` — 0-65519 bytes of plaintext; `Sip` — the current SipHash state.
 
 Output: `{Frame, Sip'}` — the encoded frame and the advanced SipHash state
 (the length field uses the frame's mask, so `Sip'` must be what the receiver
 derives from the same state).
+
+`MsgNum` is not capped at 65535. The counter is the nonce's whole 8-byte low
+half, so it is 64 bits wide and a session is not bounded at 2^16 frames; see the
+module doc.
 """.
 -spec encrypt_frame(frame_key(), non_neg_integer(), binary(), sip_state()) ->
     {frame(), sip_state()}.

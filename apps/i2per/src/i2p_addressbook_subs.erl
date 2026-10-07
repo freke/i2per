@@ -153,18 +153,29 @@ handle_info({fetch_sub, Sub, Rest}, State = #{sign_seed := SignSeed}) ->
     #{host := Host, dest_b64 := DestB64} = Sub,
     case route_to(DestB64) of
         {ok, Route} ->
-            TimeoutRef = erlang:send_after(?FETCH_TIMEOUT_MS, self(), fetch_timeout),
-            {ok, Conn} = start_http_conn(Route, Host, SignSeed),
-            {noreply, State#{
-                fetch => #{
-                    host => Host,
-                    rest => Rest,
-                    buf => <<>>,
-                    count => 0,
-                    timeout_ref => TimeoutRef,
-                    conn => Conn
-                }
-            }};
+            %% The cap is a refusal like any other failed dial, not a crash: a
+            %% router at `max_stream_connections` cannot fetch this subscription
+            %% now, and the pipeline must move on to the next one rather than
+            %% take the fetcher down and with it every future refresh. The
+            %% timeout is armed only once there is a connection to time out, so
+            %% a refusal leaves no stray `fetch_timeout` behind.
+            case start_http_conn(Route, Host, SignSeed) of
+                {ok, Conn} ->
+                    TimeoutRef = erlang:send_after(?FETCH_TIMEOUT_MS, self(), fetch_timeout),
+                    {noreply, State#{
+                        fetch => #{
+                            host => Host,
+                            rest => Rest,
+                            buf => <<>>,
+                            count => 0,
+                            timeout_ref => TimeoutRef,
+                            conn => Conn
+                        }
+                    }};
+                {error, _Refused} ->
+                    self() ! {start_pipeline, Rest},
+                    {noreply, State}
+            end;
         error ->
             self() ! {start_pipeline, Rest},
             {noreply, State}
@@ -217,8 +228,13 @@ route_to(DestB64) ->
     ),
     i2p_client:route_to_dest(i2p_keys:to_binary(Identity)).
 
-%% start_http_conn/2 - open the streaming connection and queue an HTTP GET
+%% start_http_conn/3 - open the streaming connection and queue an HTTP GET
 %% (buffered by the connection until the handshake completes).
+%%
+%% Output: `{ok, Conn}`, or the admission's own `{error, Refused}`. A refusal at
+%% `max_stream_connections` is a failed dial, and a subscription fetch that
+%% cannot dial now is a fetch that has to be retried later -- not a fetcher to
+%% take down, since it also owns the refresh timer for every other subscription.
 start_http_conn(Route, Host, SignSeed) ->
     ConnOpts = #{
         role => connect,
@@ -232,18 +248,22 @@ start_http_conn(Route, Host, SignSeed) ->
         remote_dest_bin => maps:get(dest_bin, Route),
         remote_dest_hash => maps:get(dest_hash, Route)
     },
-    {ok, Conn} = i2p_sam_sup:start_stream_conn(ConnOpts),
-    erlang:monitor(process, Conn),
-    %% Buffered while connecting; flushed automatically once established.
-    Request = [
-        <<"GET / HTTP/1.0\r\n">>,
-        <<"Host: ">>,
-        Host,
-        <<"\r\n">>,
-        <<"Accept: text/plain\r\n\r\n">>
-    ],
-    ok = i2p_stream_conn:send(Conn, iolist_to_binary(Request)),
-    {ok, Conn}.
+    case i2p_sam_sup:start_stream_conn(ConnOpts) of
+        {ok, Conn} ->
+            erlang:monitor(process, Conn),
+            %% Buffered while connecting; flushed automatically once established.
+            Request = [
+                <<"GET / HTTP/1.0\r\n">>,
+                <<"Host: ">>,
+                Host,
+                <<"\r\n">>,
+                <<"Accept: text/plain\r\n\r\n">>
+            ],
+            ok = i2p_stream_conn:send(Conn, iolist_to_binary(Request)),
+            {ok, Conn};
+        {error, _Refused} = Refused ->
+            Refused
+    end.
 
 %% complete_response/1 - true once HTTP headers plus Content-Length worth of
 %% body have arrived (or no length was declared and the peer half-closed).

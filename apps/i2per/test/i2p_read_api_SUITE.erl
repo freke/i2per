@@ -23,6 +23,7 @@
     view_key_set_matches_the_declared_list/1,
     view_reports_version_and_uptime/1,
     core_exposes_only_cumulative_values/1,
+    backlog_reaches_the_read_api/1,
     counters_are_readable_with_no_presentation_app/1,
     bus_announcements_are_counted/1,
     counters_are_volatile_across_a_router_restart/1
@@ -37,6 +38,7 @@ all() ->
         view_key_set_matches_the_declared_list,
         view_reports_version_and_uptime,
         core_exposes_only_cumulative_values,
+        backlog_reaches_the_read_api,
         counters_are_readable_with_no_presentation_app,
         bus_announcements_are_counted,
         counters_are_volatile_across_a_router_restart
@@ -156,21 +158,80 @@ core_exposes_only_cumulative_values(_Config) ->
         Values = maps:values(maps:get(counters, View)),
         ?assertEqual([], [V || V <- Values, not (is_integer(V) andalso V >= 0)]),
 
+        %% And no gauge is named like a derived quantity either. The filter above
+        %% walks the key names, and `bus_backlog` would pass it while a
+        %% `backlog_rate` would not -- so the check reaches the gauges' own names,
+        %% which is the only place a derived value could hide now that they are
+        %% carried beside the counters rather than inside them.
+        DerivedGauges = [K || K <- maps:keys(maps:get(gauges, View)), looks_derived(K)],
+        ?assertEqual([], DerivedGauges),
+
         %% And two readings of an unchanged router agree on everything except the
         %% clock. A timer, a smoothing window, or any other derived state would
         %% make a cumulative value move between two reads; cumulative totals and a
         %% boot time cannot.
         %%
-        %% `uptime_ms` is the one field that legitimately differs, because it is
-        %% recomputed from the clock on every call. It is the sample clock the
-        %% client differences against, not a total, so it is excluded here and
-        %% checked separately -- and it may only move forwards.
+        %% Two fields legitimately differ between readings, and neither is a
+        %% derived *quantity*:
+        %%
+        %% `uptime_ms` is recomputed from the clock on every call. It is the sample
+        %% clock the client differences against, not a total, and it may only move
+        %% forwards.
+        %%
+        %% `gauges` holds sampled instantaneous values -- `bus_backlog`, refreshed
+        %% on a timer by `m:i2p_events:sample_backlog/0` -- so a reading may change
+        %% because the sampler ran between two calls. **This is a real exception and
+        %% it is why gauges are a separate key rather than entries in `counters`**:
+        %% putting them in the counters would have made the bit-identical assertion
+        %% below false on a timer, which is precisely the property that proves a
+        %% counter is a total. A gauge is allowed to move without anyone deriving
+        %% anything from it.
+        %%
+        %% So the strong form is asserted where it is meaningful: over everything
+        %% except the two fields that are sampled rather than counted.
         Again = i2p_status_data:view(),
+        Sampled = [uptime_ms, gauges],
         ?assertEqual(
-            maps:without([uptime_ms], View),
-            maps:without([uptime_ms], Again)
+            maps:without(Sampled, View),
+            maps:without(Sampled, Again)
         ),
-        ?assert(maps:get(uptime_ms, Again) >= maps:get(uptime_ms, View))
+        ?assert(maps:get(uptime_ms, Again) >= maps:get(uptime_ms, View)),
+
+        %% And the gauges are gauges, not counters in disguise: whatever they hold,
+        %% every value is an instant's reading, and nothing in them is derived from
+        %% the counters. A gauge that were a running total would reintroduce the
+        %% ambiguity `f:i2p_stats:add/2` refuses to create.
+        Gauges = maps:get(gauges, View),
+        ?assertEqual([], [V || V <- maps:values(Gauges), not is_number(V)])
+    end).
+
+%% The bus backlog reaches the read API, on a whole router.
+%%
+%% **This is the case that makes the gauge a read-API figure rather than a
+%% curiosity in `m:i2p_stats`.** `m:i2p_events_tests` covers the sampling and the
+%% value under a wedge; that module does not start `m:i2p_tunnel_srv`, so it cannot
+%% call `f:view/0`. Only a whole router can, so only here can it be shown that the
+%% key is carried rather than merely held.
+%%
+%% **Presence is the assertion, not the value.** A backlog of zero on an idle router
+%% is correct and uninteresting, and a case that waited for a non-zero reading would
+%% be a deadline in disguise -- so this takes the reading it is given. The wedge
+%% case in `m:i2p_events_tests` is where the interesting value lives.
+backlog_reaches_the_read_api(_Config) ->
+    ok = with_router(fun() ->
+        View = i2p_status_data:view(),
+        Gauges = maps:get(gauges, View),
+        ?assert(maps:is_key(bus_backlog, Gauges)),
+        %% Absent-before-first-sample is a distinction `f:gauges/0` promises, and on
+        %% a freshly started router the sampler may not have run yet -- so the
+        %% value is only constrained when the name is there at all.
+        case maps:find(bus_backlog, Gauges) of
+            {ok, Depth} -> ?assert(is_integer(Depth) andalso Depth >= 0);
+            error -> ok
+        end,
+        %% And it is not in the counters, which is the property the derive layer's
+        %% differencing depends on.
+        ?assertNot(maps:is_key(bus_backlog, maps:get(counters, View)))
     end).
 
 %% A counter or key whose name says it was computed from other numbers rather than

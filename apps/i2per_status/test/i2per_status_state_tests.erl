@@ -103,9 +103,15 @@ handle_cast_fallthrough_test() ->
     State = dead_state(),
     {noreply, State} = i2per_status_state:handle_cast(whatever, State).
 
+%% These three run the callback through `m:i2p_ct_helpers:in_throwaway/1`, which
+%% owns the reasoning: under eunit the caller is a worker shared by every module in
+%% the tier, and `f:handle_info(poll, ...)` re-arms itself into it. A local copy of
+%% that helper used to live here; it moved to `m:i2p_ct_helpers` when
+%% `i2p_addressbook_subs_tests` needed the same thing, because two copies of a
+%% helper whose own failure mode is a leaked `'DOWN'` is how they start to differ.
 nodeup_resubscribes_test() ->
     State0 = dead_state(),
-    {noreply, State} = in_throwaway(fun() ->
+    {noreply, State} = i2p_ct_helpers:in_throwaway(fun() ->
         i2per_status_state:handle_info({nodeup, ?DEAD_NODE}, State0)
     end),
     %% subscribe/1 to an unreachable node collapses to false.
@@ -113,7 +119,7 @@ nodeup_resubscribes_test() ->
 
 nodedown_marks_offline_test() ->
     State0 = dead_state(),
-    {noreply, State} = in_throwaway(fun() ->
+    {noreply, State} = i2p_ct_helpers:in_throwaway(fun() ->
         i2per_status_state:handle_info({nodedown, ?DEAD_NODE}, State0)
     end),
     ?assertEqual(false, maps:get(online, State)),
@@ -127,50 +133,11 @@ poll_to_unreachable_goes_offline_test() ->
     %% Previously-online router disappears: next poll must flip the view to
     %% offline_view() instead of keeping the stale snapshot.
     State0 = (dead_state())#{online => true, view => #{stale => 1}},
-    {noreply, State} = in_throwaway(fun() ->
+    {noreply, State} = i2p_ct_helpers:in_throwaway(fun() ->
         i2per_status_state:handle_info(poll, State0)
     end),
     ?assertEqual(false, maps:get(online, State)),
     ?assertEqual(#{}, maps:get(view, State)).
-
-%% Run a `gen_server` callback in a process that is thrown away afterwards, and
-%% return what it answered.
-%%
-%% **Because the callback re-arms itself, calling it here is a side effect on the
-%% shared eunit worker.** `handle_info(poll, ...)` ends by scheduling another
-%% `poll` `poll_interval()` into the *calling* process, and `handle_info({nodeup,
-%% ...})` schedules the first one. Under eunit that caller is a worker shared by
-%% every module in the tier, so the chain keeps firing into a mailbox other
-%% modules read: `i2p_peer_tests` collects bus events from that mailbox and
-%% asserts on their shape, and a stray `poll` turned into `{case_clause, [poll,
-%% {peer_connect_failed, ...}]}` in a module two directories away.
-%%
-%% Draining the messages does not fix it -- the timer that will produce the next
-%% one is still armed, and the interval is five seconds, so a drain that waits
-%% long enough to be conclusive is slower than the whole suite. A process that
-%% dies takes its timers with it, which is the only thing that is actually true
-%% here: `f:handle_info/2` is written for a process whose lifetime is the
-%% gen_server's, and the test is not that.
--spec in_throwaway(fun(() -> Result)) -> Result.
-in_throwaway(Fun) ->
-    Parent = self(),
-    Ref = make_ref(),
-    {Pid, MRef} = spawn_monitor(fun() -> Parent ! {Ref, catch Fun()} end),
-    Reply =
-        receive
-            {Ref, Result} -> Result
-        after 5000 ->
-            exit({callback_timeout, Pid})
-        end,
-    %% Wait for the process to be gone before returning. It is already dead --
-    %% it answered and exited -- but the `DOWN` is still in this mailbox, and
-    %% leaving it there is the same class of leak this helper exists to stop.
-    receive
-        {'DOWN', MRef, process, _Pid, _Reason} -> ok
-    after 5000 ->
-        exit({callback_would_not_die, Pid})
-    end,
-    Reply.
 
 terminate_and_code_change_test() ->
     State = dead_state(),

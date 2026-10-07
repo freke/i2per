@@ -12,7 +12,13 @@
 [
   main: "readme",
   proglang: :erlang,
-  source_ref: "v0.1.0",
+  # Source links point at github.com/freke/i2per/blob/<source_ref>/..., so
+  # source_ref must name a ref that exists. "main" always does, so it is the
+  # default; CI overrides with the tag being built (I2PER_DOCS_SOURCE_REF),
+  # which makes the published site's links resolve to the code the site is
+  # about.
+  source_ref: System.get_env("I2PER_DOCS_SOURCE_REF") || "main",
+  source_url: "https://github.com/freke/i2per",
 
   extras: [
     "README.md",

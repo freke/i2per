@@ -1,8 +1,8 @@
 %% Operator boot and listener integration tests. With `data_dir` configured,
 %% the app binds its NTCP2 listener, accepts an inbound session, learns the
-%% peer's RouterInfo, and announces the local RouterInfo. When
-%% `ssu2_enabled` is set, the boot also binds an SSU2 listener and advertises
-%% its address.
+%% peer's RouterInfo, and announces the local RouterInfo. When `ssu2` serves UDP
+%% (`enable_udp` or `prefer_udp`), the boot also binds an SSU2 listener and
+%% advertises its address.
 %%
 %% Each case owns its process, mailbox, application lifecycle, and listeners.
 %% Assertions use public wire and status behavior, with deadline-bounded waits
@@ -22,6 +22,7 @@
     host_validation_rejects_private_boot/1,
     boot_router_info_carries_caps/1,
     ssu2_boot_listener_binds_when_enabled/1,
+    ssu2_boot_listener_binds_under_enable_udp/1,
     ssu2_inbound_session_round_trips/1,
     ssu2_disabled_boot_binds_nothing/1,
     reseed_runs_after_live_opt_in/1,
@@ -51,6 +52,7 @@ all() ->
         host_validation_rejects_private_boot,
         boot_router_info_carries_caps,
         ssu2_boot_listener_binds_when_enabled,
+        ssu2_boot_listener_binds_under_enable_udp,
         ssu2_inbound_session_round_trips,
         ssu2_disabled_boot_binds_nothing,
         reseed_runs_after_live_opt_in,
@@ -81,6 +83,7 @@ end_per_testcase(_Case, _Config) ->
             port,
             sam_port,
             allow_private_host,
+            ssu2,
             ssu2_enabled,
             reseed,
             ntcp2_published,
@@ -292,9 +295,11 @@ boot_router_info_carries_caps(Config) ->
     end.
 
 %% --------------------------------------------------------------------------
-%% SSU2 transport wiring: with `ssu2_enabled` the operator boot binds
-%% a permanent UDP listener on the published SSU2 port and the RouterInfo
-%% advertises the SSU2 address with the peer-test `B` cap.
+%% SSU2 transport wiring: with `ssu2` set to a value that *serves* UDP the
+%% operator boot binds a permanent UDP listener on the published SSU2 port and the
+%% RouterInfo advertises the SSU2 address with the peer-test `B` cap. Which
+%% transport a dial reaches for is a separate question, and belongs to
+%% `i2p_peer_transport_SUITE`.
 %% --------------------------------------------------------------------------
 
 ssu2_boot_listener_binds_when_enabled(Config) ->
@@ -305,7 +310,7 @@ ssu2_boot_listener_binds_when_enabled(Config) ->
         application:set_env(?APP, seeds, [dummy_seed()]),
         application:set_env(?APP, port, Port),
         application:set_env(?APP, allow_private_host, true),
-        application:set_env(?APP, ssu2_enabled, true),
+        application:set_env(?APP, ssu2, prefer_udp),
         {ok, _} = application:ensure_all_started(?APP),
         %% Behavioural: a packet to a closed port is refused by the OS; to the
         %% listening socket it is silently dropped (no reply).
@@ -337,7 +342,61 @@ ssu2_boot_listener_binds_when_enabled(Config) ->
         application:unset_env(?APP, seeds),
         application:unset_env(?APP, port),
         application:unset_env(?APP, allow_private_host),
-        application:unset_env(?APP, ssu2_enabled)
+        application:unset_env(?APP, ssu2)
+    end.
+
+%% `enable_udp` boots exactly the same listener as `prefer_udp` does, because
+%% *serving* UDP is one decision and *preferring* it is another, and this case is
+%% about the first one.
+%%
+%% The case above cannot stand in for this one, and the way it cannot is the
+%% point: it is written for `prefer_udp`, so it would still pass if the boot asked
+%% "do we prefer UDP?" where it should ask "do we serve UDP?" -- and the only
+%% configuration in which those two answers differ is `enable_udp`. A setting
+%% whose one unrepresentable state is the one nothing tests is a setting that is
+%% half a boolean again.
+ssu2_boot_listener_binds_under_enable_udp(Config) ->
+    Dir = i2p_ct_helpers:temp_data_dir(Config),
+    Port = i2p_ct_helpers:free_port(),
+    try
+        application:set_env(?APP, data_dir, Dir),
+        application:set_env(?APP, seeds, [dummy_seed()]),
+        application:set_env(?APP, port, Port),
+        application:set_env(?APP, allow_private_host, true),
+        application:set_env(?APP, ssu2, enable_udp),
+        %% The two answers, held apart before the boot rather than inferred from
+        %% it: this router serves UDP and does not reach for it.
+        ?assertEqual(true, i2p_identity:ssu2_available()),
+        ?assertEqual(false, i2p_identity:ssu2_preferred()),
+        {ok, _} = application:ensure_all_started(?APP),
+        {ok, Sock} = gen_udp:open(0, [binary, {active, true}]),
+        ok = gen_udp:connect(Sock, {127, 0, 0, 1}, Port),
+        ok = gen_udp:send(Sock, <<1, 2, 3, 4>>),
+        Reply =
+            receive
+                {udp, Sock, _IP, _RPort, _Datagram} -> replied;
+                {udp_error, Sock, _Reason} -> refused
+            after 150 ->
+                timeout
+            end,
+        %% The bound socket swallows the datagram; a closed port is refused by
+        %% the OS. `refused` here would mean the listener is not up.
+        ?assertEqual(timeout, Reply),
+        ok = gen_udp:close(Sock),
+        %% And the address is advertised, which is the other half of serving: a
+        %% bound listener nothing publishes is not reachable by anyone.
+        {ok, Id} = i2p_identity:ensure_identity(Dir),
+        Host = application:get_env(i2per, host, <<"127.0.0.1">>),
+        Local = i2p_identity:build_local(Id, Host, Port, maps:get(sign_seed, Id)),
+        {ok, SSU2Opts} = i2p_router_info:ssu2_address_options(maps:get(ri, Local)),
+        ?assertEqual(Port, maps:get(port, SSU2Opts))
+    after
+        application:stop(?APP),
+        application:unset_env(?APP, data_dir),
+        application:unset_env(?APP, seeds),
+        application:unset_env(?APP, port),
+        application:unset_env(?APP, allow_private_host),
+        application:unset_env(?APP, ssu2)
     end.
 
 %% --------------------------------------------------------------------------
@@ -356,9 +415,9 @@ ssu2_inbound_session_round_trips(Config) ->
         application:set_env(?APP, seeds, [dummy_seed()]),
         application:set_env(?APP, port, Port),
         application:set_env(?APP, allow_private_host, true),
-        application:set_env(?APP, ssu2_enabled, true),
+        application:set_env(?APP, ssu2, prefer_udp),
         %% The booted router's Local (and its SSU2 address) mirrors the app env:
-        %% `ssu2_enabled` must be set before `build_local` folds it in.
+        %% `ssu2` must be set before `build_local` folds it in.
         {ok, Id} = i2p_identity:ensure_identity(Dir),
         Local = i2p_identity:build_local(Id, <<"127.0.0.1">>, Port, maps:get(sign_seed, Id)),
         OurHash = i2p_router_info:hash(maps:get(ri, Local)),
@@ -392,7 +451,7 @@ ssu2_inbound_session_round_trips(Config) ->
         application:unset_env(?APP, seeds),
         application:unset_env(?APP, port),
         application:unset_env(?APP, allow_private_host),
-        application:unset_env(?APP, ssu2_enabled)
+        application:unset_env(?APP, ssu2)
     end.
 
 %% Disabled (default): the RouterInfo stays NTCP2-only.
@@ -428,7 +487,7 @@ reseed_runs_after_live_opt_in(Config) ->
     Dir = i2p_ct_helpers:temp_data_dir(Config),
     Port = i2p_ct_helpers:free_port(),
     Ris = [remote_ri(4800), remote_ri(4801)],
-    Su3Port = serve_su3(sign_ris(Ris)),
+    {Su3Port, Su3Srv} = i2p_ct_helpers:serve_su3(sign_ris(Ris)),
     try
         application:set_env(?APP, data_dir, Dir),
         application:set_env(?APP, seeds, [dummy_seed()]),
@@ -471,6 +530,7 @@ reseed_runs_after_live_opt_in(Config) ->
         )
     after
         application:stop(?APP),
+        i2p_ct_helpers:stop_su3_server(Su3Srv),
         application:unset_env(?APP, data_dir),
         application:unset_env(?APP, seeds),
         application:unset_env(?APP, port),
@@ -1205,33 +1265,6 @@ sign_ris(Ris) ->
     ],
     {ok, {_Name, ZipBin}} = zip:create("i2pseeds.zip", Entries, [memory]),
     i2p_su3:encode(<<"1789000000">>, <<"test-signer">>, ZipBin, Priv).
-
-serve_su3(Su3) ->
-    {ok, Listen} = gen_tcp:listen(0, [
-        {ip, {127, 0, 0, 1}},
-        binary,
-        {active, false},
-        {reuseaddr, true}
-    ]),
-    {ok, P} = inet:port(Listen),
-    spawn(fun() -> serve_once(Listen, Su3) end),
-    P.
-
-serve_once(Listen, Su3) ->
-    {ok, Sock} = gen_tcp:accept(Listen, 15_000),
-    {ok, _Request} = gen_tcp:recv(Sock, 0, 15_000),
-    Response = [
-        <<"HTTP/1.1 200 OK\r\n">>,
-        <<"Content-Type: application/octet-stream\r\n">>,
-        <<"Content-Length: ">>,
-        integer_to_binary(byte_size(Su3)),
-        <<"\r\n">>,
-        <<"Connection: close\r\n\r\n">>,
-        Su3
-    ],
-    ok = gen_tcp:send(Sock, Response),
-    gen_tcp:close(Sock),
-    gen_tcp:close(Listen).
 
 reseed_url(Port) ->
     lists:flatten(io_lib:format("http://127.0.0.1:~b/", [Port])).

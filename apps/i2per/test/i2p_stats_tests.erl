@@ -204,6 +204,78 @@ add_is_a_no_op_while_the_owner_is_absent_test() ->
     ?assertEqual(ok, i2p_stats:add(events_notified, 1)),
     ?assertEqual(#{}, i2p_stats:snapshot()).
 
+%% %%%%% %%% Gauges %%%%% %%%
+
+%% A gauge holds the value it was last given, and a later reading replaces it.
+%%
+%% **Falling is the point, and it is what a counter cannot do.** `f:add/2` rejects a
+%% negative amount precisely because a counter that goes backwards is
+%% indistinguishable downstream from a router restarting -- so a value that rises and
+%% falls with the system has no representation in the array and would corrupt every
+%% rate derived from it. Asserting the fall is what distinguishes this test from the
+%% counting tests above; asserting only the rise would pass for an accumulator.
+gauge_holds_its_latest_reading_test() ->
+    with_stats(fun() ->
+        ?assertEqual(ok, i2p_stats:set_gauge(bus_backlog, 500)),
+        ?assertEqual(#{bus_backlog => 500}, i2p_stats:gauges()),
+        ?assertEqual(ok, i2p_stats:set_gauge(bus_backlog, 0)),
+        ?assertEqual(#{bus_backlog => 0}, i2p_stats:gauges())
+    end).
+
+%% Gauges and counters are separate stores, and a gauge never appears in the
+%% snapshot.
+%%
+%% This is the property `m:i2per_status_derive` depends on when it differences two
+%% readings: a consumer that found a falling value inside `counters` would read it
+%% as a restart. So the case asserts the *absence*, not just that both are readable.
+gauges_do_not_appear_in_the_counter_snapshot_test() ->
+    with_stats(fun() ->
+        ok = i2p_stats:set_gauge(bus_backlog, 1234),
+        ok = i2p_stats:add(events_notified, 1),
+        %% Checked as an *absence*, because `snapshot/0` reports every registered
+        %% counter whether or not it has moved -- so the assertion is that the
+        %% gauge's name is not among them, not that the snapshot is small.
+        ?assertNot(maps:is_key(bus_backlog, i2p_stats:snapshot())),
+        ?assertEqual(1234, maps:get(bus_backlog, i2p_stats:gauges()))
+    end).
+
+%% An unset gauge is absent rather than zero, which is the distinction
+%% `f:snapshot/0` makes for counters and `f:gauges/0` has to make too.
+%%
+%% "Not measured yet" and "measured, and zero" are different faults: the first means
+%% the sampler has not run, the second means the bus is idle. Reporting zero for both
+%% would make a router whose sampler never started look like a healthy one.
+unset_gauge_is_absent_not_zero_test() ->
+    with_stats(fun() ->
+        ?assertEqual(#{}, i2p_stats:gauges()),
+        ok = i2p_stats:set_gauge(bus_backlog, 0),
+        ?assert(maps:is_key(bus_backlog, i2p_stats:gauges()))
+    end).
+
+%% Writing a gauge does not disturb the counters, and vice versa.
+%%
+%% **Both halves are needed.** The counter half alone would pass if the gauge write
+%% had replaced the whole `persistent_term` state and dropped the counter reference
+%% with it -- every counter would read `0` rather than raise, so a snapshot assertion
+%% on its own is not enough to catch the counter being lost.
+gauge_writes_leave_the_counters_alone_test() ->
+    with_stats(fun() ->
+        ok = i2p_stats:add(events_notified, 7),
+        ok = i2p_stats:set_gauge(bus_backlog, 42),
+        ?assertEqual(7, maps:get(events_notified, i2p_stats:snapshot())),
+        ok = i2p_stats:add(events_notified, 3),
+        ?assertEqual(10, maps:get(events_notified, i2p_stats:snapshot())),
+        ?assertEqual(42, maps:get(bus_backlog, i2p_stats:gauges()))
+    end).
+
+%% A gauge write is a no-op while the owner is absent, for the reason
+%% `f:add/2` is: telemetry must not be able to crash a working connection, and the
+%% suites that start part of the tree rely on it.
+set_gauge_is_a_no_op_while_the_owner_is_absent_test() ->
+    ?assertEqual(undefined, whereis(i2p_stats)),
+    ?assertEqual(ok, i2p_stats:set_gauge(bus_backlog, 999)),
+    ?assertEqual(#{}, i2p_stats:gauges()).
+
 %% %%%%% %%% Internal helpers %%%%% %%%
 
 %% Everything the traced process received while the trace was on. An empty list

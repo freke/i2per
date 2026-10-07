@@ -31,7 +31,7 @@
 %% the same test, which is the point -- the number moves, because nothing is
 %% synchronising it.
 %%
-%% ## The three properties, and why each is its own case
+%% ## The properties, and why each is its own case
 %%
 %% **The cap holds under concurrency.** These are the cases that fail against the
 %% old code, and the load-bearing ones in this module. Count-then-start is a race
@@ -49,10 +49,25 @@
 %% *exclusive* one, which is what a per-process `LockRequesterId` or a
 %% `global:register_name/3` mutex gives you -- and it costs four lines.
 %%
-%% **The three caps are independent.** A router refusing a ninth SAM session while
+%% **The four caps are independent.** A router refusing a ninth SAM session while
 %% an NTCP2 connection is admitted is the ticket's open question, answered by
 %% assertion rather than by a comment: a shared admission process, or a shared
 %% counter, would make these one queue.
+%%
+%% ## The fourth cap, which is the one that had none at all
+%%
+%% `i2p_sam_sup` owns **two** bounded resources, so this module covers four caps
+%% and there are four admission processes. Streaming connections got their cap with
+%% `max_stream_connections`; before it `f:i2p_sam_sup:start_stream_conn/1` was a
+%% bare `supervisor:start_child/2` and nothing bounded the number of live
+%% `i2p_stream_conn` processes. Unlike the other three, that count is driven by
+%% *remote* peers -- a STREAM ACCEPT destination invites any number of inbound
+%% streams -- so it is the cap whose absence is reachable by anyone on the network.
+%%
+%% Two caps in one supervisor is why `f:assert_cap_holds/5` takes the count reader
+%% as well as the supervisor: "how many children does the SAM supervisor hold" is
+%% not an answer, because a cap on sessions and a cap on streams are different
+%% numbers over one tree.
 %%
 %% ## What is *not* under test
 %%
@@ -67,7 +82,8 @@
 
 -moduledoc """
 Tests that the connection cap is a cap under concurrent dials, that admitting a
-child no longer takes a cluster-wide lock, and that the three caps are
+child no longer takes a cluster-wide lock, and that the four caps -- NTCP2
+connections, SSU2 sessions, SAM sessions and streaming connections -- are
 independent of one another.
 """.
 
@@ -97,20 +113,46 @@ independent of one another.
 
 %%% %%%%% %%% The cap holds under concurrent dials %%%%% %%%
 
-%% Each of the three, as its own case rather than one case looping over a list.
+%% Each of the four, as its own case rather than one case looping over a list.
 %%
 %% A parameterised case that failed would name no resource, and "the cap does not
-%% hold" is not an actionable report when three caps exist. Three near-identical
-%% bodies is the trade this project makes elsewhere for a failure message that
-%% can be acted on.
+%% hold" is not an actionable report when four caps exist. Near-identical bodies is
+%% the trade this project makes elsewhere for a failure message that can be acted
+%% on.
 ntcp2_cap_holds_under_concurrent_dials_test() ->
-    assert_cap_holds(ntcp2_cap, i2p_ntcp2_sup, fun start_ntcp2/0, max_ntcp2_connections).
+    assert_cap_holds(
+        ntcp2_cap,
+        i2p_ntcp2_sup,
+        fun start_ntcp2/0,
+        max_ntcp2_connections,
+        fun count_ntcp2/0
+    ).
 
 ssu2_cap_holds_under_concurrent_dials_test() ->
-    assert_cap_holds(ssu2_cap, i2p_ssu2_sup, fun start_ssu2/0, max_ssu2_sessions).
+    assert_cap_holds(
+        ssu2_cap,
+        i2p_ssu2_sup,
+        fun start_ssu2/0,
+        max_ssu2_sessions,
+        fun count_ssu2/0
+    ).
 
 sam_cap_holds_under_concurrent_dials_test() ->
-    assert_cap_holds(sam_cap, i2p_sam_sup, fun start_sam/0, max_sam_sessions).
+    assert_cap_holds(
+        sam_cap, i2p_sam_sup, fun start_sam/0, max_sam_sessions, fun count_sam/0
+    ).
+
+%% The fourth, and the only one whose pressure comes from outside this router: the
+%% admitted child is a streaming connection, and the thing competing for its slots
+%% is inbound SYNs from remote peers. Before the cap existed this admitted all 24.
+stream_conn_cap_holds_under_concurrent_dials_test() ->
+    assert_cap_holds(
+        stream_conn_cap,
+        i2p_sam_sup,
+        fun start_stream/0,
+        max_stream_connections,
+        fun count_stream/0
+    ).
 
 %%% %%%%% %%% No cluster-wide lock %%%%% %%%
 
@@ -143,7 +185,13 @@ admission_does_not_consult_a_cluster_wide_lock_test() ->
                     [
                         {i2p_ntcp2_sup, fun start_ntcp2/0},
                         {i2p_ssu2_sup, fun start_ssu2/0},
-                        {i2p_sam_sup, fun start_sam/0}
+                        {i2p_sam_sup, fun start_sam/0},
+                        %% The fourth admission instance goes through the same
+                        %% assertion. It never took one of the three ids above --
+                        %% it was a bare `start_child` -- so this is not a claim
+                        %% about code that existed, only about where a lock would
+                        %% be taken if one were reintroduced.
+                        {i2p_sam_sup, fun start_stream/0}
                     ]
                 )
             end
@@ -152,7 +200,7 @@ admission_does_not_consult_a_cluster_wide_lock_test() ->
         lists:foreach(fun(Id) -> global:del_lock(Id, [node()]) end, Locks)
     end.
 
-%%% %%%%% %%% Three caps, three queues %%%%% %%%
+%%% %%%%% %%% Four caps, four queues %%%%% %%%
 
 %% The ticket's open question, answered. A SAM session is a client connection an
 %% operator is waiting on by hand; the bursts the peer caps exist for are floodfill
@@ -162,7 +210,14 @@ admission_does_not_consult_a_cluster_wide_lock_test() ->
 %% Asserted by saturating one cap and admitting on the others, which is the shape a
 %% shared lock or a shared counter would fail: the refusal here is on *SAM
 %% sessions* and must not be the answer to a question about a peer connection.
-the_three_caps_are_independent_test() ->
+%%
+%% **The two caps in `i2p_sam_sup` are asserted separately, and that is the
+%% half of this case that is about the fourth cap.** One supervisor, two admission
+%% processes, two counters over one child list -- so "at the session cap" and "at
+%% the stream cap" are answers a shared instance or a shared counter would merge
+%% into one. A STREAM ACCEPT destination can be sent inbound streams by any peer,
+%% and that is a remote peer filling a local operator's queue.
+the_four_caps_are_independent_test() ->
     with_caps(fun() ->
         with_sups(fun() ->
             set_cap(max_sam_sessions, 1),
@@ -177,6 +232,27 @@ the_three_caps_are_independent_test() ->
             set_cap(max_ntcp2_connections, 0),
             ?assertMatch({error, connection_limit}, start_ntcp2()),
             %% ... and refusing a peer connection does not disturb the live SAM one.
+            ?assertEqual(1, i2p_sam_sup:session_count()),
+            %% Nor does it refuse the streaming connection that same session would
+            %% have opened: the refusal above is on NTCP2 connections and nothing else.
+            {ok, _Stream} = start_stream(),
+            ?assertEqual(1, i2p_sam_sup:stream_conn_count())
+        end)
+    end).
+
+%% The same two caps in the same supervisor, from the other direction: saturating
+%% *streams* says nothing about *sessions*. Stated separately because a cap on one
+%% resource charged to the other's counter, or answered with the other's refusal
+%% atom, would pass the case above -- which only ever fills sessions.
+stream_conn_cap_does_not_bound_sessions_test() ->
+    with_caps(fun() ->
+        with_sup(i2p_sam_sup, fun() ->
+            set_cap(max_stream_connections, 0),
+            ?assertMatch({error, stream_limit}, start_stream()),
+            ?assertEqual(0, i2p_sam_sup:stream_conn_count()),
+            %% A session is admitted at a cap that refuses every stream: they are
+            %% two resources, not two names for one.
+            {ok, _} = start_sam(),
             ?assertEqual(1, i2p_sam_sup:session_count())
         end)
     end).
@@ -203,6 +279,57 @@ a_refused_dial_is_counted_test() ->
                 ?assertEqual(
                     After, i2p_stats:snapshot(), admitted_dial_must_not_be_counted_as_a_refusal
                 )
+            end)
+        end)
+    end).
+
+%% **Each cap counts into its own counter, which is only testable per cap.** The
+%% four are separate keys rather than one total because the four bound different
+%% things; a single shared total would be a number no operator can act on. So this
+%% is a case per resource for the streaming cap -- the one whose cap is new -- and
+%% the assertion is that it moves `stream_conns_refused_limit` and leaves the other
+%% three alone. That second half is the part a copy-pasted `refused_counter` gets
+%% wrong.
+a_refused_stream_conn_is_counted_against_its_own_counter_test() ->
+    with_caps(fun() ->
+        with_stats(fun() ->
+            with_sup(i2p_sam_sup, fun() ->
+                Before = i2p_stats:snapshot(),
+                set_cap(max_stream_connections, 0),
+                ?assertMatch({error, stream_limit}, start_stream()),
+                After = i2p_stats:snapshot(),
+                ?assertEqual(
+                    1, maps:get(stream_conns_refused_limit, After)
+                ),
+                ?assertEqual(
+                    [
+                        {ntcp2_connections_refused_limit,
+                            maps:get(
+                                ntcp2_connections_refused_limit, After
+                            )},
+                        {ssu2_sessions_refused_limit,
+                            maps:get(
+                                ssu2_sessions_refused_limit, After
+                            )},
+                        {sam_sessions_refused_limit,
+                            maps:get(
+                                sam_sessions_refused_limit, After
+                            )}
+                    ],
+                    [
+                        {Key, maps:get(Key, Before)}
+                     || Key <- [
+                            ntcp2_connections_refused_limit,
+                            ssu2_sessions_refused_limit,
+                            sam_sessions_refused_limit
+                        ]
+                    ]
+                ),
+                %% Declared, not merely present once it has moved. `f:snapshot/0`
+                %% reports every declared counter whether or not it has moved, so a
+                %% consumer can tell "measured and zero" from "not measured yet" --
+                %% which is what makes the zero above worth asserting.
+                ?assertEqual(0, maps:get(stream_conns_refused_limit, Before))
             end)
         end)
     end).
@@ -246,28 +373,57 @@ an_admission_process_is_restarted_after_dying_test() ->
             %% dedicated cap cases run, against the supervisor that is already up —
             %% nesting `with_sup/2` here would try to start a second one under the same
             %% registered name and fail on `{already_started, _}`.
-            assert_cap_still_holds(ntcp2_cap, i2p_ntcp2_sup, fun start_ntcp2/0)
+            assert_cap_still_holds(ntcp2_cap, fun start_ntcp2/0, fun count_ntcp2/0)
         end)
     end).
+
+%% **The input the case above cannot produce, produced on demand.**
+%%
+%% `i2p_ntcp2_sup` allows five restarts in ten seconds, so a single kill always
+%% comes back and the wait above always terminates. The case that matters is the
+%% one where it does not: a supervisor that has spent its restart intensity stops
+%% starting the child, the registered name is never claimed again, and a wait with
+%% no bound on it sits there for the life of the node. That is a real state of a
+%% real supervisor rather than a hypothetical one -- it is where a `permanent`
+%% child that keeps crashing puts its supervisor, which then terminates with
+%% `reached_max_restart_intensity` -- and the only reason it never reached the
+%% report is that nothing in the suite ever put a supervisor in it.
+%%
+%% So this asks for that state rather than waiting for it to happen by accident,
+%% and asserts the wait **gives up naming what it gave up on**. A helper that
+%% reports is the whole ticket; one that returns a pid it never verified would
+%% pass this case for the wrong reason.
+a_supervisor_that_gives_up_is_reported_not_waited_test() ->
+    Name = i2p_admission_tests_gives_up,
+    {ok, Sup} = i2p_admission_tests_sup:start_link(Name),
+    %% Unlinked for the reason `with_sup/2` documents: this supervisor's exit
+    %% reason is `reached_max_restart_intensity`, and a linked eunit test process
+    %% does not survive that. The fixture is expected to die on its own, so there
+    %% is no teardown to write -- which is also why the case ends where it does.
+    true = unlink(Sup),
+    Old = whereis(Name),
+    ?assert(is_pid(Old)),
+    exit(Old, kill),
+    ?assertError({admission_process_never_restarted, Name, Old}, await_restart(Name, Old)).
 
 %%% %%%%% %%% The cap case, once %%%%% %%%
 
 %% The whole concurrency case for one resource: start the supervisor, set the
-%% cap, race. The three call sites differ in which supervisor, which start function
-%% and which key — nothing else, and each of those three is a name rather than a
-%% shape.
-assert_cap_holds(Label, Sup, Start, CapKey) ->
+%% cap, race. The four call sites differ in which supervisor, which start
+%% function, which key and which count -- nothing else, and each of those is a
+%% name rather than a shape.
+assert_cap_holds(Label, Sup, Start, CapKey, CountOf) ->
     with_caps(fun() ->
         with_sup(Sup, fun() ->
             set_cap(CapKey, ?CAP),
-            assert_cap_still_holds(Label, Sup, Start)
+            assert_cap_still_holds(Label, Start, CountOf)
         end)
     end).
 
 %% The assertions, for a supervisor that is already running with its cap set. Split
 %% from the fixture so the restart case can re-run them without standing a second
 %% supervisor up under a name the first one holds.
-assert_cap_still_holds(Label, Sup, Start) ->
+assert_cap_still_holds(Label, Start, CountOf) ->
     Results = race_dials(Start),
     Admitted = [R || R <- Results, R =:= admitted],
     Denied = [R || R <- Results, R =:= refused],
@@ -281,7 +437,7 @@ assert_cap_still_holds(Label, Sup, Start) ->
     %% Read back from the supervisor rather than from the tally above: the count
     %% admission used and the count an operator sees must be the same number, and
     %% only the supervisor knows the second one.
-    ?assertEqual({Label, ?CAP}, {Label, count_of(Sup)}).
+    ?assertEqual({Label, ?CAP}, {Label, CountOf()}).
 
 %%% %%%%% %%% Racing the dials %%%%% %%%
 
@@ -358,16 +514,40 @@ admit_within(Sup, Start) ->
 %% The supervisor restarts a `permanent` child, so the new pid exists as soon as
 %% the old one is gone. Polled rather than assumed, because "restarted" and "the
 %% name still points at a dead process" are different answers.
+%%
+%% **Bounded, because a poll that cannot fail is not a poll.** A supervisor past
+%% its restart intensity stops starting the child, and then the name is never
+%% claimed again for the life of the node. An unbounded loop does not report that:
+%% it hangs, and a hung case names no supervisor, no bound and no assertion -- so
+%% the one input that says the thing under test is broken produces the one output
+%% that cannot say so. `a_supervisor_that_gives_up_is_reported_not_waited_test/0`
+%% is that input, so the bound is exercised rather than asserted in a comment.
 await_restart(Name, OldPid) ->
+    await_restart(Name, OldPid, erlang:monotonic_time(millisecond) + ?BOUND_MS).
+
+%% **A pid that is not `OldPid` is the answer, and there is no other one.** Two
+%% answers are "not yet", and they are the same one: `undefined` is the ordinary
+%% middle of a restart, and `OldPid` is the short window before the name has been
+%% unregistered. Telling them apart is the only reason a kill of an already-dead
+%% pid was here, and a second `exit/2` does not shorten that window -- the name is
+%% released by the dying process, not by anything this one does to it.
+await_restart(Name, OldPid, Deadline) ->
     case whereis(Name) of
-        OldPid ->
-            exit(OldPid, kill),
-            await_restart(Name, OldPid);
-        undefined ->
+        Pid when is_pid(Pid), Pid =/= OldPid -> Pid;
+        _NotYet -> retry_restart(Name, OldPid, Deadline)
+    end.
+
+%% Read from one clock rather than counted in sleeps, so a scheduler that grants
+%% this process less time than the sleep it asked for cannot stretch the bound
+%% without limit -- which is the failure a `?BOUND_MS` decremented by a millisecond
+%% per pass has, and the reason the bound is a deadline rather than a counter.
+retry_restart(Name, OldPid, Deadline) ->
+    case Deadline - erlang:monotonic_time(millisecond) of
+        Remaining when Remaining > 0 ->
             timer:sleep(1),
-            await_restart(Name, OldPid);
-        Pid ->
-            Pid
+            await_restart(Name, OldPid, Deadline);
+        _Expired ->
+            erlang:error({admission_process_never_restarted, Name, OldPid})
     end.
 
 %%% %%%%% %%% Standing up a supervisor, and a child to admit %%%%% %%%
@@ -434,6 +614,69 @@ start_ssu2() ->
 start_sam() ->
     i2p_sam_sup:start_session(sleeper_child(session)).
 
+%% **A real `m:i2p_stream_conn`, not a sleeper, and the reason is specific to this
+%% resource.** `f:i2p_sam_sup:start_stream_conn/1` builds the child spec itself from
+%% connection options, so a case cannot hand it a substitute child the way it hands
+%% `f:start_session/1` one. That is a constraint, and it buys something: the tag is
+%% the production one. A spec built with the wrong id would leave
+%% `f:count_stream/0` reading zero, the cap unenforceable, and every assertion here
+%% still passing -- which is the failure the module doc warns a sleeper would also
+%% catch, reached from the other direction.
+%%
+%% `send_fn` is a no-op, so the SYN goes nowhere and the connection sits in
+%% `connecting` until its 15s connect timeout, far longer than this case takes.
+%% Nothing here depends on a handshake completing, and no assertion reads anything
+%% but the admission's answer and the count.
+start_stream() ->
+    i2p_sam_sup:start_stream_conn(stream_conn_opts()).
+
+%% One destination per dialer, generated here rather than shared: the identity is
+%% only ever signed and hashed on this path, so sharing one would work too, and a
+%% reader should not have to check that before trusting the fixture.
+stream_conn_opts() ->
+    {StaticPub, _StaticPriv} = i2p_crypto:x25519_keygen(),
+    {SignPub, SignSeed} = i2p_crypto:ed25519_keygen(),
+    Identity = i2p_keys:from_keys(StaticPub, SignPub),
+    DestBin = i2p_keys:to_binary(Identity),
+    #{
+        role => connect,
+        owner => stream_owner(),
+        send_fn => fun(_Wire) -> ok end,
+        local_seed => SignSeed,
+        local_dest_bin => DestBin,
+        local_dest_hash => i2p_keys:hash(Identity),
+        remote_dest_bin => DestBin,
+        remote_dest_hash => i2p_keys:hash(Identity)
+    }.
+
+%% **The owner is its own process, and `owner => self()` here was a real defect
+%% this case introduced.**
+%%
+%% `f:i2p_stream_conn:init/1` announces the demux key to its owner first:
+%%
+%%     maps:get(owner, S) ! {stream_started, self(), maps:get(my_id, S)}
+%%
+%% With `owner => self()` and this running inside the shared eunit worker, that
+%% announcement stayed in the worker's mailbox after the case finished — and
+%% `i2p_events_tests:collector_test/0` partitions that same mailbox, so it read a
+%% `{stream_started, _, _}` where it expected its own `{leaseset_published, _}` and
+%% failed. One module's fixture reddening another's test over a stray message,
+%% which is the shape #SG93V0P is about, and it took the whole eunit tier red
+%% rather than one case.
+%%
+%% A dedicated owner keeps that message in a mailbox nothing else reads. It exits
+%% after the announcement, because that is all it is here for: the stream id is
+%% what a real owner needs (a SAM session registers it as the demux key), and this
+%% case asserts about admission, not about demultiplexing. Nothing in
+%% `i2p_stream_conn` monitors its owner, so an owner that has gone is only ever a
+%% pid that no longer resolves, and the connection does not die of it.
+stream_owner() ->
+    spawn(fun() ->
+        receive
+            {stream_started, _Conn, _MyId} -> ok
+        end
+    end).
+
 sleeper_child(Tag) ->
     #{
         id => {Tag, erlang:unique_integer([positive, monotonic])},
@@ -453,12 +696,15 @@ sleeper_init() ->
 
 %%% %%%%% %%% Reading a count back %%%%% %%%
 
-%% Which read answers "how many are live" for a given supervisor. A function
-%% rather than a fun applied at the call site, because `Fun:arity` is not
-%% something Erlang can write — an applied fun needs a known arity at the call.
-count_of(i2p_ntcp2_sup) -> i2p_ntcp2_sup:connection_count();
-count_of(i2p_ssu2_sup) -> i2p_ssu2_sup:session_count();
-count_of(i2p_sam_sup) -> i2p_sam_sup:session_count().
+%% Which read answers "how many are live" for a given resource. Four functions
+%% rather than one dispatching on the supervisor, because `i2p_sam_sup` answers two
+%% different questions and a case that asked it the wrong one would be silently
+%% asserting the wrong number: `f:count_sam/0` counts sessions and
+%% `f:count_stream/0` counts streaming connections, both over one child list.
+count_ntcp2() -> i2p_ntcp2_sup:connection_count().
+count_ssu2() -> i2p_ssu2_sup:session_count().
+count_sam() -> i2p_sam_sup:session_count().
+count_stream() -> i2p_sam_sup:stream_conn_count().
 
 %%% %%%%% %%% Caps and the counter home %%%%% %%%
 
@@ -466,13 +712,13 @@ set_cap(Key, Value) ->
     ok = application:set_env(?APP, Key, Value),
     Value.
 
-%% The three cap keys, and the fixture that puts them back.
+%% The four cap keys, and the fixture that puts them back.
 %%
 %% **Every one of these is on the `m:i2p_config` allowlist**, so a cap left set
 %% shows up in `m:i2p_config:in_force/0` and the router's boot line. EUnit runs
 %% every module in this directory in one node, so a case here that does not clean
 %% up breaks `i2p_config_tests:in_force_reports_values_as_stored_test` — which
-%% asserts the boot line is *exactly* two keys — with three extra ones and no hint
+%% asserts the boot line is *exactly* two keys — with four extra ones and no hint
 %% that the fault is two directories away. That is what this is for.
 with_caps(Fun) ->
     Saved = [{Key, application:get_env(?APP, Key)} || Key <- cap_keys()],
@@ -488,7 +734,7 @@ restore_cap({Key, undefined}) ->
     ok = application:unset_env(?APP, Key).
 
 cap_keys() ->
-    [max_ntcp2_connections, max_ssu2_sessions, max_sam_sessions].
+    [max_ntcp2_connections, max_ssu2_sessions, max_sam_sessions, max_stream_connections].
 
 %% **Stopped, not killed.** `i2p_stats:terminate/2` erases the `persistent_term`
 %% entry holding the counter registry, and only a clean stop runs it. A `kill`

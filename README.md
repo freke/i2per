@@ -68,11 +68,34 @@ The toolchain this tree is built and gated against:
 `just check` runs `erlfmt`, which is not part of a stock Erlang install, and
 `rebar.config` compiles with `warnings_as_errors` — so a different OTP version
 can fail on warnings this one does not produce. Use the pinned environment
-instead of assembling the toolchain by hand:
+instead of assembling the toolchain by hand.
+
+**The pinned environment loads itself.** `.envrc` puts it in every shell you open
+in this directory, including your editor's, a REPL and anything an agent runs:
 
 ```sh
-devenv shell
+git clone https://github.com/freke/i2per && cd i2per
+direnv allow      # once per checkout, and deliberately not automatic
 ```
+
+That prompt is direnv's, and it is a security boundary rather than a papercut:
+running an `.envrc` executes shell code from the checkout, so direnv refuses
+until you have read it. Approve it once and every later shell is already
+correct.
+
+**Editing `.envrc` asks again.** direnv trusts a specific revision of the file,
+not the path, so any change to it re-blocks every open shell — and the symptom is
+`rebar3: command not found` in a shell that worked a minute ago. Run `direnv
+allow` again after editing it.
+
+For a shell that does not have direnv — a script, or CI:
+
+```sh
+devenv shell -- <command>
+```
+
+Note the `--`. `devenv shell` without it starts an interactive subshell, which is
+why an editor or a REPL opened from inside one still has no toolchain.
 
 ## Developer mode
 
@@ -100,13 +123,14 @@ packaged release section below when you need a full router process.
 
 ## Build and verify
 
-From the repository root, inside the devenv shell:
+From the repository root — where the pinned environment is already on `PATH`:
 
 ```sh
 just smoke-test   # the push tier: lint, unit tests, most of the CT suites
 just test         # everything: lint, docs, all eunit, all CT, coverage
+just check        # the release gate: `just test` plus dialyzer
 just proper       # the property tests alone (also inside `just test`)
-just dialyzer     # static analysis
+just dialyzer     # static analysis alone (also inside `just check`)
 just live-smoke   # boot a throwaway router and print its network observables
 just doc          # regenerate the local ExDoc site in doc/
 ```
@@ -118,9 +142,13 @@ after that:
 
 | recipe | runs | when |
 | --- | --- | --- |
-| `just proper` | 3 modules, 16 properties over generated inputs | `main`, and on request |
-| `just smoke-test` | lint, 935 unit cases, 211 of 224 CT cases | **every push** |
-| `just test` | lint, docs, dialyzer, all 951 eunit, all 224 CT | `main` |
+| `just proper` | the property modules, over generated inputs | `main`, and on request |
+| `just smoke-test` | lint, every unit module, every CT suite but the slow two | **every push** |
+| `just test` | lint, docs, dialyzer, every eunit module, every CT suite | `main` |
+
+Case totals are not written down here on purpose: `rebar3` prints the number of
+tests each run executed, and a figure kept in prose is a second copy of it that
+no run checks.
 
 Measured at **91s** for `just smoke-test` and **205s** for `just test` on a
 developer machine. The smoke tier is under five minutes on a GitHub runner.
@@ -140,8 +168,12 @@ The tier boundaries are derived from the tree by `scripts/ct-suites.sh` (CT) and
 `scripts/eunit-modules.sh` (eunit/PropEr), so a new suite is in tomorrow's smoke
 run by default rather than by an edit someone has to remember.
 
-`just test` and `just dialyzer` are the release gates. `just check` is an alias
-for `just test`. `doc/` is generated output and is not committed. The repository
+`just check` is the release gate: `erlfmt`, the generated docs, dialyzer, and
+every test. It is an alias for `just test` plus `just dialyzer`, and dialyzer is
+run before the tests because it reads source and does not depend on which suites
+ran — so a type error fails the gate in ~49s rather than after the ~4 minutes of
+eunit and CT. Dialyzer is separately runnable because the `compat` CI job invokes
+it on its own. `doc/` is generated output and is not committed. The repository
 test suite is part of the release quality process.
 
 ## Run the packaged release
@@ -192,6 +224,7 @@ tunnel_build_rate = 1
 max_ntcp2_connections = 64
 max_sam_sessions = 32
 max_ssu2_sessions = 32
+max_stream_connections = 128
 
 [tunnel_pool]
 outbound = 3
@@ -201,6 +234,39 @@ inbound = 3
 enabled = false
 min_routers = 50
 ```
+
+### UDP transport
+
+How this router uses UDP (SSU2) is one application-environment key, not an
+`i2per.conf` entry, and it is not settable through `i2p_config_srv`:
+
+```erlang
+%% sys.config, or: application:set_env(i2per, ssu2, prefer_udp).
+{ssu2, no_udp}.
+```
+
+| value | serves UDP | dials UDP first |
+|---|---|---|
+| `no_udp` (default) | no | no |
+| `enable_udp` | yes | no |
+| `prefer_udp` | yes | yes |
+
+Serving UDP and preferring it are separate choices, so `enable_udp` binds the
+listener and publishes the address in the RouterInfo while outbound dials still
+go to NTCP2 first. The fourth combination — serve nothing, dial UDP — is not
+offered, since there would be no address to dial.
+
+**The choice is boot-time and there is no runtime escape.** The listener is bound
+and the RouterInfo address published from the value read at start; changing the
+key while the router runs changes nothing, and a restart is the only way to
+change it. The running setting is on the boot's `config in force` line. Choosing
+`prefer_udp` on a UDP-blocked network therefore has no way back but a reboot, so
+it is worth deciding deliberately. The configuration value read at boot is
+rejected if it is not one of the three, rather than falling back to the default.
+
+The deprecated boolean `ssu2_enabled` is still read when `ssu2` is unset, and
+means what it always meant: `true` is `prefer_udp`, `false` is `no_udp`. Setting
+both is not a contradiction the router resolves by guessing — `ssu2` wins.
 
 Addressbook subscriptions are configured through `sys.config` or the
 application environment, not the INI file. Each entry names an I2P host and

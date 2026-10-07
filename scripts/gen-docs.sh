@@ -7,6 +7,23 @@
 # `docs/docs.exs`. Run through `just doc`.
 #
 # Requires: rebar3 (for compile + the bundled ExDoc escript via rebar3_ex_doc).
+#
+# %%%%% Why `--warnings-as-errors` is here %%%%%
+#
+# ExDoc prints a `warning:` for every documentation reference that resolves to
+# nothing — a `t:foo/0` that is not a type, an `m:bar` that is not a module —
+# and **still exits 0**. A docs step whose whole job is to catch malformed
+# documentation attributes therefore reported four of them and returned success,
+# which is the same failure the tree calls out everywhere else: a gate that
+# cannot fail is not a gate. The flag turns ExDoc's own warning stream into a
+# non-zero exit, so the docs build fails on a dead cross-reference.
+#
+# It is a flag on the ExDoc invocation rather than a grep over its output
+# because ExDoc already knows which of its messages are warnings; re-deriving
+# that from text would be a second, worse copy of the same judgement.
+#
+# **The site's own extras are checked too**, not only the module docs, since the
+# README and `docs/` extras go through the same autolinker.
 
 set -euo pipefail
 
@@ -15,7 +32,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 PROJECT_NAME="i2per"
-VERSION="0.1.0"
+# The site version comes from the app's own {vsn, ...} -- one source, read by
+# the release script too. Overridable so a release-notes build can stamp a
+# candidate version without editing the tree.
+VERSION="${I2PER_DOCS_VERSION:-$(sed -n 's/^[[:space:]]*{vsn, "\([^"]*\)"}.*/\1/p' apps/i2per/src/i2per.app.src | head -1)}"
+[ -n "$VERSION" ] || { echo "error: could not read {vsn, ...} from apps/i2per/src/i2per.app.src" >&2; exit 1; }
 EBI_I2PER="${EBI_I2PER:-_build/default/lib/i2per/ebin}"
 EBI_STATUS="${EBI_STATUS:-_build/default/lib/i2per_status/ebin}"
 CONFIG="docs/docs.exs"
@@ -44,6 +65,7 @@ echo "Generating umbrella docs -> $OUT (${PROJECT_NAME} ${VERSION})"
 "$EX_DOC" "$PROJECT_NAME" "$VERSION" "$EBI_I2PER" "$EBI_STATUS" \
     --proglang erlang \
     --config "$CONFIG" \
+    --warnings-as-errors \
     --output "$OUT"
 
 echo "Docs written to $OUT/"

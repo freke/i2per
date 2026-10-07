@@ -16,14 +16,24 @@ handles their ready, frame, and data messages.
 
 ## Transport selection
 
-Outbound dials run in a spawned process and prefer SSU2: when app env
-`i2per` -> `ssu2_enabled` is set, the local SSU2 listener is up, and the
-remote publishes a usable SSU2 address, the manager attempts the SSU2
-handshake there. The handshake blocks until it succeeds or fails; on failure
-(SessionCreated timeout, protocol error, or an attempt at a dead SSU2 port)
-the dial falls back to NTCP2 without retrying SSU2. When SSU2 is unavailable
-(disabled, no listener, or the remote is NTCP2-only) the dial goes straight
-to NTCP2. The live transport is surfaced per peer by `f:status/0`.
+Outbound dials run in a spawned process and prefer SSU2: when app env `i2per`
+-> `ssu2` is `prefer_udp` (`f:i2p_identity:ssu2_preferred/0`), the local SSU2
+listener is up, and the remote publishes a usable SSU2 address, the manager
+attempts the SSU2 handshake there. The handshake blocks until it succeeds or
+fails; on failure (SessionCreated timeout, protocol error, or an attempt at a
+dead SSU2 port) the dial falls back to NTCP2 without retrying SSU2. Under
+`enable_udp` — serve UDP, dial NTCP2 first — no dial attempts SSU2 at all, even
+though the listener is bound. When SSU2 is not preferred (not served, not
+preferred, no listener, or the remote is NTCP2-only) the dial goes straight to
+NTCP2. The live transport is surfaced per peer by `f:status/0`.
+
+**A dial cannot strand a peer.** The dial is spawned unlinked, so a raise on that
+path cannot take the manager down — every send the router makes goes through this
+process — but unlinked is not unobserved. `f:start_dial/3` monitors the dial and
+arms a deadline on it (`f:dial_deadline_ms/0`), so a peer at `connecting` has two
+ways out that do not depend on the dial behaving: its monitor `DOWN`, and the
+deadline. Both release the peer through `f:handle_connect_failed/3`, the same
+path every other terminal dial message takes, and both count `dials_escaped`.
 
 Inbound sessions arrive from the boot listener as `bob`-role connections. The
 ready message carries the dialer's RouterInfo: when the connection's pid does
@@ -118,6 +128,14 @@ i2p_peer:stop().
 ]).
 
 -define(HANDSHAKE_TIMEOUT, 15000).
+%% Headroom on top of the dial's own legs, for a handshake that is retransmitting
+%% rather than stalled. One NTCP2 budget's worth, so a peer that is merely slow
+%% is retried rather than declared lost.
+-define(DIAL_DEADLINE_MARGIN_MS, 15000).
+%% How long a peer may sit in `connecting` before the manager stops waiting for
+%% its dial to report. Overridable via app env `i2per` -> `dial_deadline_ms`,
+%% which is also how the CT case exercises a bound this long without waiting for
+%% it. The default is derived rather than written down: see `f:dial_deadline_ms/0`.
 -define(MAX_BACKOFF_SECONDS, 300).
 -define(REFRESH_INTERVAL_SECONDS, 300).
 %% How often the bounded structures are swept: `pending_sends` entries past
@@ -253,17 +271,28 @@ Inspect the peer manager.
 
 Input: none.
 Output: a map of peer hash to `#{status => connecting | connected | backoff,
-attempts => non_neg_integer(), transport => ntcp2 | ssu2}` — the status of
-each connection, how many consecutive connect attempts it has made, and which
-transport a live connection uses (outbound selection prefers SSU2 and falls
-back to NTCP2).
+attempts => non_neg_integer(), transport => ntcp2 | ssu2, last_attempt =>
+integer()}` — the status of each connection, how many consecutive connect
+attempts it has made, which transport it is on or attempting, and when the
+current attempt began.
+
+`transport` is **the attempt, not the entry's creation-time default**. A peer
+whose SSU2 dial is parked reports `ssu2`, and only reports `ntcp2` once the
+fallback has actually begun, because the dialing process announces each attempt
+to this process as it makes it (see `f:attempt_announced/2`).
+
+`last_attempt` is the unix-seconds instant the current attempt began, and it is
+what separates a parked dial from a fresh one: `connecting` at `attempts = 0`
+is what a healthy dial looks like five milliseconds in, so the age of this field
+— not the attempt count — is what says a dial has been stuck.
 """.
 -spec status() ->
     #{
         i2p_crypto:hash() => #{
             status := connecting | connected | backoff,
             attempts := non_neg_integer(),
-            transport := ntcp2 | ssu2
+            transport := ntcp2 | ssu2,
+            last_attempt := integer()
         }
     }.
 status() ->
@@ -371,7 +400,8 @@ handle_call(status, _From, State) ->
             #{
                 status => maps:get(status, PeerState),
                 attempts => maps:get(attempts, PeerState),
-                transport => maps:get(transport, PeerState, ntcp2)
+                transport => maps:get(transport, PeerState, ntcp2),
+                last_attempt => maps:get(last_attempt, PeerState)
             }
         end,
         Peers
@@ -427,10 +457,11 @@ handle_cast(stop, State) ->
     _ = cancel_timer(maps:find(discovery_kick_ref, State)),
     _ = cancel_timer(maps:find(sweep_ref, State)),
     lists:foreach(
-        fun({_Hash, #{conn := Conn}}) ->
-            case Conn of
+        fun({_Hash, PeerState}) ->
+            _ = stop_dial(PeerState),
+            case maps:get(conn, PeerState, undefined) of
                 undefined -> ok;
-                _ -> stop_conn(Conn)
+                Conn -> stop_conn(Conn)
             end
         end,
         maps:to_list(Peers)
@@ -449,6 +480,12 @@ handle_cast(_Msg, State) ->
 
 handle_info({conn_started, PeerHash, ConnPid, Transport}, State) ->
     {noreply, handle_conn_started(PeerHash, ConnPid, Transport, State)};
+%% A dial told us which transport it is attempting. Sent by the dialing process
+%% before it blocks, so a peer parked in an SSU2 handshake reports `ssu2` rather
+%% than the `ntcp2` its entry was seeded with. See `f:attempt_announced/2` for
+%% why the dialing process is the one that has to say so.
+handle_info({dial_attempt, PeerHash, Transport}, State) ->
+    {noreply, handle_dial_attempt(PeerHash, Transport, State)};
 %% A connect failure with a reason, and one without. The second shape is what a
 %% failure before the connection process exists can only say: `ntcp2_connect/4`
 %% reports a supervisor refusal with nothing more to go on, and inventing a reason
@@ -479,8 +516,15 @@ handle_info({ssu2_closed, ConnPid, _Reason}, State) ->
     {noreply, handle_conn_down_by_pid(ConnPid, State)};
 handle_info({ntcp2_frame, ConnPid, Payload}, State) ->
     {noreply, handle_frame(ConnPid, Payload, State)};
-handle_info({'DOWN', MonRef, process, _ConnPid, _Reason}, State) ->
-    {noreply, handle_conn_down(MonRef, State)};
+%% A monitored process died. Which one is not in the message — the same `DOWN`
+%% arrives for a connection and for an outbound dial, and a monitor ref is what
+%% tells them apart — so it is resolved here, once. The dial table is checked
+%% first because the two kinds can never share a ref, and because a dial's `DOWN`
+%% is the only one that can arrive while its peer is still `connecting`.
+handle_info({'DOWN', MonRef, process, _Pid, Reason}, State) ->
+    {noreply, handle_down(MonRef, Reason, State)};
+handle_info({timeout, TimerRef, {dial_expired, PeerHash}}, State) ->
+    {noreply, handle_dial_expired(PeerHash, TimerRef, State)};
 handle_info({retry_peer, PeerHash}, State) ->
     {noreply, maybe_connect(PeerHash, State)};
 handle_info(refresh_routerinfo, State) ->
@@ -562,6 +606,13 @@ fresh_sends(Msgs, NowMs, Acc) ->
 %% `error` for an unknown peer by stopping the connection. So an in-flight dial
 %% would be torn down by its own successful handshake.
 %%
+%% **The rule stands and its reason has not changed**, but the state it protects
+%% is no longer permanent: `f:start_dial/3` gives every dial a monitor and a
+%% deadline, so a `connecting` peer reaches `backoff` on its own. That is what
+%% makes not evicting here a choice about the in-flight dial rather than the only
+%% escape — and it has to stay a choice, because eviction is still the one thing
+%% that breaks the case above.
+%%
 %% `?MAX_PEERS` is a backstop rather than the primary mechanism: a peer in
 %% `backoff` keeps being retried, so it is only ever unreachable-but-retained,
 %% and the count is expected to sit well below the cap. It exists so a router
@@ -598,6 +649,25 @@ idle_peer(Peer) ->
         maps:get(status, Peer, none) =/= connecting.
 
 %%%%%%%%% %%% Internal %%%%%%%
+
+%% Record the transport a dial has committed to, leaving the rest of the entry
+%% alone.
+%%
+%% The `error` clause is the same shape as `f:handle_conn_started/4`'s, and for
+%% the same reason: the dialing process is an unlinked spawn, so a message from
+%% one is input from outside this process even though it is not a socket. It is
+%% in practice unreachable — the entry is written before the spawn returns, and
+%% an attempt is only announced once per dial — but the failure mode for being
+%% wrong about that is a crash in the process every send path runs through, so
+%% it degrades to ignoring the announcement instead. Losing one transport report
+%% is a smaller fault than losing the peer manager.
+handle_dial_attempt(PeerHash, Transport, State) ->
+    case peer_state(PeerHash, State) of
+        {ok, PeerState} ->
+            put_peer(PeerHash, PeerState#{transport := Transport}, State);
+        error ->
+            State
+    end.
 
 handle_conn_started(PeerHash, ConnPid, Transport, State) ->
     case peer_state(PeerHash, State) of
@@ -674,18 +744,32 @@ is_i2np_block(_) -> false.
 %% blocks those coordinators need is how a future implementation ends up looking
 %% broken for a reason that lives in this module.
 %%
-%% Both lines stay, and they are not a duplicate. The event carries the block name
-%% alone, which is the dimension a counter wants; the log line adds the *peer*, which
-%% the event deliberately does not carry because its cardinality is unbounded. That
-%% is the ADR 0002 split rather than a breach of it: the fact is recorded once, and
-%% the two lines record different parts of it.
+%% **Both instruments fire once per peer and kind, and the counter fires always.**
 %%
-%% The warning is emitted once per peer and kind, because a peer that floods us with
-%% these must not turn the log into the flood it is causing. The event is not
-%% deduplicated, for the same reason in reverse: a counter wants the total.
+%% The warning was already deduplicated, because "a peer that floods us with these
+%% must not turn the log into the flood it is causing". The event used to be emitted
+%% per *block*, on the reasoning that "a counter wants the total" -- and it was right
+%% about the want and wrong about the instrument. The total now lives in
+%% `m:i2p_stats:ssu2_blocks_unhandled`, charged on every block, so the announce rate
+%% is free to be what it was always supposed to be: a notice.
+%%
+%% **Why that is not merely tidiness.** A wedged `gen_event` handler parks the manager,
+%% and every event queued behind it waits in the manager's mailbox, undelivered,
+%% for as long as the handler stays wedged. The announce rate *is* the backlog rate.
+%% Leaving one emit per block meant the most likely way to wedge a handler -- a peer
+%% flooding blocks the router does not handle -- was also the fastest way to fill the
+%% queue behind it, from the peer manager, which is the process every send path in
+%% the router goes through. See #HPH59JN.
+%%
+%% The key is the same one the log uses, `{Identity, Name}`, so the two instruments
+%% describe the same occurrences and the dedup set bounds both. Keeping the log line
+%% as well as the event is a deliberate overlap rather than an oversight: the log is
+%% the record that exists when nothing is attached, and `i2per_status` is never
+%% started by the router. See #HPH59JN for the two-instrument question this leaves
+%% open.
 note_unhandled_ssu2_block(ConnPid, Block, State) ->
     Name = ssu2_block_name(Block),
-    i2p_events:notify({ssu2_block_unhandled, Name}),
+    ok = i2p_stats:add(ssu2_blocks_unhandled, 1),
     Identity =
         case find_conn_peer(ConnPid, State) of
             {Hash, _PeerState} -> {peer, base64:encode(Hash)};
@@ -697,6 +781,7 @@ note_unhandled_ssu2_block(ConnPid, Block, State) ->
         true ->
             State;
         false ->
+            i2p_events:notify({ssu2_block_unhandled, Name}),
             i2p_log:emit(
                 unhandled_ssu2_block_peer, "unhandled ssu2 ~0p block from ~0p", [Name, Identity]
             ),
@@ -773,6 +858,18 @@ handle_conn_ready(ConnPid, Transport, State) ->
         not_found ->
             stop_conn(ConnPid),
             State
+    end.
+
+%% Which monitored process died is not carried in the `DOWN`. The dial table is
+%% consulted first and the connection path below is left otherwise untouched, so
+%% the only thing this changes for an existing `DOWN` is one failed lookup on a
+%% ref that is not in it.
+handle_down(MonRef, Reason, State) ->
+    case find_peer_by_dial_mon(MonRef, State) of
+        {PeerHash, PeerState} ->
+            handle_dial_down(PeerHash, PeerState, Reason, State);
+        not_found ->
+            handle_conn_down(MonRef, State)
     end.
 
 handle_conn_down(MonRef, State) ->
@@ -886,7 +983,7 @@ maybe_connect_status(none, PeerHash, State) ->
         undefined ->
             State;
         PeerConfig ->
-            spawn(fun() -> init_connect(PeerHash, PeerConfig, maps:get(local, State)) end),
+            Dial = start_dial(PeerHash, PeerConfig, maps:get(local, State)),
             PeerState = #{
                 config => PeerConfig,
                 conn => undefined,
@@ -895,7 +992,8 @@ maybe_connect_status(none, PeerHash, State) ->
                 backoff => 0,
                 attempts => 0,
                 last_attempt => erlang:system_time(second),
-                status => connecting
+                status => connecting,
+                dial => Dial
             },
             put_peer(PeerHash, PeerState, State)
     end;
@@ -907,15 +1005,124 @@ maybe_connect_status(backoff, PeerHash, State) ->
     case backoff_elapsed(PeerHash, State) of
         true ->
             {ok, PeerState} = peer_state(PeerHash, State),
-            spawn(fun() ->
-                init_connect(PeerHash, maps:get(config, PeerState), maps:get(local, State))
-            end),
+            Dial = start_dial(PeerHash, maps:get(config, PeerState), maps:get(local, State)),
             Now = erlang:system_time(second),
-            Updated = PeerState#{status := connecting, last_attempt := Now},
+            Updated = PeerState#{status := connecting, last_attempt := Now, dial := Dial},
             put_peer(PeerHash, Updated, State);
         false ->
             State
     end.
+
+%% start_dial/3 — run one outbound dial and return the bookkeeping the manager
+%% needs to know when it stops.
+%%
+%% **`spawn_monitor`, not `spawn`.** The dial is unlinked, deliberately: a raise on
+%% this path must not take the peer manager with it, since every send the router
+%% makes goes through this process. Unlinked is not unobserved, though. The dial
+%% reaches the manager by sending — `{dial_attempt, ...}`, then `{conn_started, ...}`
+%% or `{connect_failed, ...}` — so a dial that *raises* between those sends says
+%% nothing at all, and the two raises this path is one edit away from (`true =
+%% is_pid(Manager)` in `f:attempt_announced/2` and in the SSU2 success arm) leave
+%% the peer at `connecting` with nothing in flight and no way out. `connecting` is
+%% never evicted by `f:sweep_peers/1`, so that is for the life of the process.
+%%
+%% The monitor is the escape: a `DOWN` resolves to its peer by monitor ref, and a
+%% stranded peer is released through the same `f:handle_connect_failed/3` every
+%% other terminal dial message uses.
+%%
+%% **A deadline as well, because a monitor only reports a dial that *ends*.** Every
+%% leg of this dial bounds itself — the SSU2 handshake by its retransmit count,
+%% the introducer leg by `m:i2p_ssu2_conn`'s redirect wait, NTCP2 by
+%% `?HANDSHAKE_TIMEOUT` — so the deadline firing means one of them did not, which
+%% is why it is counted (`dials_escaped`) rather than folded into the ordinary
+%% connect-failure path with no trace.
+%%
+%% `f:start_timer/3` rather than `f:send_after/2` because the ref it returns is
+%% both the cancellable handle and what the message carries: a timer belonging to
+%% a dial that has already been released is then recognisable, and cannot fire
+%% against the next dial for the same peer. Cancelling on release would work today
+%% and break on the first path added that forgets.
+start_dial(PeerHash, PeerConfig, Local) ->
+    {DialPid, MonRef} = spawn_monitor(fun() -> init_connect(PeerHash, PeerConfig, Local) end),
+    TimerRef = erlang:start_timer(dial_deadline_ms(), self(), {dial_expired, PeerHash}),
+    {DialPid, MonRef, TimerRef}.
+
+%% A `DOWN` carrying a dial's monitor ref. Not a connection drop, so it does not
+%% reach `f:handle_conn_down/2` — a peer mid-dial has no connection and no
+%% connection monitor, and a dial that reported nothing at all is not something
+%% that drop path can see.
+handle_dial_down(PeerHash, PeerState, Reason, State) ->
+    State1 = clear_dial(PeerHash, State),
+    case dial_stranded(PeerState) of
+        true ->
+            ok = i2p_stats:add(dials_escaped, 1),
+            handle_connect_failed(PeerHash, {dial_died, Reason}, State1);
+        false ->
+            State1
+    end.
+
+%% `connecting` outlived `f:dial_deadline_ms/0`.
+%%
+%% The ref is matched first, and it is what makes this safe rather than merely
+%% correct in the common case: a peer released early by a failure arms a fresh
+%% deadline on its next dial, and without the match this message would end *that*
+%% dial at the previous dial's deadline — possibly seconds into a healthy SSU2
+%% park, and while it is holding the peer at `connecting` rather than in backoff.
+handle_dial_expired(PeerHash, TimerRef, State) ->
+    case peer_state(PeerHash, State) of
+        {ok, #{dial := {_Pid, _MonRef, TimerRef}} = PeerState} ->
+            case dial_stranded(PeerState) of
+                true ->
+                    ok = i2p_stats:add(dials_escaped, 1),
+                    %% Stop the dial as well as the peer. It has already overrun
+                    %% the sum of its own legs, and leaving it running means it can
+                    %% later hand a connection to a peer now in backoff — which is
+                    %% the exact completion-into-a-dead-entry case the "never evict
+                    %% a connecting peer" rule exists to prevent, reached from the
+                    %% other direction.
+                    stop_dial(PeerState),
+                    handle_connect_failed(PeerHash, dial_deadline, clear_dial(PeerHash, State));
+                false ->
+                    State
+            end;
+        _ ->
+            State
+    end.
+
+%% The one condition that means "a dial was in flight and has gone". `connecting`
+%% on its own is not enough: a peer stays `connecting` after `conn_started` while
+%% the NTCP2 handshake runs, and that one is released by the *connection's* own
+%% monitor through `f:handle_conn_down/2`. A dial that died after handing over a
+%% connection has therefore done its job, and counting it as an escape would put
+%% a "crash" on the counter for a dial that connected.
+dial_stranded(PeerState) ->
+    maps:get(status, PeerState, none) =:= connecting andalso
+        maps:get(conn, PeerState, undefined) =:= undefined.
+
+%% Retire a peer's dial bookkeeping. Safe to call twice — the DOWN and the
+%% deadline can each arrive for a dial the other already released, and neither
+%% may take the peer down over it.
+clear_dial(PeerHash, State) ->
+    case peer_state(PeerHash, State) of
+        {ok, PeerState} ->
+            _ = stop_dial(PeerState),
+            put_peer(PeerHash, PeerState#{dial => undefined}, State);
+        error ->
+            State
+    end.
+
+%% Cancel the deadline and kill the dial process. Unlinked, so the kill is an
+%% ordinary exit signal and the resulting `DOWN` reaches the monitor — which by
+%% then resolves to nothing, since the peer no longer carries the ref.
+stop_dial(#{dial := undefined}) ->
+    ok;
+stop_dial(#{dial := {DialPid, _MonRef, TimerRef}}) ->
+    _ = erlang:cancel_timer(TimerRef),
+    exit(DialPid, kill),
+    ok.
+
+dial_mon(undefined) -> undefined;
+dial_mon({_Pid, MonRef, _TimerRef}) -> MonRef.
 
 init_connect(PeerHash, #{ri := RemoteRI}, Local) ->
     Owner = whereis(?MODULE),
@@ -945,10 +1152,37 @@ park_reported(PeerHash, Reason) ->
     ok = i2p_stats:add(ssu2_dials_parked, 1),
     ok = i2p_events:notify({ssu2_dial_parked, PeerHash, Reason}).
 
+%% Tell the manager which transport this dial is about to attempt, before it
+%% blocks on the attempt.
+%%
+%% Announced from the dialing process rather than decided in the manager, because
+%% the manager cannot know the answer: the choice between the two transports is
+%% made *here*, from `f:i2p_identity:ssu2_preferred/0`, whether the SSU2 listener
+%% exists, and what the remote publishes -- none of which the manager re-reads,
+%% and the first of which an operator can change.
+%%
+%% Without it the entry keeps the `ntcp2` it was seeded with when the peer was
+%% created, so a peer parked in an SSU2 handshake reports a transport it is not
+%% on -- and the park is up to 10s direct, or 60s through an introducer, so the
+%% lie is the visible state for the whole of it rather than an instant.
+%%
+%% Sent before the blocking call and by the same process that later sends
+%% `conn_started`, so it reaches the manager first: signal order between one
+%% sender and one receiver is guaranteed by the runtime.
+attempt_announced(PeerHash, Transport) ->
+    Manager = whereis(?MODULE),
+    true = is_pid(Manager),
+    Manager ! {dial_attempt, PeerHash, Transport},
+    ok.
+
 %% Outbound SSU2 dial (Alice role). Bypassed — returning `{fallback,
-%% not_attempted}` — unless SSU2 is enabled at boot, this router's SSU2 listener
-%% is up, and the remote publishes a usable SSU2 address. The blocking handshake
-%% runs in this spawned process; on success it hands the session to the peer
+%% not_attempted}` — unless SSU2 is preferred for dialing, this router's SSU2
+%% listener is up, and the remote publishes a usable SSU2 address. **Preferred,
+%% not merely served**: under `enable_udp` the listener is bound and the address
+%% published, and every dial still goes to NTCP2, because serving UDP and
+%% reaching for it first are the two separate terms the glossary names.
+%%
+%% The blocking handshake runs in this spawned process; on success it hands the session to the peer
 %% manager and reports it as connected (as NTCP2 does), and on any failure
 %% returns `{fallback, Reason}` naming why, so the caller can fall back to NTCP2
 %% and still say what the park was. Return shape is `ok | {fallback,
@@ -959,13 +1193,14 @@ park_reported(PeerHash, Reason) ->
 %% in `t:i2p_events:event/0`, at the `f:notify/1` call site.
 ssu2_connect(PeerHash, RemoteRI, Local) ->
     case
-        i2p_identity:ssu2_enabled() andalso
+        i2p_identity:ssu2_preferred() andalso
             erlang:whereis(i2p_ssu2_listener) =/= undefined andalso
             i2p_router_info:ssu2_address_options(RemoteRI) =/= error
     of
         false ->
             {fallback, not_attempted};
         true ->
+            ok = attempt_announced(PeerHash, ssu2),
             ssu2_connect_ready(PeerHash, RemoteRI, Local)
     end.
 
@@ -1163,6 +1398,10 @@ our_endpoint(Local) ->
     end.
 
 ntcp2_connect(PeerHash, RemoteRI, Local, Owner) ->
+    %% The fallback announces itself too, and not as a detail: without it a peer
+    %% whose SSU2 leg parked would keep reporting `ssu2` for the whole NTCP2 dial
+    %% that followed, which is the same lie one transport later.
+    ok = attempt_announced(PeerHash, ntcp2),
     Args = #{
         role => alice,
         remote_ri => RemoteRI,
@@ -1703,7 +1942,7 @@ dialable_ri(RI) ->
         {ok, _} ->
             true;
         _ ->
-            i2p_identity:ssu2_enabled() andalso
+            i2p_identity:ssu2_preferred() andalso
                 i2p_router_info:ssu2_address_options(RI) =/= error
     end.
 
@@ -1713,6 +1952,22 @@ discovery_kick_ms() ->
     case application:get_env(i2per, floodfill_discovery_delay_ms) of
         {ok, Ms} when is_integer(Ms), Ms >= 0 -> Ms;
         _ -> ?FLOODFILL_DISCOVERY_KICK_MS
+    end.
+
+%% How long `connecting` is allowed to last.
+%%
+%% **Derived, so it cannot be set below a working dial.** A dial blocks on at most
+%% one SSU2 leg and then on NTCP2, and each of those bounds itself, so the deadline
+%% is their sum plus `?DIAL_DEADLINE_MARGIN_MS` — a number chosen for what a
+%% retransmitting-but-alive handshake needs, not a round figure. The SSU2 term is
+%% asked of the module that owns it rather than copied here, so retuning
+%% `handshake_retry_ms` / `handshake_max_resends` widens this with it; a deadline
+%% written down independently would quietly start cutting short legitimate dials
+%% the moment an operator slowed a handshake down.
+dial_deadline_ms() ->
+    case application:get_env(i2per, dial_deadline_ms) of
+        {ok, Ms} when is_integer(Ms), Ms > 0 -> Ms;
+        _ -> i2p_ssu2_conn:dial_budget_ms() + ?HANDSHAKE_TIMEOUT + ?DIAL_DEADLINE_MARGIN_MS
     end.
 
 %% Cancel a pending timer found by maps:find/2; a missing key stays `ok`.
@@ -1997,6 +2252,12 @@ enter_backoff(PeerHash, State) ->
     Updated = PeerState#{
         conn := undefined,
         mon := undefined,
+        %% Leaving `connecting` for `backoff` means no dial is in flight, so the
+        %% dial's bookkeeping goes with it. Set here rather than only at the two
+        %% release paths, because a `{connect_failed, ...}` from the dial arrives
+        %% *before* the dial's own `DOWN` — and by then the entry must already
+        %% stop claiming one, or the `DOWN` releases a peer that is retrying.
+        dial := undefined,
         status := backoff,
         backoff := Backoff,
         attempts := Attempts + 1,
@@ -2004,6 +2265,7 @@ enter_backoff(PeerHash, State) ->
     },
     i2p_peer_rep:connect_failed(PeerHash),
     _ = erlang:send_after(Backoff * 1000, self(), {retry_peer, PeerHash}),
+    _ = stop_dial(PeerState),
     %% The interval is returned as well as stored. It is the only figure that
     %% distinguishes a peer being retried aggressively from one the router has
     %% written off, and `f:handle_connect_failed/3` announces it. The other two
@@ -2053,6 +2315,22 @@ find_peer_by_mon(MonRef, #{peers := Peers}) ->
         [
             Hash
          || {Hash, PeerState} <- maps:to_list(Peers), maps:get(mon, PeerState, undefined) =:= MonRef
+        ]
+    of
+        [Hash | _] -> {Hash, maps:get(Hash, Peers)};
+        [] -> not_found
+    end.
+
+%% The same lookup over the *dial* monitor. A dial ref and a connection ref are
+%% distinct by construction — `f:start_dial/3` takes one and `f:handle_conn_started/4`
+%% takes the other, and neither is ever reused — so this cannot shadow a
+%% connection's `DOWN`.
+find_peer_by_dial_mon(MonRef, #{peers := Peers}) ->
+    case
+        [
+            Hash
+         || {Hash, PeerState} <- maps:to_list(Peers),
+            dial_mon(maps:get(dial, PeerState, undefined)) =:= MonRef
         ]
     of
         [Hash | _] -> {Hash, maps:get(Hash, Peers)};

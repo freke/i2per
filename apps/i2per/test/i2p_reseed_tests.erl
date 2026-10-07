@@ -1,6 +1,7 @@
-%% Reseed pipeline. A localhost HTTP server (one gen_tcp accept per
-%% request) serves SU3 files built in-test with a dedicated RSA-4096 key, so
-%% the whole fetch -> verify -> unpack path runs offline.
+%% Reseed pipeline. A localhost HTTP server (i2p_ct_helpers:serve_su3/1 —
+%% every request in the case, kept up until teardown) serves SU3 files built
+%% in-test with a dedicated RSA-4096 key, so the whole fetch -> verify ->
+%% unpack path runs offline.
 
 -module(i2p_reseed_tests).
 
@@ -15,38 +16,40 @@ fetch_and_process_test_() ->
 
 fetch_and_process() ->
     Ris = [router_info(4700), router_info(4701)],
-    Port = serve_su3(sign(Ris)),
-    {ok, Body} = i2p_reseed:fetch(url(Port)),
-    {ok, Decoded} = i2p_reseed:process(Body, trust()),
-    ?assertEqual(
-        [i2p_router_info:hash(RI) || RI <- Ris],
-        [i2p_router_info:hash(RI) || RI <- Decoded]
-    ).
+    {Port, Srv} = i2p_ct_helpers:serve_su3(sign(Ris)),
+    try
+        {ok, Body} = i2p_reseed:fetch(url(Port)),
+        {ok, Decoded} = i2p_reseed:process(Body, trust()),
+        ?assertEqual(
+            [i2p_router_info:hash(RI) || RI <- Ris],
+            [i2p_router_info:hash(RI) || RI <- Decoded]
+        )
+    after
+        i2p_ct_helpers:stop_su3_server(Srv)
+    end.
 
 %% Fallback across hosts: a dead one first, then a live one.
 %%
-%% **Order matters here and it is load-bearing.** `f:serve_su3/1` binds an ephemeral
-%% port and `f:dead_port/0` binds one and releases it, so asking for the dead port
-%% *first* leaves the OS free to hand that same number straight back to
-%% `f:serve_su3/1`. When it does, both URLs address the one-shot server: the first
-%% fetch consumes its single accept and the second gets nothing, so the case fails
-%% with `{error, no_router_infos}`.
-%%
-%% That is a flake, not a bug, and it is how this case failed roughly one run in
-%% three -- with a report naming reseed and pointing at the reseed parser. Starting
-%% the live server first and only then releasing a dead port removes it at the root:
-%% a port held by a live listener cannot be allocated again, so the two are
-%% guaranteed distinct.
+%% **Order matters here and it is load-bearing.** `f:dead_port/0` binds a port
+%% and releases it because a refused connection needs nothing listening;
+%% `f:serve_su3/1` holds the live port for the whole case, so asking for the
+%% dead port cannot shadow the live one — a held port cannot be allocated to
+%% two paths at once. Binding the dead port first would leave the OS free to
+%% hand that same number to a later bind, so the live server comes up first.
 run_falls_back_to_next_host_test_() ->
     {timeout, 60, fun run_falls_back_to_next_host/0}.
 
 run_falls_back_to_next_host() ->
     Ris = [router_info(4702)],
-    LivePort = serve_su3(sign(Ris)),
-    DeadPort = dead_port(),
-    ?assertNotEqual(LivePort, DeadPort),
-    {ok, [RI]} = i2p_reseed:run([url(DeadPort), url(LivePort)], trust()),
-    ?assertEqual(i2p_router_info:hash(hd(Ris)), i2p_router_info:hash(RI)).
+    {LivePort, Srv} = i2p_ct_helpers:serve_su3(sign(Ris)),
+    try
+        DeadPort = dead_port(),
+        ?assertNotEqual(LivePort, DeadPort),
+        {ok, [RI]} = i2p_reseed:run([url(DeadPort), url(LivePort)], trust()),
+        ?assertEqual(i2p_router_info:hash(hd(Ris)), i2p_router_info:hash(RI))
+    after
+        i2p_ct_helpers:stop_su3_server(Srv)
+    end.
 
 all_hosts_dead_test() ->
     ?assertMatch({error, _}, i2p_reseed:run([url(dead_port()), url(dead_port())])).
@@ -198,37 +201,13 @@ router_info(Port) ->
     Opts = #{<<"netId">> => <<"2">>, <<"router.version">> => <<"0.9.74">>},
     i2p_router_info:build(Identity, erlang:system_time(millisecond), [Addr], Opts, Seed).
 
-%% serve_su3/1 — start a one-shot HTTP server answering a single request with
-%% Su3; returns its port.
-serve_su3(Su3) ->
-    {ok, Listen} = gen_tcp:listen(0, [
-        {ip, {127, 0, 0, 1}},
-        binary,
-        {active, false},
-        {reuseaddr, true}
-    ]),
-    {ok, Port} = inet:port(Listen),
-    spawn_link(fun() -> serve_once(Listen, Su3) end),
-    Port.
-
-serve_once(Listen, Su3) ->
-    {ok, Sock} = gen_tcp:accept(Listen, 10_000),
-    {ok, _Request} = gen_tcp:recv(Sock, 0, 10_000),
-    Response = [
-        <<"HTTP/1.1 200 OK\r\n">>,
-        <<"Content-Type: application/octet-stream\r\n">>,
-        <<"Content-Length: ">>,
-        integer_to_binary(byte_size(Su3)),
-        <<"\r\n">>,
-        <<"Connection: close\r\n\r\n">>,
-        Su3
-    ],
-    ok = gen_tcp:send(Sock, Response),
-    gen_tcp:close(Sock),
-    gen_tcp:close(Listen).
-
 dead_port() ->
-    %% Bind and release an ephemeral port; nothing listens there now.
+    %% Bind and release an ephemeral port; nothing listens there now. The
+    %% release is the point — a refused connection needs closed, and a held
+    %% listening socket would instead stall the client until its read
+    %% timeout. A port in this state cannot be promised by the OS not to
+    %% reappear as a later bind, which is why callers bind their live
+    %% server first and hold it for the case: the held port cannot alias.
     {ok, L} = gen_tcp:listen(0, [{ip, {127, 0, 0, 1}}]),
     {ok, Port} = inet:port(L),
     gen_tcp:close(L),

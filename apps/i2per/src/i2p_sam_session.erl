@@ -419,6 +419,13 @@ connect_network(TargetB64, TargetHash, State) ->
                         pending_connect_b64 => TargetB64
                     };
                 {error, _Reason} ->
+                    %% **Including a refusal at `max_stream_connections`, and the
+                    %% client is told `CANT_REACH`** rather than nothing. A client
+                    %% that opened one session is not thereby entitled to an
+                    %% unbounded number of streams through it, and a silent drop
+                    %% here would leave it waiting on a `STREAM STATUS` line that
+                    %% never comes -- the same shape as a route that cannot be
+                    %% resolved, which is what `CANT_REACH` already means to it.
                     cant_reach(TargetB64, State)
             end;
         error ->
@@ -485,6 +492,12 @@ route_and_accept(Pkt, State) ->
 
 %% start_accept_conn/3 — spawn an accept-role streaming connection that
 %% answers the handshake; spawn failure drops the SYN silently.
+%%
+%% **A refusal at `max_stream_connections` is a spawn failure here**, and dropping
+%% the SYN is the right answer to it: the sender is a remote peer, no client is
+%% waiting on a SAM reply for an unsolicited inbound SYN, and the sender retries.
+%% Which is also the whole reason the accept path and the connect path below can
+%% treat the same `{error, stream_limit}` differently.
 -spec start_accept_conn(i2p_client:route(), i2p_streaming:packet(), state()) -> state().
 start_accept_conn(Route, Pkt, State) ->
     ConnOpts = #{
