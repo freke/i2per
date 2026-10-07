@@ -23,13 +23,14 @@
 #
 # %%%%% source_ref, and dangling links %%%%%
 #
-# `docs/docs.exs` sets `source_ref: "v0.1.0"`, a **tag**. ExDoc turns that into
-# links to `github.com/freke/i2per/blob/v0.1.0/...`. There are no tags in this
-# repository yet, so on the first run every source link 404s. A page of broken
-# links reads as a broken page, which is worse than a page without source links,
-# so the version and tag are derived from the tag being built rather than read
-# from the config, and the config's value is reported so the two cannot silently
-# disagree.
+# `docs/docs.exs` resolves `source_ref` from `I2PER_DOCS_SOURCE_REF`, falling
+# back to "main" locally. ExDoc turns it into links to
+# `github.com/freke/i2per/blob/<source_ref>/...`. A ref that does not exist as
+# a pushed tag or branch leaves every source link 404ing. A page of broken
+# links reads as a broken page, which is worse than a page without source
+# links, so this workflow exports the tag being built rather than letting the
+# fallback publish links that do not resolve, and reports the resolved value
+# so the two cannot silently disagree.
 #
 # %%%%% The mermaid CDN dependency %%%%%
 #
@@ -80,9 +81,10 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Resolve the tag being published
-        # `github.ref` is `refs/tags/v0.1.0` on a push, and the dispatch input
-        # otherwise. Stripped to `v0.1.0` and exported so the source_ref and the
-        # deployment description cannot name a different thing than was built.
+        # `github.ref` is `refs/tags/v0.2.0-rc1` on a push, and the dispatch
+        # input otherwise. Split into tag and version so the source_ref export
+        # and the deployment description cannot name a different thing than
+        # was built.
         id: version
         run: |
           set -euo pipefail
@@ -117,24 +119,29 @@ jobs:
         # rather than two steps later as "rebar3: command not found".
         run: devenv shell -- bash -c 'command -v rebar3 && command -v erlfmt && command -v just'
 
-      - name: Report the configured source_ref
-        # `docs/docs.exs` hardcodes `source_ref: "v0.1.0"`. The generated site
-        # links source to that tag. Printing it next to the tag actually being
-        # built is the whole point of this step: if they disagree, the site is
-        # about to publish links that point somewhere else, and that is visible
-        # in the run log rather than only in a broken link on a page.
+      - name: Report the version and source_ref being built
+        # One fact about what is being published, said once. The resolved
+        # values are derived from the tag being built -- the same tag both
+        # exports below use -- and the app vsn is printed next to them so a
+        # tag/version disagreement is visible in the run log rather than only
+        # as a broken link on a page.
         run: |
           set -euo pipefail
           echo "::group::version"
           echo "  building tag        : ${{ steps.version.outputs.tag }}"
           echo "  app version         : $(grep -oP '\{vsn, "\K[^"]+' apps/i2per/src/i2per.app.src)"
-          echo "  docs.exs source_ref : $(grep -oP 'source_ref: "\K[^"]+' docs/docs.exs)"
+          echo "  source_ref export   : ${{ steps.version.outputs.tag }}"
           echo "::endgroup::"
 
       - name: Build the site
         # Through `just doc` rather than `scripts/gen-docs.sh` spelled out, so CI
         # and a developer run the same recipe. A build step written twice is a
-        # build step checked once.
+        # build step checked once. I2PER_DOCS_SOURCE_REF makes the published
+        # source links resolve to the code the site is about; I2PER_DOCS_VERSION
+        # stamps the same version the release artifact carries.
+        env:
+          I2PER_DOCS_SOURCE_REF: ${{ steps.version.outputs.tag }}
+          I2PER_DOCS_VERSION: ${{ steps.version.outputs.version }}
         run: devenv shell -- just doc
 
       - name: Verify the site is not empty
