@@ -1,6 +1,6 @@
 {application, i2per_status, [
     {description, "Standalone status web service for the i2per router"},
-    {vsn, "0.2.0-rc1"},
+    {vsn, "0.2.0"},
     {registered, []},
     {mod, {i2per_status_app, []}},
     {applications, [kernel, stdlib, cowboy]},

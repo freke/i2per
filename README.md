@@ -1,8 +1,7 @@
 # i2per
 
 `i2per` is an Erlang/OTP implementation of an I2P router with a SAM v3 client
-bridge. This repository contains the 0.2.0 release line, currently at
-**0.2.0-rc1**. It implements the modern
+bridge. This repository contains the 0.2.0 release. It implements the modern
 X25519 and Ed25519 protocol surface, including NTCP2, SSU2, ECIES tunnel
 creation, LeaseSet2, the I2P streaming protocol, and bounded tunnel relay
 participation.
@@ -10,7 +9,7 @@ participation.
 The project interoperates with I2P routers. It does not bundle code from
 `i2pd` or `i2p-java`; the repository's `NOTICE` file records the attribution.
 
-> **Status: 0.2.0-rc1 is cut and published.** The release page
+> **Status: 0.2.0 is cut and published.** The release page
 > (<https://github.com/freke/i2per/releases>) carries the relx tarball and its
 > provenance MANIFEST, built by CI from the tag rather than by a person
 > remembering to run `just release`. The documentation site is published from the
@@ -122,7 +121,7 @@ Wait for `===> Booted i2per`, then run these checks at the Erlang prompt:
 application:ensure_all_started(i2per).
 true = is_pid(whereis(i2per_sup)).
 %% The version string moves with each release; it is the app's own {vsn, ...}.
-{ok, "0.2.0-rc1"} = application:get_key(i2per, vsn).
+{ok, "0.2.0"} = application:get_key(i2per, vsn).
 ```
 
 The successful results are `{ok,[i2per]}`, `true`, and `ok`. Leave the shell
@@ -309,8 +308,8 @@ application:set_env(i2per, addressbook, #{
 Values already present in `sys.config` or the application environment take
 precedence over values in `i2per.conf`. In particular, edit the release's
 `releases/<vsn>/sys.config` to change the shipped `./data` directory (the
-directory is named after the release, so it carries the version — `0.2.0-rc1`
-for this release). A
+directory is named after the release, so it carries the version — `0.2.0` for
+this release). A
 persistent boot requires `data_dir` and `seeds` in the application environment.
 The release profile sets `live_network = false` and `ntcp2_published = false`;
 changing either value is an explicit operator decision.
