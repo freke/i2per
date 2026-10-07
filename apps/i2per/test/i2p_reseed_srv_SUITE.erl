@@ -3,25 +3,35 @@
 %% through the peer manager. The worker is expected to exit normally; NetDb
 %% writes are awaited with a deadline.
 %%
-%% KNOWN RARE MISS. Under the full gate this case has been observed to fail
-%% roughly once in 17 runs with `await/2` reporting `missing` (the condition was
-%% not merely late) and an empty mailbox. It does not reproduce standalone, under
-%% `just ct` alone, or across 200 back-to-back iterations of this scenario.
+%% This case failed under the full gate about one run in seventeen, and `#Q6NKB9P`
+%% is why it is here rather than in a rerun: the loss was upstream of everything
+%% below. `f:zip_ris/1` named each entry with the RouterInfo's **raw 32 hash bytes**
+%% instead of the spec's I2P Base64, and `m:i2p_reseed`'s entry-name filter asked
+%% `filename:extension/1`, which reads `/` as a directory separator. A hash whose
+%% last byte was 47 produced the name `routerInfo-<31 bytes>/.dat`, the filter
+%% answered `<<>>`, and `m:i2p_reseed` returned one RouterInfo for a bundle of two.
+%% The second `learn_ri` cast was never sent, so the NetDb was one router short,
+%% nothing refused anything, and the gate went red with no line to explain it.
 %%
-%% Do NOT fix it by raising ?STORE_BUDGET_MS. Measured across nine full-gate
-%% runs the whole chain -- SU3 fetch, verify, unzip, the learn_ri cast, the peer
-%% manager, and the netdb_srv write -- completes in 26..41 ms, a spread of 15 ms
-%% against a 10 s budget, so the margin is roughly 240x and the latency is
-%% effectively constant even under cover-instrumented load. A miss is therefore
-%% categorical rather than slow: the chain did not run. Nothing logged a netdb
-%% refusal, and `i2p_netdb_srv:start_link/0` is a plain registered start_link
-%% with no acquire-or-reuse, so a stale process cannot explain it either.
+%% Both halves are fixed: the fixture names entries as
+%% `f:i2p_ct_helpers:reseed_zip/1` (Base64, so no `/`, as a real mirror serves
+%% them), and `m:i2p_reseed` matches the suffix itself rather than through a path
+%% function -- the filter no longer depends on the name being path-safe, which is
+%% the half that mattered. An entry it still cannot take is logged as
+%% `reseed_routerinfo_skipped` instead of vanishing.
 %%
-%% The per-RouterInfo latency is logged on every run precisely so the budget
-%% above can be re-checked against observation, and `dump_miss/2` records the
-%% state that discriminates the remaining causes: a netdb router count of 0 means
-%% no learn_ri ever arrived, 1 means one of the two was lost, and 2 means both
-%% landed and the lookup key is wrong.
+%% **Do NOT fix a miss here by raising ?STORE_BUDGET_MS.** Measured across nine
+%% full-gate runs the whole chain -- SU3 fetch, verify, unzip, the learn_ri cast,
+%% the peer manager, and the netdb_srv write -- completes in 26..41 ms, a spread of
+%% 15 ms against a 10 s budget, so the margin is roughly 240x and the latency is
+%% effectively constant even under cover-instrumented load. A miss is categorical
+%% rather than slow, and the category it was in had nothing to do with this budget.
+%%
+%% The per-RouterInfo latency is logged on every run precisely so the budget above
+%% can be re-checked against observation, and `dump_miss/2` records the state that
+%% discriminates the causes that remain: a netdb router count of 0 means no
+%% learn_ri ever arrived, 1 means one of the two was lost, and 2 means both landed
+%% and the lookup key is wrong.
 
 -module(i2p_reseed_srv_SUITE).
 
@@ -128,9 +138,11 @@ await_stored(Hash, T0) ->
 %% the causes. The router count is the decisive number: 0 means no learn_ri ever
 %% reached this NetDb, 1 means one of the two landed and the other was lost, and
 %% 2 means both landed and the lookup key is wrong. The liveness lines matter
-%% because `i2p_peer` and `i2p_netdb_srv` are registered singletons that a
-%% previous suite may have left behind, and `i2p_netdb_srv:start_link/0` can
-%% hand back an already-running process rather than a fresh one.
+%% because `i2p_peer` and `i2p_netdb_srv` are registered singletons, and
+%% `i2p_netdb_srv:start_link/0` is a plain `{local, ...}` start rather than an
+%% acquire-or-reuse -- so a previous suite's process would fail this case's
+%% `{ok, NetDb}` match loudly rather than hand back a stale one, and a name that
+%% is registered *here* is this case's own.
 dump_miss(Hash, T0) ->
     Elapsed = erlang:monotonic_time(millisecond) - T0,
     ct:pal("reseed miss for hash ~0p after ~pms (budget ~pms)", [
@@ -165,15 +177,7 @@ sign(Ris) ->
     i2p_su3:encode(<<"1789000000">>, <<"test-signer">>, Zip, Priv).
 
 zip_ris(Ris) ->
-    Entries = [
-        {
-            "routerInfo-" ++ binary_to_list(i2p_router_info:hash(RI)) ++ ".dat",
-            i2p_router_info:to_binary(RI)
-        }
-     || RI <- Ris
-    ],
-    {ok, {_ArchiveName, ZipBin}} = zip:create("i2pseeds.zip", Entries, [memory]),
-    ZipBin.
+    i2p_ct_helpers:reseed_zip(Ris).
 
 remote_ri(Port) ->
     {StaticPub, _StaticPriv} = i2p_crypto:x25519_keygen(),
