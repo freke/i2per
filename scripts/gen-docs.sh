@@ -32,7 +32,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 PROJECT_NAME="i2per"
-VERSION="0.1.0"
+# The site version comes from the app's own {vsn, ...} -- one source, read by
+# the release script too. Overridable so a release-notes build can stamp a
+# candidate version without editing the tree.
+VERSION="${I2PER_DOCS_VERSION:-$(sed -n 's/^[[:space:]]*{vsn, "\([^"]*\)"}.*/\1/p' apps/i2per/src/i2per.app.src | head -1)}"
+[ -n "$VERSION" ] || { echo "error: could not read {vsn, ...} from apps/i2per/src/i2per.app.src" >&2; exit 1; }
 EBI_I2PER="${EBI_I2PER:-_build/default/lib/i2per/ebin}"
 EBI_STATUS="${EBI_STATUS:-_build/default/lib/i2per_status/ebin}"
 CONFIG="docs/docs.exs"
