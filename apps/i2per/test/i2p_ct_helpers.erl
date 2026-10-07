@@ -22,6 +22,8 @@
 -export([
     temp_data_dir/1,
     free_port/0,
+    serve_su3/1,
+    stop_su3_server/1,
     stop_app/0,
     await/1,
     await/2,
@@ -139,6 +141,61 @@ free_port() ->
     {ok, Port} = inet:port(Sock),
     ok = gen_tcp:close(Sock),
     Port.
+
+-spec serve_su3(binary()) -> {inet:port_number(), {pid(), gen_tcp:socket()}}.
+serve_su3(Su3) ->
+    {ok, Listen} = gen_tcp:listen(0, [
+        {ip, {127, 0, 0, 1}},
+        binary,
+        {active, false},
+        {reuseaddr, true}
+    ]),
+    {ok, Port} = inet:port(Listen),
+    Pid = spawn(fun() -> serve_su3_loop(Listen, Su3) end),
+    {Port, {Pid, Listen}}.
+
+%% Serve the same bundle to every one of the case's requests until the case
+%% closes the listen socket. The earlier shape answered a single accept per
+%% case, so a second fetch in the same case — or a client that connected
+%% first — left later fetches unanswered, and under load that read as a
+%% missing RouterInfo in a syntactically valid bundle.
+serve_su3_loop(Listen, Su3) ->
+    case gen_tcp:accept(Listen) of
+        {ok, Sock} ->
+            _ = gen_tcp:recv(Sock, 0, 10_000),
+            Response = [
+                <<"HTTP/1.1 200 OK\r\n">>,
+                <<"Content-Type: application/octet-stream\r\n">>,
+                <<"Content-Length: ">>,
+                integer_to_binary(byte_size(Su3)),
+                <<"\r\n">>,
+                <<"Connection: close\r\n\r\n">>,
+                Su3
+            ],
+            _ = gen_tcp:send(Sock, Response),
+            gen_tcp:close(Sock),
+            serve_su3_loop(Listen, Su3);
+        {error, closed} ->
+            %% The case closed the listen socket in teardown.
+            ok
+    end.
+
+%% Close the listen socket (ending the accept loop) and reap the server.
+-spec stop_su3_server({pid(), gen_tcp:socket()}) -> ok.
+stop_su3_server({Pid, Listen}) ->
+    %% Closing the listen socket unblocks the parked accept, which ends the
+    %% loop: no exit signal is involved, so a linked-in process can adopt this
+    %% without watching the signal. Waiting for the loop to finish keeps the
+    %% port's close ordered before the case moves on.
+    gen_tcp:close(Listen),
+    Ref = monitor(process, Pid),
+    receive
+        {'DOWN', Ref, process, Pid, _} -> ok
+    after 11_000 ->
+        %% The loop was mid-request; its recv has a 10s bound, so this branch
+        %% is a hang report, not a normal stop.
+        error(su3_server_lingered)
+    end.
 
 %% Stop the i2per application and wait for the name to actually be free.
 %% `application:stop/1` returns before the children have unlinked, so a suite

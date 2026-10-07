@@ -149,9 +149,9 @@ syn_wrong_hash_dropped(_Config) ->
     Dir = temp_dir(),
     application:set_env(?APP, data_dir, Dir),
     EchoPort = start_echo_server(),
-    application:set_env(?APP, server_tunnels, [decl(EchoPort)]),
+    application:set_env(?APP, server_tunnels, [decl(maps:get(port, EchoPort))]),
     try
-        {ok, _} = i2p_server_tunnel:start_link(decl(EchoPort)),
+        {ok, _} = i2p_server_tunnel:start_link(decl(maps:get(port, EchoPort))),
         [{_ServerHash, _Pid, _Priv}] = i2p_server_tunnel:client_destinations(),
 
         %% A stranger destination whose LeaseSet nobody holds.
@@ -203,7 +203,8 @@ echo_accept(L, Parent) ->
     case gen_tcp:accept(L) of
         {ok, Sock} ->
             Parent ! {echo_accepted, self()},
-            echo_loop(Sock);
+            spawn(fun() -> echo_loop(Sock) end),
+            echo_accept(L, Parent);
         {error, _Closed} ->
             ok
     end.
