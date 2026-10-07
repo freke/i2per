@@ -228,10 +228,19 @@ child of the tree. Output: the usual `gen_event` start result.
 
 **No `max_heap_size` on the manager, deliberately.** See *Why there is no heap
 bound* above for the two measurements that removed it and what replaced it.
+
+**`{async_dist, true}` on the spawn.** Without it, a subscriber node that
+stops draining its distribution socket parks the manager inside the send --
+measured 12 of 26 samples suspended under a 200,000-event flood, mailbox
+peaking at 169,327 (#ZYNNQKQ). With it, the send never blocks the manager;
+the backlog then shows up where it can be watched: `bus_backlog` on the
+read API and the far side's own memory, not a parked bus. It is spawned this
+way because `gen_event:start_link/2`'s `spawn_opt` is the same route the
+removed heap bound took.
 """.
 -spec start_link() -> {ok, pid()} | {error, term()}.
 start_link() ->
-    case gen_event:start_link({local, ?MODULE}) of
+    case gen_event:start_link({local, ?MODULE}, [{spawn_opt, [{async_dist, true}]}]) of
         {ok, Pid} ->
             ok = start_sampler(),
             {ok, Pid};
@@ -252,8 +261,15 @@ notify(Event) ->
         undefined ->
             ok;
         _ ->
-            _ = gen_event:notify(?MODULE, Event),
-            ok
+            %% The manager can die between whereis/1 and the notify itself,
+            %% and the raw call surfaces that as an exit -- measured as
+            %% {error, badarg} on exactly this race in #ZYNNQKQ. An emitter
+            %% must never crash over telemetry.
+            try gen_event:notify(?MODULE, Event) of
+                _ -> ok
+            catch
+                _:_ -> ok
+            end
     end.
 
 %% %%%%% %%% The backlog gauge %%%%% %%%
