@@ -113,9 +113,10 @@ live_router_online_body() ->
 %% rather than about elapsed time.
 %%
 %% The poll interval is shortened to 20 ms so that "two readings" is 20 ms of
-%% waiting rather than a full five-second interval. The assertion is unchanged
-%% and does not depend on the interval being a particular value -- only the cost
-%% of waiting for it is under this case's control. The shipped default is 5000
+%% waiting rather than a full five-second interval. The assertions are
+%% unchanged in kind and do not depend on the interval being a particular
+%% value -- only the cost of waiting for it is under this case's control. The
+%% shipped default is 5000
 %% and is exercised by `m:i2per_status_state`; this case is about the derivation
 %% needing two readings, not about how long a poll takes.
 derived_figures_appear_after_two_readings_test_() ->
@@ -129,9 +130,14 @@ derived_figures_appear_after_two_readings_body() ->
     start_status(Port),
     try
         wait_online(),
-        %% One reading is not enough for a rate, and the first reading says so
-        %% rather than showing a zero.
-        ?assertEqual(no_previous_sample, derived_window_status()),
+        %% The wiring claim here is that polling feeds readings into the
+        %% derivation: `no_reading_yet` means it never did. `no_previous_sample`
+        %% and `ok` are both correct outcomes -- which one appears is a race
+        %% between this assertion and the next 20 ms poll, so asserting one of
+        %% them would be asserting a poll count this case does not control.
+        %% The one-reading-means-no-rate arithmetic is covered
+        %% deterministically in i2per_status_derive_tests.
+        ?assert(lists:member(derived_window_status(), [no_previous_sample, ok])),
         %% `await/2` returns `ok`; the block is read afterwards. Returning the
         %% predicate's value would read better but is not what it does.
         ok = i2p_ct_helpers:await(fun() -> derived_window_ok() end, 30000),
