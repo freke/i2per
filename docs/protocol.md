@@ -59,6 +59,33 @@ direction key `k_ab` (Alice→Bob) or `k_ba` (Bob→Alice) with no associated
 data and a counter nonce: 4 zero bytes + 8-byte little-endian message number
 (`i2p_crypto:es_nonce/1`), starting at 0.
 
+**The message number is 64 bits wide, and there is no rekey.** This is worth
+stating because the nonce looks like it could be smaller. It is not: the
+counter occupies the whole 8-byte low half of the nonce, so it runs
+`0..2^64 - 2`, and the NTCP2 specification's own rule for it is *"Maximum value
+is 2**64 - 2. Connection must be dropped and restarted after it reaches that
+value. The value 2**64 - 1 must never be sent."* One direction key is held for
+the life of the connection and the counter is what keeps the nonce unique under
+it — there is no key schedule partway through a session to rekey into.
+
+The practical consequence: **a session is not bounded at 65536 frames**, and
+nothing in the tree treats it as though it were. A bound that stopped there
+would be safe (no nonce repeats) but wrong, and this tree previously had one —
+`i2p_crypto:es_nonce/1` accepted `0..65535` on the belief that the session "must
+ratchet thereafter", so a live connection died with a `function_clause` raised
+out of a crypto helper on the 65536th frame **in each direction**, which read
+from outside as a peer that had dropped. Widening the bound creates no keystream
+reuse: the only value that collides with the nonce at 0 is 2^64, which is not
+representable and which a strictly incrementing counter cannot reach. See
+#R8WNYK3.
+
+The bound is enforced in `i2p_crypto:es_nonce/1` rather than in the connection,
+because the one value the specification forbids is precisely the one that
+function exists to keep off the wire. A counter that reached 2^64 - 1 is a defect
+in whatever increments it, so it raises; it does not get a bus event or a log
+line, because a fault that should be impossible is a bug to fix rather than a
+runtime condition to instrument.
+
 **Frame contents.** The plaintext is zero or more blocks, each a 1-byte type
 and a 2-byte big-endian length:
 
@@ -1000,7 +1027,12 @@ nearest hop's next-router so the returning STB travels home directly.
 
 Data-phase extraction for foreign outbound tunnels is not implemented in this
 release. The client path below, including pool maintenance, creator injection,
-lease addressing, and end-to-end delivery, is implemented.
+lease addressing, and end-to-end delivery, is implemented. That gap is also
+what keeps the outbound-gateway role reachable from a local caller: with no
+foreign extraction there is no caller outside this router that has to play
+the role, so every creator injection has a process to hand it to. Whoever
+implements extraction inherits a role spread across those callers and will
+have to move it back or add one more.
 
 ### Client tunnels and SAM streams
 
@@ -1012,12 +1044,26 @@ flight (their reply path). Local tunnels expire after 600 s in the sweep.
 `pick_outbound/0` / `pick_inbound/0` hand out random active entries.
 
 **Outbound gateway role.** As creator of an outbound tunnel we are its
-gateway: `send_via_outbound/3` fragments a standard-header I2NP message
-(`m:i2p_tunnel:gateway_all/4`), pre-applies every hop's inverse layer
-(`m:i2p_tunnel:obgw_prep/2`) and sends each frame to hop 1 as type-18
-TunnelData. Fragment delivery instructions decide where the far end routes
-the payload — `{tunnel, GatewayHash, TunnelID}` names a remote inbound
-tunnel's gateway, which is how client streams reach a lease.
+gateway: the message is fragmented (`m:i2p_tunnel:gateway_all/4`), every hop's
+inverse layer is pre-applied (`m:i2p_tunnel:obgw_prep/2`) and each frame goes
+to hop 1 as type-18 TunnelData. Fragment delivery instructions decide where
+the far end routes the payload — `{tunnel, GatewayHash, TunnelID}` names a
+remote inbound tunnel's gateway, which is how client streams reach a lease.
+
+Which process runs that sequence depends on who is sending, and it is the
+point rather than an implementation detail. `outbound_injection/1` reads the
+tunnel map and returns the first hop plus this tunnel's layer keys;
+`inject/3` plays the role. **A client send calls `inject/3` itself**, from the
+connection's own worker, so the tunnel manager's mailbox — shared with transit
+frames for other routers, tunnel builds and the pool ticks — does not carry
+per-frame crypto for our users. **A lookup send stays in the manager** and
+uses `send_via_outbound/3`, which calls the same `inject/3`: the lookup
+orchestrator and the peer manager are singletons rather than connections, and
+the peer manager is the process every send path in the router goes through.
+Both charge a send that finds no active tunnel, in three separate counters —
+`client_messages_dropped_no_tunnel`, `lookup_requests_dropped_no_tunnel` and
+`lookup_replies_dropped_no_tunnel` — because a lost client send, a lost query
+and a lost answer are three different things to be lost.
 
 **End-to-end garlic (`i2p_client`).** Stream bytes travel as one
 LOCAL-delivery clove carrying an I2NP type-`31` Data message, Noise-N wrapped
@@ -1298,6 +1344,17 @@ signed SYN-ACK arrives; a failed or 15-second-timed-out handshake reports
 `CANT_REACH`. An inbound SYN for a pending `STREAM ACCEPT` spawns the
 accept-role connection, answers the handshake, and pairs the socket.
 
+**The streaming-connection cap.** `max_stream_connections` (default 128) bounds
+live streaming connections router-wide, not per session: one client that has
+opened a session is not thereby entitled to an unbounded number of streams
+through it. A refused outbound `STREAM CONNECT` reports
+`STREAM STATUS RESULT=CANT_REACH`, since that is already what an unresolvable
+route means to a client. A refused inbound SYN is dropped without a reply —
+there is no client to answer, and the sending peer retries. The cap is read on
+every admission, so lowering it takes effect on the next stream without a
+restart, and `0` refuses all of them. Each refusal increments
+`stream_conns_refused_limit`.
+
 ### SU3 reseed files
 
 The bootstrap envelope: an HTTPS-fetched, RSA-signed container whose zip
@@ -1537,15 +1594,21 @@ establishment and a ChaCha20-Poly1305 data phase. Implemented in
 classification) and `m:i2p_ssu2_conn` (one process per session).
 Spec: [SSU2 Specification](https://i2p.net/en/docs/specs/ssu2/).
 
-The router operator enables SSU2 with app env `i2per` -> `ssu2_enabled`; the
-persistent boot then binds a UDP listener (owner `m:i2p_peer`) and advertises
-the SSU2 RouterAddress next to NTCP2. The handshake and data phase can be
+The router operator sets app env `i2per` -> `ssu2` to one of `no_udp`
+(default), `enable_udp`, or `prefer_udp`. Either of the last two makes the
+persistent boot bind a UDP listener (owner `m:i2p_peer`) and advertise the SSU2
+RouterAddress next to NTCP2; `prefer_udp` additionally makes outbound dials reach
+for SSU2 first. The three values are the coherent combinations of two independent
+properties — serving a transport, and preferring it when dialing — so
+`enable_udp` (serve UDP, dial NTCP2 first) is expressible and the incoherent
+fourth (serve nothing, dial UDP) is not. The handshake and data phase can be
 verified against a live i2pd with `scripts/interop_i2pd.sh`.
 
 #### Outbound connection selection
 
 For outgoing connections `m:i2p_peer` prefers SSU2 and falls back to NTCP2.
-A peer's SSU2 dial is skipped — leaving NTCP2 — when the switch is off, when
+A peer's SSU2 dial is skipped — leaving NTCP2 — when `ssu2` is not `prefer_udp`
+(which includes `enable_udp`: the listener is bound, and no dial uses it), when
 this router has no local SSU2 listener, or when the remote RouterInfo carries
 no usable SSU2 address. When a dial is attempted and the handshake fails or
 times out (the remote's SSU2 address answers nothing), the dialog repeats over
@@ -1590,6 +1653,70 @@ connected over TCP and left a UDP stall behind. The other three reasons —
 `{relay_rejected, _}`, `{relay_bad_response_sig, _}` and
 `{session_admission_failed, _}` — are the introducer leg, so they only appear on
 the firewalled-remote path.
+
+#### Seeing a park while it is happening
+
+The counter and the event are reported *after* a park ends. A park is up to ~10s
+direct and up to ~60s through an introducer, and for that whole time the peer is
+still `connecting` — so the read API has to describe the attempt in progress, not
+only its outcome.
+
+`i2p_peer:status/0` reports `transport` as **the transport being attempted**, and
+the dialing process announces each attempt to the manager as it makes it. Before
+this, `transport` was only ever the value the peer entry was created with —
+`ntcp2`, the fallback — so a peer parked mid-SSU2 reported the fallback as though
+it had already happened, for the entire park.
+
+`last_attempt` (unix seconds) is the companion field. `connecting` at
+`attempts = 0` is what a healthy dial looks like five milliseconds in, so the
+attempt count cannot say a dial is stuck; the *age* of `last_attempt` can.
+
+In the aggregated read API, `peers` is `#{connected, connecting, other}`.
+`connecting` is a **subset** of `other`, not a bucket carved out of it: `other`
+still counts every peer that is not connected, so a consumer reading version 1 of
+the map gets the same number it always did. The backoff count is therefore
+`other - connecting`. See #X7BP9G1.
+
+#### Leaving `connecting`
+
+A peer reaches `connecting` when `f:maybe_connect_status/3` spawns a dial, and it
+leaves when something says what the dial did: `{conn_started, ...}` for a
+connection, `{ssu2_ready, ...}` for an SSU2 session, `{connect_failed, ...}` for a
+failure. All three are messages **from the dial**, and the dial is an unlinked
+spawn — a raise on that path must not take the peer manager down, since every send
+the router makes runs through it. So a dial that raises between two of those
+messages says nothing at all, and before #8V1Z06A nothing else could: the peer sat
+at `connecting` for the life of the process, because `f:sweep_peers/1` deliberately
+never evicts a `connecting` peer (evicting would let the dial complete into an
+entry that is gone, and `f:handle_conn_started/4` stops a connection for an unknown
+peer).
+
+Two escapes close that, and both are counted `dials_escaped`:
+
+- **the dial's monitor.** `f:start_dial/3` spawns with `spawn_monitor/1`, so a
+  dial that ends reports `{dial_died, Reason}` on `peer_connect_failed` — carrying
+  the exit reason, which is the whole diagnosis (`true = is_pid(Manager)` in
+  `f:attempt_announced/2` raises `{badmatch, false}`, and that is now visible
+  rather than silent).
+- **a deadline on `connecting`**, because a monitor only reports a dial that
+  *ends*. A dial blocked forever on a socket produces nothing to report, so
+  `dial_deadline_ms` (app env `i2per`, default the SSU2 leg budget plus an NTCP2
+  handshake plus margin) ends the dial with a `dial_deadline` reason and stops the
+  dial process. The default is **derived** from the legs rather than written down
+  — `f:i2p_ssu2_conn:dial_budget_ms/0` is the longer of the direct handshake's
+  retransmit budget and the introducer leg's redirect wait — so retuning
+  `handshake_retry_ms` / `handshake_max_resends` widens it with them.
+
+A dial that dies *after* handing over a connection is neither escape. The peer
+stays `connecting` on purpose, because NTCP2's handshake has not answered yet, and
+the connection's own monitor releases it from there through `peer_disconnected` —
+`ntcp2_connect/4` sends `conn_started` and returns in the same breath, so every
+NTCP2 dial's `DOWN` follows a successful hand-over.
+
+`dials_escaped` is a statement about **this** router, where every ordinary connect
+failure is a statement about the remote: a non-zero value means a raise on the dial
+path, or a blocking call that stopped honouring its own bound. The reason is on the
+event, since "raised" and "never returned" are not the same fault.
 
 #### Handshake sequence
 

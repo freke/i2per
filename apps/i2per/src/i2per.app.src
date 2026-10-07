@@ -3,7 +3,13 @@
   {vsn, "0.1.0"},
   {registered, []},
   {mod, {i2per_app, []}},
-  {applications, [kernel, stdlib, crypto, public_key, ssl, inets]},
+  %% `telemetry` is listed, and it has to be: `f:i2p_events:sample_backlog/0`
+  %% calls `f:telemetry:execute/3` from the bus's own `start_link/0`, so a node that
+  %% loaded this application without it would fail to start the bus at all. Being in
+  %% `deps` only makes the module available on the code path -- it does not put it in
+  %% a running node, and the suite that boots a router on a peer node is what caught
+  %% that.
+  {applications, [kernel, stdlib, crypto, public_key, ssl, inets, telemetry]},
   {env, []},
   {modules, []},
   {licenses, ["BSD-3-Clause"]},

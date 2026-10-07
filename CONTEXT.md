@@ -82,13 +82,21 @@ it starts empty.
 **Transport** — a way for two routers to carry a session: SSU2 over UDP, or
 NTCP2 over TCP. A router publishes one address per transport it serves.
 
-**Transport availability** — whether this router serves a transport: whether
-it publishes an address for it, and whether peers can therefore reach it that
-way.
+**Transport availability** — whether this router serves a transport: whether it
+binds a listener for it and publishes an address for it. Nothing about whether
+peers can reach it that way, which is a different term.
 
 **Transport preference** — which transport this router reaches for first when
-dialing. Independent of availability, and deliberately so: a router may serve
-both transports and still dial one of them first.
+dialing. Independent of availability: a router may serve both transports and
+still dial one of them first.
+
+The two are separate because what this router offers and what the network
+reports back are different facts. A router that publishes an address and sits
+behind a stateful firewall is available and unreachable at the same time — the
+firewall permits traffic on a session it has already established while dropping
+unsolicited inbound. So availability is a statement about this router's own
+configuration, and whether peers can reach it is **reachability**, which is
+measured rather than declared. See **measured reachability**.
 
 Neither term is a judgement about which transport is better. The network runs
 both because one is UDP and one is TCP, so neither covers every network. A
@@ -128,3 +136,43 @@ succeeded. Cumulative here, counted since the router started.
 **Status view** — a single snapshot of a core's state, fetched in one call by a
 presentation app. A public contract: consumers other than the core depend on it,
 so its shape changes only additively within a version.
+
+## Observability
+
+**The bus** — the router-wide channel on which state changes are announced so
+something outside the core can follow them in real time. The core announces; it
+never interprets and never renders.
+
+**Announce** — to put one state change on the bus. Cheap, best-effort, and never
+allowed to fail the work that reported the change.
+
+**Subscriber** — something that receives announced events. May be in the core or
+in a separate presentation app on another node.
+
+**Notified** — that an event was put on the bus. Counted. Says what the router
+*did*, not what anyone received.
+
+**Delivered** — that an event reached a subscriber. **Not counted anywhere**, and
+knowing why is load-bearing: delivery happens inside the process that fans events
+out, so a count of it would have to be maintained by the thing most likely to
+fail. Notified and delivered are therefore different figures and are not
+interchangeable — a rising notified count says nothing about receipt.
+
+The log is the **witness** where the bus is the instrument: a fact on the bus is
+not also written to the log except at a level that is off by default. That is the
+distinction, and it is a discipline rather than a preference — see ADR 0002.
+
+**Retention** — memory a structure keeps once the work that filled it is over. It
+is the figure a soak reports, and it has two causes that look identical inside a
+single window:
+
+- *traffic-proportional retention* — it grew with the traffic offered and gave the
+  memory back when the traffic stopped. Bounded by construction.
+- *traffic-independent caching* — it grew with nothing offered, so something other
+  than the traffic filled it.
+
+Neither is a leak, and that distinction is the point: a slope is a slope, and
+calling one a *leak* claims the structure is unbounded, which a pair of snapshots
+cannot show. Retention is measured in **memory rather than in reductions** for the
+same reason — reductions only ever accumulate, so whether a process gave its
+consumption back is not a question they can answer.

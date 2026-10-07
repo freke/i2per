@@ -8,8 +8,9 @@ stale timers, dropped callers, catch-alls), plus the full "no candidates, give
 up" orchestration against a live-but-empty `m:i2p_netdb_srv` (no floodfills,
 no rows): a `find` arms the pipeline, the single attempt round finds no target
 and `fail/2` answers the caller `{error, {lookup_failed, no_answer}}`. The tunnel-carrying
-DatabaseLookup chase (`f:i2p_lookup_srv:send_lookup/4`) needs live tunnels and
-is covered by `m:i2p_lookup_srv_SUITE`.
+DatabaseLookup chase (`f:i2p_lookup_srv:send_lookup/4`) is driven against a stub
+tunnel server here, for the counted case of a send that finds no tunnel; the
+chase against live tunnels is covered by `m:i2p_lookup_srv_SUITE`.
 """.
 
 -include_lib("eunit/include/eunit.hrl").
@@ -346,6 +347,104 @@ every_failure_reason_is_distinguishable_test() ->
 
 classify({not_stored, _Reason}) -> unreadable;
 classify(_Reason) -> nobody_answered.
+
+%%%%%%%%% A lookup request that finds no tunnel %%%%%%%%%
+%%
+%% The third and last injection site, and the only one that charged nothing.
+%% `m:i2p_client` and `m:i2p_peer` each count the send they cannot make, so
+%% before this a DatabaseLookup that never left was indistinguishable from one
+%% nobody answered -- the exact line `t:lookup_failed_reason/0` draws between
+%% `no_answer` and everything else.
+%%
+%% Driven through `f:send_lookup/4` against a stub tunnel server, because that
+%% is the only arrangement that produces the condition: the picks must answer
+%% `{ok, _}` and the send `error`, and the two are separate calls. A real
+%% tunnel manager holding a real tunnel would answer `ok` to both, and retiring
+%% one between the two is a race this suite refuses to depend on.
+
+%% The drop is counted, and the answer still comes back to the caller. Both
+%% halves matter: `attempt/2` discards the answer, so a fix that propagated
+%% instead of counting would break the retry loop while passing a case that
+%% only watched the counter.
+send_to_a_vanished_tunnel_is_counted_test() ->
+    with_lookup_sends(error, fun() ->
+        ?assertEqual(0, lookup_request_drops()),
+        ?assertEqual(error, i2p_lookup_srv:send_lookup(pending(), <<2:256>>, <<3:256>>, ?HASH)),
+        ?assertEqual(1, lookup_request_drops())
+    end).
+
+%% The positive control. Without it, "a drop is counted" is also satisfied by
+%% a counter that moves on every attempt, which would report a healthy lookup
+%% round as a failing one.
+send_on_a_live_tunnel_does_not_count_test() ->
+    with_lookup_sends(ok, fun() ->
+        ?assertEqual(ok, i2p_lookup_srv:send_lookup(pending(), <<2:256>>, <<3:256>>, ?HASH)),
+        ?assertEqual(0, lookup_request_drops())
+    end).
+
+%% Declared before anything moves, so "measured and zero" is distinguishable
+%% from "not measured yet" -- the property that lets a consumer trust the
+%% zero it reads before the first drop. Absent from the read API, a consumer
+%% would have to treat absent and zero as the same thing.
+lookup_request_counter_is_in_the_read_api_before_anything_moves_test() ->
+    with_fresh_stats(fun() ->
+        ?assertMatch(#{lookup_requests_dropped_no_tunnel := 0}, i2p_stats:snapshot())
+    end).
+
+lookup_request_drops() ->
+    maps:get(lookup_requests_dropped_no_tunnel, i2p_stats:snapshot()).
+
+%% A stub standing in for the tunnel manager, answering the three requests
+%% `f:send_lookup/4` makes and nothing else. The two picks resolve; only the
+%% send's answer is the case's subject, which is why `Answer` is passed for the
+%% send alone -- a stub that failed the picks would exercise a different branch
+%% and count nothing.
+with_lookup_sends(Answer, Fun) ->
+    with_fresh_stats(fun() ->
+        Stub = spawn(fun() -> lookup_srv_stub(Answer) end),
+        register(i2p_tunnel_srv, Stub),
+        try
+            Fun()
+        after
+            case whereis(i2p_tunnel_srv) of
+                Stub -> unregister(i2p_tunnel_srv);
+                _ -> ok
+            end
+        end
+    end).
+
+lookup_srv_stub(Answer) ->
+    receive
+        {'$gen_call', From, pick_lookup_inbound} ->
+            gen_server:reply(From, {ok, 1, #{}}),
+            lookup_srv_stub(Answer);
+        {'$gen_call', From, pick_lookup_outbound} ->
+            gen_server:reply(From, {ok, 2, #{}}),
+            lookup_srv_stub(Answer);
+        {'$gen_call', From, {send_via_outbound, _Tid, _Delivery, _Wire}} ->
+            gen_server:reply(From, Answer),
+            lookup_srv_stub(Answer)
+    end.
+
+%% Counters are cumulative and this module's other cases do not read this one,
+%% but eunit runs a module's cases in definition order -- so a counter read by
+%% one case would otherwise be whatever the previous case left behind. Restarted
+%% per case so every case reads its own zero, the same way `m:i2p_client_tests`
+%% does it.
+with_fresh_stats(Fun) ->
+    ok = stop_stats(),
+    {ok, _} = i2p_stats:start_link(),
+    try
+        Fun()
+    after
+        ok = stop_stats()
+    end.
+
+stop_stats() ->
+    case whereis(i2p_stats) of
+        undefined -> ok;
+        Pid -> gen_server:stop(Pid)
+    end.
 
 %%% %%%%% Helpers for the cases above %%%%% %%%
 

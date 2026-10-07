@@ -1,5 +1,5 @@
 #!/usr/bin/env escript
-%%! -pa _build/default/lib/i2per/ebin
+%%! -pa _build/default/lib/i2per/ebin -pa _build/default/lib/telemetry/ebin
 
 %% Live-network smoke: boot a throwaway i2per router and emit a JSON report of
 %% the four observables that tell an operator whether the instance is really
@@ -24,6 +24,13 @@
 %%
 %% The router writes its ephemeral identity under /tmp and is stopped after
 %% the report.
+%%
+%% **`telemetry` is on the `%%!` path explicitly.** An escript's code path does
+%% not pick up a release's dependencies, so this one listed only `i2per/ebin` and
+%% worked until `telemetry` joined `i2per.app.src`'s `applications` (#VH7Z0KJ):
+%% `application:ensure_all_started/1` then failed with
+%% `{error, {telemetry, {"no such file or directory", "telemetry.app"}}}`.
+%% `scripts/soak.escript` needs the same entry.
 
 main(Args) ->
     Opts = parse(args_to_bin(Args), #{window => 15, live => false}),

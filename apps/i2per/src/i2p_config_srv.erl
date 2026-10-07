@@ -70,6 +70,7 @@ writes configuration files.
             max_ntcp2_connections,
             max_sam_sessions,
             max_ssu2_sessions,
+            max_stream_connections,
             ntcp2_keepalive_interval_ms
         ]
 ).
@@ -132,6 +133,7 @@ set(Key, Value) ->
     | max_ntcp2_connections
     | max_sam_sessions
     | max_ssu2_sessions
+    | max_stream_connections
     | ntcp2_keepalive_interval_ms
     | log_level
     | host
@@ -235,6 +237,7 @@ validate_value(Key, Value) ->
         {max_ntcp2_connections, V} when is_integer(V), V > 0 -> ok;
         {max_sam_sessions, V} when is_integer(V), V > 0 -> ok;
         {max_ssu2_sessions, V} when is_integer(V), V > 0 -> ok;
+        {max_stream_connections, V} when is_integer(V), V > 0 -> ok;
         {ntcp2_keepalive_interval_ms, V} when is_integer(V), V > 0 -> ok;
         {floodfill, V} when is_boolean(V) -> ok;
         {ntcp2_published, V} when is_boolean(V) -> ok;

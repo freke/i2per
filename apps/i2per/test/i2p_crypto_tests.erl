@@ -312,8 +312,70 @@ nonce_test() ->
     ?assertEqual(<<0:96>>, i2p_crypto:es_nonce(0)),
     ?assertEqual(<<0:32, 1:64/little-unsigned>>, i2p_crypto:es_nonce(1)),
     ?assertEqual(<<0:32, 16#ffff:64/little-unsigned>>, i2p_crypto:es_nonce(65535)),
-    ?assertError(function_clause, i2p_crypto:es_nonce(-1)),
-    ?assertError(function_clause, i2p_crypto:es_nonce(65536)).
+    ?assertError(function_clause, i2p_crypto:es_nonce(-1)).
+
+%% The counter is 64 bits, and the boundary that matters is the specification's
+%% rather than 2^16.
+%%
+%% This bound used to be `0..65535`, on a doc claim that the session "must
+%% ratchet thereafter" — which NTCP2 does not have and does not need. The guard
+%% was the entire defect: a live data phase walks the counter once per frame in
+%% each direction, so a connection died on the 65536th frame in *both*
+%% directions with a `function_clause` raised out of a crypto helper, and from
+%% outside read as a peer that had dropped. See #R8WNYK3.
+%%
+%% Three things are pinned here, and the middle one is the one a narrower test
+%% would have missed:
+%%
+%%   - the top of the specification's range is accepted, and 2^64 - 1 — the one
+%%     value the spec says must never be sent — is refused;
+%%   - **65536 does not collide with 0.** The reason the old bound was defended
+%%     as keystream reuse was that the nonce "is 8 bytes little-endian, so 65536
+%%     and 0 collide". They do not: the field is 8 bytes, so the only value that
+%%     collides with `es_nonce(0)` is 2^64, which is not representable and
+%%     cannot be produced by an incrementing counter. Nonce reuse needs the
+%%     counter to *repeat*, and a strictly monotonic one over a 64-bit field does
+%%     not repeat. This asserts it on the bytes rather than arguing it in prose;
+%%   - the encoding is little-endian all the way up, not only for small numbers.
+%%     65536 is `16#010000`, so its low-order half is 1: byte 2 of the counter
+%%     carries it and byte 6 carries 0. A big-endian encoding would put the 1 in
+%%     byte 6 instead, which is what makes this discriminate rather than merely
+%%     pass.
+%%
+%% 2^64 - 2 is written out once, here and nowhere else in the test: these are
+%% the numbers the specification states, and a bound that moved should arrive as
+%% a reviewable diff rather than as a retuned constant.
+es_nonce_spans_the_specification_range_test() ->
+    Top = 16#FFFFFFFFFFFFFFFE,
+    ?assertEqual(<<0:32, Top:64/little-unsigned>>, i2p_crypto:es_nonce(Top)),
+    ?assertError(function_clause, i2p_crypto:es_nonce(Top + 1)),
+    ?assertError(function_clause, i2p_crypto:es_nonce(1 bsl 64)).
+
+es_nonce_does_not_repeat_across_65536_test() ->
+    N0 = i2p_crypto:es_nonce(0),
+    N65535 = i2p_crypto:es_nonce(65535),
+    N65536 = i2p_crypto:es_nonce(65536),
+    %% The claim the old 65535 bound rested on, stated as bytes.
+    ?assertNotEqual(N0, N65536),
+    ?assertNotEqual(N65535, N65536),
+    %% Little-endian at the boundary: 65536 = 16#010000, so `<<0:32, 0:8, 0:8,
+    %% 1:8, 0:40>>`.
+    ?assertEqual(<<0:32, 0:8, 0:8, 1:8, 0:40>>, N65536).
+
+%% A strictly monotonic counter over the field's width cannot repeat, and that is
+%% the whole reason widening the bound creates no keystream reuse.
+%%
+%% Enumerating a 64-bit field is impossible, so this checks the property at the
+%% three points where it could plausibly be false: the wrap-adjacent top of the
+%% range, the 16-bit boundary the defect was found at, and the very first
+%% increment. Each is a distinct nonce, and the top is the largest the function
+%% will produce.
+es_nonce_is_unique_across_the_range_test() ->
+    Points = [0, 1, 65535, 65536, 65537, 16#FFFFFFFFFFFFFFFD, 16#FFFFFFFFFFFFFFFE],
+    Nonces = [i2p_crypto:es_nonce(N) || N <- Points],
+    ?assertEqual(length(Nonces), length(lists:usort(Nonces))),
+    %% and every one is 12 bytes, the size the AEAD calls require
+    ?assert(lists:all(fun(Nonce) -> byte_size(Nonce) =:= 12 end, Nonces)).
 
 %%% --------------------------------------------------------------------------
 %%% Noise initialization and ratchet KDFs

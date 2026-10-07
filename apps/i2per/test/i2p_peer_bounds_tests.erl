@@ -18,7 +18,7 @@
 %% dialled. `f:maybe_connect/2` declines when `find_peer_config/2` is `undefined`,
 %% and no amount of waiting drains the queue. That is a RouterInfo with no
 %% published address, and a RouterInfo whose only address is SSU2 on a router
-%% with `ssu2_enabled()` false.
+%% that does not reach for UDP (`f:i2p_identity:ssu2_preferred/0` false).
 %%
 %% ## What this suite does not claim
 %%

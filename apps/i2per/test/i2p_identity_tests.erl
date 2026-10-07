@@ -133,3 +133,154 @@ rebuild_router_info_resigns() ->
     ),
     %% The fresh RouterInfo still parses under the strict validator.
     ?assertMatch({ok, _}, i2p_router_info:parse(RIBin1)).
+
+%% --------------------------------------------------------------------------
+%% The UDP transport setting
+%% --------------------------------------------------------------------------
+%%
+%% The setting is one enum read through two questions, and the whole ticket turns
+%% on the questions being separate. So these assert the pair per value, not the
+%% setting alone: a case that asserted `ssu2_setting()` three times would pass
+%% against an implementation where both accessors answered from the same bit.
+%%
+%% `with_ssu2/2` restores the environment whole rather than unsetting one key,
+%% for the reason `i2p_log_tests:f:with_env/2` says: a key left behind here
+%% reconfigures whichever suite boots next.
+
+%% Every value, and both answers, in one table so the two columns cannot drift
+%% apart in a future edit -- the table *is* the contract the boot and the dial
+%% path each depend on.
+setting_answers_both_transport_questions_test() ->
+    [
+        ?_assertEqual(
+            {S, Available, Preferred},
+            with_ssu2(
+                [{ssu2, S}],
+                fun() ->
+                    {
+                        i2p_identity:ssu2_setting(),
+                        i2p_identity:ssu2_available(),
+                        i2p_identity:ssu2_preferred()
+                    }
+                end
+            )
+        )
+     || {S, Available, Preferred} <- [
+            {no_udp, false, false},
+            {enable_udp, true, false},
+            {prefer_udp, true, true}
+        ]
+    ].
+
+%% `enable_udp` is the value the boolean could not express, so it is pinned from
+%% both sides in one case: served and not preferred. Either half alone would be
+%% satisfied by `prefer_udp`.
+%%
+%% The setting is also read by the boot (`m:i2per_sup`) and by the dial
+%% (`f:i2p_peer:ssu2_connect/3`), which want exactly these two answers and ask for
+%% them by these two names.
+enable_udp_serves_without_preferring_test() ->
+    with_ssu2(
+        [{ssu2, enable_udp}],
+        fun() ->
+            ?assertEqual(enable_udp, i2p_identity:ssu2_setting()),
+            ?assertEqual(true, i2p_identity:ssu2_available()),
+            ?assertEqual(false, i2p_identity:ssu2_preferred())
+        end
+    ).
+
+%% An unset key is `no_udp`, not an error and not `undefined`. A router booted
+%% with nothing configured must still answer the question, because the answer is
+%% what decides whether the SSU2 supervisor comes up at all.
+unset_is_no_udp_test() ->
+    with_ssu2(
+        [],
+        fun() ->
+            %% Start from a *known-unset* key rather than from whatever this VM
+            %% happens to hold, and prove it: a case asserting the unset default
+            %% in an environment where the key is set is asserting nothing.
+            ok = application:unset_env(i2per, ssu2),
+            ok = application:unset_env(i2per, ssu2_enabled),
+            ?assertEqual(undefined, application:get_env(i2per, ssu2)),
+            ?assertEqual(no_udp, i2p_identity:ssu2_setting()),
+            ?assertEqual(false, i2p_identity:ssu2_available()),
+            ?assertEqual(false, i2p_identity:ssu2_preferred())
+        end
+    ).
+
+%% The deprecated boolean, at the meaning it had. `true` is `prefer_udp` and not
+%% `enable_udp`: it gated the published address *and* the outbound preference
+%% together, so reading it as the weaker value would change which transport a
+%% live router dials -- the one thing this mapping exists to prevent. Pinned from
+%% both sides for the same reason as `enable_udp` above.
+legacy_true_still_means_prefer_udp_test() ->
+    with_ssu2(
+        [{ssu2_enabled, true}],
+        fun() ->
+            ?assertEqual(prefer_udp, i2p_identity:ssu2_setting()),
+            ?assertEqual(true, i2p_identity:ssu2_available()),
+            ?assertEqual(true, i2p_identity:ssu2_preferred())
+        end
+    ).
+
+legacy_false_still_means_no_udp_test() ->
+    with_ssu2(
+        [{ssu2_enabled, false}],
+        fun() ->
+            ?assertEqual(no_udp, i2p_identity:ssu2_setting()),
+            ?assertEqual(false, i2p_identity:ssu2_available())
+        end
+    ).
+
+%% A value that is not one of the three raises rather than falling back. The
+%% mutant this kills is a `_ -> no_udp` catch-all: it passes every case above and
+%% silently gives an operator who asked for `prefer_udp` a router that publishes
+%% no SSU2 address and declines every UDP dial, with nothing in the log about it.
+%%
+%% Asserted through both accessors, because a validator reached only from
+%% `ssu2_setting/0` would leave `ssu2_available/0` reading the key itself.
+unknown_setting_is_refused_test() ->
+    with_ssu2(
+        [{ssu2, "prefer"}],
+        fun() ->
+            ?assertError({unknown_ssu2_setting, "prefer"}, i2p_identity:ssu2_setting()),
+            ?assertError({unknown_ssu2_setting, "prefer"}, i2p_identity:ssu2_available()),
+            ?assertError({unknown_ssu2_setting, "prefer"}, i2p_identity:ssu2_preferred())
+        end
+    ).
+
+%% Both keys set: the enum wins, because it is the one an operator is being asked
+%% to edit. The direction matters and is asserted, not merely that *a* value
+%% came back -- a fallback to the legacy boolean here would mean an operator who
+%% migrated the key and left the old line behind silently kept the old behaviour.
+enum_wins_over_the_deprecated_key_test() ->
+    with_ssu2(
+        [{ssu2, prefer_udp}, {ssu2_enabled, false}],
+        fun() ->
+            ?assertEqual(prefer_udp, i2p_identity:ssu2_setting()),
+            ?assertEqual(true, i2p_identity:ssu2_preferred())
+        end
+    ).
+
+%% Run `Body` with `Env` set on the `i2per` application, then put the environment
+%% back the way it was found.
+%%
+%% Restore is **unset-everything-then-put-back**, not a diff, for the reason
+%% `i2p_log_tests:f:restore_env/2` gives: a diff cannot unset a key the snapshot
+%% does not mention, and that is exactly the key that leaks. These cases set
+%% `ssu2`, which the suites that boot a router read, so a leaked one reconfigures
+%% whichever suite runs next -- which is how a unit test in this module once broke
+%% seven cases in a different suite.
+with_ssu2(Env, Body) ->
+    Saved = application:get_all_env(i2per),
+    try
+        lists:foreach(fun({K, V}) -> application:set_env(i2per, K, V) end, Env),
+        Body()
+    after
+        lists:foreach(
+            fun({K, _}) -> application:unset_env(i2per, K) end,
+            application:get_all_env(i2per)
+        ),
+        lists:foreach(fun({K, V}) -> application:set_env(i2per, K, V) end, Saved),
+        ok
+    end.

@@ -1012,17 +1012,23 @@ core_source_files() ->
 %% nothing in front of it: not on `m:i2p_config_srv`'s key list, and not in the ini
 %% whitelist either, so there is no validator anywhere in the tree.
 %%
-%% `seeds` is a third, and is deliberately absent -- it is far too large to print,
-%% which is why the boot reports a seed *count* on a different line. These two are
-%% on the allowlist because both change what the router publishes: whether it
-%% advertises a private address, and whether it binds an SSU2 listener at all. An
-%% operator reading the configuration line needs both.
+%% `seeds` is a fourth, and is deliberately absent -- it is far too large to print,
+%% which is why the boot reports a seed *count* on a different line.
 %%
-%% Named here so that a fourth one is a decision rather than an omission, which is
+%% The two `ssu2` keys are on the allowlist for the same reason as
+%% `allow_private_host`: each changes what the router publishes, and an operator
+%% reading the configuration line needs both. `ssu2` because it decides whether a
+%% UDP address is advertised and which transport a dial reaches for; the
+%% deprecated `ssu2_enabled` because it is still read, so a configuration that
+%% still uses it must be able to see that it did. Naming both is also what makes
+%% the precedence visible: an operator who set the enum *and* left the boolean
+%% behind sees two keys on the line and can go and remove one.
+%%
+%% Named here so that a fifth one is a decision rather than an omission, which is
 %% the whole point of the case that reads this.
 -spec env_only_config_keys() -> [atom()].
 env_only_config_keys() ->
-    [allow_private_host, ssu2_enabled].
+    [allow_private_host, ssu2, ssu2_enabled].
 
 %% EUnit has no `ct:pal/2`.
 ct_pal(Rendered) ->
@@ -1098,6 +1104,11 @@ resolve(Key) -> {i2per, Key}.
 
 probe_value(log_level) -> info;
 probe_value(data_dir) -> "/tmp/i2p-log-probe";
+%% A probe value the router would *accept*. The default clause's binary is fine for
+%% a key nothing validates, but `ssu2` refuses anything outside its three values, so
+%% a probe that set it to a binary would fail the next case that boots a router --
+%% for a reason that has nothing to do with what that case is about.
+probe_value(ssu2) -> prefer_udp;
 probe_value(host) -> <<"198.51.100.7">>;
 probe_value(port) -> 49152;
 probe_value(_Key) -> <<"i2p-log-probe">>.

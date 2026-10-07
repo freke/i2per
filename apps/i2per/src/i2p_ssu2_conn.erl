@@ -37,6 +37,7 @@ outbound datagrams through it because only the listener owns the socket.
     connect/4,
     connect/5,
     connect_via_introducer/5,
+    dial_budget_ms/0,
     set_owner/2,
     send_i2np/4,
     send_peertest/2,
@@ -66,6 +67,13 @@ outbound datagrams through it because only the listener owns the socket.
 %% Overridable per app via `i2per` env `handshake_retry_ms` /
 %% `handshake_max_resends`.
 -define(MAX_RESENDS, 9).
+%% The indirect (introducer) leg's own bound: how long the redirect to a
+%% firewalled Charlie is waited for before the dial gives up on her introducers
+%% and falls back to NTCP2. Named and exported through `f:dial_budget_ms/0`
+%% because it is the longest single thing an SSU2 dial can block on, and
+%% `m:i2p_peer`'s deadline on `connecting` has to exceed it — a deadline written
+%% as its own number here would be a second copy that drifts.
+-define(REDIRECT_TIMEOUT_MS, 60000).
 %% How many `{nack, ack}` range pairs a session's ACK blocks may carry. This is
 %% a *policy* choice — the wire format would allow more — and it is deliberately
 %% the single place the number is written down, because the receive window's
@@ -301,12 +309,26 @@ connect_via_introducer(LocalKeys, BobOpts, RIBlock, Listener, Relay) ->
         },
     case i2p_ssu2_sup:start_session(i2p_ssu2_sup:session_child(Config)) of
         {ok, Pid} ->
-            await_ssu2_redirect(Pid, 60000);
+            await_ssu2_redirect(Pid, ?REDIRECT_TIMEOUT_MS);
         {ok, Pid, _Extra} ->
-            await_ssu2_redirect(Pid, 60000);
+            await_ssu2_redirect(Pid, ?REDIRECT_TIMEOUT_MS);
         {error, Reason} ->
             {error, Reason}
     end.
+
+-doc """
+The longest a single SSU2 leg of one outbound dial can block, in milliseconds.
+
+Two legs exist and they are bounded differently: a direct handshake by its
+retransmit count (`f:handshake_retry_ms/0` times `f:handshake_max_resends/0`),
+and the indirect one through an introducer by a flat wait. The longer of the two
+is what a caller bounding the *whole* dial needs, so it is asked for here rather
+than restated — and it moves when an operator retunes the retransmit settings,
+which a number written down in the caller would not follow.
+""".
+-spec dial_budget_ms() -> pos_integer().
+dial_budget_ms() ->
+    max(?REDIRECT_TIMEOUT_MS, handshake_retry_ms() * handshake_max_resends()).
 
 -spec await_ssu2_redirect(pid(), timeout()) ->
     {ok, pid(), pid(), i2p_ssu2:data_keys()} | {error, term()}.

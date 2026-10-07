@@ -6,7 +6,8 @@
 #   gate      "is this commit good enough to ship?" -- `main` only, and it runs
 #             everything: lint, docs, dialyzer, every eunit, every property,
 #             every CT suite, no time limit.
-#   compat    "can someone run this on another OTP?" -- `main` only.
+#   compat    "can someone run this on another OTP?" -- every pull request and
+#             `main`, but not a push to a feature branch.
 #
 # Separate jobs rather than one job with a matrix, because a matrix of the pinned
 # version answers the compat question with the smoke job's strictness -- which is
@@ -21,17 +22,25 @@
 # smoke job plus `compat`, because a PR is asking "would this merge cleanly" and
 # an OTP matrix is part of that answer before the merge rather than after.
 #
-# `main` runs **everything**: lint, docs, dialyzer, 951 eunit (935 unit + 16
-# property), all 224 CT across all 25 suites.
+# `main` runs **everything**: lint, docs, dialyzer, every eunit module
+# including the property layer, every CT suite.
 #
 # **What the smoke tier costs, measured not estimated.** 79s of CT and 10s of
-# eunit here, across 23 of the 25 suites and 211 of the 224 CT cases. The
-# `gate (pinned toolchain)` job on this workflow's last pull-request run took
-# **162s** on a runner for a smaller payload, which puts the smoke job at roughly
-# 4-5 minutes against a 5-minute budget. **That margin is thin and the figure is
-# extrapolated, so it is stated rather than asserted** -- the first push that runs
-# this workflow should be read for its real wall time, and the partition widened
-# or narrowed on the measurement rather than on this paragraph.
+# eunit here, across every suite but the slow two. The `gate (pinned toolchain)`
+# job on this workflow's last pull-request run took **162s** on a runner for a
+# smaller payload, which puts the smoke job at roughly 4-5 minutes against a
+# 5-minute budget. **That margin is thin and the figure is extrapolated, so it is
+# stated rather than asserted** -- the first push that runs this workflow should
+# be read for its real wall time, and the partition widened or narrowed on the
+# measurement rather than on this paragraph.
+#
+# **Case counts are not written down here, and this file used to be full of
+# them.** It claimed 951 eunit across 935 unit and 16 property, and 224 CT --
+# every one of them wrong when written, and rebar3 prints the totals it actually
+# ran. A figure in a workflow comment cannot be checked against the run it
+# describes, which is the same defect as a second copy of anything else. The
+# `Report the tiers` step below prints the partition from the scripts that derive
+# it, so the number in the log is never older than the log. #STMC7NC.
 #
 # **What the smoke tier does not run, stated rather than implied.** Two suites:
 # `i2p_peer_transport_SUITE` (protocol-mandated connect timeouts and backoff) and
@@ -161,9 +170,10 @@ jobs:
           echo "::endgroup::"
 
       - name: just smoke-test
-        # lint + the 935 unit cases + 211 CT cases. Invoked through `just` rather
-        # than spelled out here so CI and a developer run the same list: a gate
-        # that is written twice is a gate that is checked once.
+        # lint + every unit module + every CT suite but the slow two. Invoked
+        # through `just` rather than spelled out here so CI and a developer run
+        # the same list: a gate that is written twice is a gate that is checked
+        # once.
         #
         # `--sname` is inside the recipe, because `apps/i2per_status_SUITE` spawns
         # a `peer` router node and fails loudly without a dist-enabled CT node.
@@ -206,8 +216,8 @@ jobs:
         run: nix profile install nixpkgs#devenv
 
       - name: just test
-        # lint + docs + 951 eunit (935 unit + 16 property) + all 224 CT + the
-        # merged coverage report. Unattended, so the time is not a cost.
+        # lint + docs + every eunit module + every CT suite + the merged coverage
+        # report. Unattended, so the time is not a cost.
         #
         # **The property layer runs here and not in `smoke`, deliberately.** They
         # are 0.23s of work, so runtime is not the reason. The reason is that a
@@ -228,6 +238,12 @@ jobs:
       - name: just dialyzer
         # `main` only, where there is time for it. It analyses source, not tests,
         # so its answer does not depend on which CT tier ran.
+        #
+        # **Invoked directly rather than through `just check`, which now includes
+        # dialyzer.** This step runs after `just test`, so taking it through
+        # `check` would run the tests a second time; the ordering here is also why
+        # `check` puts dialyzer *before* `test` locally — a type error should fail
+        # the gate before it spends four minutes on suites.
         run: devenv shell -- just dialyzer
 
   # %%%%% The compatibility job %%%%%
@@ -255,9 +271,24 @@ jobs:
   #
   # Starts at one version, the same as devenv, because a matrix nobody has run
   # is a matrix of guesses. Expansion is 1.0.0 material.
+  #
+  # **A pull request or `main`, by ref rather than by event.** Same rule and the
+  # same reason as `full`: the question is about the code, and
+  # `github.event_name` would also let a `workflow_dispatch` -- which a human can
+  # fire on any branch -- run this job. It is *not* the same condition as
+  # `full`'s, because a pull request asks "would this merge cleanly" and an OTP
+  # matrix is part of that answer before the merge rather than after.
+  #
+  # A push to a feature branch is excluded because it asks neither question: it
+  # is someone working, and the run it does get is the five-minute smoke tier.
+  # Left unconditioned, every such push also paid a checkout, an OTP 28 install,
+  # a smoke-tier compile, the unit tier, CT and dialyzer -- so the push tier was
+  # neither the one documented above nor the one anybody would choose if they had
+  # been asked.
   compat:
     name: compat (OTP ${{ matrix.otp }}, warnings relaxed)
     runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/pull/')
     strategy:
       # One version, so this job is reporting rather than surveying. `fail-fast:
       # false` is kept because the day a second version is added, the useful
@@ -296,7 +327,7 @@ jobs:
 
       - name: eunit (unit tier)
         # The unit layer only. This job's question is "does it run on this OTP",
-        # and 935 in-process cases answer that; the property layer adds a
+        # and the in-process cases answer that; the property layer adds a
         # randomised dimension that would make a version difference look like a
         # flake.
         run: rebar3 as test eunit --module="$(bash scripts/eunit-modules.sh unit)"
