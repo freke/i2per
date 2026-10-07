@@ -1,0 +1,187 @@
+# The release artifact, built by the tree and published by a tag.
+#
+# `just release` (scripts/build-release.sh) produces the relx tarball and its
+# provenance MANIFEST. Nothing used to invoke it: the script records a source
+# digest and refuses a dirty working copy, but a check no CI job runs is never
+# exercised. This workflow is what runs it.
+#
+# %%%%% The container path is what CI runs, so CI must exercise it %%%%%
+#
+# The release script builds two ways. In place when the local Erlang is system
+# Erlang, and inside a throwaway Debian 13 container when the local Erlang is
+# nix-linked -- because a nix-built ERTS cannot boot the Debian the tarball is
+# for. Under `devenv shell` the Erlang here is nix-linked, which is also what
+# the gate workflow's toolchain produces, so the container path is the one a CI
+# runner takes. Runner tooling matches: ubuntu-latest has docker, so
+# build-release.sh takes its container branch there.
+#
+# That makes the weekly schedule below load-bearing rather than decorative: it
+# runs the container build on an ordinary week, so a broken container path is
+# found by a Tuesday, not by the release. If the container path has never
+# produced a green CI run, treat the next tag as a test, not a release.
+#
+# %%%%% The tag names the version, and only the tag %%%%%
+#
+# The artifact's version comes from apps/i2per/src/i2per.app.src and rebar.config
+# (the script asserts the two agree). A tag whose name disagrees with that
+# version fails the build rather than publishing a tarball named one thing for
+# a commit that thinks of itself as another. Nothing routes around the script's
+# dirty-tree refusal with I2PER_ALLOW_DIRTY_RELEASE: a release built off a
+# dirty tree claims a provenance the MANIFEST cannot back.
+#
+# %%%%% What the schedule is not %%%%%
+#
+# A scheduled or manual run builds and verifies the artifact and uploads it as a
+# workflow artifact. It publishes nothing: only a tag push (or an explicit
+# dispatch-time publish opt-in) creates the release.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Create/update the GitHub release for the dispatched ref (must be a v* tag)"
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    - cron: "17 4 * * 1"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build the relx tarball + MANIFEST
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve what is being built
+        # A tag push builds that tag and publishes it. A dispatch builds
+        # whatever ref was chosen, and publishes only when the dispatcher
+        # asked and that ref is a tag. The schedule builds main and
+        # publishes nothing.
+        id: version
+        run: |
+          set -euo pipefail
+          TAG=""
+          PUBLISH="false"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            PUBLISH="true"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            case "$GITHUB_REF" in
+              refs/tags/v*) TAG="${GITHUB_REF#refs/tags/}" ;;
+            esac
+            if [ "${{ inputs.publish }}" = "true" ]; then
+              [ -n "$TAG" ] || { echo "error: publish requested on a non-tag ref ($GITHUB_REF)" >&2; exit 1; }
+              PUBLISH="true"
+            fi
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
+          echo "building: ref=${GITHUB_REF} tag=${TAG:-<none>} publish=$PUBLISH"
+
+      - name: The tag agrees with the app version
+        # One fact about what we are shipping, said once. If the tag says
+        # v0.2.0 while i2per.app.src says 0.1.0, the MANIFEST would record a
+        # truth the tag's name denies.
+        if: steps.version.outputs.tag != ''
+        run: |
+          set -euo pipefail
+          APP_VSN="$(grep -oP '\{vsn, "\K[^"]+' apps/i2per/src/i2per.app.src | head -1)"
+          TAG="${{ steps.version.outputs.tag }}"
+          echo "tag: $TAG, app vsn: $APP_VSN"
+          [ "v$APP_VSN" = "$TAG" ] || { echo "error: tag $TAG does not match app version $APP_VSN" >&2; exit 1; }
+
+      - name: Install the pinned toolchain
+        # The same steps as the gate workflow, for the same reason: the
+        # versions live in devenv.nix, so CI and a developer cannot disagree
+        # about which OTP the release was built against.
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            accept-flake-config = true
+            extra-experimental-features = nix-command flakes
+
+      - uses: cachix/cachix-action@v17
+        with:
+          name: devenv
+
+      - name: Install the devenv CLI
+        run: nix profile install nixpkgs#devenv
+
+      - name: Verify the pinned toolchain
+        run: devenv shell -- bash -c 'command -v rebar3 && command -v erl && command -v just'
+
+      - name: just release
+        # No I2PER_ALLOW_DIRTY_RELEASE. The checkout of a tag is clean, and the
+        # script's own dirty-tree refusal is the provenance claim's teeth.
+        run: devenv shell -- just release
+
+      - name: Verify the artifact before it can travel
+        # The build script checks its own profile (safe-default config gates,
+        # license documents). This step checks what the script wrote: the
+        # tarball and MANIFEST exist, the tarball carries the documents the
+        # script names, and the MANIFEST's sha256 is today's sha256. A stale
+        # or partial artifact fails here rather than at the release page.
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          TARBALL="$(ls dist/i2per-*.tar.gz | head -1)"
+          [ -f "$TARBALL" ] || { echo "error: no tarball in dist/" >&2; exit 1; }
+          [ -f "$TARBALL.manifest" ] || { echo "error: no manifest for $TARBALL" >&2; exit 1; }
+          RECORDED="$(grep -oP '^sha256: \K.+' "$TARBALL.manifest")"
+          ACTUAL="$(sha256sum "$TARBALL" | cut -d' ' -f1)"
+          echo "manifest sha256: $RECORDED"
+          echo "actual  sha256: $ACTUAL"
+          [ "$RECORDED" = "$ACTUAL" ] || { echo "error: manifest does not match artifact" >&2; exit 1; }
+          for doc in LICENSE NOTICE README.md docs/documentation.md docs/protocol.md; do
+            tar -tzf "$TARBALL" | grep -Fx "$doc" >/dev/null || { echo "error: tarball missing $doc" >&2; exit 1; }
+          done
+          echo "artifact verified: $TARBALL"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: i2per-release
+          path: dist/
+          retention-days: 14
+          if-no-files-found: error
+
+  publish:
+    name: attach to the GitHub release
+    needs: build
+    if: needs.build.outputs.publish == 'true' && needs.build.outputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: i2per-release
+          path: dist/
+
+      - name: Create the release if it does not exist, then upload
+        # The tag is the single source of truth for the version; gh derives the
+        # release name from it. --clobber so a rebuilt tag can replace an
+        # earlier artifact rather than failing on the duplicate.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.build.outputs.tag }}"
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --generate-notes
+          gh release upload "$TAG" dist/* --clobber
+          echo "published: ${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG"
