@@ -422,7 +422,7 @@ is emitted.
 Input: the session pid (an established Alice-role session); `BobHash` — the
 32-byte introducer router hash; `Port` and `Ip` — the endpoint Alice asserts
 reachable. The nonce is chosen fresh here; the caller need not supply one.
-Automatic NetDb-driven Charlie selection is not part of 0.1.0.
+Automatic NetDb-driven Charlie selection is not part of this release.
 Output: `ok`.
 """.
 -spec initiate_peertest(pid(), binary(), 0..65535, binary()) -> ok.
@@ -1189,7 +1189,7 @@ handle_keepalive(Blocks, State) ->
 %% (type 10) inside Data messages for messages 1-4 (see `m:i2p_peertest` and
 %% `docs/protocol.md`). In-session responses and explicit Alice initiation are
 %% implemented. Automatic NetDb-driven Charlie selection is not implemented in
-%% 0.1.0. The dispatch keys off the session's peer-test discriminator
+%% this release. The dispatch keys off the session's peer-test discriminator
 %% (`f:peertest_discriminator/2`): an explicit peer-test role when the session
 %% carries one, otherwise the default handshake-role-and-message inference.
 handle_peertest(Blocks, State) ->

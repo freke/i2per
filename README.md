@@ -1,7 +1,8 @@
 # i2per
 
 `i2per` is an Erlang/OTP implementation of an I2P router with a SAM v3 client
-bridge. This repository contains the 0.1.0 release. It implements the modern
+bridge. This repository contains the 0.2.0 release line, currently at
+**0.2.0-rc1**. It implements the modern
 X25519 and Ed25519 protocol surface, including NTCP2, SSU2, ECIES tunnel
 creation, LeaseSet2, the I2P streaming protocol, and bounded tunnel relay
 participation.
@@ -9,23 +10,25 @@ participation.
 The project interoperates with I2P routers. It does not bundle code from
 `i2pd` or `i2p-java`; the repository's `NOTICE` file records the attribution.
 
-> **Status: proof of concept.** The 0.1.0 in this tree is a development snapshot,
-> not a published release.
+> **Status: 0.2.0-rc1 is cut and published.** The release page
+> (<https://github.com/freke/i2per/releases>) carries the relx tarball and its
+> provenance MANIFEST, built by CI from the tag rather than by a person
+> remembering to run `just release`. The documentation site is published from the
+> same tag at <https://freke.github.io/i2per/>. `CHANGELOG.md` records what
+> changed, including the known issues an operator should know about.
 >
-> CI is here as of this tree's HEAD: a smoke tier on **every push** answering
-> "does the router still come up and work", and on `main` a pinned gate running
-> everything (`just test` and `just dialyzer`) plus a warnings-relaxed job asking
-> whether another OTP can build and run it. The read API is versioned and its key
-> set is checked across the core/consumer boundary, not only inside each
-> application. What 0.1.0 does **not** yet have is the external i2pd
-> interoperability suite as a required gate — that is deferred to 0.3.0, the
-> first release to make protocol claims, because a gate that cannot tell a real
-> failure from a known-broken prerequisite is worse than no gate. See
-> [ADR 0001](https://github.com/freke/i2per/blob/main/docs/adr/0001-data-only-core-with-presentation-apps.md)
-> and [ADR 0002](https://github.com/freke/i2per/blob/main/docs/adr/0002-the-logging-floor-the-bus-is-the-instrument.md)
-> for the reasoning.
+> What 0.2.0 added over 0.1.0 is what "operable" means: a versioned public read
+> API over the event bus, the telemetry contract (counters, failure events,
+> node uptime, and a `bus_backlog` gauge), a logging floor that is a build-time
+> gate rather than prose, and a docs site that CI publishes. The external i2pd
+> interoperability suite is still not a required gate — that is deferred to
+> 0.3.0, the first release to make protocol claims, because a gate that cannot
+> tell a real failure from a known-broken prerequisite is worse than no gate.
+> See [ADR 0001](https://github.com/freke/i2per/blob/main/docs/adr/0001-data-only-core-with-presentation-apps.md),
+> [ADR 0002](https://github.com/freke/i2per/blob/main/docs/adr/0002-the-logging-floor-the-bus-is-the-instrument.md)
+> and the [changelog](CHANGELOG.md) for the reasoning.
 
-## Included in 0.1.0
+## Included in 0.2.0
 
 - **Transports:** NTCP2 and SSU2, with one supervised process per connection
   and per-session isolation.
@@ -40,10 +43,17 @@ The project interoperates with I2P routers. It does not bundle code from
 - **Client APIs:** SAM v3 `STREAM`, `DATAGRAM`, `RAW`, `NAMING LOOKUP`, and
   `STREAM FORWARD`, with the signed and reliable I2P streaming protocol.
 - **Services:** server tunnels for local TCP services, a strict INI
-  configuration loader, a runtime configuration service, an event bus, and
-  the standalone `i2per_status` web service.
+  configuration loader, a runtime configuration service, an event bus with a
+  published `subscribe/1` / `unsubscribe/1` entry point, and the standalone
+  `i2per_status` web service.
+- **Observability:** a versioned read API (`i2p_status_data:view/0`) over
+  counters, gauges and node uptime; the telemetry contract 0.2.0 added
+  (per-transport bytes, transit relay bytes, tunnel build/fail tallies, and
+  the `peer_connect_failed` / `transit_denied` / `leaseset_publish_failed`
+  / `lookup_failed` events); and a logging floor whose 3am checklist is
+  executable rather than prose.
 - **Operations:** offline-safe release defaults, reseed certificate anchors,
-  and relx packaging.
+  and relx packaging with a provenance MANIFEST.
 
 The default profile is a local client. It does not contact the live network,
 publish a floodfill RouterInfo, or accept public transit unless an operator
@@ -111,7 +121,8 @@ Wait for `===> Booted i2per`, then run these checks at the Erlang prompt:
 ```erlang
 application:ensure_all_started(i2per).
 true = is_pid(whereis(i2per_sup)).
-{ok, "0.1.0"} = application:get_key(i2per, vsn).
+%% The version string moves with each release; it is the app's own {vsn, ...}.
+{ok, "0.2.0-rc1"} = application:get_key(i2per, vsn).
 ```
 
 The successful results are `{ok,[i2per]}`, `true`, and `ok`. Leave the shell
@@ -178,7 +189,22 @@ test suite is part of the release quality process.
 
 ## Run the packaged release
 
-Build a release artifact with:
+To install a published release, download the tarball and its `.manifest` from
+the [release page](https://github.com/freke/i2per/releases), then check the
+recorded hash against the artifact:
+
+```sh
+tar xzf i2per-<vsn>-<rev>.tar.gz
+grep '^sha256:' i2per-<vsn>-<rev>.tar.gz.manifest
+sha256sum i2per-<vsn>-<rev>.tar.gz
+cd i2per-<vsn>-<rev> && bin/i2per foreground
+```
+
+The manifest also records the source commit, the source tree hash, the OTP it
+was built against, and the build date, so a deployment can say exactly which
+build it is running.
+
+To build one locally:
 
 ```sh
 just release
@@ -282,7 +308,9 @@ application:set_env(i2per, addressbook, #{
 
 Values already present in `sys.config` or the application environment take
 precedence over values in `i2per.conf`. In particular, edit the release's
-`releases/0.1.0/sys.config` to change the shipped `./data` directory. A
+`releases/<vsn>/sys.config` to change the shipped `./data` directory (the
+directory is named after the release, so it carries the version — `0.2.0-rc1`
+for this release). A
 persistent boot requires `data_dir` and `seeds` in the application environment.
 The release profile sets `live_network = false` and `ntcp2_published = false`;
 changing either value is an explicit operator decision.
@@ -334,14 +362,21 @@ already present in `sys.config` must be changed there.
 Router state changes are announced on the `i2p_events` `gen_event` manager.
 Events include peer connection changes, tunnel builds and failures, LeaseSet
 publication, SAM session lifecycle, configuration changes, and SSU2 reachability
-results. A handler on another connected node can receive them with:
+results. `i2p_events:subscribe/1` is the published entry point — a local or a
+remote collector attaches the same way, and nothing outside the core calls
+`gen_event:*` directly:
 
 ```erlang
-ok = gen_event:add_handler({i2p_events, RouterNode}, i2p_events_forward, [self()]).
+ok = i2p_events:subscribe(self()).
 receive
     {event, Event} -> Event
 end.
 ```
+
+Delivery is best-effort and never propagates a delivery failure to the
+emitter. The backlog depth behind a wedged handler is published as the
+`bus_backlog` gauge in the read API; a depth that does not fall is what
+identifies the fault.
 
 ## Status service
 
@@ -385,20 +420,30 @@ part of the normal gate. `just live-smoke` is an offline self-check. Use
 
 ## Release limitations
 
-The 0.1.0 release does not implement NTCP1, SSU1, I2CP, the legacy ElGamal/AES
+The 0.2.0 release does not implement NTCP1, SSU1, I2CP, the legacy ElGamal/AES
 crypto formats, Datagram2, or a TUN interface. Path migration and advanced
 congestion control are outside the current SSU2 data path. Floodfill and
 transit participation are available as bounded features, but they are not
 enabled by the shipped default profile. Automatic NetDb-driven Charlie selection
 and the complete firewalled HolePunch path are not implemented. In-place relup
-upgrades are not supported in 0.1.0; upgrading means installing a new tarball.
+upgrades are not supported in 0.2.0; upgrading means installing a new tarball.
+
+`CHANGELOG.md` lists the known issues for this release: the event bus's far
+side is unbounded if a subscriber node stops draining (OTP 28 offers no cap
+from the router side), and seven bus-carried facts have no log record yet.
 
 ## Documentation
 
+- The published documentation site for the current release is
+  <https://freke.github.io/i2per/>, built and published by CI from the release
+  tag. `just doc` regenerates it locally into `doc/`.
+- [Changelog](CHANGELOG.md) records what changed in each release, with ticket
+  references and the known issues.
 - [Protocol reference](docs/protocol.md) documents the wire formats implemented
   by this release.
 - [Documentation standards](docs/documentation.md) defines the EEP-48 and
   ExDoc requirements for source changes.
+- ADRs under `docs/adr/` record the decisions this release line rests on.
 
 ## License
 

@@ -76,7 +76,7 @@ The DHT helpers follow i2pd's `IdentMetrics` / `NetDb`:
 - **Floodfill eligibility**: version `>= 0.9.62` (`i2pd NETDB_MIN_FLOODFILL_VERSION`),
   router caps without `U`/`H`, and a published address — `published v4
   orelse (reachable v4 andalso published v6)` — matching
-  `RouterInfo::IsEligibleFloodfill`. In 0.1.0 eligibility requires a published
+  `RouterInfo::IsEligibleFloodfill`. In this release eligibility requires a published
   NTCP2 address; non-published NTCP2 addresses are ignored rather than treated
   as IPv6 endpoints.
 - **Closest selection**: `f:closest/3` on routing-key distance,
