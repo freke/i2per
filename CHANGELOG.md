@@ -4,6 +4,21 @@ All notable changes to i2per are recorded here. Versions follow the OTP
 applications' own `{vsn, ...}`; the release tag is `v` + that version, and
 CI refuses a tag that disagrees.
 
+## [Unreleased]
+
+### Fixed
+
+- **A reseed could silently take fewer RouterInfos out of a bundle than the
+  bundle held.** The entry-name filter asked `filename:extension/1`, which
+  reads `/` as a directory separator, so an entry whose name put one before
+  the `.dat` suffix reported no extension and the RouterInfo behind it was
+  dropped — with nothing logged, leaving a NetDb a router short and a
+  reseed that reported success. A RouterInfo was lost about once in 128
+  reseeds and was the cause of a red release gate about one run in seventeen
+  (#Q6NKB9P). The suffix is now matched off the end of the name, and an
+  entry the reseed client still cannot take is recorded as the new
+  `reseed_routerinfo_skipped` log fact instead of vanishing.
+
 ## [0.2.0] — 2026-10-07
 
 Promotes [`v0.2.0-rc1`](https://github.com/freke/i2per/releases/tag/v0.2.0-rc1)

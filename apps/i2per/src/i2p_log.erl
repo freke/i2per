@@ -274,12 +274,13 @@ site is not.
     config_in_force
     | started_as
     | online
-    %% The four log-only faults the tree records. Each has no possible subscriber:
+    %% The five log-only faults the tree records. Each has no possible subscriber:
     %% none of them is about a pending lookup, so no event exists to describe it.
     | netdb_store_type_unsupported
     | unhandled_ssu2_block_peer
     | netdb_refused_routerinfo
     | reseed_failed
+    | reseed_routerinfo_skipped
     %% ADR 0002's seven bus-carried rows. Named for the event that carries them,
     %% because the fact *is* the event: an operator's symptom and the announcement
     %% that answers it are the same thing here, so a second name for it would be a
@@ -348,12 +349,19 @@ checklist() ->
         config_in_force => #{level => notice, instrument => log},
         started_as => #{level => notice, instrument => log},
         online => #{level => notice, instrument => log},
-        %% Log-only faults. All four `warning`, because each is a peer or a
+        %% Log-only faults. All five `warning`, because each is a peer or a
         %% source behaving in a way the operator may want to act on.
         netdb_store_type_unsupported => #{level => warning, instrument => log},
         unhandled_ssu2_block_peer => #{level => warning, instrument => log},
         netdb_refused_routerinfo => #{level => warning, instrument => log},
         reseed_failed => #{level => warning, instrument => log},
+        %% **Its own fact rather than a second reseed_failed line.** A bundle
+        %% that fails wholesale is an operator's "the reseed did not work"; a
+        %% bundle this router accepted and then took two entries out of is
+        %% "the reseed half-worked", and the second is the one with no other
+        %% symptom at all -- the NetDb is a router short and every other line
+        %% says the reseed succeeded. `#Q6NKB9P`.
+        reseed_routerinfo_skipped => #{level => warning, instrument => log},
         %% ADR 0002's seven bus-carried rows, one per entry, in the order the ADR's
         %% table lists them. No `level` on any of them: see `t:entry/0`.
         peer_connect_failed => #{instrument => bus},

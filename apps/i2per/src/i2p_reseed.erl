@@ -126,6 +126,11 @@ Input: `Su3Bin` — raw SU3 bytes; `TrustStore` — signer-ID → certificate ma
 Output: `{ok, RouterInfos}` — every decodable `routerInfo-*.dat` entry in the
 zip — or an error: `{unknown_signer, SignerId}`, `bad_signature`,
 `no_router_infos`, or anything `m:i2p_su3` / `f:zip:unzip/2` can produce.
+
+**An entry this module does not take is recorded, not dropped.** `reseed_failed`
+says the bundle was refused as a whole; nothing said anything about the entries
+this router quietly left out of one it accepted, which is the same silent loss
+one level up. See `f:take_entries/1`.
 """.
 -spec process(binary(), trust_store()) -> {ok, [i2p_router_info:router_info()]} | {error, term()}.
 process(Su3Bin, TrustStore) ->
@@ -251,12 +256,8 @@ verify_fresh(false, _Su3, _CertDer, SignerId) ->
 unzip_ris(ZipBin) ->
     case zip:unzip(ZipBin, [memory]) of
         {ok, Entries} ->
-            Ris = [
-                RI
-             || {Name, Data} <- Entries,
-                ri_entry(Name),
-                {ok, RI} <- [i2p_router_info:decode(Data)]
-            ],
+            {Ris, Skipped} = take_entries(Entries),
+            lists:foreach(fun report_skipped/1, Skipped),
             case Ris of
                 [] -> {error, no_router_infos};
                 _ -> {ok, Ris}
@@ -265,15 +266,73 @@ unzip_ris(ZipBin) ->
             {error, no_router_infos}
     end.
 
-%% ri_entry/1 — reseed zips carry top-level routerInfo-<hash>.dat files only.
-%% Entry names arrive as strings or binaries depending on how they were
-%% written, so normalise before matching.
-ri_entry(Name0) ->
-    Name = iolist_to_binary(Name0),
-    case Name of
-        <<"routerInfo-", _Hash/binary>> -> filename:extension(Name) =:= <<".dat">>;
-        _ -> false
+%% Every entry, sorted into the RouterInfos this module can use and the entries
+%% it could not use.
+%%
+%% **The second list is the point.** This was a comprehension with the two
+%% filters as clauses, so an entry that failed either one simply did not appear
+%% in the result and nothing recorded that it had been there. `f:process/2`
+%% returning a short list was therefore indistinguishable from a bundle that
+%% held a short list -- the exact shape of `#Q6NKB9P`, where a reseed of two
+%% RouterInfos silently yielded one, the NetDb stayed a router short, and the
+%% only log line anywhere said nothing. A filter this cheap does not need to be
+%% silent to be cheap: a bundle is hundreds of entries and all of them match, so
+%% the reporting path is empty on every real reseed.
+take_entries(Entries) ->
+    {Taken, Skipped} = lists:foldl(fun take_entry/2, {[], []}, Entries),
+    %% **Entry order, not fold order.** Both accumulators are built by
+    %% prepending, so the taken list comes out reversed; a caller reading the
+    %% bundle in the order the mirror wrote it is not something to change
+    %% quietly, and `i2p_reseed_tests:fetch_and_process/0` pins it.
+    {lists:reverse(Taken), Skipped}.
+
+take_entry({Name, Data}, {Ris, Skipped}) ->
+    case ri_entry(Name) of
+        true -> decode_entry(Name, Data, {Ris, Skipped});
+        false -> {Ris, [{Name, not_a_router_info_entry} | Skipped]}
     end.
+
+decode_entry(Name, Data, {Ris, Skipped}) ->
+    case i2p_router_info:decode(Data) of
+        {ok, RI} -> {[RI | Ris], Skipped};
+        {error, Reason} -> {Ris, [{Name, Reason} | Skipped]}
+    end.
+
+report_skipped({Name, Reason}) ->
+    i2p_log:emit(
+        reseed_routerinfo_skipped,
+        "reseed bundle entry ~0p skipped: ~0p",
+        [Name, Reason]
+    ).
+
+%% ri_entry/1 — reseed zips carry routerInfo-<base64 hash>.dat files.
+%%
+%% Entry names arrive as strings or binaries depending on how they were written,
+%% so normalise before matching.
+%%
+%% **The suffix is matched here, not with `filename:extension/1`.** That function
+%% reads `/` as a directory separator, so a name whose hash ended in one put
+%% `.dat` in what it considered the directory part and returned `<<>>` -- and
+%% `f:take_entries/1` dropped the RouterInfo behind it. The hash bytes are not
+%% this module's to constrain: a zip entry name is a name, and the bytes in it
+%% are whatever the signed bundle put there. `#Q6NKB9P`.
+ri_entry(Name0) ->
+    is_router_info_name(iolist_to_binary(Name0)).
+
+%% Clause pair rather than a `case`, so each answer is its own head. The two are
+%% separate functions because a binary segment that is not last has to be followed
+%% by a size, and the length of the hash between the prefix and the suffix is not
+%% fixed -- it is whatever the signer wrote.
+is_router_info_name(<<"routerInfo-", Rest/binary>>) ->
+    is_dat_named(Rest);
+is_router_info_name(_Name) ->
+    false.
+
+%% **A suffix, read off the end of the bytes.** See `f:ri_entry/1` for what this
+%% replaced and why `filename:extension/1` cannot answer it.
+is_dat_named(Rest) ->
+    Size = byte_size(Rest),
+    Size >= 4 andalso binary:part(Rest, Size - 4, 4) =:= <<".dat">>.
 
 try_hosts([], _TrustStore, LastError) ->
     {error, LastError};
