@@ -21,7 +21,7 @@ The decision is published as `{reachability, ssu2, Status}` events whenever it
 changes. `Status` is the aggregate over the IPv4 and IPv6 families:
 `firewalled` if either family is firewalled, `unknown` while neither family is
 decided, otherwise `reachable`. Router components do not consume this event in
-0.1.0.
+this release.
 """.
 
 -behaviour(gen_server).

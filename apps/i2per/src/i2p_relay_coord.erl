@@ -32,7 +32,7 @@ requester. One coordinator serves one tagged peer and one requester at a
 time, mirroring `m:i2p_peertest_coord`'s single-alice/single-charlie model.
 
 Relay-request signature verification and the out-of-session HolePunch path
-are not implemented in 0.1.0. The coordinator relays signed blocks
+are not implemented in this release. The coordinator relays signed blocks
 unmodified.
 """.
 

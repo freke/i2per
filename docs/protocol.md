@@ -1,6 +1,6 @@
 # Protocol Reference
 
-This document describes the I2P wire formats implemented by i2per 0.1.0.
+This document describes the I2P wire formats implemented by i2per 0.2.0.
 Unsupported formats and release limitations are listed explicitly.
 
 All multi-byte integers in I2P are big-endian unless otherwise noted. Ed25519
@@ -12,11 +12,11 @@ in the [I2P documentation](https://i2p.net/en/docs/).
 
 ## Release boundaries
 
-The 0.1.0 release does not implement NTCP1, SSU1, I2CP, the legacy
+The 0.2.0 release does not implement NTCP1, SSU1, I2CP, the legacy
 ElGamal/AES garlic formats, Datagram2, or a TUN interface. SSU2 path migration,
 RTT-based congestion control, automatic Charlie selection for PeerTest, and
 the complete firewalled HolePunch path are also outside this release. The
-sections below describe only behavior that is present in 0.1.0.
+sections below describe only behavior that is present in 0.2.0.
 
 ## Implemented
 
@@ -777,7 +777,7 @@ The plaintext inside the ECIES encryption is a sequence of **TLV blocks**:
 
 **Known TLV block types:**
 
-| Type | Name | Data size and 0.1.0 behavior |
+| Type | Name | Data size and behavior |
 |------|------|-----------------------------|
 | 0 | DATETIME | Four Unix seconds. `encode_payload/1,2` emits this block first. |
 | 1 | SESSION_ID | Opaque data; recognized by the decoder. |
@@ -855,7 +855,7 @@ sequenceDiagram
     R->>R: Parse TLV blocks, process each clove
 ```
 
-**The 0.1.0 client path is one clove.** `i2p_client:wrap_payload/2` builds
+**The client path is one clove.** `i2p_client:wrap_payload/2` builds
 one LOCAL-delivery clove whose I2NP type is `31` (Data), with a random
 4-byte message ID, a 60-second expiration, and the raw application or
 streaming packet as its body. It calls `i2p_garlic:wrap_router/2` with the
@@ -1550,7 +1550,7 @@ packet
 | Field | Size | Description |
 |-------|------|-------------|
 | from | 391 | Sender Destination (X25519 ‖ padding ‖ Ed25519 ‖ KEY cert), same fixed layout as every destination in this router. Its signing key verifies the signature. |
-| signature | 64 | Ed25519 over the **payload bytes only** (non-DSA rule, release 0.9.14+). Datagram2 replay protection is not implemented in 0.1.0. |
+| signature | 64 | Ed25519 over the **payload bytes only** (non-DSA rule, release 0.9.14+). Datagram2 replay protection is not implemented in this release. |
 | payload | 1..~11 KB practical | Application bytes. Unreliable and unordered end-to-end. |
 
 RAW datagrams carry no header at all: the Data-clove payload is the
@@ -1813,7 +1813,7 @@ when a payload would fall short. Unknown types are ignored.
 | 13 | Address | Port + IPv4/IPv6. |
 | 15/16 | Relay tag request/tag | In-session handshake: block 15 requests a relay tag, block 16 grants it; see [Relay](#relay). |
 | 17 | New token | Expires (4) + token (8). |
-| 18/19 | Path challenge/response | Keep-alive echo. Path migration is not implemented in 0.1.0. |
+| 18/19 | Path challenge/response | Keep-alive echo. Path migration is not implemented in this release. |
 | 254 | Padding | Must be last. |
 
 #### Data-phase AEAD
@@ -1976,7 +1976,7 @@ Implemented in `m:i2p_peertest` (pure signing/conn-id/result core), `m:i2p_ssu2`
 block 10), driven by the session process (`m:i2p_ssu2_conn`: Bob-side reject on
 message 1, Charlie-side message-3 reply on message 2, result hook on message 4)
 and the listener's out-of-session type-7 classification
-(`m:i2p_ssu2_listener`: Charlie-role responder on message 6). The 0.1.0
+(`m:i2p_ssu2_listener`: Charlie-role responder on message 6). This release
 coordinator and session path construct and relay the signed fields, but do not
 verify incoming PeerTest signatures.
 
@@ -1991,7 +1991,7 @@ implementation keeps the deterministic "no Charlie available" reject.
 
 Alice-outbound initiation is implemented for setup only. The coordinator is
 handed Charlie's RouterInfo to relay; automatic NetDb-driven Charlie selection
-is not implemented in 0.1.0.
+is not implemented in this release.
 
 ##### Peer Test block (type 10)
 
@@ -2087,7 +2087,7 @@ nonce-derived connection ID.
 After message 4 is accepted and Charlie's address is available, Alice sends
 message 6 even if message 5 has not arrived. The current result function
 returns only `ok`, `firewalled`, or `unknown`; it does not emit a `symnat`
-result in 0.1.0.
+result in this release.
 The table below is the exact matrix implemented by
 `i2p_peertest:result/3`:
 
@@ -2137,7 +2137,7 @@ handshake (blocks 15/16) grants the tag in-session: block 15 asks, block 16
 answers with a fresh tag recorded against the requesting session in the
 introducer's tag registry.
 
-The 0.1.0 implementation has the block codec, tag registry, introducer
+The implementation has the block codec, tag registry, introducer
 coordinator, requester redirect, and inbound HolePunch classification. It does
 not run the Charlie-side responder or verify RelayRequest/RelayIntro
 signatures. The sequence below is the wire flow, with those edges not yet
@@ -2280,7 +2280,7 @@ Charlie-side rejects; Bob signs his own rejects (with `csz = 0`, so no
 endpoint fields). The covered data is the 16-byte prologue
 `"RelayAgreementOK"`, Bob's hash, then `nonce || timestamp || ver || csz ||
 [CharliePort || Charlie IP]` — the endpoint pair only when an endpoint is
-present. The 0.1.0 requester path verifies a received RelayResponse with the
+present. The requester path verifies a received RelayResponse with the
 configured target Charlie signing key before starting the redirect. The
 coordinator does not independently verify Bob-side rejects or RelayRequest /
 RelayIntro signatures.
@@ -2316,7 +2316,7 @@ packet
 | asz | 1 | Endpoint size: 6 or 18. |
 | AlicePort | 2 | From Alice's RelayRequest, echoed unchanged. |
 | Alice IP | asz-2 | From Alice's RelayRequest, echoed unchanged. |
-| signature | 64 | Alice's original signature over `"RelayRequestData"` (request data, prologue unchanged). The wire format leaves it for Charlie to verify; 0.1.0 does not perform that verification. |
+| signature | 64 | Alice's original signature over `"RelayRequestData"` (request data, prologue unchanged). The wire format leaves it for Charlie to verify; this release does not perform that verification. |
 
 ```mermaid
 sequenceDiagram
@@ -2361,7 +2361,7 @@ Implementations: `m:i2p_relay` (pure signing/conn-id/reject-code core),
 listener-owned `i2p_ssu2_relay_tags` registry, and routes blocks 7/8/9
 between the tagged session and the requester), `m:i2p_ssu2_listener`
 (registry ownership) and `m:i2p_ssu2_conn` (sessions forward relay blocks to
-their owner; relay blocks 7/8/9 are ack-eliciting). The 0.1.0 release does not
+their owner; relay blocks 7/8/9 are ack-eliciting). The release does not
 implement Charlie-side HolePunch establishment or the full firewalled-router
 edge. Beyond codec round-trips, the wire layout above follows i2p-java's
 `SSU2Util` (the `bHash`/`cHash` in the request signature are context, not

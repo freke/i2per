@@ -15,7 +15,7 @@ routes them:
   as message 4, carrying Charlie's router hash.
 
 Charlie selection is supplied by the caller. Automatic NetDb-driven selection
-is not implemented in 0.1.0: the coordinator receives the Charlie RouterInfo to
+is not implemented in this release: the coordinator receives the Charlie RouterInfo to
 relay, not a hash to resolve. It binds the intro-side listener as both its owner
 and `peer_test_coordinator`, so an inbound Alice message 1 is forwarded here
 instead of auto-rejected.

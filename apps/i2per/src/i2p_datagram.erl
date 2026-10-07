@@ -19,7 +19,7 @@ payload    application bytes, arbitrary length (practically <= ~11 KB)
 There is no length field: the layers around the datagram fix its extent.
 The signature is verified on decode (`f:decode/2` returns `error` for both
 malformed input and failed authentication — callers treat them alike and
-drop). Datagram2 replay protection is not implemented in 0.1.0.
+drop). Datagram2 replay protection is not implemented in this release.
 
 ## Usage
 
