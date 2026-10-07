@@ -6,6 +6,15 @@ CI refuses a tag that disagrees.
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-10-07
+
+**A patch release, because the defect was a silent one.**
+
+0.2.0 shipped and was correct in behaviour except for one thing an operator
+could not see: a reseed could quietly put fewer RouterInfos into the NetDb
+than the bundle it had just fetched and verified, and nothing said so. There
+are no other changes on this tag.
+
 ### Fixed
 
 - **A reseed could silently take fewer RouterInfos out of a bundle than the
@@ -18,6 +27,16 @@ CI refuses a tag that disagrees.
   (#Q6NKB9P). The suffix is now matched off the end of the name, and an
   entry the reseed client still cannot take is recorded as the new
   `reseed_routerinfo_skipped` log fact instead of vanishing.
+
+### Upgrading
+
+The wire formats, the configuration keys, the read API's key set and the
+artifact's layout are all unchanged from 0.2.0, so an upgrade is the new
+tarball and nothing else. A `data_dir` written by 0.2.0 is read by 0.2.1
+unchanged. See the README's [upgrade
+note](https://github.com/freke/i2per/blob/main/README.md#known-issues-and-limitations):
+path migration is still not supported, so upgrading means installing a new
+tarball.
 
 ## [0.2.0] — 2026-10-07
 

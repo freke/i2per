@@ -89,7 +89,7 @@ Every wire format implemented by the router must be documented in both places:
 2. [Protocol Reference](protocol.md) gives the wire-format table and a Mermaid
    `packet` or `sequenceDiagram` for the message flow.
 
-The protocol reference describes only the formats implemented in the 0.2.0
+The protocol reference describes only the formats implemented in the 0.2.1
 release. Unsupported formats and explicit limitations belong in the release
 documentation; they must not be presented as implemented behavior.
 
