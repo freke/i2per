@@ -112,7 +112,9 @@ release candidate is the same release before the version was final.
   prefer UDP (#75YRPJ7).
 - The RouterInfo expiry horizon slides with store size (#RA5PVR1); the
   closest-peer lookup no longer rehashes per comparison (#8YGZFB8); the
-  floodfill lookup walks an index instead of scanning (#13EY2MQ).
+  floodfill lookup no longer hashes per candidate, via a day-tagged routing-key
+  memo (#8YGZFB8). The floodfill-only index and the sort over the floodfill set
+  are still to come (#13EY2MQ).
 
 ### Known issues
 
