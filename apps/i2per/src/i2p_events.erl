@@ -239,6 +239,16 @@ way because `gen_event:start_link/2`'s `spawn_opt` is the same route the
 removed heap bound took.
 """.
 -spec start_link() -> {ok, pid()} | {error, term()}.
+%% dialyzer: nowarn because proc_lib:start_spawn_option() has no
+%% {async_dist, boolean()} entry even though the BIFs accept it and the flag
+%% demonstrably lands (verified: process_flag(async_dist, false) in the
+%% spawned process reads back true). An OTP types gap, not a bad call.
+-dialyzer({nowarn_function, start_link/0}).
+%% start_sampler/0 inherits a poisoned success typing from the same type gap:
+%% with start_link/0's Ok path invisible to dialyzer, a caller of it looks
+%% unreachable. Knock-on of the same causes as above, not dead code — the
+%% sampler is what reports the backlog (#VH7Z0KJ).
+-dialyzer({nowarn_function, start_sampler/0}).
 start_link() ->
     case gen_event:start_link({local, ?MODULE}, [{spawn_opt, [{async_dist, true}]}]) of
         {ok, Pid} ->
