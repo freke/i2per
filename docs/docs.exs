@@ -5,7 +5,7 @@
 # standalone `i2per_status` web service). Consumed by `scripts/gen-docs.sh`;
 # run via `just doc`.
 #
-#   ex_doc i2per 0.2.0 _build/default/lib/i2per/ebin \
+#   ex_doc i2per 0.2.1 _build/default/lib/i2per/ebin \
 #     _build/default/lib/i2per_status/ebin \
 #     --proglang erlang --config docs/docs.exs --output doc
 
