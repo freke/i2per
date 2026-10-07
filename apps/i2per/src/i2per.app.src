@@ -1,6 +1,6 @@
 {application, i2per,
  [{description, "Erlang I2P router"},
-  {vsn, "0.2.0"},
+  {vsn, "0.2.1"},
   {registered, []},
   {mod, {i2per_app, []}},
   %% `telemetry` is listed, and it has to be: `f:i2p_events:sample_backlog/0`

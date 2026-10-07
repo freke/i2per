@@ -1,6 +1,6 @@
 # Protocol Reference
 
-This document describes the I2P wire formats implemented by i2per 0.2.0.
+This document describes the I2P wire formats implemented by i2per 0.2.1.
 Unsupported formats and release limitations are listed explicitly.
 
 All multi-byte integers in I2P are big-endian unless otherwise noted. Ed25519
@@ -12,11 +12,12 @@ in the [I2P documentation](https://i2p.net/en/docs/).
 
 ## Release boundaries
 
-The 0.2.0 release does not implement NTCP1, SSU1, I2CP, the legacy
+The 0.2.1 release does not implement NTCP1, SSU1, I2CP, the legacy
 ElGamal/AES garlic formats, Datagram2, or a TUN interface. SSU2 path migration,
 RTT-based congestion control, automatic Charlie selection for PeerTest, and
 the complete firewalled HolePunch path are also outside this release. The
-sections below describe only behavior that is present in 0.2.0.
+sections below describe only behavior that is present in 0.2.1. 0.2.1 is a
+patch release over 0.2.0 and changes no wire format.
 
 ## Implemented
 
