@@ -64,7 +64,10 @@ source_tree_digest() {
 
 source_dirty() {
     local status
-    if command -v jj >/dev/null 2>&1; then
+    # `jj` may be installed while the checkout is git-only -- the devenv shell
+    # has it either way. So the branch is taken on `jj root` succeeding, not
+    # on the binary being findable, or a git repo dies with "no jj repo".
+    if command -v jj >/dev/null 2>&1 && jj root >/dev/null 2>&1; then
         if ! status="$(jj status --no-pager)"; then
             echo "error: could not inspect the jj working copy" >&2
             return 2
@@ -84,7 +87,7 @@ source_dirty() {
 
 source_commit_id() {
     local commit rev jj_state
-    if command -v jj >/dev/null 2>&1; then
+    if command -v jj >/dev/null 2>&1 && jj root >/dev/null 2>&1; then
         jj_state="$(jj log -r @ --no-graph --no-pager -T 'if(empty, "empty", "nonempty")')" || return 1
         case "$jj_state" in
             empty) rev=@- ;;
