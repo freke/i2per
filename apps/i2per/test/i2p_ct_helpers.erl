@@ -24,6 +24,7 @@
     free_port/0,
     serve_su3/1,
     stop_su3_server/1,
+    reseed_zip/1,
     stop_app/0,
     await/1,
     await/2,
@@ -179,6 +180,35 @@ serve_su3_loop(Listen, Su3) ->
             %% The case closed the listen socket in teardown.
             ok
     end.
+
+%% The zip a reseed bundle's payload is: one `routerInfo-<hash>.dat` entry per
+%% RouterInfo, which is what the [reseed spec] says a mirror serves.
+%%
+%% **The name is I2P Base64, not the raw hash bytes.** Three suites built their
+%% own copy of this and all three spelled the hash as `binary_to_list/1`, which is
+%% 32 arbitrary bytes rather than the spec's alphabet. The difference is not
+%% cosmetic: `A-Za-z0-9-~` contains no `/`, and `m:i2p_reseed`'s entry-name filter
+%% used `filename:extension/1`, which reads `/` as a directory separator. So a raw
+%% hash ending in byte 47 produced the name `routerInfo-....dat`, the filter
+%% answered `<<>>`, and the RouterInfo was dropped with nothing logged -- once in
+%% roughly 128 runs, which `#Q6NKB9P` found as a red gate one run in seventeen. The
+%% fixture now names entries the way a real bundle does, and the filter no longer
+%% depends on it.
+%%
+%% [reseed spec]: https://geti2p.net/en/docs/spec/updates
+-spec reseed_zip([i2p_router_info:router_info()]) -> binary().
+reseed_zip(Ris) ->
+    %% Entry names are strings: OTP 28's zip rejects binary names with einval.
+    Entries = [
+        {
+            "routerInfo-" ++ binary_to_list(i2p_keys:encode_b64(i2p_router_info:hash(RI))) ++
+                ".dat",
+            i2p_router_info:to_binary(RI)
+        }
+     || RI <- Ris
+    ],
+    {ok, {_ArchiveName, ZipBin}} = zip:create("i2pseeds.zip", Entries, [memory]),
+    ZipBin.
 
 %% Close the listen socket (ending the accept loop) and reap the server.
 -spec stop_su3_server({pid(), gen_tcp:socket()}) -> ok.

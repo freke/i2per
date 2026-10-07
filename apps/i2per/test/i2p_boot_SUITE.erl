@@ -1256,15 +1256,9 @@ test_keypair() ->
 
 sign_ris(Ris) ->
     {Priv, _Cert} = test_keypair(),
-    Entries = [
-        {
-            "routerInfo-" ++ binary_to_list(i2p_router_info:hash(RI)) ++ ".dat",
-            i2p_router_info:to_binary(RI)
-        }
-     || RI <- Ris
-    ],
-    {ok, {_Name, ZipBin}} = zip:create("i2pseeds.zip", Entries, [memory]),
-    i2p_su3:encode(<<"1789000000">>, <<"test-signer">>, ZipBin, Priv).
+    i2p_su3:encode(
+        <<"1789000000">>, <<"test-signer">>, i2p_ct_helpers:reseed_zip(Ris), Priv
+    ).
 
 reseed_url(Port) ->
     lists:flatten(io_lib:format("http://127.0.0.1:~b/", [Port])).

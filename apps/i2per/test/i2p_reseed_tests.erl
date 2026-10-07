@@ -130,6 +130,96 @@ real_live_su3_bundle() ->
     ?assertEqual(75, length(Ris)).
 
 %% --------------------------------------------------------------------------
+%% Entry names
+%% --------------------------------------------------------------------------
+
+%% #Q6NKB9P. The entry-name filter asked `filename:extension/1`, which reads `/`
+%% as a directory separator -- so an entry named `routerInfo-<31 bytes>/.dat`
+%% reported no extension, the filter said no, and the RouterInfo behind it was
+%% dropped. Silently, because the filter was a comprehension clause: a bundle of
+%% two came back as one, the NetDb stayed a router short, and nothing anywhere
+%% said so. Observed once in roughly 128 reseeds from the three suites that built
+%% their entry names out of raw hash bytes rather than the spec's Base64.
+entry_name_with_a_slash_is_still_taken_test_() ->
+    {timeout, 60, fun entry_name_with_a_slash_is_still_taken/0}.
+
+entry_name_with_a_slash_is_still_taken() ->
+    RI = router_info(4707),
+    Hash = i2p_router_info:hash(RI),
+    %% The last hash byte replaced by a `/`, so the name ends `/.dat` exactly as
+    %% the fixtures' raw-byte names did one time in 256.
+    Name = "routerInfo-" ++ binary_to_list(binary:part(Hash, 0, 31)) ++ "/.dat",
+    ?assertEqual(<<>>, filename:extension(list_to_binary(Name))),
+    Su3 = sign_named([{Name, i2p_router_info:to_binary(RI)}]),
+    ?assertMatch({ok, [RI]}, i2p_reseed:process(Su3, trust())).
+
+%% A name is a name: `routerInfo-<hash>.dat` with anything in between, and the
+%% `.dat` suffix matched wherever it falls.
+entry_name_matching_is_not_a_path_query_test_() ->
+    {timeout, 60, fun entry_name_matching_is_not_a_path_query/0}.
+
+entry_name_matching_is_not_a_path_query() ->
+    RI = router_info(4708),
+    Hash = i2p_router_info:hash(RI),
+    Taken = [
+        {"routerInfo-" ++ binary_to_list(Hash) ++ ".dat", i2p_router_info:to_binary(RI)},
+        {"routerInfo-" ++ binary_to_list(Hash) ++ "/sub.dat", i2p_router_info:to_binary(RI)},
+        {"routerInfo-.dat", i2p_router_info:to_binary(RI)}
+    ],
+    NotTaken = [
+        {"routerInfo-" ++ binary_to_list(Hash), i2p_router_info:to_binary(RI)},
+        {"routerInfo-" ++ binary_to_list(Hash) ++ ".dat.bak", i2p_router_info:to_binary(RI)},
+        {"leaset-" ++ binary_to_list(Hash) ++ ".dat", i2p_router_info:to_binary(RI)},
+        {"README", i2p_router_info:to_binary(RI)}
+    ],
+    {ok, Ris} = i2p_reseed:process(sign_named(Taken), trust()),
+    ?assertEqual(3, length(Ris)),
+    %% Nothing left, so the bundle is refused rather than half-accepted: the
+    %% name filter is what decides this, and it decides all four.
+    ?assertEqual({error, no_router_infos}, i2p_reseed:process(sign_named(NotTaken), trust())).
+
+%% An entry this module cannot take is recorded, not dropped. `reseed_failed`
+%% covers the bundle; nothing covered the entries, which is how a NetDb ended up
+%% one router short with every other line saying the reseed had worked.
+skipped_entries_are_recorded_test_() ->
+    {timeout, 60, fun skipped_entries_are_recorded/0}.
+
+skipped_entries_are_recorded() ->
+    Good = router_info(4709),
+    %% Two entries this module will not take: one whose name is not one it
+    %% recognises, and one whose name is fine but whose bytes are not a
+    %% RouterInfo.
+    Names = [
+        {"README", <<"not a router info">>},
+        {"routerInfo-broken.dat", <<"not a router info either">>}
+    ],
+    Entries = [{"routerInfo-good.dat", i2p_router_info:to_binary(Good)} | Names],
+    Events = i2p_ct_helpers:log_events_from(
+        fun() ->
+            {ok, [Good]} = i2p_reseed:process(sign_named(Entries), trust())
+        end
+    ),
+    Lines = [i2p_ct_helpers:render_log_event(E) || E <- Events],
+    %% **Both reasons, and both at `warning`.** The checklist row says
+    %% `warning`, and this is the assertion that the row and the call site
+    %% agree -- text alone would pass for the same line recorded at any level.
+    Skipped = [E || #{msg := {Format, Args}} = E <- Events, is_skip(Format, Args)],
+    ?assertEqual(2, length(Skipped)),
+    lists:foreach(fun(#{level := L}) -> ?assertEqual(warning, L) end, Skipped),
+    ?assert(lists:any(fun(L) -> string:find(L, "README") =/= nomatch end, Lines)),
+    ?assert(
+        lists:any(fun(L) -> string:find(L, "routerInfo-broken.dat") =/= nomatch end, Lines)
+    ).
+
+%% The one line this module writes about an entry it did not take. Matched on
+%% the reason argument so the two entries above cannot both be counted by one
+%% line.
+is_skip("reseed bundle entry ~0p skipped: ~0p", [_Name, Reason]) ->
+    Reason =/= undefined;
+is_skip(_, _) ->
+    false.
+
+%% --------------------------------------------------------------------------
 %% Fixtures
 %% --------------------------------------------------------------------------
 
@@ -145,6 +235,14 @@ sign(Ris) ->
     {Priv, _Cert} = keypair(),
     Zip = zip_ris(Ris),
     i2p_su3:encode(<<"1789000000">>, <<"test-signer">>, Zip, Priv).
+
+%% A bundle whose entry names are chosen here rather than by `f:zip_ris/1`, for
+%% the cases that are about the names. Entry names are strings: OTP 28's zip
+%% rejects binary names with einval.
+sign_named(Entries) ->
+    {Priv, _Cert} = keypair(),
+    {ok, {_Name, ZipBin}} = zip:create("i2pseeds.zip", Entries, [memory]),
+    i2p_su3:encode(<<"1789000000">>, <<"test-signer">>, ZipBin, Priv).
 
 su3_with_content_type(ContentType) ->
     {Priv, _Cert} = keypair(),
@@ -181,16 +279,7 @@ su3_with_content_type(ContentType) ->
     <<Signed/binary, Signature/binary>>.
 
 zip_ris(Ris) ->
-    %% Entry names are strings: OTP 28's zip rejects binary names with einval.
-    Entries = [
-        {
-            "routerInfo-" ++ binary_to_list(i2p_router_info:hash(RI)) ++ ".dat",
-            i2p_router_info:to_binary(RI)
-        }
-     || RI <- Ris
-    ],
-    {ok, {_ArchiveName, ZipBin}} = zip:create("i2pseeds.zip", Entries, [memory]),
-    ZipBin.
+    i2p_ct_helpers:reseed_zip(Ris).
 
 router_info(Port) ->
     {StaticPub, _StaticPriv} = i2p_crypto:x25519_keygen(),
