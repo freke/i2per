@@ -112,6 +112,7 @@ i2p_peer:stop().
     publish/1,
     publish_floodfills/0,
     advertise_introducers/1,
+    relay_introducers/0,
     send_when_ready/2,
     status/0,
     dialed/0,
@@ -181,6 +182,13 @@ i2p_peer:stop().
 %% Overridable via app env `i2per` -> `floodfill_discovery_delay_ms` (0 in
 %% tests to run it synchronously after init).
 -define(FLOODFILL_DISCOVERY_KICK_MS, 1500).
+
+%% The periodic re-test interval of the peer-test policy: every newly
+%% established SSU2 session is tested on connect, and this timer draws a fresh
+%% Bob from connected peers between connects — on-connect alone is
+%% structurally blind to a rebinding NAT changing our reachability with no new
+%% connection. App env `peertest_interval_ms` overrides.
+-define(PEERTEST_INTERVAL_MS, 900000).
 
 -doc """
 The router's local identity keys, shared between the managers. Carried by the
@@ -265,6 +273,19 @@ Output: `ok` — the swap and re-announce are queued.
 -spec advertise_introducers([i2p_router_info:introducer()]) -> ok.
 advertise_introducers(Introducers) ->
     gen_server:cast(?MODULE, {advertise_introducers, Introducers}).
+
+-doc """
+The introducers this router can rely on, for a firewalled-mode address swap.
+
+Input: none. Output: up to three `t:i2p_router_info:introducer/0` entries drawn
+from the relay tags peers have issued to us on live SSU2 sessions — each an
+introducer's router hash and the tag we hold with it. Empty until the relay
+machinery issues tags; a swap without introducers would publish an address
+nobody can reach us through, so the caller holds off on an empty answer.
+""".
+-spec relay_introducers() -> [i2p_router_info:introducer()].
+relay_introducers() ->
+    gen_server:call(?MODULE, relay_introducers).
 
 -doc """
 Inspect the peer manager.
@@ -387,6 +408,15 @@ init([Local, Seeds]) ->
         our_hash => i2p_router_info:hash(maps:get(ri, Local)),
         refresh_ref => RefreshRef,
         discovery_kick_ref => KickRef,
+        %% The peer-test policy's periodic re-test: armed at boot like the
+        %% sweep and refresh timers, drawing a fresh Bob from connected SSU2
+        %% peers each time it fires.
+        peertest_ref => erlang:send_after(peertest_interval_ms(), self(), peertest),
+        %% Relay tags peers have issued to us on live SSU2 sessions — the
+        %% introducers a firewalled-mode address swap is built from. Tags are
+        %% ours to track even when no coordinator is enabled: the block is on
+        %% this process's dispatch either way.
+        relay_tags => #{},
         sweep_ref => erlang:send_after(?SWEEP_INTERVAL_SECONDS * 1000, self(), sweep)
     }}.
 
@@ -409,6 +439,8 @@ handle_call(status, _From, State) ->
     {reply, Summary, State};
 handle_call(dialed, _From, State) ->
     {reply, map_size(maps:get(inbound, State, #{})), State};
+handle_call(relay_introducers, _From, State) ->
+    {reply, relay_introducers(maps:get(relay_tags, State, #{})), State};
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 
@@ -455,6 +487,7 @@ handle_cast(stop, State) ->
     #{peers := Peers} = State,
     _ = cancel_timer(maps:find(refresh_ref, State)),
     _ = cancel_timer(maps:find(discovery_kick_ref, State)),
+    _ = cancel_timer(maps:find(peertest_ref, State)),
     _ = cancel_timer(maps:find(sweep_ref, State)),
     lists:foreach(
         fun({_Hash, PeerState}) ->
@@ -537,6 +570,8 @@ handle_info(sweep, State) ->
     State1 = sweep(State),
     Ref = erlang:send_after(?SWEEP_INTERVAL_SECONDS * 1000, self(), sweep),
     {noreply, State1#{sweep_ref := Ref}};
+handle_info(peertest, State) ->
+    {noreply, periodic_peertest(State)};
 handle_info(_Msg, State) ->
     {noreply, State}.
 
@@ -695,15 +730,17 @@ handle_ssu2_ready(ConnPid, State) ->
             State2 = send_pending(ConnPid, ssu2, PeerHash, State1),
             State3 = send_pending_sends(ConnPid, ssu2, PeerHash, State2),
             Local = maps:get(local, State3),
-            case maps:get(ff_publish, PeerState, false) of
-                true ->
-                    State4 = clear_ff_publish(PeerHash, State3),
-                    send_our_router_info(ConnPid, ssu2, Local, floodfill),
-                    State4;
-                false ->
-                    send_our_router_info(ConnPid, ssu2, Local, plain),
-                    State3
-            end;
+            State4 =
+                case maps:get(ff_publish, PeerState, false) of
+                    true ->
+                        State3b = clear_ff_publish(PeerHash, State3),
+                        send_our_router_info(ConnPid, ssu2, Local, floodfill),
+                        State3b;
+                    false ->
+                        send_our_router_info(ConnPid, ssu2, Local, plain),
+                        State3
+                end,
+            maybe_initiate_peertest(ssu2, ConnPid, PeerHash, State4);
         not_found ->
             stop_conn(ConnPid),
             State
@@ -723,21 +760,183 @@ handle_ssu2_ready(ConnPid, State) ->
 %% default), nothing is forwarded and every non-I2NP shape is unhandled, which
 %% is the state `i2p_peer_block_flood_tests` pins.
 handle_ssu2_data(ConnPid, Blocks, State) ->
-    {Messages, Rest} = lists:partition(fun is_i2np_block/1, Blocks),
+    {Messages, Rest0} = lists:partition(fun is_i2np_block/1, Blocks),
+    {State1, Rest} = store_relay_tags(ConnPid, Rest0, State),
     Framed = [
         #{type => 3, data => <<Type:8, MsgId:32, ShortExp:32, Body/binary>>}
      || {i2np, Type, MsgId, ShortExp, Body} <- Messages
     ],
-    State1 = lists:foldl(
+    State2 = lists:foldl(
         fun(Block, AccState) -> handle_block(ConnPid, ssu2, Block, AccState) end,
-        State,
+        State1,
         Framed
     ),
-    Unhandled = forward_coord_blocks(ConnPid, Rest, State1),
-    note_unhandled_ssu2_blocks(ConnPid, Unhandled, State1).
+    Unhandled = forward_coord_blocks(ConnPid, Rest, State2),
+    note_unhandled_ssu2_blocks(ConnPid, Unhandled, State2).
 
 is_i2np_block({i2np, _, _, _, _}) -> true;
 is_i2np_block(_) -> false.
+
+%% Record the relay tags a peer issued to us, keyed by tag with the peer's
+%% router hash, so a firewalled-mode address swap can name them as its
+%% introducers. Tags are stored whether or not a coordinator is enabled — the
+%% tag is ours on either path — and storing one removes the block from the
+%% stream the caller counts and announces: the tag is claimed here, not an
+%% anomaly. A block whose owner this process cannot name stays in the stream —
+%% a tag it cannot attribute is exactly what the unhandled announce is for.
+store_relay_tags(ConnPid, Blocks, State) ->
+    case conn_peer_hash(ConnPid, State) of
+        {Hash, _PeerState} ->
+            {Tags, Rest} = lists:partition(fun is_relay_tag_block/1, Blocks),
+            TagMap = store_tags(Hash, Tags, maps:get(relay_tags, State, #{})),
+            {State#{relay_tags => TagMap}, Rest};
+        not_found ->
+            {State, Blocks}
+    end.
+
+is_relay_tag_block({relay_tag, _}) -> true;
+is_relay_tag_block(_) -> false.
+
+store_tags(_Hash, [], TagMap) ->
+    TagMap;
+store_tags(Hash, [{relay_tag, Tag} | Rest], TagMap) ->
+    store_tags(Hash, Rest, TagMap#{Tag => Hash}).
+
+%% Drop every tag a peer issued us — called when one of its sessions dies, so
+%% the introducer list stops naming a peer that cannot relay.
+drop_relay_tags(Hash, State) ->
+    TagMap = maps:get(relay_tags, State, #{}),
+    State#{relay_tags => maps:filter(fun(_Tag, H) -> H =/= Hash end, TagMap)}.
+
+%% The introducers a firewalled-mode address swap is built from: the relay tags
+%% peers have issued us, as up to three `t:i2p_router_info:introducer/0`
+%% entries. No expiry is carried in the block, so none is asserted here.
+relay_introducers(TagMap) ->
+    [
+        #{hash => Hash, tag => Tag}
+     || {Tag, Hash} <- lists:sublist(maps:to_list(TagMap), 3)
+    ].
+
+%% ----------------------------------------------------------------------
+%% Peer-test policy
+
+%% The policy, applied at the point a session becomes ready: on every newly
+%% established SSU2 session, run a test round as Alice through that peer (the
+%% fresh Bob), so the router measures whether a Charlie can reach it at its
+%% asserted endpoint — unsolicited inbound, which is what makes being selected
+%% as a Charlie worth anything. `allow_private_host` is the short-circuit: the
+%% operator asserted inbound is impossible, so no test runs and the verdict
+%% stays pinned. NTCP2 sessions carry no peer-test block, so theirs are not
+%% tested here.
+maybe_initiate_peertest(ssu2, ConnPid, PeerHash, State) ->
+    case i2p_identity:allow_private_host() of
+        true ->
+            State;
+        false ->
+            case asserted_endpoint(State) of
+                {ok, {Port, Ip}} ->
+                    i2p_ssu2_conn:initiate_peertest(ConnPid, PeerHash, Port, Ip),
+                    announce_test_started(Ip),
+                    State;
+                error ->
+                    State
+            end
+    end;
+maybe_initiate_peertest(_Transport, _ConnPid, _PeerHash, State) ->
+    State.
+
+%% The endpoint the test asserts reachable: our published SSU2 address — the
+%% address the network was told, which is what a Charlie dials. Read from the
+%% stored published address rather than the current RouterInfo, so the periodic
+%% re-test measures the real address even while a firewalled-mode swap has
+%% replaced the published one with the non-published form (no host/port).
+asserted_endpoint(State) ->
+    Local = maps:get(local, State, #{}),
+    case maps:get(ssu2_addr, Local, undefined) of
+        undefined ->
+            error;
+        Addr ->
+            Options = maps:get(options, Addr, #{}),
+            Host = maps:get(<<"host">>, Options, undefined),
+            Port = maps:get(<<"port">>, Options, undefined),
+            case {Host, Port} of
+                {undefined, _} -> error;
+                {_, undefined} -> error;
+                _ -> parse_asserted(Host, Port)
+            end
+    end.
+
+parse_asserted(Host, PortStr) ->
+    case inet:parse_address(binary_to_list(Host)) of
+        {ok, Ip} -> {ok, {binary_to_integer(PortStr), i2p_ssu2_conn:ip_bin(Ip)}};
+        {error, _} -> error
+    end.
+
+%% Tell the reachability manager a test went in flight, so the family's rung
+%% reads `testing` until the result lands. Announce-shaped: an absent manager
+%% is a skip rather than a raise.
+announce_test_started(Ip) ->
+    AddrType =
+        case byte_size(i2p_ssu2_conn:ip_bin(ip_tuple(Ip))) of
+            4 -> ipv4;
+            _ -> ipv6
+        end,
+    i2p_ssu2_reachability:test_started(AddrType).
+
+ip_tuple(Ip) when byte_size(Ip) =:= 4 ->
+    <<A, B, C, D>> = Ip,
+    {A, B, C, D};
+ip_tuple(Ip) when byte_size(Ip) =:= 16 ->
+    <<A:16, B:16, C:16, D:16, E:16, F:16, G:16, H:16>> = Ip,
+    {A, B, C, D, E, F, G, H}.
+
+%% The periodic re-test: re-arm first (a skipped round must not stop the
+%% policy), then draw a fresh Bob and run the round through it. The same
+%% short-circuit as the on-connect trigger.
+periodic_peertest(State) ->
+    State1 = arm_peertest(State),
+    case i2p_identity:allow_private_host() of
+        true ->
+            State1;
+        false ->
+            case {draw_fresh_bob(State1), asserted_endpoint(State1)} of
+                {undefined, _} ->
+                    State1;
+                {_, error} ->
+                    State1;
+                {{ConnPid, PeerHash}, {ok, {Port, Ip}}} ->
+                    i2p_ssu2_conn:initiate_peertest(ConnPid, PeerHash, Port, Ip),
+                    announce_test_started(Ip),
+                    State1
+            end
+    end.
+
+arm_peertest(State) ->
+    _ = cancel_timer(maps:find(peertest_ref, State)),
+    State#{peertest_ref => erlang:send_after(peertest_interval_ms(), self(), peertest)}.
+
+%% A fresh Bob for a re-test: drawn from the connected SSU2 peers, so no single
+%% peer's answer becomes a global conclusion. No connected SSU2 peer, no test —
+%% there is nobody to relay it.
+draw_fresh_bob(State) ->
+    Outbound = [
+        {maps:get(conn, PeerState), Hash}
+     || {Hash, PeerState} <- maps:to_list(maps:get(peers, State, #{})),
+        maps:get(transport, PeerState, ntcp2) =:= ssu2,
+        maps:get(status, PeerState) =:= connected
+    ],
+    Inbound = [
+        {ConnPid, Hash}
+     || {ConnPid, {Hash, _, ssu2}} <- maps:to_list(maps:get(inbound, State, #{}))
+    ],
+    Candidates = Outbound ++ Inbound,
+    case Candidates of
+        [] -> undefined;
+        _ -> lists:nth(rand:uniform(length(Candidates)), Candidates)
+    end.
+
+peertest_interval_ms() ->
+    application:get_env(i2per, peertest_interval_ms, ?PEERTEST_INTERVAL_MS).
 
 %% Split the non-I2NP shapes by the coordinator that routes them and forward
 %% each set; the shapes no enabled coordinator claims come back as the
@@ -894,14 +1093,19 @@ handle_conn_down_by_pid(ConnPid, State) ->
     case find_conn_peer(ConnPid, State) of
         {PeerHash, _PeerState} ->
             i2p_events:notify({peer_disconnected, PeerHash}),
-            {State1, _Backoff} = enter_backoff(PeerHash, State),
+            %% The tags this peer issued us rode on the session that just died,
+            %% and an introducer without a live session cannot relay, so they
+            %% are stale the moment the session is gone.
+            State0 = drop_relay_tags(PeerHash, State),
+            {State1, _Backoff} = enter_backoff(PeerHash, State0),
             State1;
         not_found ->
             case inbound_conn_by_pid(ConnPid, State) of
                 {ok, Hash} ->
                     i2p_events:notify({peer_disconnected, Hash}),
-                    Inbound = maps:remove(ConnPid, maps:get(inbound, State, #{})),
-                    State#{inbound := Inbound};
+                    State0 = drop_relay_tags(Hash, State),
+                    Inbound = maps:remove(ConnPid, maps:get(inbound, State0, #{})),
+                    State0#{inbound := Inbound};
                 error ->
                     State
             end
@@ -1010,7 +1214,7 @@ handle_inbound_ready(ConnPid, RemoteRI, Transport, State) ->
     forward_inbound_ready(ConnPid, RemoteRI, Transport, State3),
     send_our_router_info(ConnPid, Transport, maps:get(local, State3), plain),
     i2p_events:notify({peer_connected, Hash}),
-    State3.
+    maybe_initiate_peertest(Transport, ConnPid, Hash, State3).
 
 %% An inbound SSU2 session announced ready. Its RemoteRI is the requester's
 %% RouterInfo — what `m:i2p_relay_coord` serves a RelayRequest with — so it is

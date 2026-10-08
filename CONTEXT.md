@@ -43,17 +43,17 @@ Reachability is a ladder, not a boolean:
 - **unknown** — not yet determined
 - **testing** — a test is in flight
 - **unreachable** — no path reaches this router
-- **introducer-only** — a Charlie completes the hole punch and the session, but
+- **introducer_only** — a Charlie completes the hole punch and the session, but
   unsolicited inbound never arrives, so a Charlie is always needed
 - **reachable** — unsolicited inbound arrives
 
 It is reported with a separate **reason**, naming where the chain broke:
-**own-config** (the operator asserted inbound is impossible, so no test ran) ·
-**clock-skew** (the peer's signed timestamp disagrees with ours) ·
-**no-charlie-report** (the Charlie never confirmed the test arrived) ·
-**punch-not-delivered** (it did confirm, but the unsolicited punch never came) ·
-**punch-delivered-no-session** (punch arrived, no session request followed) ·
-**session-incomplete** (both happened, the session never established).
+**own_config** (the operator asserted inbound is impossible, so no test ran) ·
+**clock_skew** (the peer's signed timestamp disagrees with ours) ·
+**no_charlie_report** (the Charlie never confirmed the test arrived) ·
+**punch_not_delivered** (it did confirm, but the unsolicited punch never came) ·
+**punch_delivered_no_session** (punch arrived, no session request followed) ·
+**session_incomplete** (both happened, the session never established).
 
 The reasons exist because the distinction is what makes a failure diagnosable.
 *Punch-not-delivered* is the important one: a stateful firewall usually permits
