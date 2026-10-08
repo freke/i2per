@@ -73,6 +73,50 @@ unknown_and_non_atom_key_test() ->
         i2p_config_srv:handle_call({set, <<"k">>, 1}, from(), #{})
     ).
 
+%% The two coordinator keys: booleans, applied immediately, and the relay one
+%% gated on `live_network`. Asserted in the no-identity boot this module runs
+%% in, which is exactly the boot where the apply path refuses rather than
+%% starts -- there is no RouterInfo to route with. The `false` half of the
+%% switch (hot stop) is the CT suite's, because stopping goes through
+%% `m:i2per_sup`, which this module's plain-module invocation has none of.
+coordinator_keys_test() ->
+    %% A non-boolean value is a bad value for both keys.
+    ?assertEqual(
+        {reply, {error, {bad_value, relay_coord, <<"yes">>}}, #{}},
+        i2p_config_srv:handle_call({set, relay_coord, <<"yes">>}, from(), #{})
+    ),
+    ?assertEqual(
+        {reply, {error, {bad_value, peertest_coord, 1}}, #{}},
+        i2p_config_srv:handle_call({set, peertest_coord, 1}, from(), #{})
+    ),
+    %% `relay_coord = true` additionally requires `live_network` -- refused at
+    %% the door, before the apply path is reached, and nothing is stored.
+    ok = application:unset_env(i2per, relay_coord),
+    ok = application:unset_env(i2per, live_network),
+    ?assertEqual(
+        {reply, {error, {requires_live_network, relay_coord}}, #{}},
+        i2p_config_srv:handle_call({set, relay_coord, true}, from(), #{})
+    ),
+    ?assertEqual(undefined, application:get_env(i2per, relay_coord)),
+    %% With `live_network`, the value validates -- and the apply path refuses
+    %% rather than starts, because this boot carries no identity.
+    ok = application:set_env(i2per, live_network, true),
+    try
+        ?assertEqual(
+            {reply, {error, no_identity}, #{}},
+            i2p_config_srv:handle_call({set, relay_coord, true}, from(), #{})
+        ),
+        ?assertEqual(undefined, application:get_env(i2per, relay_coord)),
+        %% The peer-test coordinator has no `live_network` requirement; the same
+        %% no-identity refusal is what it hits.
+        ?assertEqual(
+            {reply, {error, no_identity}, #{}},
+            i2p_config_srv:handle_call({set, peertest_coord, true}, from(), #{})
+        )
+    after
+        application:unset_env(i2per, live_network)
+    end.
+
 valid_values_test() ->
     %% Hot keys are applied and acknowledged ok; restart-required keys are
     %% acknowledged as pending. Both run through validate.
