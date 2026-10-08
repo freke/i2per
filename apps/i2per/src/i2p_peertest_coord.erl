@@ -22,6 +22,19 @@ instead of auto-rejected.
 
 Out-of-session messages 5, 6 and 7 are handled directly by the Alice and
 Charlie SSU2 sessions — the coordinator does not participate in them.
+
+## Two start shapes
+
+`f:start_link/1` binds the coordinator's own SSU2 listener as both its owner
+and `peer_test_coordinator` — the standalone Bob shape the tests own.
+`f:start_attach/1` starts it with no listener of its own — the shape
+`m:i2per_sup` starts it in, when app env `i2per` -> `peertest_coord` is
+enabled (defaulting off): the sessions it routes between are the ones the
+router's own SSU2 listener spawned, owned by `m:i2p_peer`, and their
+peer-test and RouterInfo blocks reach this process forwarded by the peer
+manager. Until a Charlie session is dialed (`f:dial_charlie/3`) an in-session
+message 1 is held, not answered: routing it is the Charlie-selection work,
+which is not this release's.
 """.
 
 -behaviour(gen_server).
@@ -29,13 +42,30 @@ Charlie SSU2 sessions — the coordinator does not participate in them.
 %% API
 -export([
     start_link/1,
+    start_attach/1,
     port/1,
     dial_charlie/3,
     charlie_sess/1,
     stop/1
 ]).
 %% gen_server
--export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
+-export([enabled/0, init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
+
+-doc """
+Whether the coordinator is enabled.
+
+App env `i2per` -> `peertest_coord` is `true`. Unlike `f:i2p_relay_coord:enabled/0`
+there is no `live_network` requirement: the resolved decision on the peer-test
+policy gates this coordinator on its own key alone. Read from the application
+environment rather than asked of a process, so boot, supervisor restart, and a
+hot set all consult this one predicate.
+""".
+-spec enabled() -> boolean().
+enabled() ->
+    case application:get_env(i2per, peertest_coord) of
+        {ok, true} -> true;
+        _ -> false
+    end.
 
 -doc """
 Start a PeerTest relay coordinator for Bob.
@@ -48,8 +78,21 @@ intro-side SSU2 listener as both its owner and its `peer_test_coordinator`.
 start_link(BobLocal) ->
     gen_server:start_link(?MODULE, BobLocal, []).
 
+-doc """
+Start the coordinator attached to the running router's SSU2 sessions.
+
+`BobLocal` is as `f:start_link/1`. No listener is bound: the sessions this
+process routes between are the ones the router's own SSU2 listener spawned
+(owned by `m:i2p_peer`), and their peer-test and RouterInfo blocks reach it
+forwarded by the peer manager. This is the shape `m:i2per_sup` starts the
+coordinator in when app env `i2per` -> `peertest_coord` is enabled.
+""".
+-spec start_attach(map()) -> {ok, pid()}.
+start_attach(BobLocal) ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, {attach, BobLocal}, []).
+
 -doc "The introducer's bound SSU2 listener port.".
--spec port(pid()) -> 0..65535.
+-spec port(pid()) -> 0..65535 | {error, no_listener}.
 port(Coord) ->
     gen_server:call(Coord, port).
 
@@ -60,9 +103,11 @@ Input: `CharlieOpts` (SSU2 address options as
 `t:i2p_ssu2_conn:remote_opts/0`) and the decoded Charlie `RouterInfo` to
 relay to Alice before message 4 (its `ri` must be a `m:i2p_router_info` map).
 The SessionConfirmed routes Bob's own RouterInfo. Returns once the session is
-established.
+established. In attach mode the dial sends through the running router's SSU2
+listener, resolved by name; with no listener up the answer is
+`{error, no_listener}`.
 """.
--spec dial_charlie(pid(), map(), term()) -> ok.
+-spec dial_charlie(pid(), map(), term()) -> ok | {error, no_listener}.
 dial_charlie(Coord, CharlieOpts, CharlieRI) ->
     gen_server:call(Coord, {dial_charlie, CharlieOpts, CharlieRI}).
 
@@ -79,30 +124,41 @@ stop(Coord) ->
 %% ----------------------------------------------------------------------
 %% gen_server
 
+init({attach, BobLocal}) ->
+    {ok, routing_state(BobLocal)};
 init(BobLocal) ->
     {ok, Listener} =
         i2p_ssu2_listener:listen(<<"127.0.0.1">>, 0, BobLocal, self(), self()),
-    {ok, #{
-        listener => Listener,
+    {ok, (routing_state(BobLocal))#{listener => Listener}}.
+
+routing_state(BobLocal) ->
+    #{
         bob_local => BobLocal,
         alice_sess => undefined,
         charlie_sess => undefined,
         alice_hash => undefined,
         charlie_ri => undefined
-    }}.
+    }.
 
 handle_call(port, _From, State = #{listener := Listener}) ->
     {reply, i2p_ssu2_listener:port(Listener), State};
+handle_call(port, _From, State) ->
+    {reply, listener_port(State), State};
 handle_call(
     {dial_charlie, CharlieOpts, CharlieRI},
     _From,
-    State = #{bob_local := BobLocal, listener := Listener}
+    State = #{bob_local := BobLocal}
 ) ->
-    BobRIBlock = i2p_router_info:to_binary(maps:get(ri, BobLocal)),
-    {ok, CharlieSess, _Keys} =
-        i2p_ssu2_conn:connect(BobLocal, CharlieOpts, BobRIBlock, Listener),
-    erlang:unlink(CharlieSess),
-    {reply, ok, State#{charlie_sess => CharlieSess, charlie_ri => CharlieRI}};
+    case dial_listener(State) of
+        undefined ->
+            {reply, {error, no_listener}, State};
+        Listener ->
+            BobRIBlock = i2p_router_info:to_binary(maps:get(ri, BobLocal)),
+            {ok, CharlieSess, _Keys} =
+                i2p_ssu2_conn:connect(BobLocal, CharlieOpts, BobRIBlock, Listener),
+            erlang:unlink(CharlieSess),
+            {reply, ok, State#{charlie_sess => CharlieSess, charlie_ri => CharlieRI}}
+    end;
 handle_call(charlie_sess, _From, State) ->
     {reply, maps:get(charlie_sess, State), State};
 handle_call(_Other, _From, State) ->
@@ -113,12 +169,52 @@ handle_cast(_Other, State) ->
 
 handle_info({ssu2_data, Pid, Blocks}, State) ->
     {noreply, route_blocks(Pid, Blocks, State)};
+%% A session this process routes between died. A stale pid in the state would
+%% be cast to — a cast to a dead process is silently dropped, which is harmless
+%% here but leaves the state describing a session that is not there, and a
+%% later message 3 would be skipped against a session pid that can no longer
+%% answer. Clear the slots the dead session held.
+handle_info({ssu2_closed, Pid, _Reason}, State) ->
+    {noreply, forget_session(Pid, State)};
 handle_info(_Other, State) ->
     {noreply, State}.
 
 terminate(_Reason, #{listener := Listener}) ->
     catch i2p_ssu2_listener:stop(Listener),
+    ok;
+terminate(_Reason, _State) ->
     ok.
+
+%% Clear the routing slots a dead session held, so the state stops naming a
+%% session that is not there.
+forget_session(Pid, State = #{alice_sess := Alice, charlie_sess := Charlie}) ->
+    State#{
+        alice_sess => clear_if(Pid, Alice),
+        charlie_sess => clear_if(Pid, Charlie)
+    }.
+
+clear_if(Pid, Pid) -> undefined;
+clear_if(_Pid, Other) -> Other.
+
+%% The listener an outbound Charlie dial sends through. The standalone shape
+%% binds its own and holds it from init; attach mode sends through the running
+%% router's listener, resolved by name per use — a listener restart changes the
+%% pid and the registered name is the stable handle.
+dial_listener(#{listener := Listener}) ->
+    Listener;
+dial_listener(_State) ->
+    whereis(i2p_ssu2_listener).
+
+%% The port an operator asks for. The standalone shape's own listener in the
+%% first clause; the running router's listener in attach mode, where that is
+%% the port peers dial. No listener, no port to name.
+listener_port(#{listener := Listener}) ->
+    i2p_ssu2_listener:port(Listener);
+listener_port(_State) ->
+    case whereis(i2p_ssu2_listener) of
+        undefined -> {error, no_listener};
+        Listener -> i2p_ssu2_listener:port(Listener)
+    end.
 
 %% ----------------------------------------------------------------------
 %% Routing
@@ -165,10 +261,24 @@ relay_msg1_or_buffer(Code, Flags, Ver, Nonce, Ts, Port, Ip, Sig, State) ->
                 pending_msg1 => {peertest, 1, Code, Flags, <<0:256>>, Ver, Nonce, Ts, Port, Ip, Sig}
             };
         AliceHash ->
-            i2p_log:debug({coord_msg1, sent}, []),
-            Msg2 = {peertest, 2, Code, Flags, AliceHash, Ver, Nonce, Ts, Port, Ip, Sig},
-            i2p_ssu2_conn:send_peertest(maps:get(charlie_sess, State), Msg2),
-            State#{pending_msg1 => undefined}
+            case maps:get(charlie_sess, State) of
+                undefined ->
+                    %% No Charlie session yet (`f:dial_charlie/3` not called):
+                    %% hold the request until one is dialed, the same hold as
+                    %% above. In attach mode this is the ordinary state — the
+                    %% Charlie selection is the caller's work — and sending to
+                    %% no session at all would raise this process.
+                    i2p_log:debug({coord_msg1, buffered, no_charlie}, []),
+                    State#{
+                        pending_msg1 =>
+                            {peertest, 1, Code, Flags, <<0:256>>, Ver, Nonce, Ts, Port, Ip, Sig}
+                    };
+                CharlieSess ->
+                    i2p_log:debug({coord_msg1, sent}, []),
+                    Msg2 = {peertest, 2, Code, Flags, AliceHash, Ver, Nonce, Ts, Port, Ip, Sig},
+                    i2p_ssu2_conn:send_peertest(CharlieSess, Msg2),
+                    State#{pending_msg1 => undefined}
+            end
     end.
 
 learn_alice_hash(Blocks, State) ->
@@ -204,6 +314,11 @@ flush_pending_msg1(State) ->
             State
     end.
 
+forward_router_infos(_Blocks, undefined, State) ->
+    %% No Charlie session yet: there is nobody to forward a RouterInfo to, and
+    %% sending to no session at all would raise this process. The RouterInfo
+    %% blocks are still the ones that learn Alice's hash, handled above.
+    State;
 forward_router_infos(Blocks, Charlie, State) ->
     lists:foreach(
         fun

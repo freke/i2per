@@ -31,6 +31,19 @@ is the tagged peer being introduced; whichever sends a RelayRequest is the
 requester. One coordinator serves one tagged peer and one requester at a
 time, mirroring `m:i2p_peertest_coord`'s single-alice/single-charlie model.
 
+## Two start shapes
+
+`f:start_link/1` binds the coordinator's own SSU2 listener (the standalone
+Bob shape the tests own). `f:start_attach/1` starts it with no listener of
+its own — the shape `m:i2per_sup` starts it in, when app env `i2per` ->
+`relay_coord` is enabled (defaulting off, and additionally requiring
+`live_network`): the sessions it routes between are the ones the router's own
+SSU2 listener spawned, owned by `m:i2p_peer`, and their relay blocks reach
+this process forwarded by the peer manager. The relay-tag registry is the
+running listener's in both shapes; in attach mode it is resolved by name per
+use rather than held, because a listener restart changes the pid and the
+name is the stable handle.
+
 Relay-request signature verification and the out-of-session HolePunch path
 are not implemented in this release. The coordinator relays signed blocks
 unmodified.
@@ -41,12 +54,35 @@ unmodified.
 %% API
 -export([
     start_link/1,
+    start_attach/1,
     port/1,
     tagged_sess/1,
     stop/1
 ]).
 %% gen_server
--export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
+-export([enabled/0, init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
+
+-doc """
+Whether the coordinator is enabled.
+
+App env `i2per` -> `relay_coord` is `true` and additionally `live_network` is
+`true` — the resolved decision on the Charlie/introducer role, which gates the
+capability on the one "am I really on the network" switch. Read from the
+application environment rather than asked of a process, so the check is an ETS
+read on the forwarding path, and boot, supervisor restart, and a hot set all
+consult this one predicate.
+""".
+-spec enabled() -> boolean().
+enabled() ->
+    case application:get_env(i2per, relay_coord) of
+        {ok, true} ->
+            case application:get_env(i2per, live_network) of
+                {ok, true} -> true;
+                _ -> false
+            end;
+        _ ->
+            false
+    end.
 
 %% How long a handed-out relay tag stays valid (the tag is tied to the
 %% session's lifetime and this lease bounds stale registry entries).
@@ -67,8 +103,22 @@ spawned into `m:i2p_ssu2_sup` and owned by this process.
 start_link(BobLocal) ->
     gen_server:start_link(?MODULE, BobLocal, []).
 
+-doc """
+Start the coordinator attached to the running router's SSU2 sessions.
+
+`BobLocal` is as `f:start_link/1`. No listener is bound: the sessions this
+process routes between are the ones the router's own SSU2 listener spawned
+(owned by `m:i2p_peer`), and their relay blocks reach it forwarded by the
+peer manager. The relay-tag registry is the running listener's, resolved by
+name per use. This is the shape `m:i2per_sup` starts the coordinator in when
+app env `i2per` -> `relay_coord` is enabled.
+""".
+-spec start_attach(map()) -> {ok, pid()}.
+start_attach(BobLocal) ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, {attach, BobLocal}, []).
+
 -doc "The introducer's bound SSU2 listener port.".
--spec port(pid()) -> 0..65535.
+-spec port(pid()) -> 0..65535 | {error, no_listener}.
 port(Coord) ->
     gen_server:call(Coord, port).
 
@@ -90,6 +140,14 @@ stop(Coord) ->
 %% ----------------------------------------------------------------------
 %% gen_server
 
+init({attach, BobLocal}) ->
+    {ok, #{
+        bob_local => BobLocal,
+        sessions => #{},
+        tagged_sess => undefined,
+        tag => undefined,
+        requester_sess => undefined
+    }};
 init(BobLocal) ->
     {ok, Listener} =
         i2p_ssu2_listener:listen(<<"127.0.0.1">>, 0, BobLocal, self()),
@@ -104,6 +162,8 @@ init(BobLocal) ->
 
 handle_call(port, _From, State = #{listener := Listener}) ->
     {reply, i2p_ssu2_listener:port(Listener), State};
+handle_call(port, _From, State) ->
+    {reply, listener_port(State), State};
 handle_call(tagged_sess, _From, State) ->
     {reply, maps:get(tagged_sess, State), State};
 handle_call(_Other, _From, State) ->
@@ -132,12 +192,35 @@ handle_info({ssu2_ready, _Pid, _Keys, undefined}, State) ->
     {noreply, State};
 handle_info({ssu2_data, Pid, Blocks}, State) ->
     {noreply, route_blocks(Pid, Blocks, State)};
+%% A session this process knows died. Its RouterInfo row is stale the moment
+%% the pid is, and a requester or tagged session pid left in the state would be
+%% cast to -- a cast to a dead process is silently dropped, which is harmless
+%% here but leaves the state describing a session that is not there. The
+%% attach shape routes every inbound session through `m:i2p_peer`, so without
+%% this the `sessions` map would grow by one entry per inbound session over the
+%% life of the router and never shrink.
+handle_info({ssu2_closed, Pid, _Reason}, State = #{sessions := Sessions}) ->
+    {noreply, forget_session(Pid, State#{sessions => maps:remove(Pid, Sessions)})};
 handle_info(_Other, State) ->
     {noreply, State}.
 
 terminate(_Reason, #{listener := Listener}) ->
     catch i2p_ssu2_listener:stop(Listener),
+    ok;
+terminate(_Reason, _State) ->
     ok.
+
+%% Forget a dead session wherever the state still names it: its RouterInfo row
+%% (removed by the caller) and the tagged/requester slots, which are cast to on
+%% the relay paths.
+forget_session(Pid, State = #{tagged_sess := Tagged, requester_sess := Requester}) ->
+    State#{
+        tagged_sess => clear_if(Pid, Tagged),
+        requester_sess => clear_if(Pid, Requester)
+    }.
+
+clear_if(Pid, Pid) -> undefined;
+clear_if(_Pid, Other) -> Other.
 
 %% ----------------------------------------------------------------------
 %% Routing
@@ -185,7 +268,7 @@ maybe_issue_tag(Pid, Blocks, State = #{tagged_sess := Pid}) ->
 maybe_issue_tag(_Pid, _Blocks, State) ->
     State.
 
-issue_tag(State = #{tagged_sess := Tagged, listener := Listener}) ->
+issue_tag(State = #{tagged_sess := Tagged}) ->
     case live_tags() >= ?MAX_RELAY_TAGS of
         true ->
             %% Registry at capacity: leave the request unanswered, the spec's
@@ -193,26 +276,61 @@ issue_tag(State = #{tagged_sess := Tagged, listener := Listener}) ->
             i2p_log:debug({tag, refused, cap_reached}, []),
             State;
         false ->
-            Tag = fresh_tag(),
-            Expires = erlang:system_time(second) + ?RELAY_TAG_TTL,
-            i2p_log:debug({tag, issued, Tag}, []),
-            _ = i2p_ssu2_listener:register_relay_tag(Listener, Tag, Tagged, Expires),
-            tag_answer(Tag, Tagged, State#{tag => Tag})
+            case relay_listener(State) of
+                undefined ->
+                    %% No listener owns a registry (SSU2 disabled, or the
+                    %% listener is down): the same refusal channel as the
+                    %% registry at capacity, and for the same reason — a tag
+                    %% nobody can look up is not a tag.
+                    i2p_log:debug({tag, refused, no_listener}, []),
+                    State;
+                Listener ->
+                    Tag = fresh_tag(),
+                    Expires = erlang:system_time(second) + ?RELAY_TAG_TTL,
+                    i2p_log:debug({tag, issued, Tag}, []),
+                    _ = i2p_ssu2_listener:register_relay_tag(Listener, Tag, Tagged, Expires),
+                    tag_answer(Tag, Tagged, State#{tag => Tag})
+            end
     end.
 
 %% Re-arm the handed-out tag with a fresh expiry (upsert into the registry).
-refresh_tag(State = #{listener := Listener}) ->
+refresh_tag(State) ->
     case maps:get(tag, State, undefined) of
         undefined ->
             State;
         Tag ->
-            Expires = erlang:system_time(second) + ?RELAY_TAG_TTL,
-            i2p_log:debug({tag, refreshed, Tag}, []),
-            _ =
-                i2p_ssu2_listener:register_relay_tag(
-                    Listener, Tag, maps:get(tagged_sess, State), Expires
-                ),
-            State
+            case relay_listener(State) of
+                undefined ->
+                    State;
+                Listener ->
+                    Expires = erlang:system_time(second) + ?RELAY_TAG_TTL,
+                    i2p_log:debug({tag, refreshed, Tag}, []),
+                    _ =
+                        i2p_ssu2_listener:register_relay_tag(
+                            Listener, Tag, maps:get(tagged_sess, State), Expires
+                        ),
+                    State
+            end
+    end.
+
+%% The listener that owns the relay-tag registry. Held from init in the
+%% standalone shape; resolved by name per use in attach mode, where the
+%% registry belongs to the running router's listener — a listener restart
+%% changes the pid and the registered name is the stable handle.
+relay_listener(#{listener := Listener}) ->
+    Listener;
+relay_listener(_State) ->
+    whereis(i2p_ssu2_listener).
+
+%% The port an operator asks for. The standalone shape's own listener in the
+%% first clause; the running router's listener in attach mode, where that is
+%% the port peers dial. No listener, no port to name.
+listener_port(#{listener := Listener}) ->
+    i2p_ssu2_listener:port(Listener);
+listener_port(_State) ->
+    case whereis(i2p_ssu2_listener) of
+        undefined -> {error, no_listener};
+        Listener -> i2p_ssu2_listener:port(Listener)
     end.
 
 tag_answer(Tag, Tagged, State) when Tag =/= undefined ->

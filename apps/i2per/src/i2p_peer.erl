@@ -714,8 +714,16 @@ handle_ssu2_ready(ConnPid, State) ->
 %% from fragments) as `{i2np, Type, MsgId, ShortExp, Body}`; NTCP2 delivers raw
 %% framing blocks `#{type := 3, data := Data}`. Rebuild the 9-byte short-header
 %% wire for each so `handle_frame/3` treats both transports identically.
+%%
+%% The non-I2NP blocks are split, not discarded: the introducer-relay shapes
+%% belong to `m:i2p_relay_coord` and the peer-test and RouterInfo shapes to
+%% `m:i2p_peertest_coord`, and when the operator has enabled them the blocks
+%% are forwarded there — cast, so a wedged or dead coordinator cannot delay
+%% this process, which is the one every send path runs through. Disabled (the
+%% default), nothing is forwarded and every non-I2NP shape is unhandled, which
+%% is the state `i2p_peer_block_flood_tests` pins.
 handle_ssu2_data(ConnPid, Blocks, State) ->
-    {Messages, Unhandled} = lists:partition(fun is_i2np_block/1, Blocks),
+    {Messages, Rest} = lists:partition(fun is_i2np_block/1, Blocks),
     Framed = [
         #{type => 3, data => <<Type:8, MsgId:32, ShortExp:32, Body/binary>>}
      || {i2np, Type, MsgId, ShortExp, Body} <- Messages
@@ -725,14 +733,98 @@ handle_ssu2_data(ConnPid, Blocks, State) ->
         State,
         Framed
     ),
-    lists:foldl(
-        fun(Block, AccState) -> note_unhandled_ssu2_block(ConnPid, Block, AccState) end,
-        State1,
-        Unhandled
-    ).
+    Unhandled = forward_coord_blocks(ConnPid, Rest, State1),
+    note_unhandled_ssu2_blocks(ConnPid, Unhandled, State1).
 
 is_i2np_block({i2np, _, _, _, _}) -> true;
 is_i2np_block(_) -> false.
+
+%% Split the non-I2NP shapes by the coordinator that routes them and forward
+%% each set; the shapes no enabled coordinator claims come back as the
+%% unhandled remainder, in their original order, which the caller counts and
+%% announces. Disabled (the default), nothing is forwarded and every non-I2NP
+%% shape is unhandled — the state `i2p_peer_block_flood_tests` pins.
+%% Forwarding is cast-shaped, so a wedged or dead coordinator cannot delay this
+%% process, which is the one every send path runs through.
+forward_coord_blocks(ConnPid, Blocks, _State) ->
+    RelayOn = i2p_relay_coord:enabled(),
+    PtOn = i2p_peertest_coord:enabled(),
+    Classified = [{owner(B, RelayOn, PtOn), B} || B <- Blocks],
+    send_coord_blocks(i2p_relay_coord, relay, ConnPid, Classified),
+    send_coord_blocks(i2p_peertest_coord, peertest, ConnPid, Classified),
+    [B || {none, B} <- Classified].
+
+%% One coordinator's set out of the classified blocks. An empty set is no send.
+send_coord_blocks(Name, Owner, ConnPid, Classified) ->
+    case [B || {O, B} <- Classified, O =:= Owner] of
+        [] -> ok;
+        Blocks -> send_coord(Name, {ssu2_data, ConnPid, Blocks})
+    end,
+    ok.
+
+%% Which process a non-I2NP block belongs to, resolved against the enabled
+%% flags rather than after them: a shape whose coordinator is disabled is
+%% unhandled here, and it keeps its position in the unhandled stream. The
+%% introducer-relay shapes (7/8/9 and the 15/16 tag exchange) are
+%% `m:i2p_relay_coord`'s; the peer-test blocks (1-4) and RouterInfo are
+%% `m:i2p_peertest_coord`'s — the RouterInfo because it is what learns Alice's
+%% hash and what it forwards to the Charlie session ahead of message 2.
+owner(B, RelayOn, PtOn) ->
+    case is_relay_block(B) of
+        true ->
+            case RelayOn of
+                true -> relay;
+                false -> none
+            end;
+        false ->
+            case is_peertest_coord_block(B) of
+                true ->
+                    case PtOn of
+                        true -> peertest;
+                        false -> none
+                    end;
+                false ->
+                    none
+            end
+    end.
+
+%% Deliver one message to a coordinator. Resolved by name per use, and an
+%% absent name is a skip rather than a raise: the enabled key and the running
+%% process can disagree for the moment a hot set is in flight, and a send to an
+%% unregistered name would kill this process — the one every send path in the
+%% router runs through.
+send_coord(Name, Msg) ->
+    case whereis(Name) of
+        undefined ->
+            ok;
+        Pid ->
+            Pid ! Msg,
+            ok
+    end.
+
+%% The five introducer-relay shapes `m:i2p_relay_coord` routes.
+is_relay_block(relay_tag_request) -> true;
+is_relay_block({relay_tag, _}) -> true;
+is_relay_block({relay_request, _, _, _, _, _, _, _, _}) -> true;
+is_relay_block({relay_response, _, _, _, _, _, _, _, _, _}) -> true;
+is_relay_block({relay_intro, _, _, _, _, _, _, _, _, _}) -> true;
+is_relay_block(_) -> false.
+
+%% The shapes `m:i2p_peertest_coord` routes: the in-session peer-test blocks
+%% and the RouterInfo blocks that carry Alice's hash.
+is_peertest_coord_block({peertest, _, _, _, _, _, _, _, _, _, _}) -> true;
+is_peertest_coord_block({router_info, _, _}) -> true;
+is_peertest_coord_block(_) -> false.
+
+%% Count and announce the shapes no coordinator claimed — as one announce per
+%% peer and kind, with every block still counted. See
+%% `f:note_unhandled_ssu2_block/3`.
+note_unhandled_ssu2_blocks(ConnPid, Blocks, State) ->
+    lists:foldl(
+        fun(Block, AccState) -> note_unhandled_ssu2_block(ConnPid, Block, AccState) end,
+        State,
+        Blocks
+    ).
 
 %% A non-I2NP SSU2 block reached the peer manager, which has no handler for it.
 %% Every shape `m:i2p_ssu2_conn` forwards is meaningful to somebody: the
@@ -798,6 +890,7 @@ ssu2_block_name(Block) -> Block.
 %% rather than by monitor ref (SSU2 sessions close with `{ssu2_closed, ...}`
 %% before any DOWN arrives).
 handle_conn_down_by_pid(ConnPid, State) ->
+    forward_coord_closed(ConnPid, State),
     case find_conn_peer(ConnPid, State) of
         {PeerHash, _PeerState} ->
             i2p_events:notify({peer_disconnected, PeerHash}),
@@ -812,6 +905,21 @@ handle_conn_down_by_pid(ConnPid, State) ->
                 error ->
                     State
             end
+    end.
+
+%% A session died. The coordinators route between sessions, so a death is
+%% announced to both when they are enabled — the relay coordinator forgets the
+%% requester's RouterInfo row and the tagged/requester slots, the peer-test
+%% coordinator clears the routing slots the session held. A session neither
+%% knows is a no-op there.
+forward_coord_closed(ConnPid, _State) ->
+    case i2p_relay_coord:enabled() orelse i2p_peertest_coord:enabled() of
+        true ->
+            send_coord(i2p_relay_coord, {ssu2_closed, ConnPid, closed}),
+            send_coord(i2p_peertest_coord, {ssu2_closed, ConnPid, closed}),
+            ok;
+        false ->
+            ok
     end.
 
 %% handle_connect_failed/3 — a connect attempt did not become a connection.
@@ -899,9 +1007,23 @@ handle_inbound_ready(ConnPid, RemoteRI, Transport, State) ->
     Inbound = maps:put(ConnPid, {Hash, MonRef, Transport}, maps:get(inbound, State1, #{})),
     State2 = State1#{inbound := Inbound},
     State3 = learn_ri(RemoteRI, State2),
+    forward_inbound_ready(ConnPid, RemoteRI, Transport, State3),
     send_our_router_info(ConnPid, Transport, maps:get(local, State3), plain),
     i2p_events:notify({peer_connected, Hash}),
     State3.
+
+%% An inbound SSU2 session announced ready. Its RemoteRI is the requester's
+%% RouterInfo — what `m:i2p_relay_coord` serves a RelayRequest with — so it is
+%% forwarded when the coordinator is enabled, in the same `{ssu2_ready, Pid,
+%% Keys, RemoteRI}` shape the standalone shape receives from its own listener.
+%% NTCP2 inbound sessions carry no relay role, so theirs are not forwarded.
+forward_inbound_ready(ConnPid, RemoteRI, ssu2, _State) ->
+    case i2p_relay_coord:enabled() of
+        true -> send_coord(i2p_relay_coord, {ssu2_ready, ConnPid, undefined, RemoteRI});
+        false -> ok
+    end;
+forward_inbound_ready(_ConnPid, _RemoteRI, ntcp2, _State) ->
+    ok.
 
 stop_replaced_inbound(Hash, NewConnPid, State) ->
     Inbound0 = maps:get(inbound, State, #{}),

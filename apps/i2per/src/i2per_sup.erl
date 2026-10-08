@@ -5,9 +5,11 @@ The top-level supervisor of the i2per application.
 
 Holds the event bus, runtime configuration service, NetDb store, peer
 reputation store, reachability decision, NTCP2 and SSU2 supervisors, peer
-connection manager, tunnel manager, lookup service, address-book services, and
-the SAM v3 bridge supervisor. The `i2per_status` web service is a separate
-application and is not started here.
+connection manager, tunnel manager, lookup service, address-book services, the
+SAM v3 bridge supervisor, and — when the operator has enabled them — the two
+SSU2 introducer coordinators (`m:i2p_relay_coord`, `m:i2p_peertest_coord`),
+started in attach mode with no listener of their own. The `i2per_status` web
+service is a separate application and is not started here.
 
 In persistent operator mode, app env `i2per` -> `data_dir` selects the identity
 directory and `seeds` supplies bootstrap RouterInfos. The NTCP2 supervisor
@@ -41,7 +43,7 @@ The `Local` identity map is computed once and shared between all managers.
 
 -behaviour(supervisor).
 
--export([start_link/0, init/1]).
+-export([start_link/0, init/1, apply_coordinator/2]).
 
 -spec start_link() -> {ok, pid()} | {error, term()}.
 start_link() ->
@@ -69,7 +71,7 @@ init([]) ->
             %% fails as a `start_spec` badmatch from every test that boots the app.
             netdb_children() ++
             ntcp2_sup_children(LocalSeeds) ++ ssu2_sup_children(LocalSeeds) ++
-            manager_children(LocalSeeds),
+            manager_children(LocalSeeds) ++ coordinator_children(LocalSeeds),
     {ok, {#{strategy => one_for_one, intensity => 10, period => 10}, Children}}.
 
 %% ADR 0002's "it started and I don't know with what".
@@ -416,6 +418,30 @@ ssu2_local(Local) ->
         ri => maps:get(ri, Local)
     }.
 
+%% The local map the introducer coordinators route with, in attach mode.
+%% Deliberately not `f:ssu2_local/1`: that carries `intro_key`, which only a
+%% listener needs, and an attach-mode coordinator binds no listener — it sends
+%% through the running router's sessions. Building the SSU2 map here would
+%% crash every NTCP2-only boot (whose local map carries no intro key) while
+%% building a spec nothing asked for. What a coordinator routes with is its own
+%% RouterInfo, hash and signing material, plus the static keys
+%% `f:dial_charlie/3`'s outbound dial needs; the intro key joins when the boot
+%% serves UDP, which is when an SSU2 dial can exist at all.
+coord_local_of(Local) ->
+    Base =
+        #{
+            static_priv => maps:get(static_priv, Local),
+            static_pub => maps:get(static_pub, Local),
+            sign_seed => maps:get(sign_seed, Local),
+            sign_pub => maps:get(sign_pub, Local),
+            hash => maps:get(hash, Local),
+            ri => maps:get(ri, Local)
+        },
+    case maps:find(intro_key, Local) of
+        {ok, Intro} -> Base#{intro_key => Intro};
+        error -> Base
+    end.
+
 %% Compute Local once; start peer + tunnel + SAM managers when configured.
 manager_children({ok, Local, Seeds, Listen}) ->
     [
@@ -555,6 +581,122 @@ reseed_child_spec(Opts) ->
         type => worker,
         modules => [i2p_reseed_srv]
     }.
+
+%% The SSU2 introducer coordinators (`m:i2p_relay_coord`, `m:i2p_peertest_coord`),
+%% when the operator has enabled them. Both default off: the shipped profile is a
+%% local client, and the relay coordinator in particular begins issuing relay
+%% tags and emitting unsolicited datagrams to third-party addresses, so it is
+%% gated on `live_network` in addition to its own key — the resolved decision on
+%% the Charlie/introducer role.
+%%
+%% The gate is re-evaluated here, at every supervisor (re)start, rather than
+%% consulted once at boot: the hot keys are runtime keys, so a value set through
+%% `m:i2p_config_srv` lives in the application environment and survives a
+%% supervisor crash — meaning the coordinators a hot set started come back with
+%% the router. Boot, restart, and a hot set therefore all consult one predicate.
+coordinator_children(LocalSeeds) ->
+    case LocalSeeds of
+        {ok, Local, _Seeds, _Listen} ->
+            %% Inlined in the comprehension, not computed here: the
+            %% comprehension evaluates its expression only when the gate is
+            %% true, which is what makes inlining the guard — a boot with both
+            %% coordinators disabled must not build a spec nothing asked for.
+            [
+                coordinator_child(i2p_peertest_coord, coord_local_of(Local))
+             || i2p_peertest_coord:enabled()
+            ] ++
+                [
+                    coordinator_child(i2p_relay_coord, coord_local_of(Local))
+                 || i2p_relay_coord:enabled()
+                ];
+        error ->
+            %% No identity: there is no RouterInfo to route with, so neither
+            %% coordinator can run. The hot set reports the same refusal as
+            %% `{error, no_identity}` rather than starting a coordinator that
+            %% holds nothing.
+            []
+    end.
+
+coordinator_child(Module, CoordLocal) ->
+    #{
+        id => Module,
+        start => {Module, start_attach, [CoordLocal]},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker,
+        modules => [Module]
+    }.
+
+%% Apply a coordinator enable change at runtime — called by
+%% `m:i2p_config_srv` when one of the two coordinator keys is set, the same
+%% shape as `log_level` routing through `m:i2p_log:set_level/1`. An accepted
+%% `true` starts the coordinator; an accepted `false` stops it and removes the
+%% child, so a following set does not find a stopped-but-present child.
+%%
+%% The start path re-resolves the local map rather than holding it from `init/1`,
+%% because a supervisor has no state to hold it in and the hot set is a rare
+%% operator event: in the persistent boot that is one identity load from disk,
+%% and in the explicit (test) boot an application-environment read.
+-spec apply_coordinator(relay_coord | peertest_coord, boolean()) -> ok | {error, term()}.
+apply_coordinator(Key, true) ->
+    case coord_local() of
+        {ok, CoordLocal} -> start_coord(Key, coordinator_child(coord_id(Key), CoordLocal));
+        error -> {error, no_identity}
+    end;
+apply_coordinator(Key, false) ->
+    stop_coord(Key).
+
+coord_local() ->
+    case resolve_local() of
+        {ok, Local, _Seeds, _Listen} -> {ok, coord_local_of(Local)};
+        error -> error
+    end.
+
+start_coord(Key, Spec) ->
+    case supervisor:start_child(?MODULE, Spec) of
+        {ok, _Pid} ->
+            application:set_env(i2per, Key, true),
+            ok;
+        {error, {already_started, _Pid}} ->
+            application:set_env(i2per, Key, true),
+            ok;
+        {error, already_present} ->
+            %% Present but not running: a previous stop that did not delete, or
+            %% a failed restart. Delete and start fresh — a stopped-but-present
+            %% child must not be the reason the switch appears broken.
+            _ = supervisor:delete_child(?MODULE, coord_id(Key)),
+            case supervisor:start_child(?MODULE, Spec) of
+                {ok, _Pid} ->
+                    application:set_env(i2per, Key, true),
+                    ok;
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+stop_coord(Key) ->
+    Id = coord_id(Key),
+    case supervisor:terminate_child(?MODULE, Id) of
+        ok ->
+            _ = supervisor:delete_child(?MODULE, Id),
+            application:set_env(i2per, Key, false),
+            ok;
+        {error, not_found} ->
+            application:set_env(i2per, Key, false),
+            ok;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% The supervisor child id each enable key drives. The key and the id are
+%% different atoms — `relay_coord` names the setting, `i2p_relay_coord` names
+%% the child — and a stop that looked up the child by the setting's name would
+%% answer `not_found`, update the environment, and leave the coordinator
+%% running: a switch that reports off and did nothing.
+coord_id(relay_coord) -> i2p_relay_coord;
+coord_id(peertest_coord) -> i2p_peertest_coord.
 
 %% Resolve our NTCP2 identity. Two modes:
 %%
