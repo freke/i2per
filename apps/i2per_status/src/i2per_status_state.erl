@@ -83,7 +83,12 @@ i2per_status_state:snapshot().
 
 -define(PEERTEST_ADDRESS_TYPES, [ipv4, ipv6]).
 
--define(PEERTEST_RESULTS, [ok, firewalled, unknown]).
+%% The reachability ladder's rungs, mirrored from the core's
+%% `m:i2p_peertest:rung/0` — the widened peer-test result is `{Rung, Reason}`,
+%% and the rung is the closed vocabulary the counters break out. The reason is
+%% the diagnostic detail and stays on the bus for anyone who needs it, the same
+%% reasoning as `db_store_not_stored`'s total-only figure below.
+-define(PEERTEST_RESULTS, [unknown, testing, unreachable, introducer_only, reachable]).
 
 %% The key an event this service does not recognise is flagged under, alongside the
 %% event's own tag.
@@ -214,6 +219,14 @@ A snapshot is the union of the two sets, and the union is what a reader of
     },
     netdb => #{ri => non_neg_integer(), ls => non_neg_integer()},
     sessions => non_neg_integer(),
+    %% The measured reachability per family, as the router's read API carries
+    %% it: the latest concluded test's ladder rung and, when the chain broke,
+    %% the typed reason. Optional for the same reason `peers` is — a snapshot
+    %% built while the router is offline has no view merged into it.
+    reachability_detail => #{
+        ipv4 => #{rung => atom(), reason => atom()},
+        ipv6 => #{rung => atom(), reason => atom()}
+    },
     %% The router's current inbound-reachability verdict, or `undefined` before it
     %% has announced one. `n/a` on the page, not a guess.
     last_reachability => reachable | firewalled | unknown | undefined,
@@ -393,8 +406,11 @@ tag_of(_Event) ->
 %% reason is on the bus for anyone who needs it.
 key_for({reachability, _Transport, Verdict}) ->
     {reachability, Verdict};
-key_for({peertest_result, AddressType, Result}) ->
-    {peertest_result, AddressType, Result};
+key_for({peertest_result, AddressType, {Rung, _Reason}}) ->
+    %% The widened peer-test result carries the rung and the reason; the
+    %% counters break out the rung, and the reason stays on the bus for anyone
+    %% who needs it.
+    {peertest_result, AddressType, Rung};
 key_for(Event) ->
     tag_of(Event).
 
@@ -466,6 +482,7 @@ known_view_keys() ->
         identity,
         netdb,
         peers,
+        reachability_detail,
         sessions,
         tunnels,
         uptime_ms,

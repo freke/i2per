@@ -44,6 +44,7 @@ outbound datagrams through it because only the listener owns the socket.
     send_router_info/3,
     send_relay/2,
     initiate_peertest/4,
+    ip_bin/1,
     terminate_session/2,
     charlie_reply_block/7
 ]).
@@ -1223,12 +1224,14 @@ handle_peertest(Blocks, State) ->
         {alice, {peertest, 4, Code, _Flags, _Hash, _Ver, Nonce, _Ts, _Port, Ip, _Sig}} ->
             %% We are the test target (Alice) and the introducer relayed a
             %% message 4 back in-session: either a reject or Charlie's response.
-            %% An explicitly `alice`-tagged session (an outbound initiator)
-            %% validates the reject against the nonce of the test it originated
-            %% and reports the result; an untagged session uses the conservative
-            %% FIREWALLED result from message 4 alone.
-            case is_explicit_alice(State) of
-                true ->
+            %% The gate is the outstanding test, not the explicit role tag: a
+            %% test this session originated (the nonce matches) takes the full
+            %% flow, so the driver's tests run on any session regardless of how
+            %% it was tagged at connect time. A message 4 with no matching
+            %% test is ignored — a stale or forged block can neither conclude a
+            %% test nor emit a spurious result.
+            case maps:get(pending_test, State, undefined) of
+                #{nonce := Nonce} ->
                     case i2p_peertest:is_reject(Code) of
                         true ->
                             i2p_log:debug({pt_dispatch, alice, 4, reject_concluded}, role(State)),
@@ -1243,9 +1246,8 @@ handle_peertest(Blocks, State) ->
                             i2p_log:debug({pt_dispatch, alice, 4, accepted}, role(State)),
                             maybe_seen4_accept(Nonce, Ip, State)
                     end;
-                false ->
-                    i2p_log:debug({pt_dispatch, alice, 4, legacy_firewalled}, role(State)),
-                    i2p_events:notify({peertest_result, addr_type(Ip), firewalled}),
+                _ ->
+                    i2p_log:debug({pt_dispatch, alice, 4, unmatched_ignored}, role(State)),
                     State
             end;
         _ ->
@@ -1257,9 +1259,6 @@ handle_peertest(Blocks, State) ->
             State
     end.
 
-is_explicit_alice(State) ->
-    maps:get(peer_test_role, maps:get(config, State), undefined) =:= alice.
-
 %% Is this session owned by an external peer-test coordinator (a separate
 %% process that routes peer-test blocks to a Charlie session)? When it is, the
 %% session defers the deterministic message-1 reject to the coordinator.
@@ -1269,15 +1268,18 @@ is_coordinator_owned(State) ->
 %% Resolve an in-session message 4 reject against Alice's outstanding peer
 %% test. The message must be a reject (`m:i2p_peertest:is_reject/1`) and its
 %% nonce must match the one Alice chose when she initiated (message 1); only
-%% then is the pending test concluded with the spec result (`firewalled` from
-%% message 4 alone) and `pending_test` cleared. Unsolicited, mismatched, or
-%% non-reject message 4s are ignored so a stale or forged block can neither
-%% conclude a test nor emit a spurious result.
+%% then is the pending test concluded with the typed outcome (`unknown` with
+%% reason `no_charlie_report` — a reject is the introducer chain failing before
+%% Charlie's confirmation, not evidence about our own reachability) and
+%% `pending_test` cleared. Unsolicited, mismatched, or non-reject message 4s
+%% are ignored so a stale or forged block can neither conclude a test nor emit
+%% a spurious result.
 conclude_peertest_reject(Nonce, State) ->
     case maps:get(pending_test, State, undefined) of
         #{nonce := Nonce, addr_type := AddrType, judge_ref := JudgeRef} ->
             cancel_judge_timer(JudgeRef),
-            i2p_events:notify({peertest_result, AddrType, firewalled}),
+            Outcome = i2p_peertest:result(reject, false, false),
+            i2p_events:notify({peertest_result, AddrType, Outcome}),
             State1 = clear_peertest(State),
             _ = unregister_peertest_conn_ids(Nonce),
             State1;
@@ -1292,13 +1294,20 @@ maybe_seen4_accept(Nonce, Ip, State) ->
     case maps:get(pending_test, State, undefined) of
         #{nonce := Nonce} = PT ->
             State1 = State#{pending_test => PT#{seen4 => true, addr_type => addr_type(Ip)}},
-            maybe_probe_charlie(State1);
+            %% The settle window arms on message 4's acceptance — the SSU2
+            %% "wait several seconds after message 4" rule — not on message 6
+            %% having been sent, so a Charlie RouterInfo that never arrives
+            %% cannot leave the test pending forever with a second initiation
+            %% silently ignored behind it.
+            State2 = arm_judge_timer(State1),
+            maybe_probe_charlie(State2);
         _ ->
             State
     end.
 
-%% Send message 6 to Charlie and arm the result-settle timer once both the
-%% message 4 has been accepted and Charlie's out-of-session address is known.
+%% Send message 6 to Charlie once his out-of-session address is known. The
+%% settle timer is already armed (`f:maybe_seen4_accept/3`); message 6 is the
+%% reply that lets Charlie echo message 7, not the thing the judge waits on.
 maybe_probe_charlie(State = #{pending_test := #{seen4 := true} = PT, pt_target := Target}) when
     Target =/= undefined
 ->
@@ -1307,8 +1316,7 @@ maybe_probe_charlie(State = #{pending_test := #{seen4 := true} = PT, pt_target :
             State;
         false ->
             State1 = send_msg6(Target, PT, State),
-            State2 = arm_judge_timer(State1#{pending_test := PT#{sent6 => true}}),
-            State2
+            State1#{pending_test := PT#{sent6 => true}}
     end;
 maybe_probe_charlie(State) ->
     State.
@@ -1358,11 +1366,15 @@ cancel_judge_timer(Ref) ->
 judge_peertest(
     State = #{
         pending_test := #{
-            addr_type := AddrType, seen4 := S4, seen5 := S5, seen7 := S7, nonce := Nonce
+            addr_type := AddrType, seen5 := S5, seen7 := S7, nonce := Nonce
         }
     }
 ) ->
-    Result = i2p_peertest:result(S4, S5, S7),
+    %% The judge only fires after an accepted message 4 (the settle timer is
+    %% armed on `seen4`, and message 5's arrival short-circuits it), so the
+    %% outcome is `accept` here; a reject concludes in
+    %% `f:conclude_peertest_reject/2` instead.
+    Result = i2p_peertest:result(accept, S5, S7),
     i2p_events:notify({peertest_result, AddrType, Result}),
     _ = unregister_peertest_conn_ids(Nonce),
     clear_peertest(State).
@@ -1867,7 +1879,7 @@ answer_session_created(HS1, Listener, Endpoint) ->
     SCBlocks =
         [
             {datetime, unix_now()},
-            {address, element(2, Endpoint), ip_bin(Endpoint)}
+            {address, element(2, Endpoint), ip_bin(element(1, Endpoint))}
         ],
     {ok, SCPacket, HS2} = i2p_ssu2:create_session_created(HS1, BeskPriv, rand32(), SCBlocks),
     _ = i2p_ssu2_listener:send(Listener, SCPacket, Endpoint),
@@ -2025,8 +2037,17 @@ endpoint(HostBin, Port) ->
         Error -> Error
     end.
 
-ip_bin(Endpoint) ->
-    case element(1, Endpoint) of
-        {A, B, C, D} -> <<A, B, C, D>>;
-        {A, B, C, D, E, F, G, H} -> <<A:16, B:16, C:16, D:16, E:16, F:16, G:16, H:16>>
-    end.
+-doc """
+The SSU2 wire bytes for an IP tuple.
+
+Input: a parsed IPv4 tuple (4 elements) or IPv6 tuple (8). Output: the address
+as 4 or 16 bytes in network byte order — the shape a peer-test block's `Ip`
+field and an SSU2 address block carry.
+""".
+-spec ip_bin(
+    {0..255, 0..255, 0..255, 0..255}
+    | {0..65535, 0..65535, 0..65535, 0..65535, 0..65535, 0..65535, 0..65535, 0..65535}
+) ->
+    binary().
+ip_bin({A, B, C, D}) -> <<A, B, C, D>>;
+ip_bin({A, B, C, D, E, F, G, H}) -> <<A:16, B:16, C:16, D:16, E:16, F:16, G:16, H:16>>.

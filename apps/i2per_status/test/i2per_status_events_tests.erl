@@ -51,7 +51,7 @@ bus_event_shapes() ->
         {leaseset_publish_failed, crypto:strong_rand_bytes(32), no_floodfill_targets},
         {sam_session_created, <<"sid">>, stream},
         {sam_session_closed, <<"sid">>},
-        {peertest_result, ipv4, ok},
+        {peertest_result, ipv4, {reachable, undefined}},
         {reachability, ssu2, firewalled},
         {ssu2_block_unhandled, some_block_kind},
         {db_store_not_stored, unparseable_router_info_data},
@@ -99,7 +99,7 @@ the_eleven_previously_dropped_shapes_are_counted_test() ->
     PreviouslyDropped = [
         {peer_connected, crypto:strong_rand_bytes(32)},
         {peer_disconnected, crypto:strong_rand_bytes(32)},
-        {peertest_result, ipv4, firewalled},
+        {peertest_result, ipv4, {introducer_only, punch_not_delivered}},
         {reachability, ssu2, reachable},
         {ssu2_block_unhandled, peer_test},
         {db_store_not_stored, expired},
@@ -142,10 +142,16 @@ reachability_verdicts_are_separate_counters_test() ->
     ?assertEqual(1, maps:get({reachability, firewalled}, Counters)),
     ?assertEqual(0, maps:get({reachability, unknown}, Counters)).
 
+%% The counters break out the rung of the widened peer-test result
+%% (`{Rung, Reason}`), so a reader can see which rung the latest test landed on
+%% without counting the reason into the key set.
 peertest_result_is_counted_per_type_and_result_test() ->
-    Counters = fold({peertest_result, ipv4, ok}),
-    ?assertEqual(1, maps:get({peertest_result, ipv4, ok}, Counters)),
-    ?assertEqual(0, maps:get({peertest_result, ipv6, ok}, Counters)).
+    Counters = fold({peertest_result, ipv4, {reachable, undefined}}),
+    ?assertEqual(1, maps:get({peertest_result, ipv4, reachable}, Counters)),
+    ?assertEqual(0, maps:get({peertest_result, ipv6, reachable}, Counters)),
+    Punched = fold({peertest_result, ipv6, {introducer_only, punch_not_delivered}}),
+    ?assertEqual(1, maps:get({peertest_result, ipv6, introducer_only}, Punched)),
+    ?assertEqual(0, maps:get({peertest_result, ipv4, introducer_only}, Punched)).
 
 %% %%%%% %%%%% The verdict, kept current %%%%% %%%%%
 
@@ -230,5 +236,5 @@ key_tag(Key) when is_atom(Key) -> Key;
 key_tag(Key) when is_tuple(Key) -> element(1, Key).
 
 fold_key({reachability, _, Verdict}) -> {reachability, Verdict};
-fold_key({peertest_result, A, R}) -> {peertest_result, A, R};
+fold_key({peertest_result, A, {Rung, _Reason}}) -> {peertest_result, A, Rung};
 fold_key(Event) -> element(1, Event).

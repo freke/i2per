@@ -132,12 +132,41 @@ reject_classification_test() ->
     ?assertNot(i2p_peertest:is_reject(0)).
 
 result_matrix_test() ->
-    %% Exactly the SSU2 spec result table.
-    ?assertEqual(unknown, i2p_peertest:result(false, false, false)),
-    ?assertEqual(firewalled, i2p_peertest:result(true, false, false)),
-    ?assertEqual(ok, i2p_peertest:result(false, true, false)),
-    ?assertEqual(ok, i2p_peertest:result(true, true, false)),
-    ?assertEqual(unknown, i2p_peertest:result(false, false, true)),
-    ?assertEqual(firewalled, i2p_peertest:result(true, false, true)),
-    ?assertEqual(ok, i2p_peertest:result(false, true, true)),
-    ?assertEqual(ok, i2p_peertest:result(true, true, true)).
+    %% Exactly the matrix `f:i2p_peertest:result/3` implements: the
+    %% introducer's relayed response (message 4) is either an accept or a
+    %% reject, and the out-of-session messages 5/7 (Charlie→Alice) say whether
+    %% the punch landed. A reject is the introducer chain failing before
+    %% Charlie's confirmation, not evidence about our own reachability, so it
+    %% reads `unknown` with reason `no_charlie_report`.
+    ?assertEqual({unknown, no_charlie_report}, i2p_peertest:result(reject, false, false)),
+    ?assertEqual({unknown, no_charlie_report}, i2p_peertest:result(accept, false, false)),
+    ?assertEqual({reachable, undefined}, i2p_peertest:result(accept, true, false)),
+    ?assertEqual({reachable, undefined}, i2p_peertest:result(accept, true, true)),
+    %% The stateful-firewall case: the Charlie confirmed in-session (message 4
+    %% accepted) but the unsolicited punch never landed. Message 7 is the
+    %% solicited echo of our message 6, so its arrival without message 5 is
+    %% still a punch that did not deliver.
+    ?assertEqual({introducer_only, punch_not_delivered}, i2p_peertest:result(accept, false, true)).
+
+%% The typed vocabulary the widened result draws from: the ladder's rungs and
+%% the chain's reasons, exported so the status view and any alert on it keep
+%% their type safety (the settled decision's rejection of free-form text).
+typed_vocabulary_test() ->
+    Rungs = [unknown, testing, unreachable, introducer_only, reachable],
+    Reasons =
+        [
+            own_config,
+            clock_skew,
+            no_charlie_report,
+            punch_not_delivered,
+            punch_delivered_no_session,
+            session_incomplete
+        ],
+    {Rung, Reason} = i2p_peertest:result(accept, true, false),
+    ?assert(lists:member(Rung, Rungs)),
+    %% A successful test broke no link, so its reason is `undefined`; a
+    %% concluded failure names one of the typed reasons.
+    ?assert(Reason =:= undefined orelse lists:member(Reason, Reasons)),
+    {Rung1, Reason1} = i2p_peertest:result(accept, false, true),
+    ?assertEqual(introducer_only, Rung1),
+    ?assert(lists:member(Reason1, Reasons)).

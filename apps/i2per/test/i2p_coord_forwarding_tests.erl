@@ -32,7 +32,7 @@ forwarded_blocks_reach_the_coordinators_test() ->
         Conn = conn_of(S0, peer_hash(1)),
         Msg1 =
             {peertest, 1, 0, 0, <<0:256>>, 2, 1, 0, <<127, 0, 0, 1>>, <<127, 0, 0, 1>>, <<0:512>>},
-        {noreply, _} =
+        {noreply, S1} =
             i2p_peer:handle_info(
                 {ssu2_data, Conn, [
                     {relay_tag, 7},
@@ -42,7 +42,11 @@ forwarded_blocks_reach_the_coordinators_test() ->
                 ]},
                 S0
             ),
-        ?assertEqual([{ssu2_data, Conn, [{relay_tag, 7}]}], drain_relay()),
+        %% The relay tag is the peer manager's own: it is stored against the
+        %% peer's hash, so only the four shapes the relay coordinator routes
+        %% reach it.
+        ?assertEqual([], drain_relay()),
+        ?assertEqual(#{7 => peer_hash(1)}, maps:get(relay_tags, S1)),
         ?assertEqual([{ssu2_data, Conn, [Msg1, {router_info, 0, <<"ri">>}]}], drain_pt()),
         ?assertEqual([path_challenge], announced())
     end).
@@ -69,10 +73,13 @@ a_relay_group_travels_in_order_test() ->
         ?assertEqual([], announced())
     end).
 
-%% Disabled (the default), nothing is forwarded and every non-I2NP shape is
-%% still announced as unhandled — the state `i2p_peer_block_flood_tests` pins.
-%% This case is the distinction: the sinks are registered, the keys off — so a
-%% forward that ignored the gate would land in a sink and fail the assertion.
+%% Disabled (the default), nothing is forwarded and every non-I2NP shape that
+%% nothing claims is still announced as unhandled — the state
+%% `i2p_peer_block_flood_tests` pins. The relay tag is the exception: it is
+%% claimed by the peer manager's own storage on either path, so it is stored
+%% rather than announced. This case is the distinction: the sinks are
+%% registered, the keys off — so a forward that ignored the gate would land in
+%% a sink and fail the assertion.
 disabled_router_forwards_nothing_test() ->
     with_sinks(fun() ->
         ok = application:unset_env(i2per, relay_coord),
@@ -80,14 +87,15 @@ disabled_router_forwards_nothing_test() ->
         ok = application:unset_env(i2per, peertest_coord),
         S0 = state_with_peer(peer_hash(1)),
         Conn = conn_of(S0, peer_hash(1)),
-        {noreply, _} =
+        {noreply, S1} =
             i2p_peer:handle_info(
                 {ssu2_data, Conn, [{relay_tag, 7}, {path_challenge, <<"x">>}]},
                 S0
             ),
         ?assertEqual([], drain_relay()),
         ?assertEqual([], drain_pt()),
-        ?assertEqual([relay_tag, path_challenge], announced())
+        ?assertEqual(#{7 => peer_hash(1)}, maps:get(relay_tags, S1)),
+        ?assertEqual([path_challenge], announced())
     end).
 
 %% --------------------------------------------------------------------------

@@ -78,6 +78,42 @@ build_local_reconstructs_keys() ->
         )
     ).
 
+%% The measured verdict drives the published caps (#CDZBVH): a measured
+%% `firewalled` demotes the caps even when the operator's config would claim
+%% reachable, and a measured `reachable` restores them. App env
+%% `measured_reachability` is what the caps read at use time; absent means no
+%% test has yet contradicted the operator's assertion. Asserted through
+%% `f:i2p_identity:build_local/5`, the path the RouterInfo is published
+%% through — a demotion lands on the next build, not the next restart.
+local_caps_follow_the_measured_verdict_test() ->
+    application:set_env(i2per, ntcp2_published, true),
+    application:set_env(i2per, allow_private_host, false),
+    try
+        Caps = fun() ->
+            {ok, Id} = i2p_identity:ensure_identity(?TEMP_DIR),
+            Local = i2p_identity:build_local(
+                Id, <<"127.0.0.1">>, 9150, maps:get(sign_seed, Id)
+            ),
+            maps:get(<<"caps">>, i2p_router_info:options(maps:get(ri, Local)))
+        end,
+        %% No measurement yet: the configured reachability is the answer.
+        application:unset_env(i2per, measured_reachability),
+        ?assertEqual(<<"RL">>, Caps()),
+
+        %% A measured firewalled demotes, whatever the config claims: the
+        %% `U` cap replaces the `R`.
+        application:set_env(i2per, measured_reachability, firewalled),
+        ?assertEqual(<<"UL">>, Caps()),
+
+        %% A measured reachable restores.
+        application:set_env(i2per, measured_reachability, reachable),
+        ?assertEqual(<<"RL">>, Caps())
+    after
+        application:unset_env(i2per, ntcp2_published),
+        application:unset_env(i2per, allow_private_host),
+        application:unset_env(i2per, measured_reachability)
+    end.
+
 build_local_nonpublished() ->
     application:set_env(i2per, ntcp2_published, false),
     application:set_env(i2per, allow_private_host, true),
