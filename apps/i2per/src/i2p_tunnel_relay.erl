@@ -343,8 +343,11 @@ accept_and_pace(State) ->
 recv_tunnel_id(#{recv_tunnel_id := RecvID}) -> RecvID.
 
 -spec maybe_deny(0..16#FFFFFFFF, accept | transit_denied_reason()) -> ok.
-maybe_deny(_RecvID, accept) -> ok;
-maybe_deny(RecvID, Reason) -> ok = i2p_events:notify({transit_denied, RecvID, Reason}).
+maybe_deny(_RecvID, accept) ->
+    ok;
+maybe_deny(RecvID, Reason) ->
+    ok = i2p_events:notify({transit_denied, RecvID, Reason}),
+    i2p_log:debug(transit_denied, #{recv_id => RecvID, reason => Reason}).
 
 %% pace_build/1 — charge one build-decision token against the build-accept
 %% bucket. When the bucket is drained the acceptance becomes ret 30; a

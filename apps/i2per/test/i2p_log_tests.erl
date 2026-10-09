@@ -386,7 +386,7 @@ a_frame_appears_when_the_log_level_is_debug_test() ->
 
 %% The emitters are wired to it, and every one of them says something.
 %%
-%% The whole fold is a claim about the tree, not about a function: 63 call sites
+%% The whole fold is a claim about the tree, not about a function: 69 call sites
 %% across four modules have to be recording frames, and a module that was missed
 %% would keep the old mechanism alive and pass every case above. So this reads
 %% the sources and counts what is actually there.
@@ -394,6 +394,14 @@ a_frame_appears_when_the_log_level_is_debug_test() ->
 %% The four names are named rather than counted to four, because "at least four"
 %% would survive an emitter being dropped from the list and re-added somewhere
 %% else, and the ticket's own text lists three when there are four.
+%%
+%% **Frames only.** `f:debug/2` now has a second caller: the seven bus-carried
+%% facts record themselves beside their `notify/1` site (#ADQ3WVM), which puts
+%% ten call sites in six more modules. Those are not frames and counting them as
+%% such would have made this case say a module emits frames when it emits a
+%% checklist fact's off-by-default record. The two are told apart by reading the
+%% label, through the same scan `i2p_log_checklist_tests` uses for the other half
+%% of the same partition -- one scanner, two questions about its output.
 the_four_frame_emitters_record_through_the_log_test() ->
     Expected = #{
         %% `i2p_ssu2_conn` gained one call site at #7GP4A4K: an inbound packet
@@ -968,21 +976,30 @@ log_carried_facts() ->
 
 %%% %%%%% Reading the frame call sites %%%%% %%%%%
 
-%% Every `i2p_log:debug(` in the core tree, as a count per file.
-%%
-%% Read with `binary:matches/2` and byte offsets, for the reason
-%% `i2p_log_checklist_tests` gives and repeats: these sources carry em-dashes, so
-%% a character index and a byte offset are different numbers.
--define(DEBUG, <<"i2p_log:debug(">>).
-
+%% `i2p_log:debug(` call sites whose label is *not* a checklist fact, as a count per
+%% file. A site naming a checklist fact is a bus fact's off-by-default record, which
+%% is `i2p_log_checklist_tests`' question; everything else is a frame, which is this
+%% module's. The scan itself is the checklist module's, exported rather than written
+%% twice -- a second reader over one needle is a second thing to keep in step with
+%% the call shape.
 -spec frame_call_counts() -> #{string() => non_neg_integer()}.
 frame_call_counts() ->
-    maps:from_list([{filename:basename(F), count_frames(F)} || F <- core_source_files()]).
+    lists:foldl(
+        fun({File, _Line, Fact}, Acc) ->
+            case is_checklist_fact(Fact) of
+                true -> Acc;
+                false -> maps:update_with(File, fun(N) -> N + 1 end, 1, Acc)
+            end
+        end,
+        #{},
+        i2p_log_checklist_tests:debug_call_sites()
+    ).
 
--spec count_frames(file:filename_all()) -> non_neg_integer().
-count_frames(File) ->
-    {ok, Bin} = file:read_file(File),
-    length(binary:matches(Bin, ?DEBUG)).
+%% Whether a `debug/2` label names something on the checklist. `dynamic` -- a tuple
+%% frame -- is not on it, which is the answer rather than an omission.
+-spec is_checklist_fact(atom()) -> boolean().
+is_checklist_fact(Fact) ->
+    lists:member(Fact, i2p_log:fact_names()).
 
 %% `{File, Line}` for every mention of `Needle` under any of `Dirs`.
 %%
@@ -1013,13 +1030,10 @@ mentions_in_dir(Needle, Dir) ->
 line_of(Bin, Offset) ->
     length(binary:matches(binary:part(Bin, 0, Offset), <<"\n">>)) + 1.
 
-%% Regular files only. A glob can return an entry that cannot be read, and
-%% `file:read_file/1` failing inside the scan would look like a broken test
-%% rather than a broken glob.
--spec core_source_files() -> [file:filename_all()].
-core_source_files() ->
-    Glob = filename:join(i2p_ct_helpers:project_root(), "apps/i2per/src/*.erl"),
-    [F || F <- filelib:wildcard(Glob), filelib:is_regular(F)].
+%% The frame call sites used to be found by globbing `apps/i2per/src/*.erl` here, and
+%% the glob is gone with the scanner: `f:frame_call_counts/0` reads the sites
+%% `i2p_log_checklist_tests:debug_call_sites/0` found, so the two cases partitioning
+%% one call shape cannot disagree about which files exist.
 
 %% Configuration the router reads straight from the application environment with
 %% nothing in front of it: not on `m:i2p_config_srv`'s key list, and not in the ini

@@ -188,8 +188,13 @@ project({error, {lookup_failed, _Reason}}, _Opts) -> {error, not_found};
 project(Other, _Opts) -> Other.
 
 %% A failure raised outside the orchestrator, projected the same way.
+%%
+%% The `undefined` key and `none` kind are the honest shapes here: this failure never
+%% had a key to look up and never reached the orchestrator, and the record says so
+%% rather than borrowing a key it did not fail on.
 failed(Reason, Opts) ->
     i2p_events:notify({lookup_failed, undefined, none, Reason}),
+    i2p_log:debug(lookup_failed, #{key => undefined, kind => none, reason => Reason}),
     project({error, {lookup_failed, Reason}}, Opts).
 
 -spec init([i2p_crypto:hash()]) -> {ok, state()}.
@@ -425,6 +430,7 @@ resolve_stored(Key, Kind, Outcome, State = #{pending := Pending}) ->
                     %% hold what this lookup wanted.
                     Reason = stored_failure(Kind, Outcome),
                     i2p_events:notify({lookup_failed, Key, Kind, Reason}),
+                    i2p_log:debug(lookup_failed, #{key => Key, kind => Kind, reason => Reason}),
                     reply_all(
                         maps:get(callers, P), {error, {lookup_failed, Reason}}
                     ),
@@ -487,7 +493,9 @@ fail(Key, State = #{pending := Pending}) ->
             %% this function to read back, which could never fire: `resolve_stored/4`
             %% removes the entry on every path that reaches it.
             Reason = no_answer,
-            i2p_events:notify({lookup_failed, Key, maps:get(kind, P), Reason}),
+            Kind = maps:get(kind, P),
+            i2p_events:notify({lookup_failed, Key, Kind, Reason}),
+            i2p_log:debug(lookup_failed, #{key => Key, kind => Kind, reason => Reason}),
             reply_all(maps:get(callers, P), {error, {lookup_failed, Reason}}),
             State#{pending := maps:remove(Key, Pending)}
     end.
