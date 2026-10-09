@@ -6,6 +6,28 @@ CI refuses a tag that disagrees.
 
 ## [Unreleased]
 
+**The Charlie role is implemented.** `i2p_relay_coord` now answers a RelayIntro
+on the tagged session as Charlie: it verifies Alice's RelayRequest signature
+with the router signing key her own forwarded RouterInfo publishes, checks her
+asserted endpoint for being punchable, and on accept signs a RelayResponse with
+its own key and answers twice — in-session to the introducer, and again inside
+the out-of-session HolePunch (type 11) sent straight to her asserted endpoint.
+A refusal is answered in-session only, with no punch, and carries Charlie's own
+reject code (70 Alice unknown, 67 signature failure, 65 endpoint not punchable,
+66 the punch budget is spent).
+
+Two bounds the reference implementations do not have: the punch is rate-limited
+by a per-session token bucket (a burst of 4, then one per second), and the
+endpoint predicate refuses loopback, private, link-local literals and privileged
+ports. Neither i2pd nor i2p-java rate-limits a punch this way.
+
+Supporting changes: `m:i2p_addr_policy` is the one predicate for "is this
+address on the public internet", shared by the boot validation (which had its
+own copy) and the punch gate. `m:i2p_peer` forwards a RouterInfo to both
+coordinators, which is the one shape that is not exclusively owned — the
+peer-test coordinator needs it for a message 1 and the relay coordinator for a
+RelayIntro.
+
 ## [0.2.1] — 2026-10-07
 
 **A patch release, because the defect was a silent one.**

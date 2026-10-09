@@ -422,7 +422,14 @@ the_four_frame_emitters_record_through_the_log_test() ->
         %% capacity -- and the peer-test coordinator's message 1 buffers with
         %% `no_charlie`, the same hold as the hash-not-yet-learned one, which is
         %% what keeps attach mode from raising on a Charlie session nobody dialed.
-        "i2p_relay_coord.erl" => 11,
+        %%
+        %% The relay coordinator gained four more with the Charlie role
+        %% (#A740VAB), and each is a verdict nobody else can see: an intro
+        %% refused with its Charlie-side code, an accept, a punch, and the
+        %% refuse-without-a-published-address branch of the accept. The route
+        %% lines are unchanged -- a block still travels the same two ways it
+        %% always did -- so the count is the verdicts and not the routing.
+        "i2p_relay_coord.erl" => 16,
         "i2p_peertest_coord.erl" => 8
     },
     Emitting = maps:filter(fun(_File, Count) -> Count > 0 end, frame_call_counts()),

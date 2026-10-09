@@ -14,9 +14,11 @@ in the [I2P documentation](https://i2p.net/en/docs/).
 
 The 0.2.1 release does not implement NTCP1, SSU1, I2CP, the legacy
 ElGamal/AES garlic formats, Datagram2, or a TUN interface. SSU2 path migration,
-RTT-based congestion control, automatic Charlie selection for PeerTest, and
-the complete firewalled HolePunch path are also outside this release. The
-sections below describe only behavior that is present in 0.2.1. 0.2.1 is a
+RTT-based congestion control, automatic Charlie selection for PeerTest, and a
+session token in the relay accept are also outside this release. The Charlie
+role itself is implemented: a tagged session answers a RelayIntro as Charlie,
+verifies the requester's signature, checks the asserted endpoint, and punches.
+The sections below describe only behavior that is present in 0.2.1. 0.2.1 is a
 patch release over 0.2.0 and changes no wire format.
 
 ## Implemented
@@ -2158,10 +2160,33 @@ answers with a fresh tag recorded against the requesting session in the
 introducer's tag registry.
 
 The implementation has the block codec, tag registry, introducer
-coordinator, requester redirect, and inbound HolePunch classification. It does
-not run the Charlie-side responder or verify RelayRequest/RelayIntro
-signatures. The sequence below is the wire flow, with those edges not yet
-active.
+coordinator, requester redirect, the Charlie-side responder, and inbound
+HolePunch classification. It does not grant a session token in the accept, and
+the firewalled-mode edge that publishes introducer addresses is the peer-test
+half only. The sequence below is the wire flow.
+
+**Charlie's verdict on a RelayIntro.** The intro arrives on the session the
+introducer holds with the tagged peer, and answering it is what being selected
+as a Charlie is for. The signature is verified first: Alice's Ed25519 router
+signing key, taken from the RouterInfo the introducer forwarded ahead of the
+intro, against `"RelayRequestData"` plus `bhash` (the introducer's) and `chash`
+(the tagged peer's own) — both hashes are inside the signed bytes, so the
+request is unreflectable. Then the asserted endpoint is checked for being
+punchable: a public literal and an unprivileged port, and nothing else. It is
+deliberately **not** matched against Alice's published SSU2 address, because
+that address is frequently the unreachable one, which is the whole reason she
+needs a Charlie.
+
+On accept, Charlie signs a RelayResponse with its own router signing key and
+answers twice: in-session to the introducer, and again inside the out-of-session
+HolePunch sent straight to Alice's asserted endpoint. Both copies carry the same
+code, nonce and endpoint. A refusal is answered in-session only, with no punch:
+Charlie-side 70 (Alice's RouterInfo not known), 67 (signature failure), 65
+(endpoint not punchable) or 66 (the punch budget is spent). The punch budget is
+a per-session token bucket — `?PUNCH_BURST` punches and then one per second —
+because a punch is an unsolicited datagram this router emits to an address a
+third party asserted, and an unbounded series of them is an amplification vector
+aimed wherever the tag-holder likes.
 
 **Relay-tag handshake (blocks 15/16).** The tagged peer, Charlie in
 this narrative, the firewalled router in the firewalled-mode flow — sends a
@@ -2374,16 +2399,18 @@ bitwise inverse `~(nonce << 32) | nonce`. Alice's listener classifies the
 message by decrypting under her own intro key and routes it to the pending
 relay.
 
-Implementations: `m:i2p_relay` (pure signing/conn-id/reject-code core),
+Implementations: `m:i2p_relay` (pure signing/conn-id/reject-code core and the
+punch payload blocks),
 `m:i2p_ssu2` (codec: `encode_blocks`/`decode_blocks` blocks 7/8/9 and
 15/16, `encode_holepunch/5`, `decode_holepunch/2`), `m:i2p_relay_coord`
 (introducer serving: grants tags in-session, keeps them in the
-listener-owned `i2p_ssu2_relay_tags` registry, and routes blocks 7/8/9
-between the tagged session and the requester), `m:i2p_ssu2_listener`
-(registry ownership) and `m:i2p_ssu2_conn` (sessions forward relay blocks to
-their owner; relay blocks 7/8/9 are ack-eliciting). The release does not
-implement Charlie-side HolePunch establishment or the full firewalled-router
-edge. Beyond codec round-trips, the wire layout above follows i2p-java's
-`SSU2Util` (the `bHash`/`cHash` in the request signature are context, not
-wire fields).
+listener-owned `i2p_ssu2_relay_tags` registry, routes blocks 7/8/9 between the
+tagged session and the requester, and answers a RelayIntro on the tagged
+session as Charlie — the signature verification, the endpoint check, the punch
+budget, and the out-of-session HolePunch), `m:i2p_ssu2_listener` (registry
+ownership) and `m:i2p_ssu2_conn` (sessions forward relay blocks to
+their owner; relay blocks 7/8/9 are ack-eliciting). Beyond codec round-trips,
+the wire layout above follows i2pd's `SSU2Session::HandleRelayIntro` and
+`SSU2HolePunchSession` (i2p-java's `SSU2Util` is the other reference: the
+`bHash`/`cHash` in the request signature are context, not wire fields).
 

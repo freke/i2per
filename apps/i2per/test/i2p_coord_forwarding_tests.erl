@@ -43,10 +43,13 @@ forwarded_blocks_reach_the_coordinators_test() ->
                 S0
             ),
         %% The relay tag is the peer manager's own: it is stored against the
-        %% peer's hash, so only the four shapes the relay coordinator routes
-        %% reach it.
-        ?assertEqual([], drain_relay()),
+        %% peer's hash and is not forwarded to either coordinator, so the
+        %% router_info is all the relay coordinator receives.
+        ?assertEqual([{ssu2_data, Conn, [{router_info, 0, <<"ri">>}]}], drain_relay()),
         ?assertEqual(#{7 => peer_hash(1)}, maps:get(relay_tags, S1)),
+        %% The RouterInfo is the one shape both coordinators claim: the
+        %% peer-test coordinator needs it to learn Alice's hash for a message 1,
+        %% the relay coordinator to verify her signature for a RelayIntro.
         ?assertEqual([{ssu2_data, Conn, [Msg1, {router_info, 0, <<"ri">>}]}], drain_pt()),
         ?assertEqual([path_challenge], announced())
     end).

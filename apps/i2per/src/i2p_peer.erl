@@ -948,44 +948,42 @@ peertest_interval_ms() ->
 forward_coord_blocks(ConnPid, Blocks, _State) ->
     RelayOn = i2p_relay_coord:enabled(),
     PtOn = i2p_peertest_coord:enabled(),
-    Classified = [{owner(B, RelayOn, PtOn), B} || B <- Blocks],
+    Classified = [{owners(B, RelayOn, PtOn), B} || B <- Blocks],
     send_coord_blocks(i2p_relay_coord, relay, ConnPid, Classified),
     send_coord_blocks(i2p_peertest_coord, peertest, ConnPid, Classified),
-    [B || {none, B} <- Classified].
+    [B || {[], B} <- Classified].
 
 %% One coordinator's set out of the classified blocks. An empty set is no send.
 send_coord_blocks(Name, Owner, ConnPid, Classified) ->
-    case [B || {O, B} <- Classified, O =:= Owner] of
+    case [B || {Owners, B} <- Classified, lists:member(Owner, Owners)] of
         [] -> ok;
         Blocks -> send_coord(Name, {ssu2_data, ConnPid, Blocks})
     end,
     ok.
 
-%% Which process a non-I2NP block belongs to, resolved against the enabled
-%% flags rather than after them: a shape whose coordinator is disabled is
-%% unhandled here, and it keeps its position in the unhandled stream. The
-%% introducer-relay shapes (7/8/9 and the 15/16 tag exchange) are
-%% `m:i2p_relay_coord`'s; the peer-test blocks (1-4) and RouterInfo are
-%% `m:i2p_peertest_coord`'s — the RouterInfo because it is what learns Alice's
-%% hash and what it forwards to the Charlie session ahead of message 2.
-owner(B, RelayOn, PtOn) ->
-    case is_relay_block(B) of
-        true ->
-            case RelayOn of
-                true -> relay;
-                false -> none
-            end;
-        false ->
-            case is_peertest_coord_block(B) of
-                true ->
-                    case PtOn of
-                        true -> peertest;
-                        false -> none
-                    end;
-                false ->
-                    none
-            end
-    end.
+%% Which coordinators a non-I2NP block belongs to: a list, because most shapes
+%% are exclusively owned and the RouterInfo is not. A block whose every owner is
+%% disabled is unhandled here, and it keeps its position in the unhandled
+%% stream.
+%%
+%% **The RouterInfo is claimed by both coordinators**, which is the one shape
+%% that is not exclusively owned. `m:i2p_peertest_coord` needs it to learn
+%% Alice's hash for a message 1, and `m:i2p_relay_coord` needs it to verify her
+%% signature for a RelayIntro — the same forwarded Alice, read for two different
+%% halves of the same traversal. Claiming it once would leave one of the two
+%% coordinators unable to verify anything it is asked to verify, and the failure
+%% would look like a peer misbehaving rather than like a forward that never
+%% arrived.
+owners(B, RelayOn, PtOn) ->
+    lists:append([
+        claimed(is_relay_block(B), relay, RelayOn),
+        claimed(is_peertest_coord_block(B), peertest, PtOn)
+    ]).
+
+%% One coordinator's claim on one block, resolved against its enabled flag.
+claimed(false, _Owner, _Enabled) -> [];
+claimed(_Claimed, _Owner, false) -> [];
+claimed(_Claimed, Owner, true) -> [Owner].
 
 %% Deliver one message to a coordinator. Resolved by name per use, and an
 %% absent name is a skip rather than a raise: the enabled key and the running
@@ -1001,12 +999,21 @@ send_coord(Name, Msg) ->
             ok
     end.
 
-%% The five introducer-relay shapes `m:i2p_relay_coord` routes.
+%% The shapes `m:i2p_relay_coord` routes: the five relay blocks, plus the
+%% RouterInfo that carries the relay requester's identity.
+%%
+%% **The RouterInfo is claimed by both coordinators**, which is the one shape
+%% that is not exclusively owned. `m:i2p_peertest_coord` needs it for a message
+%% 1 and `m:i2p_relay_coord` needs it for a RelayIntro, and both are the same
+%% forwarded Alice. Claiming it once would leave one of the two coordinators
+%% unable to verify anything it is asked to verify, and the failure would look
+%% like a peer misbehaving.
 is_relay_block(relay_tag_request) -> true;
 is_relay_block({relay_tag, _}) -> true;
 is_relay_block({relay_request, _, _, _, _, _, _, _, _}) -> true;
 is_relay_block({relay_response, _, _, _, _, _, _, _, _, _}) -> true;
 is_relay_block({relay_intro, _, _, _, _, _, _, _, _, _}) -> true;
+is_relay_block({router_info, _, _}) -> true;
 is_relay_block(_) -> false.
 
 %% The shapes `m:i2p_peertest_coord` routes: the in-session peer-test blocks
