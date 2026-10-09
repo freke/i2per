@@ -427,8 +427,10 @@ The 0.2.1 release does not implement NTCP1, SSU1, I2CP, the legacy ElGamal/AES
 crypto formats, Datagram2, or a TUN interface. Path migration and advanced
 congestion control are outside the current SSU2 data path. Floodfill and
 transit participation are available as bounded features, but they are not
-enabled by the shipped default profile. Automatic NetDb-driven Charlie selection
-and the complete firewalled HolePunch path are not implemented. In-place relup
+enabled by the shipped default profile. Automatic NetDb-driven Charlie
+selection is not implemented: the Charlie role itself is (a tagged session
+answers a RelayIntro, verifies the requester's signature and punches), so a
+peer that already holds a tag from i2per can select it. In-place relup
 upgrades are not supported in 0.2.1; upgrading means installing a new tarball.
 Nothing in 0.2.1 changes the wire formats, the configuration keys or the read
 API's key set, so a `data_dir` written by 0.2.0 is read unchanged.

@@ -31,6 +31,38 @@ is the tagged peer being introduced; whichever sends a RelayRequest is the
 requester. One coordinator serves one tagged peer and one requester at a
 time, mirroring `m:i2p_peertest_coord`'s single-alice/single-charlie model.
 
+## The Charlie half
+
+The tagged session is not passive. Whoever holds a tag is *selected as a
+Charlie* — that is what a tag is for — so the same process that hands tags out
+must also answer the RelayIntro that selection earns. An inbound `relay_intro`
+on the tagged session is therefore this router being asked to play Charlie, and
+it is answered the way `HandleRelayIntro` in i2pd answers it:
+
+* Alice's Ed25519 router signing key, taken from the RouterInfo the introducer
+  forwarded ahead of the intro, verifies her request signature over
+  `"RelayRequestData" || bhash || chash || nonce || tag || ts || ver || asz ||
+  port || ip` (`m:i2p_relay:verify_request/10`, unchanged). A failure is
+  Charlie-side code 67.
+* The asserted endpoint is Alice's *own* claim, and it frequently differs from
+  her published SSU2 address — that is the entire reason she needs a Charlie —
+  so it is not matched against her RouterInfo. It is checked for being
+  punchable (`m:i2p_addr_policy:punchable/2`) and nothing more.
+* On accept, this router signs a RelayResponse with **its own** router signing
+  key and answers twice: in-session to the introducer, which relays it to
+  Alice, and again inside the out-of-session HolePunch (type 11) sent straight
+  to her asserted endpoint. Both copies carry the same code, nonce and
+  endpoint, so Alice reaches one conclusion whichever path lands.
+
+**Two bounds the references do not have.** The punch is a datagram this router
+emits to a third party's address, so a hostile tag-holder must not be able to
+turn it into an amplifier: `f:punch_allowed/1` spends a per-session token
+bucket before each send, and the endpoint predicate refuses loopback, private
+and link-local literals and privileged ports. i2pd checks `IsSupported` on the
+address and relies on its own session tables for the rest; the bucket is the
+part that would otherwise be unbounded here, because the coordinator serves one
+tagged peer for as long as its session lives.
+
 ## Two start shapes
 
 `f:start_link/1` binds the coordinator's own SSU2 listener (the standalone
@@ -44,9 +76,10 @@ running listener's in both shapes; in attach mode it is resolved by name per
 use rather than held, because a listener restart changes the pid and the
 name is the stable handle.
 
-Relay-request signature verification and the out-of-session HolePunch path
-are not implemented in this release. The coordinator relays signed blocks
-unmodified.
+Relay-response verification is `m:i2p_ssu2_conn`'s on the requester leg: the
+requester checks Charlie's signature against the target RouterInfo it configured
+before dialling. The coordinator itself signs its own responses and relays
+Charlie's unmodified.
 """.
 
 -behaviour(gen_server).
@@ -61,6 +94,11 @@ unmodified.
 ]).
 %% gen_server
 -export([enabled/0, init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
+
+%% Exported for the tests that pin the punch bounds without a live session: the
+%% endpoint predicate is `m:i2p_addr_policy`'s, and the rate limit is the only
+%% part of this module with arithmetic in it.
+-export([punch_allowed/1]).
 
 -doc """
 Whether the coordinator is enabled.
@@ -90,6 +128,15 @@ enabled() ->
 %% Registry cap: at this many live tags, tag requests go unanswered and relay
 %% requests against a tag service refuse with code 3 "limit exceeded".
 -define(MAX_RELAY_TAGS, 100).
+%% Hole-punch rate limit, per coordinator (and so per tagged session, since one
+%% coordinator serves one tagged peer at a time). A punch is an unsolicited
+%% datagram this router emits to an address a third party asserted, so the
+%% bound is on the send and not on the accept: a tag-holder who replays one
+%% intro gets `?PUNCH_BURST` punches and then Charlie-side code 66. One per
+%% second sustained, which is far above the rate any legitimate relay arrives at
+%% and far below the rate an amplifier would want.
+-define(PUNCH_RATE, 1).
+-define(PUNCH_BURST, 4).
 
 -doc """
 Start an introducer relay coordinator for Bob.
@@ -141,24 +188,22 @@ stop(Coord) ->
 %% gen_server
 
 init({attach, BobLocal}) ->
-    {ok, #{
-        bob_local => BobLocal,
-        sessions => #{},
-        tagged_sess => undefined,
-        tag => undefined,
-        requester_sess => undefined
-    }};
+    {ok, routing(BobLocal)};
 init(BobLocal) ->
     {ok, Listener} =
         i2p_ssu2_listener:listen(<<"127.0.0.1">>, 0, BobLocal, self()),
-    {ok, #{
-        listener => Listener,
+    {ok, (routing(BobLocal))#{listener => Listener}}.
+
+routing(BobLocal) ->
+    #{
         bob_local => BobLocal,
         sessions => #{},
         tagged_sess => undefined,
         tag => undefined,
-        requester_sess => undefined
-    }}.
+        requester_sess => undefined,
+        alice_ri => undefined,
+        punch_bucket => i2p_token_bucket:new(?PUNCH_RATE, ?PUNCH_BURST)
+    }.
 
 handle_call(port, _From, State = #{listener := Listener}) ->
     {reply, i2p_ssu2_listener:port(Listener), State};
@@ -191,7 +236,7 @@ handle_info({ssu2_ready, Pid, _Keys, RemoteRI}, State = #{sessions := Sessions})
 handle_info({ssu2_ready, _Pid, _Keys, undefined}, State) ->
     {noreply, State};
 handle_info({ssu2_data, Pid, Blocks}, State) ->
-    {noreply, route_blocks(Pid, Blocks, State)};
+    {noreply, route_blocks(Pid, Blocks, learn_alice_ri(Blocks, State))};
 %% A session this process knows died. Its RouterInfo row is stale the moment
 %% the pid is, and a requester or tagged session pid left in the state would be
 %% cast to -- a cast to a dead process is silently dropped, which is harmless
@@ -236,7 +281,7 @@ route_blocks(Pid, Blocks, State = #{tagged_sess := Tagged}) ->
     case Pid =:= Tagged of
         true ->
             i2p_log:debug({coord_route, tagged_to_requester}, []),
-            relay_tagged_to_requester(Blocks, State1);
+            serve_intro(Blocks, relay_tagged_to_requester(Blocks, State1));
         false ->
             i2p_log:debug({coord_route, requester_to_tagged}, []),
             relay_requester_to_tagged(Pid, Blocks, State1)
@@ -424,6 +469,269 @@ reject_requester(Pid, Code, Ver, Nonce, State = #{bob_local := BobLocal}) ->
     Reject = i2p_relay:response_block(Code, Ver, Nonce, Ts, 0, <<>>, Sig, undefined),
     i2p_ssu2_conn:send_relay(Pid, Reject),
     State.
+
+%% ----------------------------------------------------------------------
+%% Charlie half (blocks 9/8, type 11)
+
+%% Alice's RouterInfo as the introducer forwarded it on the tagged session,
+%% held so a RelayIntro from that same session can be answered. The intro names
+%% Alice by hash and carries no key, so the introducer sends her RouterInfo ahead
+%% of it — in the same Data message or the one before, which SSU2 ordering makes
+%% either way. One slot is the whole requirement, because the coordinator serves
+%% one relay at a time; an intro arriving with no RouterInfo of its own is
+%% refused as 70 rather than answered from a stale identity.
+%%
+%% Only the tagged session's RouterInfo is learned. A requester session also
+%% carries one (it is how `f:request_ri/2` serves Alice), and reading that would
+%% be reading the other half of the relay we may be asked to be the far end of.
+%%
+%% The RI is also what supplies Alice's introduction key, which is what the
+%% out-of-session punch is sealed under. There is no path to a punch without it.
+learn_alice_ri(Blocks, State = #{tagged_sess := Tagged}) ->
+    case {Tagged, lists:keyfind(router_info, 1, Blocks)} of
+        {undefined, _} -> State;
+        {_, false} -> State;
+        {_, {router_info, _Flag, RIData}} -> decode_ri(RIData, State)
+    end;
+learn_alice_ri(_Blocks, State) ->
+    State.
+
+decode_ri(RIData, State) ->
+    case i2p_router_info:decode(RIData) of
+        {ok, RI} -> State#{alice_ri => RI};
+        {error, _Malformed} -> State
+    end.
+
+%% A RelayIntro on the tagged session is this router being selected as the
+%% Charlie. Answer it in-session (the introducer relays the response to Alice)
+%% and, on an accept, punch out of session.
+serve_intro(Blocks, State) ->
+    case lists:keyfind(relay_intro, 1, Blocks) of
+        {relay_intro, _Flag, _AliceHash, Nonce, Tag, Ts, Ver, Port, Ip, Sig} ->
+            answer_intro(Nonce, Tag, Ts, Ver, Port, Ip, Sig, State);
+        false ->
+            State
+    end.
+
+%% Charlie's verdict on an intro, in the order i2pd reaches it: the signature
+%% is checked first, because an unverified endpoint is not one we are willing to
+%% act on; the endpoint is checked next, because a punch at a private or
+%% loopback literal is the one thing this router must never do and the refusal
+%% costs nothing; and the punch budget is spent last, because a denial should
+%% not consume the budget of the legitimate request behind it.
+answer_intro(Nonce, Tag, Ts, Ver, Port, Ip, Sig, State = #{tagged_sess := Tagged}) ->
+    case verify_intro(Nonce, Tag, Ts, Ver, Port, Ip, Sig, State) of
+        {error, Code} ->
+            i2p_log:debug({charlie, refused, nonce, Nonce, code, Code}, []),
+            reject_charlie(Tagged, Code, Ver, Nonce, State);
+        ok ->
+            case i2p_addr_policy:punchable(Port, Ip) of
+                false ->
+                    i2p_log:debug({charlie, refused, nonce, Nonce, endpoint}, []),
+                    reject_charlie(Tagged, 65, Ver, Nonce, State);
+                true ->
+                    case punch_allowed(State) of
+                        {allow, State1} ->
+                            accept_intro(Tagged, Ver, Nonce, Port, Ip, State1);
+                        deny ->
+                            reject_charlie(Tagged, 66, Ver, Nonce, State)
+                    end
+            end
+    end.
+
+%% Alice's signature over `"RelayRequestData" || bhash || chash || nonce || tag
+%% || ts || ver || asz || port || ip`, verified with the router signing key her
+%% own forwarded RouterInfo publishes. `chash` is this router and `bhash` the
+%% introducer whose session forwarded the intro: both hashes are inside the
+%% signed bytes, which is what makes the request unreflectable and unplayable
+%% against a different pair of parties.
+%%
+%% Failure codes are Charlie's (64-70), not Bob's: the requester distinguishes
+%% the two sides, and answering with a Bob code here would name the wrong party
+%% as the refuser. A missing or unusable Alice RouterInfo is 70 ("Alice
+%% unknown") and a bad signature 67, matching i2pd.
+verify_intro(Nonce, Tag, Ts, Ver, Port, Ip, Sig, State = #{bob_local := BobLocal}) ->
+    case {maps:get(alice_ri, State, undefined), introducer_hash(State)} of
+        {undefined, _} ->
+            {error, 70};
+        {error, _} ->
+            {error, 70};
+        {AliceRI, {ok, BobHash}} ->
+            Pub = i2p_keys:signing_key(i2p_router_info:identity(AliceRI)),
+            OurHash = maps:get(hash, BobLocal),
+            case
+                i2p_relay:verify_request(
+                    BobHash, OurHash, Ver, Nonce, Tag, Ts, Port, Ip, Sig, Pub
+                )
+            of
+                true -> ok;
+                false -> {error, 67}
+            end
+    end.
+
+%% The hash of the introducer on the other end of the tagged session — the
+%% `bhash` Alice signed against. It comes from that session's own handshake
+%% RouterInfo, the same row `f:request_ri/2` reads, so an unknown peer is 70
+%% rather than a verification against nothing.
+introducer_hash(State = #{tagged_sess := Tagged}) ->
+    case maps:get(Tagged, maps:get(sessions, State, #{}), undefined) of
+        undefined -> error;
+        RI -> {ok, i2p_router_info:hash(RI)}
+    end.
+
+%% A Charlie-side reject: our own signing key, no endpoint (csz 0), the
+%% requester's nonce echoed. Sent to the introducer, which relays it to Alice.
+reject_charlie(Tagged, Code, Ver, Nonce, State = #{bob_local := BobLocal}) ->
+    Ts = erlang:system_time(second),
+    Sig = i2p_relay:sign_response(
+        maps:get(hash, BobLocal), Ver, Nonce, Ts, 0, <<>>, maps:get(sign_seed, BobLocal)
+    ),
+    Reject = i2p_relay:response_block(Code, Ver, Nonce, Ts, 0, <<>>, Sig, undefined),
+    i2p_ssu2_conn:send_relay(Tagged, Reject),
+    State.
+
+%% The accept. Charlie's endpoint is this router's own published SSU2 address,
+%% signed with our router signing key — Alice verifies both against the
+%% RouterInfo she was configured with, so this is the edge the whole relay
+%% exists to make possible.
+%%
+%% The same response block is then sent twice: once in-session to the
+%% introducer, and once inside the out-of-session HolePunch to Alice's asserted
+%% endpoint. i2pd builds it once and reuses the bytes, and so does this: two
+%% separately-built blocks could disagree, and Alice only reaches one conclusion
+%% whichever lands.
+accept_intro(Tagged, Ver, Nonce, Port, Ip, State = #{bob_local := BobLocal}) ->
+    Ts = erlang:system_time(second),
+    case published_endpoint(BobLocal) of
+        {ok, OurPort, OurIp} ->
+            Sig = i2p_relay:sign_response(
+                maps:get(hash, BobLocal),
+                Ver,
+                Nonce,
+                Ts,
+                OurPort,
+                OurIp,
+                maps:get(sign_seed, BobLocal)
+            ),
+            Response = i2p_relay:response_block(0, Ver, Nonce, Ts, OurPort, OurIp, Sig, undefined),
+            i2p_log:debug({charlie, accepted, nonce, Nonce}, []),
+            i2p_ssu2_conn:send_relay(Tagged, Response),
+            punch(Nonce, Ts, OurPort, OurIp, Port, Ip, Response, State);
+        error ->
+            %% No published SSU2 address of our own to hand Alice, so there is
+            %% nothing for her to dial: refusing beats an accept she cannot use.
+            i2p_log:debug({charlie, refused, nonce, Nonce, no_published_address}, []),
+            reject_charlie(Tagged, 70, Ver, Nonce, State)
+    end.
+
+%% This router's own published SSU2 endpoint — the address Alice will dial after
+%% the punch opens the path, and the endpoint the accept response carries. Read
+%% from our RouterInfo rather than from the listener, because the listener's
+%% port is what we bound and the published one is what peers can reach, and the
+%% two differ on every firewalled router. The IP comes back as wire bytes, which
+%% is what a relay block carries and what `f:punch_blocks/4` needs.
+published_endpoint(BobLocal) ->
+    case i2p_router_info:ssu2_address_options(maps:get(ri, BobLocal)) of
+        {ok, #{published := true, host := Host, port := Port}} ->
+            case endpoint_tuple(Host, Port) of
+                {ok, {IP, Port}} -> {ok, Port, ip_bytes(IP)};
+                error -> error
+            end;
+        _Unpublished ->
+            error
+    end.
+
+%% Relay endpoint bytes, from the IP tuple the listener parsed. An IPv4
+%% literal is 4 bytes and an IPv6 one 8, which is the length the codec fixes an
+%% endpoint at.
+ip_bytes(IP) ->
+    iolist_to_binary([<<B>> || B <- tuple_to_list(IP)]).
+
+%% The out-of-session HolePunch (type 11), sent straight to Alice's asserted
+%% endpoint: a long-header datagram AEAD-sealed under **Alice's** introduction
+%% key, carrying the same RelayResponse as the in-session copy. The connection
+%% IDs derive from the relay nonce exactly as PeerTest's do, which is how Alice's
+%% listener routes it to the session waiting on this relay.
+punch(Nonce, Ts, OurPort, OurIp, Port, Ip, Response, State) ->
+    case {maps:get(alice_ri, State, undefined), punch_endpoint(Port, Ip)} of
+        {undefined, _} ->
+            State;
+        {AliceRI, {ok, Endpoint}} ->
+            case alice_intro_key(AliceRI) of
+                error ->
+                    State;
+                {ok, Bik} ->
+                    Blocks = i2p_relay:punch_blocks(Ts, OurPort, OurIp, Response),
+                    {ok, Packet} = i2p_ssu2:encode_holepunch(
+                        Bik,
+                        rand:uniform(16#FFFFFFFF),
+                        i2p_relay:dst_conn_id(Nonce),
+                        i2p_relay:src_conn_id(Nonce),
+                        Blocks
+                    ),
+                    case relay_listener(State) of
+                        undefined ->
+                            State;
+                        Listener ->
+                            i2p_log:debug({charlie, punched, Nonce, Endpoint}, []),
+                            i2p_ssu2_listener:send(Listener, Packet, Endpoint),
+                            State
+                    end
+            end;
+        {_AliceRI, error} ->
+            State
+    end.
+
+%% The endpoint Alice asserted, as the listener's `{IP, Port}` shape. The
+%% punchable check is here rather than in `punch/9` because it is a property of
+%% the bytes as they arrived: 4 or 16 of them, and an address on the public
+%% internet, or this router emits nothing at all.
+punch_endpoint(Port, Ip) ->
+    case i2p_addr_policy:punchable(Port, Ip) of
+        true -> endpoint_tuple(inet:ntoa(list_to_tuple(binary_to_list(Ip))), Port);
+        false -> error
+    end.
+
+%% `{IP, Port}` from an address that may be a host string or a literal.
+endpoint_tuple(Host, Port) when is_binary(Host), is_integer(Port), Port > 0 ->
+    case inet:parse_address(binary_to_list(Host)) of
+        {ok, IP} -> {ok, {IP, Port}};
+        {error, _} -> error
+    end;
+endpoint_tuple(_Host, _Port) ->
+    error.
+
+%% The introduction key the punch is sealed under, recovered from Alice's
+%% RouterInfo. Without it the datagram is undecryptable to her, so a RouterInfo
+%% publishing no SSU2 address at all is a refusal rather than a send.
+alice_intro_key(AliceRI) ->
+    case i2p_router_info:ssu2_address_options(AliceRI) of
+        {ok, Opts} -> {ok, maps:get(intro_key, Opts)};
+        error -> error
+    end.
+
+-doc """
+Spend one token from the HolePunch budget.
+
+Input: coordinator state. Output: `{allow, State}` with the bucket debited, or
+`deny` unchanged — the caller answers Charlie-side code 66 ("limit exceeded")
+and sends nothing.
+
+The bound is on the punch and not on the accept, because the punch is what
+costs something outside this router: an accepted relay sends one datagram to an
+address a third party chose, and an unbounded series of accepts is an
+amplification vector aimed wherever the tag-holder likes. The budget is
+`?PUNCH_BURST` punches and then one per second, which covers a legitimate
+intro arriving with the burst of retransmits SSU2 can produce and stops a
+replay.
+""".
+-spec punch_allowed(#{punch_bucket := i2p_token_bucket:bucket(), _ => _}) ->
+    {allow, #{punch_bucket := i2p_token_bucket:bucket(), _ => _}} | deny.
+punch_allowed(State = #{punch_bucket := Bucket}) ->
+    case i2p_token_bucket:consume(Bucket, 1, erlang:system_time(millisecond)) of
+        {allow, Bucket1} -> {allow, State#{punch_bucket => Bucket1}};
+        deny -> deny
+    end.
 
 %% The requester's RouterInfo learned from her SessionConfirmed: its wire
 %% bytes (forwarded to the tagged peer) and hash (the RelayIntro's AliceHash).

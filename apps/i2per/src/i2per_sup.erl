@@ -753,7 +753,7 @@ validate_host(Host) ->
         {true, _} ->
             {ok, Host};
         {false, {ok, Addr}} ->
-            case public_addr(Addr, Host) of
+            case i2p_addr_policy:public(Addr) of
                 true -> {ok, Host};
                 false -> exit({config_error, {non_public_host, Host}})
             end;
@@ -761,7 +761,7 @@ validate_host(Host) ->
             %% Not an IP literal: treat as a hostname and resolve it.
             case inet:getaddrs(binary_to_list(Host), inet) of
                 {ok, Addrs} ->
-                    case lists:any(fun(A) -> public_addr(A, Host) end, Addrs) of
+                    case lists:any(fun(A) -> i2p_addr_policy:public(A) end, Addrs) of
                         true -> {ok, Host};
                         false -> exit({config_error, {non_public_host, Host}})
                     end;
@@ -769,41 +769,6 @@ validate_host(Host) ->
                     exit({config_error, {unresolvable_host, Host}})
             end
     end.
-
-public_addr(Addr, Host) ->
-    case tuple_size(Addr) of
-        4 ->
-            case Addr of
-                {127, _, _, _} -> false;
-                {169, 254, _, _} -> false;
-                {0, _, _, _} -> false;
-                {10, _, _, _} -> false;
-                {172, B, _, _} when B >= 16, B =< 31 -> false;
-                {192, 168, _, _} -> false;
-                {A, _, _, _} when A >= 224 -> false;
-                _ -> true
-            end;
-        8 ->
-            case addr_family(Addr) of
-                loopback -> false;
-                unspecified -> false;
-                link_local -> false;
-                unique_local -> false;
-                multicast -> false;
-                public -> true
-            end;
-        _ ->
-            exit({config_error, {unresolvable_host, Host}})
-    end.
-
-addr_family({0, 0, 0, 0, 0, 0, 0, 1}) -> loopback;
-addr_family({0, 0, 0, 0, 0, 0, 0, 0}) -> unspecified;
-addr_family({16#fe80, _, _, _, _, _, _, _}) -> link_local;
-addr_family({16#febf, _, _, _, _, _, _, _}) -> link_local;
-addr_family({16#fc, _, _, _, _, _, _, _}) -> unique_local;
-addr_family({16#fd, _, _, _, _, _, _, _}) -> unique_local;
-addr_family({16#ff, _, _, _, _, _, _, _}) -> multicast;
-addr_family({_, _, _, _, _, _, _, _}) -> public.
 
 peer_child_spec(Local, Seeds) ->
     #{

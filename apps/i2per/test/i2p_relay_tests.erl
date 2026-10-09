@@ -279,3 +279,78 @@ reject_code_classification_test() ->
     ?assert(i2p_relay:is_reject(64)),
     ?assert(i2p_relay:is_reject(128)),
     ?assertNot(i2p_relay:is_reject(0)).
+
+%% --------------------------------------------------------------------------
+%% HolePunch payload (type 11)
+%% --------------------------------------------------------------------------
+
+%% The punch payload is the four blocks the spec lists, in order: DateTime,
+%% Address, the very RelayResponse sent in-session, Padding. Both reference
+%% implementations build it this way (i2pd `SSU2HolePunchSession::SendHolePunch`,
+%% i2p-java `SSU2Session`), and the third is the one that matters most — the
+%% response is what tells Alice this punch is an answer and not noise.
+punch_blocks_layout_test() ->
+    Ts = 1_700_000_000,
+    Port = 49657,
+    Ip = ipv4(),
+    Response = i2p_relay:response_block(0, 2, 16#CAFEBABE, Ts, Port, Ip, <<0:512>>, undefined),
+    ?assertMatch(
+        [
+            {datetime, Ts},
+            {address, Port, Ip},
+            {relay_response, 0, 0, 16#CAFEBABE, Ts, 2, Port, Ip, <<0:512>>, undefined},
+            {padding, _Pad}
+        ],
+        i2p_relay:punch_blocks(Ts, Port, Ip, Response)
+    ).
+
+%% The punch is sealed as a type-11 long-header datagram and comes back through
+%% the decoder. This is the round trip that proves the punch is a message Alice's
+%% listener can actually classify, rather than a block list that only looks right.
+%%
+%% Padding is the one block that does not come back: it exists to give the
+%% datagram a plausible size and the decoder discards it, which is why the
+%% assertion is over the three meaningful blocks rather than over the whole list
+%% `f:punch_blocks/4` produced.
+punch_blocks_round_trip_as_a_holepunch_test() ->
+    Ts = 1_700_000_000,
+    Port = 49657,
+    Ip = ipv4(),
+    Bik = crypto:strong_rand_bytes(32),
+    Nonce = 16#CAFEBABE,
+    Response = i2p_relay:response_block(0, 2, Nonce, Ts, Port, Ip, <<0:512>>, undefined),
+    {ok, Packet} = i2p_ssu2:encode_holepunch(
+        Bik,
+        12345,
+        i2p_relay:dst_conn_id(Nonce),
+        i2p_relay:src_conn_id(Nonce),
+        i2p_relay:punch_blocks(Ts, Port, Ip, Response)
+    ),
+    {ok, #{blocks := Blocks, dst_conn_id := Dst, src_conn_id := Src}} =
+        i2p_ssu2:decode_holepunch(Bik, Packet),
+    ?assertEqual(i2p_relay:dst_conn_id(Nonce), Dst),
+    ?assertEqual(i2p_relay:src_conn_id(Nonce), Src),
+    ?assertMatch(
+        [
+            {datetime, Ts},
+            {address, Port, Ip},
+            {relay_response, 0, 0, Nonce, Ts, 2, Port, Ip, <<0:512>>, undefined}
+        ],
+        Blocks
+    ).
+
+%% A punch sealed under the wrong introduction key is not a punch — Alice's
+%% listener cannot read it, and it is indistinguishable from noise.
+punch_blocks_wrong_key_does_not_decode_test() ->
+    Bik = crypto:strong_rand_bytes(32),
+    Other = crypto:strong_rand_bytes(32),
+    Ts = 1_700_000_000,
+    Response = i2p_relay:response_block(0, 2, 1, Ts, 49657, ipv4(), <<0:512>>, undefined),
+    {ok, Packet} = i2p_ssu2:encode_holepunch(
+        Bik,
+        1,
+        i2p_relay:dst_conn_id(1),
+        i2p_relay:src_conn_id(1),
+        i2p_relay:punch_blocks(Ts, 49657, ipv4(), Response)
+    ),
+    ?assertEqual(error, i2p_ssu2:decode_holepunch(Other, Packet)).

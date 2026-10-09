@@ -15,7 +15,11 @@
 -export([
     relay_tag_request_handshake/1,
     relay_request_unknown_tag_rejected/1,
-    indirect_dial_through_introducer/1
+    indirect_dial_through_introducer/1,
+    charlie_accepts_a_verified_intro/1,
+    charlie_rejects_an_unverifiable_intro/1,
+    charlie_rejects_a_non_punchable_endpoint/1,
+    charlie_punch_budget_bounds_the_replays/1
 ]).
 
 -define(APP, i2per).
@@ -29,7 +33,11 @@ all() ->
     [
         relay_tag_request_handshake,
         relay_request_unknown_tag_rejected,
-        indirect_dial_through_introducer
+        indirect_dial_through_introducer,
+        charlie_accepts_a_verified_intro,
+        charlie_rejects_an_unverifiable_intro,
+        charlie_rejects_a_non_punchable_endpoint,
+        charlie_punch_budget_bounds_the_replays
     ].
 
 %% ---------------------------------------------------------------------------
@@ -218,12 +226,204 @@ indirect_dial_through_introducer(_Config) ->
     end.
 
 %% ---------------------------------------------------------------------------
-%% Helpers
+%% The Charlie role (blocks 9/8, out-of-session punch)
 %% ---------------------------------------------------------------------------
 
-%% Dial the coordinator's listener from a fresh peer, returning its session
-%% pid, listener and full local map (hash/RI carried, so the caller can
-%% verify signatures and recover the peer's advertised address).
+%% The tagged session is not passive: whoever holds a tag is selected as a
+%% Charlie, so a RelayIntro on the tagged session is this router being asked to
+%% play Charlie. The coordinator here holds Charlie's keys, and the introducer
+%% dials it — so the tagged session's own handshake RouterInfo is the
+%% introducer's, which is the `bhash` Alice signed against, and this router's
+%% own hash is the `chash`. A verified intro earns a signed accept on the wire:
+%% code 0, Charlie's own published endpoint, and a signature Alice checks
+%% against the RouterInfo she was configured with.
+%%
+%% **The punch is not observable here, and that is the honest limit of a
+%% hermetic test.** Alice asserts a documentation-range address, which the
+%% endpoint policy treats as public, so the accept is earned — but the punch
+%% datagram is then sent to an address nothing listens on, and a test cannot
+%% watch a socket it does not own. What is pinned is the accept on the wire and
+%% the payload's shape, the latter in `m:i2p_relay_tests`, where the punch round
+%% trips through the decoder under Alice's introduction key.
+charlie_accepts_a_verified_intro(_Config) ->
+    {CharlieLocal, _} = bob_local(),
+    CharlieHash = maps:get(hash, CharlieLocal),
+    {ok, Coord} = i2p_relay_coord:start_link(CharlieLocal),
+    try
+        %% -- The introducer (Bob) dials the coordinator and requests a tag: a
+        %%    tag request is what makes a session the tagged one, and the tag
+        %%    is the precondition for being selected as a Charlie at all.
+        {BobPid, _Listener, BobLocal} = dial_peer(Coord, CharlieLocal),
+        Tag = request_tag(BobPid),
+        true = Tag > 0,
+        BobHash = i2p_router_info:hash(maps:get(ri, BobLocal)),
+
+        %% -- Alice's RouterInfo and the RelayIntro, as the introducer forwards
+        %%    them: her RI ahead of the intro, in the same Data message. She
+        %%    signs against the introducer's hash and this router's.
+        {_AliceListener, _APort, AliceLocal} = listen_full_local(<<"127.0.0.1">>),
+        AliceRIBin = maps:get(ri_binary, AliceLocal),
+        ASignPub = maps:get(sign_pub, AliceLocal),
+        ASeed = maps:get(sign_seed, AliceLocal),
+        AHash = i2p_router_info:hash(maps:get(ri, AliceLocal)),
+        Nonce = 16#CAFEBABE,
+        Ts = erlang:system_time(second),
+        %% A documentation-range endpoint: public per the address policy, so
+        %% the accept is earned and the punch is attempted at an address
+        %% nothing here owns.
+        Sig = i2p_relay:sign_request(
+            BobHash, CharlieHash, 2, Nonce, Tag, Ts, 49657, <<192, 0, 2, 7>>, ASeed
+        ),
+        ok = i2p_ssu2_conn:send_router_info(BobPid, 0, AliceRIBin),
+        ok = i2p_ssu2_conn:send_relay(
+            BobPid,
+            i2p_relay:intro_block(
+                2, AHash, Nonce, Tag, Ts, 49657, <<192, 0, 2, 7>>, Sig
+            )
+        ),
+
+        %% -- Charlie's accept: code 0, his own published endpoint, signed with
+        %%    his router signing key. Alice's signature verified, which is the
+        %%    whole point — an unverified intro is refused, not accepted. The
+        %%    endpoint is the published one, which is what Alice dials and not
+        %%    the port the listener happened to bind.
+        CPort = published_port(CharlieLocal),
+        ok = wait_charlie_response(
+            BobPid, CharlieHash, Nonce, 0, ASignPub, CharlieLocal, CPort
+        )
+    after
+        catch i2p_relay_coord:stop(Coord)
+    end.
+
+%% The punch budget is the bound on the send, not on the accept: `?PUNCH_BURST`
+%% punches and then Charlie-side code 66. A tag-holder who replays one intro
+%% gets the burst and then nothing, which is what stops this router becoming an
+%% amplifier aimed wherever the tag-holder likes.
+charlie_punch_budget_bounds_the_replays(_Config) ->
+    {CharlieLocal, _} = bob_local(),
+    CharlieHash = maps:get(hash, CharlieLocal),
+    {ok, Coord} = i2p_relay_coord:start_link(CharlieLocal),
+    try
+        {BobPid, _Listener, BobLocal} = dial_peer(Coord, CharlieLocal),
+        Tag = request_tag(BobPid),
+        true = Tag > 0,
+        BobHash = i2p_router_info:hash(maps:get(ri, BobLocal)),
+
+        {_AliceListener, _APort, AliceLocal} = listen_full_local(<<"127.0.0.1">>),
+        AliceRIBin = maps:get(ri_binary, AliceLocal),
+        AHash = i2p_router_info:hash(maps:get(ri, AliceLocal)),
+        ASignPub = maps:get(sign_pub, AliceLocal),
+        ASeed = maps:get(sign_seed, AliceLocal),
+        CPort = published_port(CharlieLocal),
+
+        %% Five verified intros asserting the same public endpoint. The first
+        %% four spend the burst; the fifth is denied with code 66.
+        Nonces = [16#CAFE0001, 16#CAFE0002, 16#CAFE0003, 16#CAFE0004, 16#CAFE0005],
+        lists:foreach(
+            fun(Nonce) ->
+                Ts = erlang:system_time(second),
+                Sig = i2p_relay:sign_request(
+                    BobHash, CharlieHash, 2, Nonce, Tag, Ts, 49657, <<192, 0, 2, 7>>, ASeed
+                ),
+                ok = i2p_ssu2_conn:send_router_info(BobPid, 0, AliceRIBin),
+                ok = i2p_ssu2_conn:send_relay(
+                    BobPid,
+                    i2p_relay:intro_block(2, AHash, Nonce, Tag, Ts, 49657, <<192, 0, 2, 7>>, Sig)
+                )
+            end,
+            Nonces
+        ),
+        Codes = wait_charlie_codes(BobPid, CharlieHash, Nonces, ASignPub, CharlieLocal, CPort),
+        [0, 0, 0, 0, 66] = Codes
+    after
+        catch i2p_relay_coord:stop(Coord)
+    end.
+
+%% A RelayIntro whose signature does not verify is refused, not accepted: code
+%% 67 is Charlie's "signature failure", signed by Charlie with no endpoint, and
+%% no punch is attempted. This is the edge that makes the coordinator safe to
+%% run — without it, any peer holding a tag could make this router emit a
+%% datagram at a third party on the strength of an unverified claim.
+charlie_rejects_an_unverifiable_intro(_Config) ->
+    {CharlieLocal, _} = bob_local(),
+    CharlieHash = maps:get(hash, CharlieLocal),
+    {ok, Coord} = i2p_relay_coord:start_link(CharlieLocal),
+    try
+        {BobPid, _Listener, _BobLocal} = dial_peer(Coord, CharlieLocal),
+        Tag = request_tag(BobPid),
+        true = Tag > 0,
+
+        {_AliceListener, _APort, AliceLocal} = listen_full_local(<<"127.0.0.1">>),
+        AliceRIBin = maps:get(ri_binary, AliceLocal),
+        AHash = i2p_router_info:hash(maps:get(ri, AliceLocal)),
+        ASeed = maps:get(sign_seed, AliceLocal),
+        Nonce = 16#DEADBEEF,
+        Ts = erlang:system_time(second),
+        %% Signed against the wrong pair: the bhash is a router that is neither
+        %% the introducer nor this one, so the verification cannot succeed.
+        WrongPair = crypto:strong_rand_bytes(32),
+        Sig = i2p_relay:sign_request(
+            WrongPair, CharlieHash, 2, Nonce, Tag, Ts, 49657, <<192, 0, 2, 7>>, ASeed
+        ),
+        ok = i2p_ssu2_conn:send_router_info(BobPid, 0, AliceRIBin),
+        ok = i2p_ssu2_conn:send_relay(
+            BobPid, i2p_relay:intro_block(2, AHash, Nonce, Tag, Ts, 49657, <<192, 0, 2, 7>>, Sig)
+        ),
+
+        ok = wait_charlie_response(
+            BobPid, CharlieHash, Nonce, 67, maps:get(sign_pub, AliceLocal), CharlieLocal, 0
+        )
+    after
+        catch i2p_relay_coord:stop(Coord)
+    end.
+
+%% A verified intro asserting an endpoint this router will not punch at is
+%% refused with code 65 ("unsupported address") and no punch. Loopback is the
+%% case a local test bed produces and the one the hardening exists to refuse:
+%% an endpoint on somebody's internal network is not one a public i2per sends
+%% datagrams at.
+charlie_rejects_a_non_punchable_endpoint(_Config) ->
+    {CharlieLocal, _} = bob_local(),
+    CharlieHash = maps:get(hash, CharlieLocal),
+    {ok, Coord} = i2p_relay_coord:start_link(CharlieLocal),
+    try
+        {BobPid, _Listener, BobLocal} = dial_peer(Coord, CharlieLocal),
+        Tag = request_tag(BobPid),
+        true = Tag > 0,
+        BobHash = i2p_router_info:hash(maps:get(ri, BobLocal)),
+
+        {_AliceListener, _APort, AliceLocal} = listen_full_local(<<"127.0.0.1">>),
+        AliceRIBin = maps:get(ri_binary, AliceLocal),
+        AHash = i2p_router_info:hash(maps:get(ri, AliceLocal)),
+        ASignPub = maps:get(sign_pub, AliceLocal),
+        ASeed = maps:get(sign_seed, AliceLocal),
+        Nonce = 16#0BADF00D,
+        Ts = erlang:system_time(second),
+        Sig = i2p_relay:sign_request(
+            BobHash, CharlieHash, 2, Nonce, Tag, Ts, 49657, <<127, 0, 0, 1>>, ASeed
+        ),
+        ok = i2p_ssu2_conn:send_router_info(BobPid, 0, AliceRIBin),
+        ok = i2p_ssu2_conn:send_relay(
+            BobPid, i2p_relay:intro_block(2, AHash, Nonce, Tag, Ts, 49657, <<127, 0, 0, 1>>, Sig)
+        ),
+
+        ok = wait_charlie_response(
+            BobPid, CharlieHash, Nonce, 65, ASignPub, CharlieLocal, 0
+        )
+    after
+        catch i2p_relay_coord:stop(Coord)
+    end.
+
+%% The published SSU2 port of a fixture router's RouterInfo — the endpoint
+%% Charlie's accept carries, which is what Alice dials and not the port the
+%% listener happened to bind.
+published_port(Local) ->
+    {ok, #{port := Port}} = i2p_router_info:ssu2_address_options(maps:get(ri, Local)),
+    Port.
+
+%% ---------------------------------------------------------------------------
+%% Helpers
+%% ---------------------------------------------------------------------------
 dial_peer(Coord, BobLocal) ->
     {PeerListener, _PeerPort, PeerLocal} = listen_full_local(<<"127.0.0.1">>),
     PeerRIBlock = maps:get(ri_binary, PeerLocal),
@@ -340,6 +540,73 @@ has_relay_intro(Blocks, BobHash, THash, Nonce, Tag, Ts, ASignPub) ->
         _ ->
             false
     end.
+
+%% Charlie's RelayResponse (block 8) as the tagged session answers it: signed by
+%% Charlie's own router signing key, code as given, and `csz 0` on a reject.
+%% `ExpectPort` is Charlie's own published endpoint on an accept and `0` on a
+%% reject, where no endpoint follows.
+wait_charlie_response(Pid, CharlieHash, Nonce, Code, ASignPub, CharlieLocal, ExpectPort) ->
+    CSignPub = maps:get(sign_pub, CharlieLocal),
+    i2p_ct_helpers:wait_msg(
+        fun
+            ({ssu2_data, P, Blocks}) when P =:= Pid ->
+                case lists:keyfind(relay_response, 1, Blocks) of
+                    {relay_response, 0, Code, Nonce, Ts, 2, ExpectPort, CIp, Sig, undefined} ->
+                        true = i2p_relay:verify_response(
+                            CharlieHash, 2, Nonce, Ts, ExpectPort, CIp, Sig, CSignPub
+                        ),
+                        true = is_binary(ASignPub),
+                        {true, ok};
+                    Other ->
+                        erlang:error({unexpected_charlie_response, Code, Other})
+                end;
+            (_) ->
+                false
+        end,
+        ?DATA_WINDOW
+    ).
+
+%% The codes of several RelayResponses, one per nonce, in the order they arrive.
+%% Each signature is verified against the endpoint the response itself carries,
+%% because an accept names Charlie's endpoint and a reject names none — the two
+%% are different covered byte strings, and verifying both against one shape
+%% would fail the accept.
+wait_charlie_codes(Pid, CharlieHash, Nonces, ASignPub, CharlieLocal, _ExpectPort) ->
+    CSignPub = maps:get(sign_pub, CharlieLocal),
+    Codes = wait_codes(Pid, Nonces, []),
+    lists:foreach(
+        fun({Nonce, _Code, Ts, Port, Ip, Sig}) ->
+            true = i2p_relay:verify_response(CharlieHash, 2, Nonce, Ts, Port, Ip, Sig, CSignPub),
+            true = is_binary(ASignPub)
+        end,
+        Codes
+    ),
+    [Code || {_Nonce, Code, _Ts, _Port, _Ip, _Sig} <- Codes].
+
+wait_codes(_Pid, [], Acc) ->
+    lists:reverse(Acc);
+wait_codes(Pid, Nonces, Acc) ->
+    {Nonce, Code, Ts, Port, Ip, Sig} = next_charlie_code(Pid, Nonces),
+    wait_codes(Pid, lists:delete(Nonce, Nonces), [{Nonce, Code, Ts, Port, Ip, Sig} | Acc]).
+
+next_charlie_code(Pid, Nonces) ->
+    i2p_ct_helpers:wait_msg(
+        fun
+            ({ssu2_data, P, Blocks}) when P =:= Pid ->
+                case lists:keyfind(relay_response, 1, Blocks) of
+                    {relay_response, 0, Code, Nonce, Ts, 2, Port, Ip, Sig, _Token} ->
+                        case lists:member(Nonce, Nonces) of
+                            true -> {true, {Nonce, Code, Ts, Port, Ip, Sig}};
+                            false -> false
+                        end;
+                    false ->
+                        false
+                end;
+            (_) ->
+                false
+        end,
+        ?DATA_WINDOW
+    ).
 
 %% The relayed RelayResponse (block 8): T's accept, carrying T's reachable
 %% endpoint and signed by T's key.

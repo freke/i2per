@@ -28,6 +28,7 @@ Block = i2p_relay:request_block(2, Nonce, Tag, Timestamp, Port, Ip, Signature).
     request_block/7,
     response_block/8,
     intro_block/8,
+    punch_blocks/4,
     dst_conn_id/1,
     src_conn_id/1,
     address_size/1,
@@ -269,6 +270,28 @@ from her RelayRequest, including her signature.
 ) -> i2p_ssu2:block().
 intro_block(Ver, AliceHash, Nonce, Tag, Ts, Port, Ip, Sig) ->
     {relay_intro, 0, AliceHash, Nonce, Tag, Ts, Ver, Port, Ip, Sig}.
+
+-doc """
+The payload blocks of a Charlie HolePunch (type 11).
+
+The datagram Charlie sends straight to Alice's asserted endpoint, in the order
+the spec lists: a DateTime block, an Address block carrying **Charlie's** own
+published endpoint (which is the address Alice then dials), the very
+RelayResponse Charlie sent in-session to Bob, and Padding.
+
+The response travels inside the punch as well as alongside it because Alice can
+be reached by only one of the two: Bob's relay leg may be what delivered the
+intro, and if the punch is what lands then the response has to arrive with it.
+
+Input: the `Timestamp`; Charlie's own `Port` and `Ip`; and the
+`relay_response` `t:i2p_ssu2:block/0` to carry.
+Output: the block list to seal, AEAD-encrypted under Alice's introduction key by
+`m:i2p_ssu2:encode_holepunch/5`.
+""".
+-spec punch_blocks(non_neg_integer(), 0..65535, binary(), i2p_ssu2:block()) ->
+    [i2p_ssu2:block()].
+punch_blocks(Ts, Port, Ip, Response) ->
+    [{datetime, Ts}, {address, Port, Ip}, Response, {padding, <<0:(8 * 16)>>}].
 
 -doc """
 The out-of-session destination connection ID derived from a relay nonce.
