@@ -70,6 +70,16 @@ what the `instrument` field is for: **a fact on the bus is not also written to t
 log.** `f:emit/3` refuses one, so the overlap ADR 0002 warns about is something
 the code prevents rather than something a reviewer has to notice.
 
+That rule has an exception, and it is the clause the bus's own bound rests on: a
+bus-carried fact is *also* recorded through `f:debug/2`, at a level off by default.
+The bound kills the manager, and with it every fact the bus was carrying, so a fact
+whose only record is the bus is a fact lost at exactly the moment somebody goes
+looking for it. Each bus row has exactly one such record, beside its `notify/1`
+site, and `i2p_log_checklist_tests` asserts both that every row has one and that no
+`log` row has one -- a shadow under a fact already recorded at a level an operator
+sees is duplication ADR 0002 rules out, and nothing turns it off for whoever is
+reading `debug` afterwards.
+
 ## What may be logged about the configuration
 
 `f:loggable_config_keys/0` is an allowlist, and the boot's configuration line is
@@ -88,12 +98,16 @@ interchangeable.
 report, at a level `f:checklist/0` declares, refusing anything it does not. It
 is gated because a fact nobody listed is a fact nobody will go looking for at 3am.
 
-`f:debug/2` records a **diagnostic frame**: the shape of a thing that just
-happened, for whoever is reading with the level turned up. It is not gated,
-because the checklist is a table of symptoms and no operator has ever come to a
-log asking to see one SSU2 datagram. The SSU2 transport is the caller that needs
-this -- 65 sites, one per event on the wire -- and a checklist row per frame
-would be a list nobody could read.
+`f:debug/2` records two things at the same level, and neither is gated. A
+**diagnostic frame** is the shape of a thing that just happened, for whoever is
+reading with the level turned up; the transports need this -- 69 sites across four
+modules, one per event on the wire -- and a checklist row per frame would be a
+list nobody could read. A **bus-carried fact's off-by-default record** is the
+second: seven facts at ten call sites, one beside each `notify/1` that announces
+one, because `lookup_failed` and `leaseset_publish_failed` are each announced from
+more than one place. The label names the fact rather than the frame, which is what
+makes the record findable by the fact's name rather than by where in the code it
+was written.
 
 The gate is on the *instrument*, not on the module. A checklist fact is held to
 the discipline; a frame is off by default because `debug` is off by default,
@@ -455,7 +469,7 @@ loggable_config_keys() ->
 -type label() :: atom() | tuple().
 
 -doc """
-Record a diagnostic frame at `debug`.
+Record a diagnostic frame at `debug`, or a bus-carried fact's off-by-default record.
 
 Input: a `t:label/0` naming what happened and a `Context` term carrying whatever
 else the site knows -- the role, the peer, the nonce. Output: `ok`.
@@ -464,6 +478,14 @@ else the site knows -- the role, the peer, the nonce. Output: `ok`.
 symptom, and the SSU2 transport emits one per thing on the wire. What keeps that
 from being a flood is the level, not the gate: `debug` is off at the `notice`
 default, and the `log_level` key is what turns it on.
+
+The seven bus-carried facts use it as the record the bus's bound does not take
+with it, so their `Label` is the fact's own name -- `transit_denied`, not
+`{relay, denied, Id}` -- and `Context` is what the announcement carried. There is
+one per `notify/1` site rather than one per fact, because `lookup_failed` and
+`leaseset_publish_failed` are each announced from more than one place.
+`i2p_log_checklist_tests` asserts every `bus` row has at least one and no `log`
+row has any.
 
 **The label goes in the message *and* in the metadata.** Both, from the one
 argument, rather than a choice between them. The message is what the shipped

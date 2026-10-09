@@ -213,6 +213,7 @@ lease_or_pending({ok, Gw, Tid, UntilSec}, Dest, Seed, DestHash, InLen, State) ->
             %% and 0 is always inside the refresh margin. So a failed attempt still
             %% returns a live lease, and the failure is announced separately.
             ok = i2p_events:notify({leaseset_publish_failed, DestHash, Reason}),
+            i2p_log:debug(leaseset_publish_failed, #{dest => DestHash, reason => Reason}),
             #{dest => Dest, seed => Seed, until_sec => 0, in_len => InLen}
     end;
 lease_or_pending(error, Dest, Seed, DestHash, InLen, State) ->
@@ -233,6 +234,7 @@ lease_or_pending(error, Dest, Seed, DestHash, InLen, State) ->
             %% first attempt, because the retries are the tick and are not news.
             Entry = #{dest => Dest, seed => Seed, until_sec => 0, in_len => InLen},
             ok = i2p_events:notify({leaseset_publish_failed, DestHash, no_inbound_tunnel}),
+            i2p_log:debug(leaseset_publish_failed, #{dest => DestHash, reason => no_inbound_tunnel}),
             Entry
     end.
 

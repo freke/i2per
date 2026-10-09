@@ -1148,6 +1148,9 @@ handle_connect_failed(PeerHash, Reason, State) ->
         connecting ->
             {State1, Backoff} = enter_backoff(PeerHash, State),
             ok = i2p_events:notify({peer_connect_failed, PeerHash, Reason, Backoff}),
+            i2p_log:debug(peer_connect_failed, #{
+                peer => PeerHash, reason => Reason, backoff => Backoff
+            }),
             State1;
         _ ->
             State
@@ -1963,14 +1966,20 @@ replicate_stored(StoreType, Key, Data, {stored, State}, ConnPid) ->
     _ = maybe_replicate(StoreType, Key, Data, ConnPid, State),
     State;
 replicate_stored(_StoreType, _Key, _Data, {not_stored, Reason, State}, _ConnPid) ->
-    %% The announcement is the whole report (ADR 0002: each fact is recorded once,
-    %% on one instrument). This used to also call `f:report_not_stored/1`, which
-    %% logged the same reason at `debug` -- invisible under the shipped `notice`
-    %% default, so it bought nothing for a subscriber-less router either -- and at
-    %% `warning` for an unparseable RouterInfo, where the prominence was the only
-    %% addition and `unparseable_router_info_data` is already a distinct reason a
-    %% consumer can count apart from `{unsupported_type, T}`. Both lines are gone.
+    %% The announcement is the instrument; the `debug` line beside it is the
+    %% off-by-default record ADR 0002 permits alongside one. It is there because the
+    %% bus's bound kills the manager, and with it every fact the bus was carrying --
+    %% which is exactly when somebody goes looking for the reason.
+    %%
+    %% This branch used to call a `report_not_stored/1` that is gone. It logged the
+    %% same reason at `debug` *and* at `warning` for an unparseable RouterInfo, where
+    %% the prominence was the only addition: `unparseable_router_info_data` is already
+    %% a distinct reason a consumer can count apart from `{unsupported_type, T}`, so
+    %% the second copy said nothing the first had not and cost a line on every refusal.
+    %% What replaces it is one `debug` line, and the difference from then is that this
+    %% one is a checklist fact's record rather than an ad-hoc copy of it.
     i2p_events:notify({db_store_not_stored, Reason}),
+    i2p_log:debug(db_store_not_stored, #{reason => Reason}),
     State.
 
 %% A DatabaseStore with a nonzero (and not 0xFFFFFFFF) reply token asks for a

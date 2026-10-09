@@ -511,11 +511,13 @@ send_payload(Sock, Send, Payload, RemoteHash) ->
 %% dead, and letting the peer manager rediscover that through a monitor and a
 %% backoff is the recovery that already exists for a closed socket.
 %%
-%% The announcement is the whole report (ADR 0002: a fact is recorded once, on
-%% one instrument). The peer manager deliberately does not repeat the reason when
-%% it observes the disconnect — a busy consumer would read the same fact twice,
-%% and the log line that would be the tempting second copy is exactly what the
-%% rule is about.
+%% The announcement is the instrument and the `debug` line beside it is the
+%% off-by-default record ADR 0002 permits alongside one, and it is written *here*
+%% rather than in the peer manager's disconnect handling. The stall is only
+%% observable at the socket: by the time the manager sees the DOWN the fact has
+%% already been announced and the reason is gone, so a record kept for later would
+%% be a `peer_disconnected` wearing this fault's name. The manager still does not
+%% repeat the reason — a busy consumer would read the same fact twice.
 %%
 %% `closed` is not a stall and is not matched here: a closed socket raises, and
 %% the loop's own `{tcp_closed, Sock}` clause names a disconnect as a disconnect.
@@ -527,6 +529,7 @@ write_frame(Sock, Wire, RemoteHash) ->
             ok;
         {error, timeout} ->
             i2p_events:notify({peer_send_stalled, RemoteHash, socket_blocked}),
+            i2p_log:debug(peer_send_stalled, #{peer => RemoteHash, reason => socket_blocked}),
             exit({send_stalled, socket_blocked})
     end.
 

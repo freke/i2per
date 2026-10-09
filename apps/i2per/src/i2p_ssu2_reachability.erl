@@ -311,6 +311,7 @@ emit_coarse_change(State = #{families := Families, emitted := Prev}) ->
 
 emit_coarse(Agg, State) ->
     i2p_events:notify({reachability, ssu2, Agg}),
+    i2p_log:debug(reachability, #{ssu2 => Agg}),
     State#{emitted => Agg}.
 
 %% ----------------------------------------------------------------------

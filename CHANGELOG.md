@@ -28,6 +28,95 @@ coordinators, which is the one shape that is not exclusively owned — the
 peer-test coordinator needs it for a message 1 and the relay coordinator for a
 RelayIntro.
 
+### Added
+
+**Every bus-carried fact now has a record that outlives the bus.** ADR 0002 has
+said since acceptance that a fact on the event bus may also be written to the log
+"except at a level that is off by default", and the tree delivered that clause
+nowhere: seven facts were announced and not recorded anywhere else. Each of the
+seven now writes a `debug` line beside its `notify/1` site — ten sites, because
+`lookup_failed` and `leaseset_publish_failed` are each announced from more than
+one place — carrying the key, the reason and whatever else the announcement did.
+
+This is what makes the bus's bound survivable. A bound that kills the manager
+destroys the bus's copy of every fact it was carrying, and with no second copy a
+fact is lost at exactly the moment somebody goes looking for the reason. The
+level is the control rather than a gate: `debug` is off under the shipped
+`notice` default, so `lookup_failed` on a router that cannot reach the network
+is still not a line per lookup.
+
+`i2p_log_checklist_tests` pins both directions, and neither was checkable before:
+every `bus` row has such a record, and no `log` row has one — a shadow under a
+fact already recorded at a level an operator sees is the duplication ADR 0002
+exists to prevent, and nothing switches it off for whoever is reading `debug`
+afterwards.
+
+ADR 0002 also now states its one real overlap explicitly, which it had left to be
+guessed at: `unhandled_ssu2_block_peer` is on both instruments above `debug`,
+because `i2per_status` is never started by the router and the log is therefore the
+only instrument that exists for a subscriber-less node. That is the opposite
+arrangement from the seven bus rows — log-first rather than bus-first — which is
+why the check pins the asymmetry rather than a general rule. Whether it should
+collapse to bus-only stays open on #HPH59JN.
+
+### Added
+
+**The far side of the bus is now readable.** A subscriber on another node that
+falls behind grows without limit, and nothing on this router could see it: there
+was no cap to set and, as it turned out, no reading either.
+`m:i2p_events:sample_far_backlog/0` reads every remote subscriber's queue depth
+and answers with the deepest. It is a read, not a published figure — the core
+does not hand data to a stats process it does not control — so with nobody asking,
+it costs the router nothing.
+
+The far side cannot be bounded, and that is now measured rather than assumed
+(#RWTMGJ9, OTP 28.5): `process_info/2` against a remote pid raises `badarg` for
+every item, the distribution exposes no queue depth through `system_info`,
+`statistics`, `port_info` or `memory`, and `{async_dist, false}` does not supply
+one — under a 300,000-event flood against a collector that never drains, the far
+mailbox took **all 300,000** while a non-`async_dist` relay never parked. The
+runtime applies no back-pressure to a process that is not consuming. Bounding it
+would mean credit/ack flow control, which changes the delivery contract for every
+subscriber; reported is what shipped.
+
+The registry the reading walks is the bus's own state, written where the handler
+is added and removed, so it cannot drift from what the bus is carrying. It is
+pruned when a collector is found gone, which is the only thing that keeps it from
+growing across status-service restarts — `m:i2per_status_state` never unsubscribes.
+
+### Fixed
+
+**Six `gen_event` callbacks in `m:i2p_events` were exported, documented and never
+executed.** The manager was started with the bare `{local, ?MODULE}` form, which
+`gen_event:start_link/2` does not read as a `{Module, Args}` pair, so `gen_event`
+substituted its own module and the manager ran its callbacks. Measured: such a
+manager reports `current_function = {gen_event, fetch_msg, 6}`, and an `init/1`
+that prints is never entered. There is no form on this OTP that both registers the
+name and names a callback module — `{Mod, Args}`, `{local, Name, Mod}`,
+`{global, Name, Mod}` and `{via, Mod, Name, Args}` each exit `badarg` — so the
+registry lives with the sampler instead, which is a process the module does start.
+
+`manager_callbacks_test` had asserted all six by direct call, under a comment
+giving the wrong reason for their being unreachable. A case that calls a function
+directly passes whether or not anything calls it, which is how dead callbacks read
+as covered. The comment now says what is actually true, and what the case does
+*not* assert.
+
+**The backlog sampler survived a bus restart and was started a second time.**
+`start_link/0` runs in the supervisor, so its `spawn_link` linked the sampler to
+the supervisor — not to the bus — and every restart both kept the old sampler
+alive and started another. Two loops wrote the same gauge every 5s, one of them
+publishing a depth for a manager pid that no longer existed, which `depth/0`
+answers as `0`: a restarted bus reported "no backlog" from a process watching
+nothing. The sampler now monitors the manager and exits with it, and a restart
+stops any predecessor synchronously before creating the registry.
+
+**`ets:new(Name, Opts)` without `named_table` produces a table that is unreachable
+by name.** Measured on OTP 28.5: `ets:info(Name, size)` answers `undefined` and
+`named_table` is `false`, while `ets:info(Tid, name)` cheerfully reports the atom.
+The table works, holds rows, and cannot be reached by the name every other
+function uses — a silent failure that reads as an empty registry.
+
 ## [0.2.1] — 2026-10-07
 
 **A patch release, because the defect was a silent one.**
