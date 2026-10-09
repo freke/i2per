@@ -302,16 +302,86 @@ subscribe_attaches_a_collector_test() ->
     end.
 
 manager_callbacks_test() ->
-    %% The manager ships with no built-in handlers, so its own gen_event
-    %% callbacks are never reached through the live bus (events fan out to
-    %% subscriber handlers). The callbacks are still part of the behaviour
-    %% surface and exported; exercise them directly.
+    %% **None of these are reached by a live bus**, and the module says why: the
+    %% manager is `f:gen_event`'s own module, because no `f:gen_event:start_link/2`
+    %% form both registers the name and names a callback module. Exercised directly
+    %% all the same -- they are exported and documented, and a reader comparing them
+    %% with `f:gen_event`'s defaults should find them spelled out somewhere.
+    %%
+    %% What this case deliberately does **not** assert is that the manager calls them.
+    %% It did once, in a comment that gave the wrong reason, and a case that calls a
+    %% function directly passes either way -- which is how six dead callbacks read as
+    %% tested for as long as they did.
     ?assertEqual({ok, []}, i2p_events:init([])),
     ?assertEqual({ok, []}, i2p_events:handle_event(some_event, [])),
     ?assertEqual({ok, {error, unsupported}, []}, i2p_events:handle_call(query, [])),
     ?assertEqual({ok, []}, i2p_events:handle_info(irrelevant, [])),
     ?assertEqual(ok, i2p_events:terminate(any, [])),
     ?assertEqual({ok, []}, i2p_events:code_change(0, [], [])).
+
+%% The registry exists, and it exists because the sampler owns it.
+%%
+%% **This case exists because it very nearly did not, twice.** The manager cannot own
+%% the table -- `f:init/1` never runs, see the module note -- so the sampler does, and
+%% the first version of that used `ets:new(Name, Opts)` without `named_table`, which
+%% on OTP 28 creates a table whose \`ets:info(Name, _)\` is \`undefined\`. The registry
+%% was then permanently empty and every case below passed against it for the wrong
+%% reason.
+%%
+%% So this asserts the table is reachable **by name**, which is the property both bugs
+%% broke and the only one the rest of the module depends on, and then that a
+%% subscription lands in it.
+the_registry_is_reachable_by_name_test() ->
+    {ok, _} = application:ensure_all_started(i2per),
+    ?assertNotEqual(undefined, ets:info(i2p_events_subscribers, name)),
+    Collector = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    ok = i2p_events:subscribe(Collector),
+    try
+        ?assert(lists:member(Collector, i2p_events:subscribers()))
+    after
+        ok = i2p_events:unsubscribe(Collector)
+    end.
+
+%% One sampler, not one per bus start.
+%%
+%% **The failure it guards against is real and pre-dates the registry.** The sampler
+%% used to be a `spawn_link` from `f:start_link/0`, which runs in the *supervisor* --
+%% so it survived every bus restart, and `f:start_link/0` also ran again on each
+%% restart and started a second one. Two loops wrote the same \`persistent_term\` gauge
+%% every 5s, one of them publishing a depth for a manager pid that no longer existed.
+%% The registry made it worse rather than better: two samplers cannot own one named
+%% table, so the second \`ets:new\` would have failed the bus start.
+one_sampler_survives_a_bus_restart_test() ->
+    {ok, _} = application:ensure_all_started(i2per),
+    Bus = whereis(i2p_events),
+    First = whereis(i2p_events_sampler),
+    ?assertNotEqual(undefined, First),
+    %% Restart the bus the way the supervisor does. Killed from a throwaway process
+    %% because `exit/2` from the test process would take the test with it.
+    _ = spawn(fun() -> exit(Bus, kill) end),
+    %% The predicate asks for a *different* bus pid: `is_process_alive` on the old one
+    %% can never become true again, which is a test that would time out rather than
+    %% fail.
+    ok = i2p_ct_helpers:await(
+        fun() ->
+            Current = whereis(i2p_events),
+            Current =/= undefined andalso
+                Current =/= Bus andalso
+                is_process_alive(Current) andalso
+                whereis(i2p_events_sampler) =/= undefined andalso
+                whereis(i2p_events_sampler) =/= First
+        end,
+        ?FLOOD_DEADLINE_MS
+    ),
+    %% One sampler, and it is the new one -- a second would have taken the name.
+    ?assert(is_process_alive(whereis(i2p_events_sampler))),
+    %% And the registry came back with the bus rather than carrying stale rows across
+    %% a restart that detached every subscriber.
+    ?assertEqual([], i2p_events:subscribers()).
 
 %%% %%%%% The backlog gauge %%%%% %%%
 
@@ -468,6 +538,103 @@ ensure_bus_back() ->
         _ ->
             ok
     end.
+
+%% %%%%% %%% The far-side reading %%%%% %%%
+
+%% With nobody on another node there is nothing to be far of, and the reading is `0`.
+%%
+%% **No ambient subscriber is assumed, and that is a correction rather than caution.**
+%% An earlier version asserted the registry was non-empty here, on the reasoning that
+%% `m:i2p_ssu2_reachability` subscribes in its `init/1`. It does -- but the
+%% wedged-manager case above kills the bus, and a restarted manager comes back with
+%% zero handlers and nothing re-attaches (#G61Y2QZ). So by the time this case runs the
+%% registry is legitimately empty, and the assertion was asserting an accident of
+%% ordering.
+%%
+%% What replaces it is the premise the reading actually rests on, checked directly:
+%% every subscriber the tier can have is on this node, because the eunit node is
+%% `nonode@nohost` and nothing here attaches across a boundary.
+no_remote_subscriber_means_a_depth_of_zero_test() ->
+    {ok, _} = application:ensure_all_started(i2per),
+    ?assert(lists:all(fun(P) -> node(P) =:= node() end, i2p_events:subscribers())),
+    ?assertEqual(0, i2p_events:sample_far_backlog()).
+
+%% A local subscriber is registered and then skipped. The two halves are the claim:
+%% a local collector's queue grows the *router's own* memory, which is a different
+%% fault with a different fix, and folding it into a reading named for the far side
+%% would change what the number means.
+a_local_subscriber_is_registered_but_not_measured_test() ->
+    {ok, _} = application:ensure_all_started(i2per),
+    Collector = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    ok = i2p_events:subscribe(Collector),
+    try
+        ?assert(lists:member(Collector, i2p_events:subscribers())),
+        ?assertEqual(0, i2p_events:sample_far_backlog())
+    after
+        ok = i2p_events:unsubscribe(Collector)
+    end.
+
+%% The registry is written where the handler is added and removed, so it cannot
+%% drift from what the bus is actually carrying. Asserted through the published
+%% entry points rather than by reaching into the table: the far-side sweep only ever
+%% finds a collector because `f:subscribe/1` put it there, so a registry that
+%% drifted from what subscribing does would leave the sweep measuring nothing.
+subscribe_registers_and_unsubscribe_forgets_test() ->
+    {ok, _} = application:ensure_all_started(i2per),
+    Collector = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    ?assertNot(lists:member(Collector, i2p_events:subscribers())),
+    ok = i2p_events:subscribe(Collector),
+    ?assert(lists:member(Collector, i2p_events:subscribers())),
+    ok = i2p_events:unsubscribe(Collector),
+    ?assertNot(lists:member(Collector, i2p_events:subscribers())).
+
+%% Subscribing twice is one row, not two. A `set` makes that true by construction
+%% and the case says so, because a duplicate would have the sweep ask about the same
+%% pid twice and the registry would then be a list of subscriptions rather than of
+%% subscribers.
+subscribe_twice_registers_one_subscriber_test() ->
+    {ok, _} = application:ensure_all_started(i2per),
+    Collector = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    ok = i2p_events:subscribe(Collector),
+    ok = i2p_events:subscribe(Collector),
+    try
+        ?assertEqual(1, count_registered(Collector))
+    after
+        ok = i2p_events:unsubscribe(Collector)
+    end.
+
+%% The reading is offered, never pushed. `m:i2p_stats` is an observer of the core and
+%% not part of it, so nothing in this module may hand it a figure on a timer -- and
+%% with no collector asking, the far-side reading costs the router nothing at all.
+%%
+%% The near side is asserted to be *absent* rather than zero: `m:i2p_stats:gauges/0`
+%% reports a gauge it has never seen as absent, which is the distinction from
+%% "measured, and zero", so a `bus_far_backlog` key appearing at all would mean the
+%% core had started pushing.
+far_backlog_is_offered_and_not_pushed_test() ->
+    {ok, _} = application:ensure_all_started(i2per),
+    Near = i2p_events:sample_backlog(),
+    ?assertEqual(0, i2p_events:sample_far_backlog()),
+    Gauges = i2p_stats:gauges(),
+    ?assertEqual(Near, maps:get(bus_backlog, Gauges)),
+    ?assertNot(maps:is_key(bus_far_backlog, Gauges)),
+    %% And the key the read API would carry is the same one the near side uses.
+    ?assert(lists:member(gauges, i2p_status_data:view_keys())).
+
+count_registered(Collector) ->
+    length([P || P <- i2p_events:subscribers(), P =:= Collector]).
 
 %%% %%%%% Internal helpers %%%%% %%%
 
