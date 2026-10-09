@@ -158,6 +158,20 @@ out, so a count of it would have to be maintained by the thing most likely to
 fail. Notified and delivered are therefore different figures and are not
 interchangeable — a rising notified count says nothing about receipt.
 
+**Subscriber backlog** — announced events still waiting in a subscriber's mailbox,
+because that subscriber is not keeping up. Two kinds, and they are not
+interchangeable:
+
+- *bus backlog* — the fan-out process's own queue, on this router. Reported as a
+  depth.
+- *far-side backlog* — a subscriber's queue on **another node**. The router can
+  neither cap it nor see it directly: it cannot refuse to send without changing
+  the delivery contract, and a remote queue depth is not readable without asking
+  the other node. Read on request, and reported as a depth.
+
+A backlog that does not fall is the fault. A depth alone says only that a queue is
+deep, and a quiet bus and a stalled one both read as a number.
+
 The log is the **witness** where the bus is the instrument: a fact on the bus is
 not also written to the log except at a level that is off by default. That is the
 distinction, and it is a discipline rather than a preference — see ADR 0002.

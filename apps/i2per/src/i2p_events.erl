@@ -72,13 +72,34 @@ because `process_info/2` does not go through the process it describes, while eve
 what identifies the fault is a depth that does not fall, which is the consumer's to
 read.
 
+**A subscriber on another node has the same problem, and the far side cannot be
+bounded at all.** `f:sample_far_backlog/0` reads the queue depth of every remote
+subscriber and answers with the deepest. It is a **read rather than a published
+figure**, which is the shape the layering requires: the core does not hand data to a
+stats process it does not control, so nothing here is pushed anywhere on a timer.
+**Neither of the two figures bounds anything.** The near side was measured and the
+bound removed (#VH7Z0KJ); the far side has no cap available even in principle —
+measured, in the note on that function: `process_info/2` is `badarg` against a remote
+pid, the distribution exposes no queue depth on this OTP, and `{async_dist, false}`
+does not stop the far mailbox filling because the runtime applies no back-pressure to
+a process that is not consuming. The router cannot stop a subscriber on a machine it
+does not own from growing; it can only say how far behind that subscriber is.
+
 The manager carries **no** heap bound. One was measured and removed; the note on *Why
 there is no heap bound* below carries the measurements for and against it.
 """.
 
 -behaviour(gen_event).
 
--export([start_link/0, notify/1, subscribe/1, unsubscribe/1, sample_backlog/0]).
+-export([
+    start_link/0,
+    notify/1,
+    subscribe/1,
+    unsubscribe/1,
+    subscribers/0,
+    sample_backlog/0,
+    sample_far_backlog/0
+]).
 
 -export([init/1, handle_event/2, handle_call/2, handle_info/2, terminate/2, code_change/3]).
 
@@ -248,15 +269,62 @@ removed heap bound took.
 %% with start_link/0's Ok path invisible to dialyzer, a caller of it looks
 %% unreachable. Knock-on of the same causes as above, not dead code — the
 %% sampler is what reports the backlog (#VH7Z0KJ).
--dialyzer({nowarn_function, start_sampler/0}).
+-dialyzer({nowarn_function, start_sampler/1}).
+%% **The sampler's three internals, and it is the same knock-on as the two above.**
+%% They are reached only from the fun `f:start_sampler/1` spawns, and with
+%% `f:start_link/0`'s Ok path invisible to dialyzer the spawn is inside a function
+%% whose success typing is `no_return`, so the reference does not count and dialyzer
+%% reports "will never be called". Not dead code: `f:start_sampler/1` is called from
+%% `f:start_link/0`'s Ok branch, and the sampler is what owns the subscriber registry
+%% and reports the backlog (#VH7Z0KJ). The clean fix is the `{async_dist, boolean()}`
+%% entry in `proc_lib:start_spawn_option()`'s type, which is OTP's to make.
+-dialyzer({nowarn_function, sample_loop/1}).
+-dialyzer({nowarn_function, watch/1}).
+-dialyzer({nowarn_function, stop_sampler/0}).
 start_link() ->
+    %% **Only `{local, Name}` registers the manager, and it is the only form this OTP
+    %% accepts together with `Opts`.** Measured against `f:gen_event:start_link/2`:
+    %% `{Mod, Args}`, `{local, Name, Mod}`, `{global, Name, Mod}` and
+    %% `{via, Mod, Name, Args}` each exit `badarg`. So **there is no form that both
+    %% registers the manager and names a callback module**, which means this module's
+    %% own callbacks never run -- see *The manager's own callbacks are dead* below.
+    %%
+    %% That is why the subscriber registry is owned by the sampler rather than by
+    %% `f:init/1`: there is no hook in the manager process this module can run.
     case gen_event:start_link({local, ?MODULE}, [{spawn_opt, [{async_dist, true}]}]) of
         {ok, Pid} ->
-            ok = start_sampler(),
+            ok = start_sampler(Pid),
             {ok, Pid};
         Other ->
             Other
     end.
+
+%% %%%%% %%% The manager's own callbacks are dead %%%%% %%%
+%%
+%% ## Every `f:gen_event` callback here is unreachable, and the suite said otherwise
+%%
+%% `f:init/1`, `f:handle_event/2`, `f:handle_call/2`, `f:handle_info/2`,
+%% `f:terminate/2` and `f:code_change/3` are exported, documented and never executed.
+%% The manager is `f:gen_event`'s own module (see `f:start_link/0`), and
+%% `f:gen_event` calls a manager module only in the `{Mod, Args}` form -- which is
+%% also the only form that does not register the name, and the name is what
+%% `f:notify/1`, `f:bounded/1` and `f:depth/0` resolve the bus through.
+%%
+%% Measured: a manager started this way reports
+%% `current_function = {gen_event, fetch_msg, 6}`, and an `f:init/1` that prints is
+%% never entered.
+%%
+%% **What hid it.** `m:i2p_events_tests`'s `manager_callbacks_test` exercised all six
+%% by direct call, and its comment gave a reason that was wrong in a way that made it
+%% look deliberate -- it said the callbacks are unreachable "because the manager ships
+%% with no built-in handlers". They are not; the manager is not this module at all.
+%% A case that calls a function directly passes whether or not anything calls it, so
+%% it asserted that the callbacks *behave* and never that they are *reached*.
+%%
+%% They are left in place rather than deleted, because recording that they do not run
+%% is a different question from removing them, and because `f:handle_call/2`'s
+%% `{error, unsupported}` is the answer a future reader would want if a form that
+%% registers *and* names a module ever appears. Nothing depends on them either way.
 
 -doc """
 Announce a status change.
@@ -301,12 +369,29 @@ notify(Event) ->
 %% wedge -- and that is why the sampler is a separate process, because the manager
 %% is the thing that stops answering.
 %%
-%% ## Why the sampler is a linked spawn and not a child spec
+%% ## Why the sampler is a spawn and not a child spec
 %%
-%% **The lifetime is the manager's, and linking gets it for free.** When the bus
-%% dies the sampler dies with it, and the supervisor's restart brings a new one. A
-%% child spec would need its own restart strategy for a process whose only reason to
-%% exist is reading a pid the manager owns.
+%% **It is a spawn, and it is registered, because it must follow the bus rather than
+%% the supervisor.** This note used to claim a link gave it the manager's lifetime
+%% "for free"; it does not, and it is worth being precise about why it never could.
+%% `f:start_link/0` runs **in the supervisor process**, so `spawn_link` from it links
+%% the sampler to the *supervisor* -- which outlives every restart of the bus.
+%%
+%% **Measured consequence of that, before this was fixed:** the sampler survived a
+%% bus restart, and because `f:start_link/0` also ran again on the restart, a
+%% **second** sampler started beside it. Two loops writing the same
+%% `persistent_term` gauge every 5s, one of them publishing a depth for a manager pid
+%% that no longer exists -- which `f:depth/0` answers as `0`. A restarted bus
+%% therefore reported "no backlog" from a process watching nothing.
+%%
+%% **A monitor on the manager is the relationship wanted, and a link is not.** The
+%% sampler exits when the manager it watches goes down, so the next
+%% `f:start_link/0` finds no sampler and starts exactly one; and it does not add a
+%% second link into the supervisor's child set, where a sampler crash would look
+%% like a second bus crash. `f:stop_sampler/0` makes the handover synchronous so the
+%% old registry table is provably gone before the new one is created -- two samplers
+%% cannot own one named table, and a bare `ets:new` against a live one would fail the
+%% bus start.
 %%
 %% **5s is a measured choice, not a round number.** A depth sampled slower than the
 %% bus drains measures nothing -- the manager drains a 300,000-message flood in about
@@ -316,6 +401,19 @@ notify(Event) ->
 
 %% How often the backlog gauge is refreshed. See the note above.
 -define(BACKLOG_TICK_MS, 5000).
+
+%% The sampler, registered so a restart can find the one before it is about to make
+%% another.
+%%
+%% **Spelled out rather than built from `?MODULE`**, for the reason
+%% `?SUBSCRIBERS` is: `?MODULE_sampler` is one macro called `MODULE_sampler`, not
+%% `?MODULE` followed by a suffix.
+-define(SAMPLER, i2p_events_sampler).
+
+%% How long `f:stop_sampler/0` waits for the old sampler to be gone. Generous,
+%% because it is only ever paid on a bus restart and it is a hang guard: a sampler
+%% that outlived the wait would leave a named table behind and fail the next start.
+-define(SAMPLER_STOP_MS, 5000).
 
 -doc """
 Sample the manager's queue depth, publish it, and emit it.
@@ -335,7 +433,226 @@ sample_backlog() ->
     _ = telemetry:execute([i2per, i2p_events], #{backlog => Depth}, #{}),
     Depth.
 
--spec start_sampler() -> ok.
+%% %%%%% %%% The far-side gauge %%%%% %%%%%
+
+%% ## What this reports, and what it deliberately does not do
+%%
+%% **A subscriber on another node that is not keeping up grows without limit, and
+%% nothing on this side can stop it.** Measured on this build at OTP 28.5 / ERTS
+%% 16.4.0.6 (#RWTMGJ9): every route to a cap is a dead end --
+%% `erlang:system_info(dist_buffer_size)` and `erlang:memory(dist_buffer)` are
+%% `badarg`, `statistics(dist)` is `badarg`, `port_info(DistPort, queue_size)` reads
+%% `{queue_size, 0}` however full it is, and **`erlang:process_info/2` against a
+%% remote pid is `badarg` for every item**, `message_queue_len` included -- it raises
+%% rather than returning `undefined`.
+%%
+%% **`{async_dist, false}` does not supply one either, and this was the surprise.**
+%% A relay process doing the remote send with `async_dist` off was measured under a
+%% 300,000-event flood against a collector that never drains: the far mailbox took
+%% **all 300,000**, the relay never parked and its own mailbox never grew a message.
+%% The runtime applies no back-pressure to a *process* that is not consuming -- a
+%% send completes while the socket accepts, and the far node's distribution keeps
+%% reading at line rate into a mailbox that refuses nothing. `async_dist` parks a
+%% sender only when the far node stops reading its *socket*, which is a different and
+%% much rarer condition.
+%%
+%% **So the queue is bounded by the collector draining it or dying, and this gauge
+%% is how an operator finds out which is happening.** It reports; it does not cap.
+%% That is the same answer the near side took when its heap bound was measured and
+%% removed (#VH7Z0KJ), applied to the side that measurement was not about.
+%%
+%% ## Where the number comes from, and why it costs what it costs
+%%
+%% **One `erpc` round trip per remote subscriber, and there is no cheaper read.**
+%% Measured against a 200,000-deep mailbox: min 101 us, median 107 us, max 555 us
+%% over 20 samples. That is not a hot path -- it is once per subscriber per
+%% `?BACKLOG_TICK_MS`, from a process no packet ever touches -- but it is a real cost
+%% and the worst case is `subscribers * ?FAR_SAMPLE_TIMEOUT_MS`, which is why the
+%% timeout is a named bound rather than a generous round number.
+%%
+%% **The read works on a subscriber that is wedged, which is the property the whole
+%% gauge rests on.** `process_info/2` on the far node is served by *that node's*
+%% scheduler and not by the target process, so a collector stuck in a `receive`
+%% answers it as readily as a healthy one. A report of the fault does not inherit
+%% the fault -- the same property `f:sample_backlog/0` is built on, and the reason
+%% the sampler is a separate process at all.
+
+%% How long one subscriber's depth read may take before it is given up on.
+%%
+%% **An order of magnitude over the worst reading ever measured** (555 us), and
+%% bounded because the alternative -- an un-timed `erpc` into a node the router does
+%% not own -- lets one unreachable subscriber decide when the next gauge is taken.
+%% With no remote subscribers this costs nothing, which is the ordinary case.
+-define(FAR_SAMPLE_TIMEOUT_MS, 1000).
+
+-doc """
+Read the queue depth of every remote subscriber, and prune the ones that are gone.
+
+Input: none. Output: the deepest remote queue depth as a non-negative integer, or
+`0` when no subscriber is on another node.
+
+**A read, not a published value, and that shape is required rather than chosen.** The
+core does not hand figures to a stats process it does not control, so there is no
+far-side gauge and no timer feeding one: a collector that wants the number asks for
+it here, through the same public entry point it already uses to attach. With nobody
+asking, this costs nothing, which is the ordinary case.
+
+**The deepest, not the sum.** A sum over subscribers says "this router is expensive to
+observe" and scales with how many operators are watching, which is not the operator
+question. The maximum is the one that answers it: *is any subscriber falling behind,
+and by how much.*
+
+**A subscriber whose pid is gone is pruned, and that is a fact about the registry
+rather than about the depth.** `process_info/2` returns `undefined` for a pid that no
+longer exists, and it is the only way a sweep can learn a remote collector died
+without unsubscribing -- `m:i2per_status_state` never unsubscribes, so a restarted
+status service would otherwise leave the registry growing for the life of the router.
+This is not a substitute for #DN82Z7J: that ticket is about the *handler* the bus
+keeps calling, this only stops us *reading* a queue depth from it.
+
+**A subscriber that cannot be reached is skipped rather than counted as zero**, so a
+node that is down reports as nothing instead of as an idle one -- the single confusion
+this figure exists to prevent, and the same reason `f:depth/0` does not report a dead
+manager as depth zero. A caller receiving `0` therefore knows one of two things, and
+only the caller can tell them apart: nothing is queueing on a far node, or nothing
+could be asked.
+""".
+-spec sample_far_backlog() -> non_neg_integer().
+sample_far_backlog() ->
+    {Depths, Gone} = lists:foldl(fun far_depth/2, {[], []}, remote_subscribers()),
+    ok = forget_all(Gone),
+    deepest(Depths).
+
+%% One subscriber's reading. `undefined` from the far node means the pid is gone,
+%% which is a fact about the registry rather than about the depth.
+%%
+%% **`catch` rather than a case on the call, because `erpc` signals an unreachable
+%% node by exiting** (`{erpc, noconnection}`) and by *timing out*. A depth read is
+%% telemetry about a machine this router does not own, so an exception from it is
+%% expected state rather than a fault, and letting it kill the caller would turn one
+%% unreachable observer into a broken diagnostic.
+far_depth(Collector, {Depths, Gone}) ->
+    case
+        catch erpc:call(
+            node(Collector),
+            erlang,
+            process_info,
+            [Collector, message_queue_len],
+            ?FAR_SAMPLE_TIMEOUT_MS
+        )
+    of
+        {message_queue_len, Depth} -> {[Depth | Depths], Gone};
+        undefined -> {Depths, [Collector | Gone]};
+        _Other -> {Depths, Gone}
+    end.
+
+%% Split rather than one function with a `case`, so the empty case reads as its own
+%% answer instead of as a branch guarding an accumulator that does not exist.
+deepest([]) ->
+    0;
+deepest(Depths) ->
+    lists:max(Depths).
+
+%% %%%%% %%% The subscriber registry %%%%% %%%
+%%
+%% ## It is the bus's own state, and it lives in the bus
+%%
+%% **The list of subscribers is something `m:i2p_events` knows because `f:attach/1`
+%% added the handler and `f:detach/1` removed it.** Those two functions write this
+%% table in the same breath as the `f:gen_event` call, so there is no second copy to
+%% keep in step and no other module to ask: a collector cannot be listed without
+%% having been attached, and cannot be attached without being listed.
+%%
+%% It deliberately does **not** live in `m:i2p_stats`. That module is an observer of
+%% the core, not part of it -- the core does not hand data to a stats process it does
+%% not control -- so a registry parked there would be the core calling out to its own
+%% observer on the subscription path. It would also mean the bus stopped working when
+%% no stats process was running, which is the ordinary case.
+%%
+%% ## Why ETS rather than asking the bus
+%%
+%% **Because the manager is exactly what is unavailable when the answer is wanted.**
+%% Every `f:gen_event` call is an rpc to the manager, and a manager parked inside
+%% `f:gen_event:handle_event/2` answers none of them -- measured not answering after
+%% 1500 ms in #VH7Z0KJ, and `f:which_handlers/1` is no different. An ETS read is
+%% served by the VM rather than by the manager, so a sweep keeps working through a
+%% wedge that stops every other read of the bus dead.
+%%
+%% ## Why the table is `public`
+%%
+%% **Because the writes come from the collector's own node, not from the owner.**
+%% `f:subscribe/1` reaches the bus through `f:bounded/1`, which runs the
+%% `f:gen_event` call in a throwaway asker, so the process adding a row is never the
+%% manager. `protected` would push that write through an rpc to the owner -- the very
+%% dependency this arrangement exists to avoid.
+%%
+%% ## Why the owner is the manager
+%%
+%% **So the list cannot outlive the handlers it describes.** A restarted manager comes
+%% back with zero handlers, the silent detach #G61Y2QZ records, so a registry that
+%% survived it would list subscribers no longer receiving anything. Tying the table to
+%% the manager makes the two agree by construction, with no teardown code to get wrong.
+
+%% The registry table. **Named rather than passed around**, because neither long-lived
+%% writer (`f:attach/1`, `f:detach/1`) is the process that may own it.
+%%
+%% **Spelled out rather than built from `?MODULE`**: `?MODULE_subscribers` would be
+%% read by the preprocessor as one macro called `MODULE_subscribers`, not as
+%% `?MODULE` followed by a suffix.
+-define(SUBSCRIBERS, i2p_events_subscribers).
+
+-doc """
+Every subscriber attached to this bus, remote and local alike.
+
+Output: a list of collector pids, empty when there is no bus.
+
+**This is what the far-side sweep reads**, exported so a caller that wants to see what
+is being measured does not have to reach into the table. **Local subscribers are
+included** even though the sweep skips them: the registry records who attached, and
+which of them this router can usefully measure is the sweep's decision rather than the
+registry's.
+""".
+-spec subscribers() -> [pid()].
+subscribers() ->
+    case ets:info(?SUBSCRIBERS, name) of
+        undefined -> [];
+        _ -> [P || {P} <- ets:tab2list(?SUBSCRIBERS)]
+    end.
+
+remote_subscribers() ->
+    [P || P <- subscribers(), node(P) =/= node()].
+
+%% A row per attached handler, written where the handler is added and removed.
+%% `ets:insert/2` on a `set` is idempotent, which is what a convergent
+%% `f:subscribe/1` needs, and every write is guarded because the sampler can be
+%% replaced between the `f:gen_event` call and the row.
+%%
+%% **`ok` rather than the ETS return value**, because both `ets:insert/2` and
+%% `ets:delete/2` answer `true` and the callers match on `ok`. Letting the raw
+%% `true` through reads as a failed match in `f:attach/1`, which is the kind of
+%% error that points at the wrong function entirely.
+remember(Collector) ->
+    case ets:info(?SUBSCRIBERS, name) of
+        undefined ->
+            ok;
+        _ ->
+            _ = ets:insert(?SUBSCRIBERS, {Collector}),
+            ok
+    end.
+
+forget(Collector) ->
+    case ets:info(?SUBSCRIBERS, name) of
+        undefined ->
+            ok;
+        _ ->
+            _ = ets:delete(?SUBSCRIBERS, Collector),
+            ok
+    end.
+
+forget_all(Collectors) ->
+    lists:foreach(fun forget/1, Collectors).
+
+-spec start_sampler(pid()) -> ok.
 %% Sample once before waiting, so the gauge is populated from the moment the bus
 %% is up rather than after a full tick.
 %%
@@ -346,17 +663,67 @@ sample_backlog() ->
 %% for the first 5 seconds of the router's life, and a consumer polling at startup
 %% would see nothing. One immediate sample costs one `persistent_term` put at boot
 %% and makes the key's absence mean what it is supposed to mean: the sampler died.
-start_sampler() ->
-    _ = spawn_link(fun sample_loop/0),
-    _ = sample_backlog(),
+%%
+%% **The old sampler is stopped first, and synchronously**, because the new one owns
+%% the registry table by name and two processes cannot own one named table. See
+%% *Why the sampler is a spawn and not a child spec* above for what happens if this
+%% is skipped.
+start_sampler(Bus) ->
+    ok = stop_sampler(),
+    _ = spawn(fun() -> sample_loop(Bus) end),
     ok.
 
-sample_loop() ->
+%% Exit when the bus goes, and own the registry while it lives.
+%%
+%% **The table is created here rather than in `f:start_link/0`** because the creating
+%% process is its owner, and the owner is what makes it die with the bus: a restarted
+%% manager comes back with zero handlers, and a registry that outlived it would list
+%% subscribers no longer receiving anything.
+sample_loop(Bus) ->
+    %% **`named_table` is required, and without it the table silently has no name.**
+    %% Measured on OTP 28.5: `ets:new(Name, [set, public])` yields
+    %% `ets:info(Name, size) =:= undefined` and `ets:info(Tid, named_table) =:= false`,
+    %% while `ets:info(Tid, name)` cheerfully reports the atom -- so the table works,
+    %% holds rows, and is unreachable by the name every other function here uses. Add
+    %% `named_table` and all three answer. An earlier version of this omitted it, and
+    %% the symptom was a registry that was always empty rather than an error.
+    _ = ets:new(?SUBSCRIBERS, [set, public, named_table, {read_concurrency, true}]),
+    _ = sample_backlog(),
+    true = register(?SAMPLER, self()),
+    watch(Bus).
+
+watch(Bus) ->
+    MRef = monitor(process, Bus),
     receive
-        stop -> ok
+        {'DOWN', MRef, process, Bus, _Reason} ->
+            ok;
+        stop ->
+            ok
     after ?BACKLOG_TICK_MS ->
         _ = sample_backlog(),
-        sample_loop()
+        watch(Bus)
+    end.
+
+%% Make sure no sampler is left, so the next start creates the registry rather than
+%% colliding with it.
+%%
+%% **Kill rather than ask, and wait.** A polite `stop` would be undone by a sampler
+%% that is already mid-tick and about to recurse; `kill` is immediate, and the
+%% `'DOWN'` wait is what makes the handover synchronous. Without the wait the new
+%% sampler's `ets:new` races the old table and the bus fails to start -- a crash
+%% loop on a *restart*, which is the worst place to introduce one.
+stop_sampler() ->
+    case whereis(?SAMPLER) of
+        undefined ->
+            ok;
+        Pid ->
+            MRef = monitor(process, Pid),
+            exit(Pid, kill),
+            receive
+                {'DOWN', MRef, process, Pid, _Reason} -> ok
+            after ?SAMPLER_STOP_MS ->
+                ok
+            end
     end.
 
 %% `undefined` and `catch` rather than a bare match, because the manager can die
@@ -522,7 +889,8 @@ classify({'EXIT', Reason}) -> {error, {bus_error, Reason}}.
 %% event twice. See `f:detach_all/2`.
 attach(Collector) ->
     ok = detach_all(Collector),
-    gen_event:add_handler(?MODULE, {i2p_events_forward, Collector}, [Collector]).
+    ok = gen_event:add_handler(?MODULE, {i2p_events_forward, Collector}, [Collector]),
+    ok = remember(Collector).
 
 %% Remove every forwarder this collector holds, so the next attach leaves exactly
 %% one.
@@ -545,13 +913,21 @@ detach_all(Collector) ->
     end.
 
 detach(Collector) ->
-    case gen_event:delete_handler(?MODULE, {i2p_events_forward, Collector}, [Collector]) of
+    Result = gen_event:delete_handler(?MODULE, {i2p_events_forward, Collector}, [Collector]),
+    ok = forget(Collector),
+    case Result of
         {error, module_not_found} -> ok;
         Other -> Other
     end.
 
 %% %%%%% %%% gen_event callbacks %%%%% %%%
 %% The manager ships without built-in handlers; subscribers attach their own.
+%%
+%% **None of these run, and that is not the reason.** The manager is `f:gen_event`'s
+%% own module -- see *The manager's own callbacks are dead* above for the measurement
+%% and for why no `f:gen_event:start_link/2` form fixes it on this OTP. The
+%% subscriber registry therefore lives with the sampler, which is a process this
+%% module really does start.
 
 init([]) ->
     {ok, []}.
