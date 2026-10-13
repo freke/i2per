@@ -129,7 +129,7 @@ zero_window_is_discarded_test() ->
     ?assertEqual(zero_window, maps:get(window_status, Derived)),
     ?assertEqual(undefined, maps:get(total, maps:get(transfer_bps, Derived))).
 
-%% A counter that decreased within one boot should be impossible: `i2p_stats`
+%% A counter that decreased within one boot should be impossible: `i2p_counters`
 %% refuses a negative amount precisely so it cannot happen. The window is
 %% discarded anyway, because a reading we cannot believe is not a reading to
 %% difference -- the guard is about not reporting a wrong number, not about

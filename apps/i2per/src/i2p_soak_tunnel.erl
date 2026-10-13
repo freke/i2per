@@ -54,7 +54,7 @@ The seam is the supervisor's own resolve. `m:i2per_sup:resolve_local/0` returns
 `error` when `data_dir` is set and `seeds` is **not**, and `manager_children(error)`
 is `[]`. So `f:boot/1` here sets a data dir and deliberately leaves `seeds` unset,
 then starts its own `m:i2p_tunnel_srv` and registers its own `m:i2p_peer`.
-Measured, the NetDb, **the NetDb writer**, `m:i2p_stats` and the bus are all live
+Measured, the NetDb, **the NetDb writer**, `m:i2p_counters` and the bus are all live
 under `m:i2per_sup`; only the peer manager and the tunnel manager are absent.
 
 **That is a configuration shape `m:i2per_sup` already has, not a test hook added
@@ -1095,14 +1095,14 @@ pool_size(Key) ->
 -doc """
 The counters this ticket names, and the writer's saves.
 
-Read back through `m:i2p_stats:f:snapshot/0`, so every figure is the router's own
+Read back through `m:i2p_counters:f:snapshot/0`, so every figure is the router's own
 counting. Selected by **prefix** rather than by a hand-listed set of names, for the
 same reason `f:router_pids/0` enumerates: a list of counter names here would be a
-second copy of `m:i2p_stats:f:counters/0`.
+second copy of `m:i2p_counters:f:counters/0`.
 """.
 -spec counters() -> #{atom() => non_neg_integer()}.
 counters() ->
-    Snapshot = i2p_stats:snapshot(),
+    Snapshot = i2p_counters:snapshot(),
     Selected = maps:with([K || K <- maps:keys(Snapshot), wanted_counter(K)], Snapshot),
     Writer = i2p_netdb_writer:stats(),
     Selected#{writer_saves => maps:get(saves, Writer, 0)}.

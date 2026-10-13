@@ -22,7 +22,7 @@ be invisible in the read API — the figure would simply be wrong.
 %% never move. Both are failures this catches before a tunnel is built.
 registry_covers_every_derived_name_test() ->
     Derived = i2p_tunnel_outcome:counter_names(),
-    Registered = i2p_stats:counters(),
+    Registered = i2p_counters:counters(),
     Missing = Derived -- Registered,
     ?assertEqual([], Missing).
 
@@ -31,7 +31,7 @@ registry_covers_every_derived_name_test() ->
 %% appear in the read API as a permanent zero, which a consumer cannot tell from
 %% "measured, and zero".
 registry_has_no_unchargeable_tunnel_counter_test() ->
-    Tunnels = [N || N <- i2p_stats:counters(), is_atom(N), tunnel_name(N)],
+    Tunnels = [N || N <- i2p_counters:counters(), is_atom(N), tunnel_name(N)],
     ?assertEqual(lists:sort(i2p_tunnel_outcome:counter_names()), lists:sort(Tunnels)).
 
 tunnel_name(Name) ->
@@ -52,18 +52,18 @@ outcome_vocabulary_and_counters_are_in_bijection_test() ->
 
 built_charges_and_announces_test() ->
     with_bus_and_counters(fun() ->
-        Before = i2p_stats:snapshot(),
+        Before = i2p_counters:snapshot(),
         ok = i2p_tunnel_outcome:built(outbound, 3),
         ?assertEqual(
             maps:get(tunnels_built_outbound, Before) + 1,
-            maps:get(tunnels_built_outbound, i2p_stats:snapshot())
+            maps:get(tunnels_built_outbound, i2p_counters:snapshot())
         ),
         ?assertMatch({tunnel_built, outbound, 3}, next_event())
     end).
 
 failed_charges_the_reason_specific_counter_test() ->
     with_bus_and_counters(fun() ->
-        Before = i2p_stats:snapshot(),
+        Before = i2p_counters:snapshot(),
         %% Rejected twice, invalid once, so the two totals differ. One of each
         %% would prove nothing: both counters would read 1, which is exactly what a
         %% single collapsed "failed" figure would also show. Unequal totals are the
@@ -72,7 +72,7 @@ failed_charges_the_reason_specific_counter_test() ->
         ok = i2p_tunnel_outcome:failed(outbound, rejected),
         ok = i2p_tunnel_outcome:failed(outbound, rejected),
         ok = i2p_tunnel_outcome:failed(outbound, invalid),
-        After = i2p_stats:snapshot(),
+        After = i2p_counters:snapshot(),
         ?assertEqual(
             maps:get(tunnels_failed_outbound_rejected, Before) + 2,
             maps:get(tunnels_failed_outbound_rejected, After)
@@ -88,11 +88,11 @@ failed_charges_the_reason_specific_counter_test() ->
 
 expired_charges_and_announces_test() ->
     with_bus_and_counters(fun() ->
-        Before = i2p_stats:snapshot(),
+        Before = i2p_counters:snapshot(),
         ok = i2p_tunnel_outcome:expired(inbound),
         ?assertEqual(
             maps:get(tunnels_expired_inbound, Before) + 1,
-            maps:get(tunnels_expired_inbound, i2p_stats:snapshot())
+            maps:get(tunnels_expired_inbound, i2p_counters:snapshot())
         ),
         ?assertMatch({tunnel_expired, inbound}, next_event())
     end).
@@ -105,7 +105,7 @@ an_outcome_is_announced_while_the_counter_home_is_absent_test() ->
     ok = drain(),
     ok = start(i2p_events),
     ok = gen_event:add_handler(i2p_events, i2p_events_tests_collector, [self()]),
-    ?assertEqual(undefined, whereis(i2p_stats)),
+    ?assertEqual(undefined, whereis(i2p_counters)),
     try
         ok = i2p_tunnel_outcome:built(outbound, 1),
         ?assertMatch({tunnel_built, outbound, 1}, next_event())
@@ -125,9 +125,9 @@ all_events() ->
 %% so this module can take the counter home away again and have it stay away.
 with_bus_and_counters(Fun) ->
     ok = drain(),
-    ok = stop(i2p_stats),
+    ok = stop(i2p_counters),
     ok = start(i2p_events),
-    ok = start(i2p_stats),
+    ok = start(i2p_counters),
     %% The handler goes on before any outcome is announced, so an event that was
     %% sent is an event that arrives: no deadline and no polling.
     ok = gen_event:add_handler(i2p_events, i2p_events_tests_collector, [self()]),
@@ -135,7 +135,7 @@ with_bus_and_counters(Fun) ->
         Fun()
     after
         _ = gen_event:delete_handler(i2p_events, i2p_events_tests_collector, []),
-        ok = stop(i2p_stats),
+        ok = stop(i2p_counters),
         ok = stop(i2p_events)
     end.
 

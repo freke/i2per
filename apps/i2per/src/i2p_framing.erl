@@ -165,7 +165,19 @@ encrypt_frame(Key, MsgNum, Payload, Sip) ->
     {<<ObfLen:16/big, Sealed/binary>>, Sip1}.
 
 -doc """
-Decrypt a frame and verify its MAC.
+Decrypt a complete NTCP2 frame and verify its MAC.
+
+This is the *frame-level* half of the receive direction: it presupposes a full
+encoded frame (obfuscated length plus sealed AEAD payload already in hand). The
+*connection-level* receive direction — partial-frame buffering across TCP reads
+and threading the SipHash IV and message number through a stream — is owned by
+`m:i2p_stream`, which calls this function once a complete frame is available.
+
+`encrypt_frame/4` and `decrypt_frame/4` therefore remain the paired
+primitives used for complete frames and tests; the only receive path in
+production goes through `m:i2p_stream:push/2`, so there is no second
+implementation of frame decryption for the cached-plaintext case to drift
+against.
 
 Input: `Key` — the direction cipher key; `MsgNum` — the message number used
 when encrypting; `Frame` — a complete encoded frame (`t:frame/0`); `Sip` — the
@@ -175,7 +187,7 @@ Output: `{ok, Payload, Sip'}` on success (with the advanced SipHash state),
 or the atom `error` on a malformed length, a MAC failure, or a length that
 does not match the supplied bytes.
 """.
--spec decrypt_frame(frame_key(), non_neg_integer(), frame(), sip_state()) ->
+-spec decrypt_frame(frame_key(), non_neg_integer(), frame() | binary(), sip_state()) ->
     {ok, binary(), sip_state()} | error.
 decrypt_frame(Key, MsgNum, <<ObfLen:16/big, Sealed/binary>>, Sip) ->
     case deobfuscate_length(ObfLen, Sip) of

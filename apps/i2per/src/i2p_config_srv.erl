@@ -16,6 +16,18 @@ and announces `{config_changed, Key, Value}`. The first four keys are read by
 their consumers at use time. The two rate-limit keys are read when the tunnel
 server starts, so restart that service before relying on their new values.
 
+The two coordinator keys (`relay_coord`, `peertest_coord`) are booleans,
+defaulting off, and are applied immediately: an accepted `true` starts the
+coordinator under `m:i2per_sup`, an accepted `false` stops it — no restart.
+`relay_coord = true` additionally requires `live_network = true`, per the
+resolved decision on the Charlie/introducer role: the capability begins issuing
+relay tags and emitting unsolicited datagrams to third-party addresses, so it
+is gated on the one "am I really on the network" switch. Set `live_network`
+first; `relay_coord = true` without it is refused with
+`{error, {requires_live_network, relay_coord}}`. A no-identity boot cannot
+start either coordinator (there is no RouterInfo to route with) and refuses
+with `{error, no_identity}`.
+
 Restart-required keys are all other known keys, including `host`, `port`,
 `sam_port`, `data_dir`, `reseed`, `addressbook`, `server_tunnels`,
 `ntcp2_published`, `live_network`, `listen_host`, the listener and SAM limits,
@@ -45,6 +57,13 @@ writes configuration files.
     net_id,
     transit_bandwidth_kbps,
     tunnel_build_rate,
+    %% The coordinator switches. Applied immediately rather than merely stored:
+    %% an accepted `true` starts the coordinator under `m:i2per_sup` and an
+    %% accepted `false` stops it, via `f:i2per_sup:apply_coordinator/2` -- the
+    %% same shape as `log_level` below. Storing the env alone would record a
+    %% capability change the router had not made.
+    relay_coord,
+    peertest_coord,
     %% Applied immediately rather than merely stored. `m:i2p_log:set_level/1` is the
     %% only thing in the tree that can change the level, so this key routes through
     %% it: going through `application:set_env/3` alone would record the new level
@@ -136,6 +155,8 @@ set(Key, Value) ->
     | max_stream_connections
     | ntcp2_keepalive_interval_ms
     | log_level
+    | relay_coord
+    | peertest_coord
     | host
     | port
     | sam_port
@@ -188,8 +209,10 @@ apply_set(Key, Value) ->
         ok ->
             case lists:member(Key, ?RUNTIME_KEYS) of
                 true ->
-                    store_runtime(Key, Value),
-                    {ok, ok};
+                    case store_runtime(Key, Value) of
+                        ok -> {ok, ok};
+                        {error, Reason} -> {error, Reason}
+                    end;
                 false ->
                     {ok, {ok, pending_restart}}
             end;
@@ -199,11 +222,11 @@ apply_set(Key, Value) ->
 
 %% store_runtime/2 — persist a runtime key, applying the ones that need it.
 %%
-%% Only `log_level` needs more than storing. Everything else in the set is read from
-%% the app env by its consumer at use time, so writing the env *is* the whole of
-%% "apply". The log level is the exception because the thing that reads it is
-%% `logger`, and `logger` is not an application environment.
--spec store_runtime(atom(), term()) -> ok.
+%% Three keys need more than storing. `log_level` because the thing that reads it is
+%% `logger`, and `logger` is not an application environment; the two coordinator
+%% keys because the thing that reads them is a child of `m:i2per_sup` that has to
+%% start or stop, not a value a consumer re-reads. Both route through their owner.
+-spec store_runtime(atom(), term()) -> ok | {error, term()}.
 store_runtime(log_level, Value) ->
     case i2p_log:set_level(Value) of
         ok -> ok;
@@ -213,9 +236,29 @@ store_runtime(log_level, Value) ->
         %% comment on the key above describes.
         {error, Reason} -> erlang:error({log_level_not_applied, Reason})
     end;
+store_runtime(relay_coord, Value) ->
+    apply_coordinator(relay_coord, Value);
+store_runtime(peertest_coord, Value) ->
+    apply_coordinator(peertest_coord, Value);
 store_runtime(Key, Value) ->
     application:set_env(i2per, Key, Value),
     ok.
+
+%% apply_coordinator/2 — start or stop one coordinator under `m:i2per_sup`.
+%%
+%% Lives in the supervisor module, not here: the child specs are `m:i2per_sup`'s
+%% and so is the gate that boot and supervisor restart re-evaluate. Routing the
+%% hot set through it means all three paths consult one predicate, and a router
+%% cannot come to disagree with itself about whether a coordinator is on.
+%%
+%% An env write only happens on success, so a refused start leaves the
+%% environment and the running state in agreement: neither records a capability
+%% change that did not happen.
+-spec apply_coordinator(relay_coord | peertest_coord, boolean()) -> ok | {error, term()}.
+apply_coordinator(relay_coord, Value) ->
+    i2per_sup:apply_coordinator(relay_coord, Value);
+apply_coordinator(peertest_coord, Value) ->
+    i2per_sup:apply_coordinator(peertest_coord, Value).
 
 %% %%%%% %%% Validation %%%%% %%%
 
@@ -242,6 +285,21 @@ validate_value(Key, Value) ->
         {floodfill, V} when is_boolean(V) -> ok;
         {ntcp2_published, V} when is_boolean(V) -> ok;
         {live_network, V} when is_boolean(V) -> ok;
+        {peertest_coord, V} when is_boolean(V) -> ok;
+        %% The Charlie/introducer switch additionally requires `live_network`, per
+        %% the resolved decision: the capability begins issuing relay tags and
+        %% emitting unsolicited datagrams to third-party addresses, so it is gated
+        %% on the one "am I really on the network" switch. Refusing here — at the
+        %% door where the operator sees it — rather than accepting and silently
+        %% not starting, which is the failure `f:store_runtime/2` exists to
+        %% prevent.
+        {relay_coord, true} ->
+            case application:get_env(i2per, live_network) of
+                {ok, true} -> ok;
+                _ -> {error, {requires_live_network, relay_coord}}
+            end;
+        {relay_coord, false} ->
+            ok;
         {listen_host, V} when is_binary(V), byte_size(V) > 0 -> ok;
         {net_id, V} when is_integer(V), V >= 0 -> ok;
         %% The vocabulary is `m:i2p_log`'s, not a list written out here. Two lists of

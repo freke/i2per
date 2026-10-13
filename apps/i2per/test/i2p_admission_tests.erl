@@ -268,7 +268,7 @@ a_refused_dial_is_counted_test() ->
             with_sup(i2p_ntcp2_sup, fun() ->
                 set_cap(max_ntcp2_connections, 0),
                 ?assertMatch({error, connection_limit}, start_ntcp2()),
-                After = i2p_stats:snapshot(),
+                After = i2p_counters:snapshot(),
                 ?assertEqual(
                     1, maps:get(ntcp2_connections_refused_limit, After)
                 ),
@@ -277,7 +277,7 @@ a_refused_dial_is_counted_test() ->
                 set_cap(max_ntcp2_connections, 1),
                 {ok, _} = start_ntcp2(),
                 ?assertEqual(
-                    After, i2p_stats:snapshot(), admitted_dial_must_not_be_counted_as_a_refusal
+                    After, i2p_counters:snapshot(), admitted_dial_must_not_be_counted_as_a_refusal
                 )
             end)
         end)
@@ -294,10 +294,10 @@ a_refused_stream_conn_is_counted_against_its_own_counter_test() ->
     with_caps(fun() ->
         with_stats(fun() ->
             with_sup(i2p_sam_sup, fun() ->
-                Before = i2p_stats:snapshot(),
+                Before = i2p_counters:snapshot(),
                 set_cap(max_stream_connections, 0),
                 ?assertMatch({error, stream_limit}, start_stream()),
-                After = i2p_stats:snapshot(),
+                After = i2p_counters:snapshot(),
                 ?assertEqual(
                     1, maps:get(stream_conns_refused_limit, After)
                 ),
@@ -736,7 +736,7 @@ restore_cap({Key, undefined}) ->
 cap_keys() ->
     [max_ntcp2_connections, max_ssu2_sessions, max_sam_sessions, max_stream_connections].
 
-%% **Stopped, not killed.** `i2p_stats:terminate/2` erases the `persistent_term`
+%% **Stopped, not killed.** `i2p_counters:terminate/2` erases the `persistent_term`
 %% entry holding the counter registry, and only a clean stop runs it. A `kill`
 %% leaves a term pointing at a dead counter reference, which the next case in this
 %% node would read as a live snapshot -- the same shape of leak as the cap keys
@@ -751,15 +751,15 @@ with_stats(Fun) ->
         Fun()
     after
         case Started of
-            true -> ok = gen_server:stop(whereis(i2p_stats));
+            true -> ok = gen_server:stop(whereis(i2p_counters));
             false -> ok
         end
     end.
 
 ensure_stats() ->
-    case whereis(i2p_stats) of
+    case whereis(i2p_counters) of
         undefined ->
-            {ok, _Pid} = i2p_stats:start_link(),
+            {ok, _Pid} = i2p_counters:start_link(),
             true;
         _Pid ->
             false

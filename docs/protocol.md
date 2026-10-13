@@ -1,6 +1,6 @@
 # Protocol Reference
 
-This document describes the I2P wire formats implemented by i2per 0.2.1.
+This document describes the I2P wire formats implemented by i2per 0.3.0.
 Unsupported formats and release limitations are listed explicitly.
 
 All multi-byte integers in I2P are big-endian unless otherwise noted. Ed25519
@@ -12,12 +12,15 @@ in the [I2P documentation](https://i2p.net/en/docs/).
 
 ## Release boundaries
 
-The 0.2.1 release does not implement NTCP1, SSU1, I2CP, the legacy
+The 0.3.0 release does not implement NTCP1, SSU1, I2CP, the legacy
 ElGamal/AES garlic formats, Datagram2, or a TUN interface. SSU2 path migration,
-RTT-based congestion control, automatic Charlie selection for PeerTest, and
-the complete firewalled HolePunch path are also outside this release. The
-sections below describe only behavior that is present in 0.2.1. 0.2.1 is a
-patch release over 0.2.0 and changes no wire format.
+RTT-based congestion control, automatic Charlie selection for PeerTest, and a
+session token in the relay accept are also outside this release. The Charlie
+role itself is implemented: a tagged session answers a RelayIntro as Charlie,
+verifies the requester's signature, checks the asserted endpoint, and punches.
+The sections below describe only behavior that is present in 0.3.0. 0.3.0 adds
+the Charlie RelayResponse and HolePunch blocks and the measured-reachability
+caps over 0.2.1.
 
 ## Implemented
 
@@ -1977,7 +1980,11 @@ Implemented in `m:i2p_peertest` (pure signing/conn-id/result core), `m:i2p_ssu2`
 block 10), driven by the session process (`m:i2p_ssu2_conn`: Bob-side reject on
 message 1, Charlie-side message-3 reply on message 2, result hook on message 4)
 and the listener's out-of-session type-7 classification
-(`m:i2p_ssu2_listener`: Charlie-role responder on message 6). This release
+(`m:i2p_ssu2_listener`: Charlie-role responder on message 6). The tests are
+initiated by the peer manager (`m:i2p_peer`: every newly established SSU2
+session plus a periodic re-test, `allow_private_host` the short-circuit), and
+the results are folded into the reachability ladder by
+`m:i2p_ssu2_reachability`. This release
 coordinator and session path construct and relay the signed fields, but do not
 verify incoming PeerTest signatures.
 
@@ -2086,43 +2093,58 @@ nonce-derived connection ID.
 ##### Result state machine
 
 After message 4 is accepted and Charlie's address is available, Alice sends
-message 6 even if message 5 has not arrived. The current result function
-returns only `ok`, `firewalled`, or `unknown`; it does not emit a `symnat`
+message 6 even if message 5 has not arrived. The result is a typed ladder rung
+plus a reason (see [Measured reachability](#peer-test) in CONTEXT.md): the
+concluded test reports `reachable` (the punch landed),
+`{introducer_only, punch_not_delivered}` (the Charlie confirmed in-session but
+the unsolicited punch never came — the stateful-firewall case), or
+`{unknown, no_charlie_report}` (no usable evidence). It does not emit a `symnat`
 result in this release.
 The table below is the exact matrix implemented by
 `i2p_peertest:result/3`:
 
 | message 4 | message 5 | message 7 | `i2p_peertest:result/3` |
 |---|---|---|---|
-| no | no | no | `unknown` |
-| yes | no | no | `firewalled` |
-| no | yes | no | `ok` |
-| yes | yes | no | `ok` |
-| no | no | yes | `unknown` |
-| yes | no | yes | `firewalled` |
-| no | yes | yes | `ok` |
-| yes | yes | yes | `ok` |
+| reject | — | — | `{unknown, no_charlie_report}` |
+| no | no | no | `{unknown, no_charlie_report}` |
+| yes | no | no | `{unknown, no_charlie_report}` |
+| no | yes | no | `{reachable, undefined}` |
+| yes | yes | no | `{reachable, undefined}` |
+| no | no | yes | `{unknown, no_charlie_report}` |
+| yes | no | yes | `{introducer_only, punch_not_delivered}` |
+| no | yes | yes | `{reachable, undefined}` |
+| yes | yes | yes | `{reachable, undefined}` |
+
+A reject is the introducer chain failing before Charlie's confirmation — the
+Charlie never confirmed the test arrived — not evidence about our own
+reachability, so it reads `unknown` and never demotes the coarse verdict. The
+measured outcomes are folded by `m:i2p_ssu2_reachability` with asymmetric
+hysteresis: one `{introducer_only, punch_not_delivered}` demotes, and
+`peertest_promote_after` (`i2per` env, default 3) consecutive `reachable`
+conclusions promote.
 
 The transport preference is SSU2-first with NTCP2 fallback; incoming type-7
 PeerTest datagrams are classified by the listener and routed to the owning
 session (Alice-role) or handled directly (Charlie-role, independently of any
 established session).
 
-Timing. Once message 4 is accepted and message 6 has been sent, Alice arms a
-settle timer of `peertest_settle_ms` (`i2per` env, default 10 s) before judging
-the result, so out-of-session messages 5/7 that are still in flight have time
-to land (the SSU2 "wait several seconds after message 4" rule). Two shortcuts
-keep a concluded test fast while the longer settle window merely extends
-*failure detection*:
+Timing. Once message 4 is accepted, Alice arms a settle timer of
+`peertest_settle_ms` (`i2per` env, default 10 s) before judging the result, so
+out-of-session messages 5/7 that are still in flight have time to land (the
+SSU2 "wait several seconds after message 4" rule) — the timer arms on the
+acceptance, not on message 6 having been sent, so a Charlie RouterInfo that
+never arrives cannot leave the test pending forever. Two shortcuts keep a
+concluded test fast while the longer settle window merely extends *failure
+detection*:
 
-* message 5 alone resolves the result to `OK` immediately (rows `n y n` /
-  `y y n` / `n y y` / `y y y`), so the judge timer is cancelled and the
-  result emitted the moment Charlie's out-of-session message 5 arrives;
-* a deterministic message-4 reject concludes the test as `FIREWALLED`
-  immediately.
+* message 5 alone resolves the result to `reachable` immediately (rows
+  `n y n` / `y y n` / `n y y` / `y y y`), so the judge timer is cancelled and
+  the result emitted the moment Charlie's out-of-session message 5 arrives;
+* a deterministic message-4 reject concludes the test as
+  `{unknown, no_charlie_report}` immediately.
 
 Otherwise the settle timer fires after `peertest_settle_ms` and the result is
-judged from whichever of messages 4/5/7 have arrived. The values are read from
+judged from whichever of messages 5/7 have arrived. The values are read from
 the `i2per` application environment when the settle timer is armed.
 
 #### Relay
@@ -2139,10 +2161,33 @@ answers with a fresh tag recorded against the requesting session in the
 introducer's tag registry.
 
 The implementation has the block codec, tag registry, introducer
-coordinator, requester redirect, and inbound HolePunch classification. It does
-not run the Charlie-side responder or verify RelayRequest/RelayIntro
-signatures. The sequence below is the wire flow, with those edges not yet
-active.
+coordinator, requester redirect, the Charlie-side responder, and inbound
+HolePunch classification. It does not grant a session token in the accept, and
+the firewalled-mode edge that publishes introducer addresses is the peer-test
+half only. The sequence below is the wire flow.
+
+**Charlie's verdict on a RelayIntro.** The intro arrives on the session the
+introducer holds with the tagged peer, and answering it is what being selected
+as a Charlie is for. The signature is verified first: Alice's Ed25519 router
+signing key, taken from the RouterInfo the introducer forwarded ahead of the
+intro, against `"RelayRequestData"` plus `bhash` (the introducer's) and `chash`
+(the tagged peer's own) — both hashes are inside the signed bytes, so the
+request is unreflectable. Then the asserted endpoint is checked for being
+punchable: a public literal and an unprivileged port, and nothing else. It is
+deliberately **not** matched against Alice's published SSU2 address, because
+that address is frequently the unreachable one, which is the whole reason she
+needs a Charlie.
+
+On accept, Charlie signs a RelayResponse with its own router signing key and
+answers twice: in-session to the introducer, and again inside the out-of-session
+HolePunch sent straight to Alice's asserted endpoint. Both copies carry the same
+code, nonce and endpoint. A refusal is answered in-session only, with no punch:
+Charlie-side 70 (Alice's RouterInfo not known), 67 (signature failure), 65
+(endpoint not punchable) or 66 (the punch budget is spent). The punch budget is
+a per-session token bucket — `?PUNCH_BURST` punches and then one per second —
+because a punch is an unsolicited datagram this router emits to an address a
+third party asserted, and an unbounded series of them is an amplification vector
+aimed wherever the tag-holder likes.
 
 **Relay-tag handshake (blocks 15/16).** The tagged peer, Charlie in
 this narrative, the firewalled router in the firewalled-mode flow — sends a
@@ -2355,16 +2400,18 @@ bitwise inverse `~(nonce << 32) | nonce`. Alice's listener classifies the
 message by decrypting under her own intro key and routes it to the pending
 relay.
 
-Implementations: `m:i2p_relay` (pure signing/conn-id/reject-code core),
+Implementations: `m:i2p_relay` (pure signing/conn-id/reject-code core and the
+punch payload blocks),
 `m:i2p_ssu2` (codec: `encode_blocks`/`decode_blocks` blocks 7/8/9 and
 15/16, `encode_holepunch/5`, `decode_holepunch/2`), `m:i2p_relay_coord`
 (introducer serving: grants tags in-session, keeps them in the
-listener-owned `i2p_ssu2_relay_tags` registry, and routes blocks 7/8/9
-between the tagged session and the requester), `m:i2p_ssu2_listener`
-(registry ownership) and `m:i2p_ssu2_conn` (sessions forward relay blocks to
-their owner; relay blocks 7/8/9 are ack-eliciting). The release does not
-implement Charlie-side HolePunch establishment or the full firewalled-router
-edge. Beyond codec round-trips, the wire layout above follows i2p-java's
-`SSU2Util` (the `bHash`/`cHash` in the request signature are context, not
-wire fields).
+listener-owned `i2p_ssu2_relay_tags` registry, routes blocks 7/8/9 between the
+tagged session and the requester, and answers a RelayIntro on the tagged
+session as Charlie — the signature verification, the endpoint check, the punch
+budget, and the out-of-session HolePunch), `m:i2p_ssu2_listener` (registry
+ownership) and `m:i2p_ssu2_conn` (sessions forward relay blocks to
+their owner; relay blocks 7/8/9 are ack-eliciting). Beyond codec round-trips,
+the wire layout above follows i2pd's `SSU2Session::HandleRelayIntro` and
+`SSU2HolePunchSession` (i2p-java's `SSU2Util` is the other reference: the
+`bHash`/`cHash` in the request signature are context, not wire fields).
 

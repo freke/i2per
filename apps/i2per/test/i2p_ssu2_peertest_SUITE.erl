@@ -80,7 +80,8 @@ end_per_testcase(_Case, _Config) ->
 %% An explicitly `alice`-tagged session is the test target and can originate a
 %% peer test: it builds and signs message 1, sends it in-session to the
 %% introducer, and when the message-4 "no Charlie available" reject returns,
-%% validates it and emits a `peertest_result` event (FIREWALLED).
+%% validates it and emits the typed `peertest_result` outcome (`unknown` with
+%% reason `no_charlie_report`).
 alice_initiation_reject(_Config) ->
     {Events, Started} = start_events(),
     ok = gen_event:add_handler(i2p_events, i2p_events_tests_collector, [self()]),
@@ -126,8 +127,11 @@ alice_initiation_reject(_Config) ->
 
         ok =
             i2p_ct_helpers:wait_msg(
+                %% A reject is the introducer chain failing before Charlie's
+                %% confirmation — the typed outcome, not a verdict about our
+                %% own reachability.
                 fun
-                    ({peertest_result, ipv4, firewalled}) -> {true, ok};
+                    ({peertest_result, ipv4, {unknown, no_charlie_report}}) -> {true, ok};
                     (_) -> false
                 end,
                 ?DATA_WINDOW
@@ -559,8 +563,10 @@ assert_intro_key(RIData, CIntroKey) ->
 observe_for_result(Timeout) ->
     try
         i2p_ct_helpers:wait_msg(
+            %% Message 5 arrived: Charlie reached us directly — the punch
+            %% landed and the test resolved to `reachable`.
             fun
-                ({peertest_result, ipv4, ok}) ->
+                ({peertest_result, ipv4, {reachable, undefined}}) ->
                     {true, ok};
                 (_) ->
                     false
