@@ -219,6 +219,23 @@ Output: `{ok, Pid}` once the handshake is complete and the connection is in the
 data phase, or `{error, Reason}` if the connection process died during the
 handshake. The caller also receives `{ntcp2_frame, Pid, Payload}` for each
 decrypted frame.
+
+**The `Reason` is the handshake's own reason, not the process's exit reason.**
+A handshake that fails announces `{connect_failed, PeerHash, {handshake, Why}}`
+to its owner and then exits normally — normally, because an unreachable peer is
+a dial outcome and not a fault, and a crash report per candidate would bury
+bounded discovery's log. That is why the failure reaches this return value
+through the announcement rather than the `DOWN`: an `exit(normal)` carries
+`normal`, which is the exit reason of a process that ended cleanly and says
+nothing about a handshake. The announcement names the peer it belongs to, so a
+caller awaiting several dials to the same peer reads the same figure for each
+— which is all it could do with the reason anyway, because the outcome of
+"this peer is unreachable" does not depend on which dial reported it.
+
+**Only an owned await can see the reason.** The announcement goes to the
+owner, and `f:connect/3` defaults the owner to its caller; a caller that
+passed `owner => Other` is not the recipient and learns only that the
+connection ended, as `{error, normal}`.
 """.
 -spec connect(i2p_router_info:router_info(), local_keys(), map()) ->
     {ok, pid()} | {error, term()}.
@@ -247,6 +264,9 @@ await_connection(Pid, Timeout) ->
         {ntcp2_ready, P, _RemoteRI} when P =:= Pid ->
             erlang:demonitor(MRef, [flush]),
             {ok, Pid};
+        {connect_failed, _PeerHash, {handshake, _} = Reason} ->
+            erlang:demonitor(MRef, [flush]),
+            {error, Reason};
         {'DOWN', MRef, process, Pid, Reason} ->
             {error, Reason}
     after Timeout ->
@@ -341,6 +361,13 @@ run_handshake(alice, #{
             %% the only honest thing it could report was that a peer was in
             %% backoff — which is the same figure for a timeout, a rejected
             %% handshake, and a key mismatch.
+            %%
+            %% This announcement is also the reason `f:connect/3` reports: the
+            %% owner is that call's caller, the message precedes the `DOWN` it
+            %% is followed by, and an `exit(normal)` could not carry it. The
+            %% exit stays `normal` on purpose — an unreachable peer is a dial
+            %% outcome, and a crash report per candidate would bury bounded
+            %% discovery's log.
             Owner ! {connect_failed, i2p_router_info:hash(RemoteRI), {handshake, Reason}},
             exit(normal);
         error ->
