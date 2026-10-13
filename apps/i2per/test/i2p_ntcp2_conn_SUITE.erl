@@ -22,6 +22,8 @@
     idle_reap/1,
     peer_close_kills_conn/1,
     isolation/1,
+    a_failed_handshake_says_why_not_normal/1,
+    an_unowned_await_reports_only_the_end/1,
     send_does_not_wait_on_the_connection/1,
     a_peer_that_stops_reading_ends_the_connection/1,
     an_inbound_burst_does_not_delay_a_send/1,
@@ -121,6 +123,8 @@ all() ->
         idle_reap,
         peer_close_kills_conn,
         isolation,
+        a_failed_handshake_says_why_not_normal,
+        an_unowned_await_reports_only_the_end,
         send_does_not_wait_on_the_connection,
         a_peer_that_stops_reading_ends_the_connection,
         an_inbound_burst_does_not_delay_a_send,
@@ -335,7 +339,7 @@ transport_bytes_are_counted(_Config) ->
         {ok, CA} = i2p_ntcp2_conn:connect(ri_at(listen_port(Listener), Bob), Alice, #{}),
         {CB, _} = await_ready(),
 
-        #{ntcp2_bytes_out := Out0, ntcp2_bytes_in := In0} = i2p_stats:snapshot(),
+        #{ntcp2_bytes_out := Out0, ntcp2_bytes_in := In0} = i2p_counters:snapshot(),
 
         Probe = <<"probe">>,
         ok = i2p_ntcp2_conn:send(CA, Probe),
@@ -361,7 +365,7 @@ transport_bytes_are_counted(_Config) ->
         %% reports whatever the registry declares, so this is the same names the
         %% view will carry; `m:i2p_read_api_SUITE` covers the view end to end,
         %% and this suite has no reason to boot the parts the view reads.
-        Counters = i2p_stats:snapshot(),
+        Counters = i2p_counters:snapshot(),
         true = (Out1 + Second =:= maps:get(ntcp2_bytes_out, Counters)),
         true = (In1 + Second =:= maps:get(ntcp2_bytes_in, Counters))
     after
@@ -369,10 +373,10 @@ transport_bytes_are_counted(_Config) ->
     end.
 
 ntcp2_bytes_out() ->
-    maps:get(ntcp2_bytes_out, i2p_stats:snapshot()).
+    maps:get(ntcp2_bytes_out, i2p_counters:snapshot()).
 
 ntcp2_bytes_in() ->
-    maps:get(ntcp2_bytes_in, i2p_stats:snapshot()).
+    maps:get(ntcp2_bytes_in, i2p_counters:snapshot()).
 
 %% Multiple frames in one direction stay ordered across the stream.
 multiple_frames_ordered(_Config) ->
@@ -477,6 +481,75 @@ isolation(_Config) ->
     after
         i2p_ntcp2_listener:stop(Listener)
     end.
+
+%% --------------------------------------------------------------------------
+%% A handshake that fails says why, not `{error, normal}`
+%% --------------------------------------------------------------------------
+
+%% `f:connect/3` returns the handshake's own reason.
+%%
+%% A connection process that fails to connect announces
+%% `{connect_failed, PeerHash, {handshake, Reason}}` to its owner and then exits
+%% normally — normally, because an unreachable peer is a dial outcome and a crash
+%% report per candidate would bury bounded discovery's log. An `exit(normal)`
+%% carries `normal`, which is the exit reason of a process that ended cleanly and
+%% says nothing about a handshake, so before this announcement was read the
+%% return value was the one figure that could not be diagnosed from: the 0.3.0
+%% interop run reported `{badmatch, {error, normal}}` for a handshake whose real
+%% cause was sitting unread in the caller's mailbox.
+%%
+%% The dial here is to a published address with nothing listening, so the reason
+%% is the socket's own: `econnrefused`.
+%%
+%% The announcement precedes the `DOWN` — the same process sends it and then
+%% exits, and signals from one process to another are ordered — so the awaiter
+%% reads it before the monitor fires. A peer manager that is the owner rather
+%% than the caller already consumed this announcement; it is the caller of
+%% `f:connect/3`, who defaults the owner to itself, that was losing it.
+a_failed_handshake_says_why_not_normal(_Config) ->
+    {Bob, Alice} = pair(),
+    %% Nothing listens on this port.
+    {ok, Dead} = gen_tcp:listen(0, [binary, {packet, raw}, {active, false}]),
+    {ok, DeadPort} = inet:port(Dead),
+    gen_tcp:close(Dead),
+    {error, {handshake, {connect_failed, econnrefused}}} =
+        i2p_ntcp2_conn:connect(
+            ri_at(DeadPort, Bob),
+            Alice,
+            #{owner => self(), timeout => 5000}
+        ),
+    ok.
+
+%% The same property from the other side: the awaiter of a connect whose owner
+%% is *not* the caller is not the announcement's recipient, and so learns only
+%% that the connection ended. That is the documented remainder of the contract,
+%% not a defect — the pid that was told why is the pid that asked for the dial.
+%%
+%% What makes this worth its own case rather than a comment: the announcement is
+%% matched by shape, so a caller that is not the owner must not be able to steal
+%% a message addressed elsewhere. Nothing arrives here, and the case fails the
+%% moment the awaiter returns anything but `{error, normal}` — which is exactly
+%% what a wrongly-delivered announcement would look like.
+an_unowned_await_reports_only_the_end(_Config) ->
+    {Bob, Alice} = pair(),
+    {ok, Dead} = gen_tcp:listen(0, [binary, {packet, raw}, {active, false}]),
+    {ok, DeadPort} = inet:port(Dead),
+    gen_tcp:close(Dead),
+    Owner = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    {error, normal} =
+        i2p_ntcp2_conn:connect(
+            ri_at(DeadPort, Bob),
+            Alice,
+            #{owner => Owner, timeout => 5000}
+        ),
+    %% The announcement went to the owner, and the owner is still holding it.
+    {message_queue_len, 1} = erlang:process_info(Owner, message_queue_len),
+    Owner ! stop,
+    ok.
 
 %% --------------------------------------------------------------------------
 %% The send path never makes its caller wait

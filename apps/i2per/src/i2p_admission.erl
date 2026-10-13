@@ -133,7 +133,7 @@ One admission process's configuration.
 and `limit` are read on every admission, not once at start, so a limit an
 operator changes takes effect on the next connection rather than the next boot.
 `refused` is the atom a refusal is reported as — each resource has its own, and
-callers match on it. `refused_counter` is the `m:i2p_stats` counter a refusal is
+callers match on it. `refused_counter` is the `m:i2p_counters` counter a refusal is
 charged to.
 """.
 -type config() :: #{
@@ -240,5 +240,5 @@ start_or_refuse(ChildSpec, Config) ->
 %% worth one bus message each.
 refuse(Config) ->
     #{refused := Refused, refused_counter := Counter} = Config,
-    ok = i2p_stats:add(Counter, 1),
+    ok = i2p_counters:add(Counter, 1),
     {error, Refused}.

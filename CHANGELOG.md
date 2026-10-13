@@ -4,7 +4,214 @@ All notable changes to i2per are recorded here. Versions follow the OTP
 applications' own `{vsn, ...}`; the release tag is `v` + that version, and
 CI refuses a tag that disagrees.
 
-## [Unreleased]
+## [0.3.0] — 2026-10-13
+
+**The Charlie role is implemented.** `i2p_relay_coord` now answers a RelayIntro
+on the tagged session as Charlie: it verifies Alice's RelayRequest signature
+with the router signing key her own forwarded RouterInfo publishes, checks her
+asserted endpoint for being punchable, and on accept signs a RelayResponse with
+its own key and answers twice — in-session to the introducer, and again inside
+the out-of-session HolePunch (type 11) sent straight to her asserted endpoint.
+A refusal is answered in-session only, with no punch, and carries Charlie's own
+reject code (70 Alice unknown, 67 signature failure, 65 endpoint not punchable,
+66 the punch budget is spent).
+
+Two bounds the reference implementations do not have: the punch is rate-limited
+by a per-session token bucket (a burst of 4, then one per second), and the
+endpoint predicate refuses loopback, private, link-local literals and privileged
+ports. Neither i2pd nor i2p-java rate-limits a punch this way.
+
+Supporting changes: `m:i2p_addr_policy` is the one predicate for "is this
+address on the public internet", shared by the boot validation (which had its
+own copy) and the punch gate. `m:i2p_peer` forwards a RouterInfo to both
+coordinators, which is the one shape that is not exclusively owned — the
+peer-test coordinator needs it for a message 1 and the relay coordinator for a
+RelayIntro.
+
+### Fixed
+
+**A review of the Charlie role found several interop and cleanup defects before
+the release.** Charlie's RelayResponse is now signed over the introducer's hash
+rather than this router's own hash, which is the hash Alice signed against.
+The out-of-session HolePunch now carries a usable endpoint: IPv4 addresses stay
+4 bytes, IPv6 addresses stay 16 bytes, and the punch path stops converting
+through a string form that could never be parsed. The address policy also
+rejects IPv4-mapped and IPv4-compatible IPv6 literals instead of treating the
+surrounding zeros as a public address.
+
+A session that dies by monitor `DOWN` now runs the same coordinator cleanup and
+relay-tag removal as a session that closes with an explicit SSU2 termination,
+so dead introducers no longer accumulate in the coordinator's session table.
+The identity rebuild and SSU2 introducer swap recompute the measured capability
+caps instead of carrying the previous verdict into a new RouterInfo. An
+`unknown` peer-test result no longer resets a promotion streak, and repeated
+promotion or demotion transitions no longer re-fire the same coarse change.
+
+The SSU2 listener no longer crashes when a peer-asserted endpoint cannot be
+sent to. The bus registry row is written before the forwarder is attached, and
+the forwarder demonitors its collector on termination. The release profile now
+builds the `0.3.0` relx release.
+
+### Added
+
+**Every bus-carried fact now has a record that outlives the bus.** ADR 0002 has
+said since acceptance that a fact on the event bus may also be written to the log
+"except at a level that is off by default", and the tree delivered that clause
+nowhere: seven facts were announced and not recorded anywhere else. Each of the
+seven now writes a `debug` line beside its `notify/1` site — ten sites, because
+`lookup_failed` and `leaseset_publish_failed` are each announced from more than
+one place — carrying the key, the reason and whatever else the announcement did.
+
+This is what makes the bus's bound survivable. A bound that kills the manager
+destroys the bus's copy of every fact it was carrying, and with no second copy a
+fact is lost at exactly the moment somebody goes looking for the reason. The
+level is the control rather than a gate: `debug` is off under the shipped
+`notice` default, so `lookup_failed` on a router that cannot reach the network
+is still not a line per lookup.
+
+`i2p_log_checklist_tests` pins both directions, and neither was checkable before:
+every `bus` row has such a record, and no `log` row has one — a shadow under a
+fact already recorded at a level an operator sees is the duplication ADR 0002
+exists to prevent, and nothing switches it off for whoever is reading `debug`
+afterwards.
+
+ADR 0002 also now states its one real overlap explicitly, which it had left to be
+guessed at: `unhandled_ssu2_block_peer` is on both instruments above `debug`,
+because `i2per_status` is never started by the router and the log is therefore the
+only instrument that exists for a subscriber-less node. That is the opposite
+arrangement from the seven bus rows — log-first rather than bus-first — which is
+why the check pins the asymmetry rather than a general rule. Whether it should
+collapse to bus-only stays open on #HPH59JN.
+
+### Added
+
+**The far side of the bus is now readable.** A subscriber on another node that
+falls behind grows without limit, and nothing on this router could see it: there
+was no cap to set and, as it turned out, no reading either.
+`m:i2p_events:sample_far_backlog/0` reads every remote subscriber's queue depth
+and answers with the deepest. It is a read, not a published figure — the core
+does not hand data to a stats process it does not control — so with nobody asking,
+it costs the router nothing.
+
+The far side cannot be bounded, and that is now measured rather than assumed
+(#RWTMGJ9, OTP 28.5): `process_info/2` against a remote pid raises `badarg` for
+every item, the distribution exposes no queue depth through `system_info`,
+`statistics`, `port_info` or `memory`, and `{async_dist, false}` does not supply
+one — under a 300,000-event flood against a collector that never drains, the far
+mailbox took **all 300,000** while a non-`async_dist` relay never parked. The
+runtime applies no back-pressure to a process that is not consuming. Bounding it
+would mean credit/ack flow control, which changes the delivery contract for every
+subscriber; reported is what shipped.
+
+The registry the reading walks is the bus's own state, written where the handler
+is added and removed, so it cannot drift from what the bus is carrying. It is
+pruned when a collector is found gone, which is the only thing that keeps it from
+growing across status-service restarts — `m:i2per_status_state` never unsubscribes.
+
+### Fixed
+
+**Six `gen_event` callbacks in `m:i2p_events` were exported, documented and never
+executed.** The manager was started with the bare `{local, ?MODULE}` form, which
+`gen_event:start_link/2` does not read as a `{Module, Args}` pair, so `gen_event`
+substituted its own module and the manager ran its callbacks. Measured: such a
+manager reports `current_function = {gen_event, fetch_msg, 6}`, and an `init/1`
+that prints is never entered. There is no form on this OTP that both registers the
+name and names a callback module — `{Mod, Args}`, `{local, Name, Mod}`,
+`{global, Name, Mod}` and `{via, Mod, Name, Args}` each exit `badarg` — so the
+registry lives with the sampler instead, which is a process the module does start.
+
+`manager_callbacks_test` had asserted all six by direct call, under a comment
+giving the wrong reason for their being unreachable. A case that calls a function
+directly passes whether or not anything calls it, which is how dead callbacks read
+as covered. **All six are now deleted, and so is the case** — together with the
+`-behaviour(gen_event)` declaration, which asserted the same arrangement and which
+dialyzer read as one. `m:i2p_events` is a publisher and a registry owner, not a
+manager, and the module says so with the measurement rather than with six functions
+that cannot run.
+
+Two further measurements settled it rather than the taste of it. `gen_event`'s own
+`init_it/6` still takes the manager's module and arguments and discards both
+(`init_it(Starter, Parent, Name0, _Mod, _Args, Options)`), so the manager-module
+concept is vestigial upstream rather than merely unexposed from `start_link/2`. And
+`gen_event:call/3,4` dispatch to a named **handler**, never to the manager module, so
+`handle_call/2`'s `{error, unsupported}` was a reply to a question no caller could
+ask.
+
+**The backlog sampler survived a bus restart and was started a second time.**
+`start_link/0` runs in the supervisor, so its `spawn_link` linked the sampler to
+the supervisor — not to the bus — and every restart both kept the old sampler
+alive and started another. Two loops wrote the same gauge every 5s, one of them
+publishing a depth for a manager pid that no longer existed, which `depth/0`
+answers as `0`: a restarted bus reported "no backlog" from a process watching
+nothing. The sampler now monitors the manager and exits with it, and a restart
+stops any predecessor synchronously before creating the registry.
+
+**`ets:new(Name, Opts)` without `named_table` produces a table that is unreachable
+by name.** Measured on OTP 28.5: `ets:info(Name, size)` answers `undefined` and
+`named_table` is `false`, while `ets:info(Tid, name)` cheerfully reports the atom.
+The table works, holds rows, and cannot be reached by the name every other
+function uses — a silent failure that reads as an empty registry.
+
+### Fixed
+
+**A dead subscriber's forwarder stays on the bus forever.** `i2p_events_forward`
+sent each event to the collector and returned `{ok, State}` — and a send to a
+dead pid is not an error, so a collector that died raised nothing. `gen_event`
+removes a handler for a delete, a stop or a crash, and none of the three fired:
+every subscriber restart left one more forwarder attached, and every event was
+dispatched to all of them. Measured: five attach-and-die cycles left six
+handlers, and one dead forwarder cost 8,951 µs across 20,000 announcements,
+linear in the dead count.
+
+The forwarder now takes itself off. It monitors its collector from `init/1` —
+inside the manager, so the `'DOWN'` is owned there — and returns
+`remove_handler`, which is `gen_event`'s own silent self-removal. The `'DOWN'`
+reaches it because \`gen_event:fetch_msg/6\` receives with a catch-all and
+\`gen_event:handle_msg/3\` hands every unrecognised message to every handler's
+`handle_info/2`, so a monitor a handler made is a message the handler is
+handed. That was worth measuring rather than assuming: the natural reading is
+that a stray message accumulates in the manager's mailbox, and it does not.
+
+**Every way a collector can go is covered**, on OTP 28.5 / ERTS 16.4.0.6: the
+process killed locally, the process killed on another node, and the far node
+stopped outright — which is the deployment that leaks in production, since
+`i2per_status_state` runs on its own node and never unsubscribes. In every case
+the handler is gone and the bus still answers.
+
+**It is done inside the manager, and that is the point.** The obvious
+alternatives — a watcher process per subscription, or the subsampler reaping —
+both remove the handler with `gen_event:delete_handler/3`, which is an rpc with
+no timeout and so stops working precisely when the bus is wedged, which is when
+a pile-up matters. A handler removing itself needs no rpc and cannot be blocked
+by one.
+
+**The subscriber registry now drops the dead pid too**, which it did not: the
+row outlived the handler, and `i2per_status_state` restarting on its own node
+grew it once per restart. The subsampler — the process that already owns that
+table, and already exists to hold bus state no `gen_event` call can reach — takes
+a monitor per registered row and drops it when the pid goes. A monitor rather
+than an liveness probe, because the alternative for a *remote* pid is the `erpc`
+round trip the far-side sweep already makes, once per subscriber per tick,
+forever. Two processes, one fact: the manager answers "should the bus keep
+calling this pid", the subsampler answers "is it still listed".
+
+**A failed NTCP2 handshake reported `{error, normal}` instead of why it failed.**
+The connection process announces `{connect_failed, PeerHash, {handshake, Reason}}`
+to its owner and then exits `normal` — normally, because an unreachable peer is a
+dial outcome and a crash report per candidate would bury bounded discovery's log.
+But `f:i2p_ntcp2_conn:connect/3` reports its result from the monitor's `DOWN`,
+and an `exit(normal)` carries `normal`: the exit reason of a process that ended
+cleanly, which says nothing about a handshake. The reason was being delivered and
+then thrown away — it sat unread in the caller's own mailbox.
+
+`f:await_connection/2` now reads that announcement before the `DOWN` it precedes
+(the same process sends it and then exits, and signals from one process to
+another are ordered), so `f:connect/3` returns the handshake's own reason:
+`{error, {handshake, {connect_failed, econnrefused}}}` for a dead port rather
+than `{error, normal}`. A caller that passed a different `owner` is not the
+announcement's recipient and still learns only that the connection ended — that
+is the documented remainder of the contract, and the pid that was told why is
+the pid that asked for the dial.
 
 ## [0.2.1] — 2026-10-07
 
@@ -51,7 +258,7 @@ release candidate is the same release before the version was final.
 
 ### Added
 
-- **Versioned public read API over the event bus.** `i2p_stats` holds the
+- **Versioned public read API over the event bus.** `i2p_counters` holds the
   counters and node uptime; the read API serves them under
   `i2p_status_data:view/0`, including a `bus_backlog` gauge sampled with
   `process_info/2` so a wedged bus is observable from outside the bus.
@@ -112,7 +319,9 @@ release candidate is the same release before the version was final.
   prefer UDP (#75YRPJ7).
 - The RouterInfo expiry horizon slides with store size (#RA5PVR1); the
   closest-peer lookup no longer rehashes per comparison (#8YGZFB8); the
-  floodfill lookup walks an index instead of scanning (#13EY2MQ).
+  floodfill lookup no longer hashes per candidate, via a day-tagged routing-key
+  memo (#8YGZFB8). The floodfill-only index and the sort over the floodfill set
+  are still to come (#13EY2MQ).
 
 ### Known issues
 

@@ -8,7 +8,7 @@
 %% flood it is causing". The event was left out of that protection, on the
 %% reasoning that "a counter wants the total".
 %%
-%% The total is now `m:i2p_stats:ssu2_blocks_unhandled`, so the reason the event
+%% The total is now `m:i2p_counters:ssu2_blocks_unhandled`, so the reason the event
 %% was left exposed is gone, and what is left is the exposure. This is the
 %% mechanism #HPH59JN names as the practical way a `gen_event` handler gets
 %% wedged: a wedged handler parks the manager, and every event queued behind it
@@ -44,8 +44,8 @@ while every occurrence is still counted.
 a_repeated_block_from_one_peer_is_announced_once_test() ->
     with_bus(fun() ->
         S0 = state_with_peer(peer_hash(1)),
-        {noreply, S1} = blocks(S0, {relay_tag, 1}, 10000),
-        ?assertEqual([relay_tag], announced()),
+        {noreply, S1} = blocks(S0, {path_challenge, <<"a">>}, 10000),
+        ?assertEqual([path_challenge], announced()),
         ?assertEqual(10000, blocks_counted()),
         %% The dedup set is one key, not ten thousand entries.
         ?assertEqual(1, map_size(maps:get(unhandled_ssu2_blocks, S1, #{})))
@@ -57,9 +57,9 @@ a_repeated_block_from_one_peer_is_announced_once_test() ->
 a_second_kind_from_the_same_peer_is_announced_again_test() ->
     with_bus(fun() ->
         S0 = state_with_peer(peer_hash(1)),
-        {noreply, S1} = blocks(S0, {relay_tag, 1}, 3),
-        {noreply, _} = blocks(S1, {path_challenge, <<"a">>}, 3),
-        ?assertEqual([relay_tag, path_challenge], announced())
+        {noreply, S1} = blocks(S0, {path_challenge, <<"a">>}, 3),
+        {noreply, _} = blocks(S1, {path_response, <<"b">>}, 3),
+        ?assertEqual([path_challenge, path_response], announced())
     end).
 
 %% The bound is per *peer* as well as per kind. This is the case that says the
@@ -72,8 +72,8 @@ a_second_peer_sending_the_same_kind_is_announced_again_test() ->
         A = peer_hash(1),
         B = peer_hash(2),
         S0 = state_with_peers([A, B]),
-        {noreply, _} = deliver(S0, conn_of(S0, A), {relay_tag, 1}, 2),
-        {noreply, _} = deliver(S0, conn_of(S0, B), {relay_tag, 1}, 2),
+        {noreply, _} = deliver(S0, conn_of(S0, A), {path_challenge, <<"a">>}, 2),
+        {noreply, _} = deliver(S0, conn_of(S0, B), {path_challenge, <<"a">>}, 2),
         ?assertEqual(2, length(announced()))
     end).
 
@@ -86,7 +86,7 @@ the_announce_rate_is_bounded_by_the_peer_set_not_the_block_count_test() ->
     with_bus(fun() ->
         Hashes = [peer_hash(N) || N <- lists:seq(1, 10)],
         S0 = state_with_peers(Hashes),
-        _ = [deliver(S0, conn_of(S0, H), {relay_tag, 1}, 100) || H <- Hashes],
+        _ = [deliver(S0, conn_of(S0, H), {path_challenge, <<"a">>}, 100) || H <- Hashes],
         ?assertEqual(10, length(announced())),
         ?assertEqual(1000, blocks_counted())
     end).
@@ -98,10 +98,23 @@ the_announce_rate_is_bounded_by_the_peer_set_not_the_block_count_test() ->
 every_unhandled_block_is_counted_test() ->
     with_bus(fun() ->
         S0 = state_with_peer(peer_hash(1)),
-        {noreply, S1} = blocks(S0, {relay_tag, 1}, 7),
-        {noreply, _} = blocks(S1, {path_challenge, <<"a">>}, 3),
+        {noreply, S1} = blocks(S0, {path_challenge, <<"a">>}, 7),
+        {noreply, _} = blocks(S1, {path_response, <<"b">>}, 3),
         ?assertEqual(10, blocks_counted()),
         ?assertEqual(2, length(announced()))
+    end).
+
+%% A relay tag a peer issued us is claimed here, not an anomaly: it is stored
+%% against the peer's router hash and stays out of the unhandled stream, and
+%% the introducer list a firewalled-mode swap is built from names it.
+a_relay_tag_is_stored_not_announced_test() ->
+    with_bus(fun() ->
+        Hash = peer_hash(1),
+        S0 = state_with_peer(Hash),
+        {noreply, S1} = blocks(S0, {relay_tag, 42}, 2),
+        ?assertEqual([], announced()),
+        ?assertEqual(0, blocks_counted()),
+        ?assertEqual(#{42 => Hash}, maps:get(relay_tags, S1))
     end).
 
 %% The counter is named in the registry, because a name that is not registered
@@ -109,7 +122,7 @@ every_unhandled_block_is_counted_test() ->
 %% nothing can observe. The read API reports whatever is registered, so this is
 %% the whole of the wiring for a consumer.
 the_counter_is_registered_test() ->
-    ?assert(lists:member(ssu2_blocks_unhandled, i2p_stats:counters())).
+    ?assert(lists:member(ssu2_blocks_unhandled, i2p_counters:counters())).
 
 %% --------------------------------------------------------------------------
 %% Fixtures
@@ -170,7 +183,7 @@ drain(Acc) ->
     end.
 
 blocks_counted() ->
-    maps:get(ssu2_blocks_unhandled, i2p_stats:snapshot(), 0).
+    maps:get(ssu2_blocks_unhandled, i2p_counters:snapshot(), 0).
 
 %% --------------------------------------------------------------------------
 %% Harness
@@ -179,12 +192,12 @@ blocks_counted() ->
 %% Both the bus and the counter home, because these cases assert on two
 %% different instruments: the announce is the event, and the total is the
 %% counter. Starting the counter home itself is what makes the total observable
-%% -- `m:i2p_stats:add/2` is a no-op while it is absent, so a case that did not
+%% -- `m:i2p_counters:add/2` is a no-op while it is absent, so a case that did not
 %% start it would read 0 and pass on the flood bound alone.
 with_bus(Fun) ->
-    ok = stop(i2p_stats),
+    ok = stop(i2p_counters),
     ok = stop(i2p_events),
-    {ok, _} = i2p_stats:start_link(),
+    {ok, _} = i2p_counters:start_link(),
     {ok, _} = i2p_events:start_link(),
     ok = gen_event:add_handler(i2p_events, i2p_events_forward, [self()]),
     try
@@ -192,7 +205,7 @@ with_bus(Fun) ->
     after
         _ = gen_event:delete_handler(i2p_events, i2p_events_forward, []),
         ok = stop(i2p_events),
-        ok = stop(i2p_stats)
+        ok = stop(i2p_counters)
     end.
 
 stop(Name) ->

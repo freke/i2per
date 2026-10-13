@@ -26,7 +26,7 @@ rather than retyping it. A key added to `f:view/0` without being added to the
 list fails the build, which is the only place drift gets caught before a
 consumer does.
 
-Counters are **cumulative since router start** and come from `m:i2p_stats`.
+Counters are **cumulative since router start** and come from `m:i2p_counters`.
 The core supplies totals and its boot time; deriving a rate is the consumer's
 job, by sampling twice and subtracting. Nothing here computes one.
 """.
@@ -42,7 +42,12 @@ job, by sampling twice and subtracting. Nothing here computes one.
 %% tells it so. The rule above says a value change is not allowed rather than
 %% unbumpable, which is why this is a new key and `other` still counts
 %% connecting peers: the alternative would have changed what `other` means.
--define(VIEW_VERSION, 2).
+%%
+%% 3 added `reachability_detail` — the measured reachability ladder and its
+%% typed reason per family (#CD7ZBVH). The coarse `reachability` stays on the
+%% bus event and in `m:i2p_ssu2_reachability:status/0,1` untouched, deprecated
+%% later on a real major bump once a second consumer exists.
+-define(VIEW_VERSION, 3).
 
 %% `underspecs` is off for the read API's two functions, deliberately, and this
 %% is the one place in the tree where that is the right call.
@@ -65,9 +70,10 @@ job, by sampling twice and subtracting. Nothing here computes one.
 Aggregate router status.
 
 Output: a map with the read API's `version`, the router's uptime and boot time,
-the cumulative counters and the live gauges from `m:i2p_stats`, our identity
-(base64 destination-style hash encoding of the router hash), and the peer,
-tunnel, netdb and SAM-session counts. Read-only; safe to call from any process
+the cumulative counters and the live gauges from `m:i2p_counters`, our identity
+(base64 destination-style hash encoding of the router hash), the peer,
+tunnel, netdb and SAM-session counts, and the measured reachability detail per
+family. Read-only; safe to call from any process
 on any connected node via `erpc`.
 
 The uptime, counters and gauges distinguish their own faults: when the router's
@@ -90,7 +96,7 @@ reason the two are separate.
         counters := #{atom() => non_neg_integer()},
         %% Live values as of the last sample, beside the cumulative `counters`
         %% rather than inside them: a gauge falls where a counter cannot. See
-        %% `m:i2p_stats:set_gauge/2`. `bus_backlog` is the only gauge today.
+        %% `m:i2p_counters:set_gauge/2`. `bus_backlog` is the only gauge today.
         gauges := #{atom() => number()},
         identity := binary(),
         peers := #{
@@ -108,15 +114,22 @@ reason the two are separate.
                 exploratory_inbound := non_neg_integer()
             },
         netdb := #{ri := non_neg_integer(), ls := non_neg_integer()},
-        sessions := non_neg_integer()
+        sessions := non_neg_integer(),
+        %% The measured reachability per family: the latest concluded test's
+        %% ladder rung and, when the chain broke, the typed reason. The coarse
+        %% verdict smooths this with hysteresis; this is the raw measurement.
+        reachability_detail := #{
+            ipv4 => #{rung => atom(), reason => atom()},
+            ipv6 => #{rung => atom(), reason => atom()}
+        }
     }.
 view() ->
     Tunnels = i2p_tunnel_srv:status(),
     #{
         version => ?VIEW_VERSION,
-        uptime_ms => i2p_stats:uptime_ms(),
-        boot_time => i2p_stats:boot_time(),
-        counters => i2p_stats:snapshot(),
+        uptime_ms => i2p_counters:uptime_ms(),
+        boot_time => i2p_counters:boot_time(),
+        counters => i2p_counters:snapshot(),
         identity => identity_b64(i2p_peer:router_hash()),
         peers => aggregate_peers(i2p_peer:status()),
         tunnels => #{
@@ -132,7 +145,8 @@ view() ->
         },
         netdb => #{ri => i2p_netdb_srv:count(), ls => i2p_netdb_srv:ls_count()},
         sessions => length(i2p_sam_sup:client_sessions()),
-        gauges => i2p_stats:gauges()
+        reachability_detail => i2p_ssu2_reachability:detail(),
+        gauges => i2p_counters:gauges()
     }.
 
 -doc """
@@ -152,6 +166,7 @@ view_keys() ->
         identity,
         netdb,
         peers,
+        reachability_detail,
         sessions,
         tunnels,
         uptime_ms,

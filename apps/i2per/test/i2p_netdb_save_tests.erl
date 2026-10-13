@@ -171,7 +171,7 @@ snapshot_carries_the_generation_the_store_will_disagree_with_test() ->
 %% which is the behaviour being tested away, and the fallback would make the
 %% structural assertion pass vacuously.
 %%
-%% Whatever this starts, it stops. `i2p_stats` and the two NetDb processes are
+%% Whatever this starts, it stops. `i2p_counters` and the two NetDb processes are
 %% registered names inside the `i2per` application, and a bare `start_link/0` leaves
 %% one registered that the application controller did not start, which the next
 %% module that boots `i2per` reads as `already_started` and fails on.
@@ -186,7 +186,7 @@ with_netdb(Body) ->
     application:set_env(i2per, data_dir, Dir),
     StartedWriter = ensure_started(i2p_netdb_writer),
     StartedNetdb = ensure_started(i2p_netdb_srv),
-    StartedStats = ensure_started(i2p_stats),
+    StartedStats = ensure_started(i2p_counters),
     try
         Now = erlang:system_time(millisecond),
         %% **Stored through the srv, not into a local store.** A local store is a

@@ -536,7 +536,7 @@ peer_field(Hash, Key, State) ->
     maps:get(Key, maps:get(Hash, maps:get(peers, State))).
 
 dials_escaped() ->
-    maps:get(dials_escaped, i2p_stats:snapshot(), 0).
+    maps:get(dials_escaped, i2p_counters:snapshot(), 0).
 
 %% Counters are process-wide, so a case that asserts on one has to own the window
 %% it reads. The stats process is started for the duration if the tier has not
@@ -547,7 +547,7 @@ with_escape_count(Fun) ->
         Fun(dials_escaped())
     after
         case HadStats of
-            started -> ok = gen_server:stop(whereis(i2p_stats));
+            started -> ok = gen_server:stop(whereis(i2p_counters));
             existing -> ok
         end
     end.
@@ -918,6 +918,97 @@ learn_ri_too_old_not_remembered_test() ->
     end.
 
 %% ----------------------------------------------------------------------------
+%% The peer-test policy. The observable is the reachability manager's rung: the
+%% driver announces a test start and the rung reads `testing` until the result
+%% lands. The reachability manager must be running, so each case starts it;
+%% the fixture's local map carries a published SSU2 address, which is the
+%% endpoint the test asserts.
+%% ----------------------------------------------------------------------------
+
+%% On every newly established SSU2 session, a test round runs as Alice through
+%% that peer (the fresh Bob). The same message also books the session inbound —
+%% the test start is the last thing the ready path does.
+ssu2_ready_starts_a_peertest_test() ->
+    NetDb = ensure_netdb(),
+    Owner = ensure_reachability(),
+    try
+        S0 = (base_state())#{local => local_with_ssu2_addr()},
+        RI = mk_ri(),
+        {noreply, S1} = i2p_peer:handle_info({ssu2_ready, self(), #{}, RI}, S0),
+        ?assertMatch({_Hash, _, ssu2}, maps:get(self(), maps:get(inbound, S1))),
+        ?assertEqual(testing, wait_rung(ipv4))
+    after
+        reachability_done(Owner),
+        netdb_done(NetDb)
+    end.
+
+%% `allow_private_host` is the short-circuit: the operator asserted inbound is
+%% impossible, so no test runs and the rung stays `unknown` with reason
+%% `own_config`.
+allow_private_host_short_circuits_the_peertest_test() ->
+    NetDb = ensure_netdb(),
+    Owner = ensure_reachability(),
+    try
+        ok = application:set_env(i2per, allow_private_host, true),
+        S0 = (base_state())#{local => local_with_ssu2_addr()},
+        RI = mk_ri(),
+        {noreply, _} = i2p_peer:handle_info({ssu2_ready, self(), #{}, RI}, S0),
+        timer:sleep(100),
+        ?assertEqual(unknown, rung_of(ipv4))
+    after
+        ok = application:unset_env(i2per, allow_private_host),
+        reachability_done(Owner),
+        netdb_done(NetDb)
+    end.
+
+%% The periodic re-test draws a fresh Bob from the connected SSU2 peers and
+%% runs the round through it — on-connect alone is structurally blind to a
+%% rebinding NAT changing our reachability with no new connection.
+periodic_peertest_draws_a_connected_bob_test() ->
+    Owner = ensure_reachability(),
+    try
+        S0 = (base_state())#{local => local_with_ssu2_addr()},
+        Hash = mk_hash(),
+        PeerState =
+            (peer(Hash, #{}))#{conn => self(), transport => ssu2, status => connected},
+        S1 = with_peer(Hash, PeerState, S0),
+        {noreply, _} = i2p_peer:handle_info(peertest, S1),
+        ?assertEqual(testing, wait_rung(ipv4))
+    after
+        reachability_done(Owner)
+    end.
+
+%% No connected SSU2 peer, no test — there is nobody to relay it, and the rung
+%% stays where it was.
+periodic_peertest_without_a_connected_bob_is_skipped_test() ->
+    Owner = ensure_reachability(),
+    try
+        S0 = (base_state())#{local => local_with_ssu2_addr()},
+        {noreply, _} = i2p_peer:handle_info(peertest, S0),
+        timer:sleep(100),
+        ?assertEqual(unknown, rung_of(ipv4))
+    after
+        reachability_done(Owner)
+    end.
+
+%% A connected NTCP2 peer is not a Bob: the session carries no peer-test
+%% block, so the periodic draw skips it too.
+periodic_peertest_ignores_an_ntcp2_peer_test() ->
+    Owner = ensure_reachability(),
+    try
+        S0 = (base_state())#{local => local_with_ssu2_addr()},
+        Hash = mk_hash(),
+        PeerState =
+            (peer(Hash, #{}))#{conn => self(), transport => ntcp2, status => connected},
+        S1 = with_peer(Hash, PeerState, S0),
+        {noreply, _} = i2p_peer:handle_info(peertest, S1),
+        timer:sleep(100),
+        ?assertEqual(unknown, rung_of(ipv4))
+    after
+        reachability_done(Owner)
+    end.
+
+%% ----------------------------------------------------------------------------
 %% Additional direct-callback coverage for reachable peer-manager clauses.
 %% ----------------------------------------------------------------------------
 
@@ -1272,7 +1363,7 @@ lookup_reply_delivered_does_not_count_test() ->
 %% ----------------------------------------------------------------------------
 
 lookup_reply_drops() ->
-    maps:get(lookup_replies_dropped_no_tunnel, i2p_stats:snapshot()).
+    maps:get(lookup_replies_dropped_no_tunnel, i2p_counters:snapshot()).
 
 with_lookup_reply_count(Answer, Fun) ->
     HadStats = ensure_stats(),
@@ -1295,15 +1386,15 @@ with_lookup_reply_count(Answer, Fun) ->
             _ -> ok
         end,
         case HadStats of
-            started -> ok = gen_server:stop(whereis(i2p_stats));
+            started -> ok = gen_server:stop(whereis(i2p_counters));
             existing -> ok
         end
     end.
 
 ensure_stats() ->
-    case whereis(i2p_stats) of
+    case whereis(i2p_counters) of
         undefined ->
-            {ok, _} = i2p_stats:start_link(),
+            {ok, _} = i2p_counters:start_link(),
             started;
         _Pid ->
             existing
@@ -1444,4 +1535,70 @@ ensure_netdb() ->
             started;
         _Pid ->
             existing
+    end.
+
+ensure_reachability() ->
+    case whereis(i2p_ssu2_reachability) of
+        undefined ->
+            {ok, _} = i2p_ssu2_reachability:start_link(),
+            started;
+        _Pid ->
+            existing
+    end.
+
+reachability_done(started) ->
+    case whereis(i2p_ssu2_reachability) of
+        undefined -> ok;
+        Pid -> gen_server:stop(Pid)
+    end,
+    _ = application:unset_env(i2per, measured_reachability),
+    ok;
+reachability_done(existing) ->
+    _ = application:unset_env(i2per, measured_reachability),
+    ok.
+
+netdb_done(started) ->
+    case whereis(i2p_netdb_srv) of
+        undefined -> ok;
+        Pid -> gen_server:stop(Pid)
+    end,
+    ok;
+netdb_done(existing) ->
+    ok.
+
+%% The fixture's local map plus a published SSU2 address — the endpoint the
+%% peer-test asserts. The address is built the production way, so the host and
+%% port the driver reads are the ones the RouterInfo carries.
+local_with_ssu2_addr() ->
+    Local = local(),
+    SSU2 =
+        i2p_router_info:ssu2_address(
+            <<"127.0.0.1">>,
+            9150,
+            maps:get(static_pub, Local),
+            maps:get(intro_key, Local)
+        ),
+    Local#{ssu2_addr => SSU2}.
+
+%% The rung the reachability manager reports for `Family`. The driver's
+%% announcement is a cast, so an assertion on the rung polls until it moves.
+rung_of(Family) ->
+    case maps:find(Family, i2p_ssu2_reachability:detail()) of
+        {ok, #{rung := Rung}} -> Rung;
+        error -> erlang:error({no_detail, Family})
+    end.
+
+wait_rung(Family) ->
+    Deadline = erlang:monotonic_time(millisecond) + 2000,
+    wait_rung(Family, Deadline).
+
+wait_rung(Family, Deadline) ->
+    case {rung_of(Family), erlang:monotonic_time(millisecond) > Deadline} of
+        {testing, _} ->
+            testing;
+        {_, true} ->
+            erlang:error({rung_timeout, Family, testing, rung_of(Family)});
+        _ ->
+            timer:sleep(20),
+            wait_rung(Family, Deadline)
     end.

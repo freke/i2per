@@ -1,4 +1,4 @@
--module(i2p_stats).
+-module(i2p_counters).
 
 -moduledoc """
 Counter home for the router, and the clock the counters are measured against.
@@ -52,7 +52,7 @@ use rather than silently discarding the count.
 ## Usage
 
 ```erlang
-ok = i2p_stats:add(events_notified, 1),
+ok = i2p_counters:add(events_notified, 1),
 #{events_notified := 1} = maps:get(counters, i2p_status_data:view()).
 ```
 """.
@@ -558,7 +558,7 @@ boot_time() ->
         #{boot_wall := Boot} -> Boot
     end.
 
--doc "Start the counter home. Registered locally as `m:i2p_stats`.".
+-doc "Start the counter home. Registered locally as `m:i2p_counters`.".
 -spec start_link() -> {ok, pid()} | {error, term()}.
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).

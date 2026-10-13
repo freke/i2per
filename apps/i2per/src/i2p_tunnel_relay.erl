@@ -130,7 +130,7 @@ send_tunnel_data(NextHash, FwdBody) ->
             %% Not an event: a frame we have no route for is a steady state on a
             %% transit router whose next hop has expired, and an event per frame
             %% would drown the bus.
-            ok = i2p_stats:add(transit_frames_dropped_no_route, 1),
+            ok = i2p_counters:add(transit_frames_dropped_no_route, 1),
             ok
     end.
 
@@ -343,8 +343,11 @@ accept_and_pace(State) ->
 recv_tunnel_id(#{recv_tunnel_id := RecvID}) -> RecvID.
 
 -spec maybe_deny(0..16#FFFFFFFF, accept | transit_denied_reason()) -> ok.
-maybe_deny(_RecvID, accept) -> ok;
-maybe_deny(RecvID, Reason) -> ok = i2p_events:notify({transit_denied, RecvID, Reason}).
+maybe_deny(_RecvID, accept) ->
+    ok;
+maybe_deny(RecvID, Reason) ->
+    ok = i2p_events:notify({transit_denied, RecvID, Reason}),
+    i2p_log:debug(transit_denied, #{recv_id => RecvID, reason => Reason}).
 
 %% pace_build/1 — charge one build-decision token against the build-accept
 %% bucket. When the bucket is drained the acceptance becomes ret 30; a
@@ -414,7 +417,7 @@ relay_transit_data(Body, Info, State) ->
             %% would let a router under pressure report the traffic it turned
             %% away as traffic it did — and the bucket is consulted before the
             %% crypto precisely because that is the cheapest place to stop.
-            ok = i2p_stats:add(transit_bytes_in, byte_size(Body)),
+            ok = i2p_counters:add(transit_bytes_in, byte_size(Body)),
             NextID = maps:get(next_tunnel_id, Info),
             NextHash = maps:get(next_hash, Info),
             case i2p_tunnel:process_tunnel_data(Body, Info, NextID, i2p_i2np:fresh_msg_id()) of
@@ -423,7 +426,7 @@ relay_transit_data(Body, Info, State) ->
                     %% which is also the gateway's own path for injecting local
                     %% client data. Counting there would report another router's
                     %% traffic and our own as the same figure.
-                    ok = i2p_stats:add(transit_bytes_out, byte_size(FwdBody)),
+                    ok = i2p_counters:add(transit_bytes_out, byte_size(FwdBody)),
                     send_tunnel_data(NextHash, FwdBody),
                     State1;
                 error ->

@@ -186,14 +186,14 @@ has_router_does_not_need_the_netdb_process_test() ->
 %% Brings up a NetDb holding one RouterInfo, then hands the body that
 %% RouterInfo's hash and a hash nothing holds.
 %%
-%% **Whatever this starts, it stops.** `i2p_stats` and `i2p_netdb_srv` are
+%% **Whatever this starts, it stops.** `i2p_counters` and `i2p_netdb_srv` are
 %% registered names inside the `i2per` application, and a bare `start_link/0`
 %% leaves one registered that the application controller did not start -- which
 %% the next module that boots `i2per` reads as `already_started` and fails on.
 %% Stopping only what was started here keeps the module order-independent.
 with_netdb(Body) ->
     StartedNetdb = ensure_started(i2p_netdb_srv),
-    StartedStats = ensure_started(i2p_stats),
+    StartedStats = ensure_started(i2p_counters),
     try
         Now = erlang:system_time(millisecond),
         RI = i2p_ct_helpers:floodfill_router_info(Now, <<"192.0.2.10">>),
@@ -223,10 +223,10 @@ send_frames(Hash, N) ->
     Frame = <<0:32, 0:16, 0:1008>>,
     [ok = i2p_tunnel_relay:send_tunnel_data(Hash, Frame) || _ <- lists:seq(1, N)].
 
-%% `i2p_stats:snapshot/0` is a flat map of counter name to value. (It is
+%% `i2p_counters:snapshot/0` is a flat map of counter name to value. (It is
 %% `m:i2p_status_data:view/0` that nests them under `counters`.)
 drop_counter() ->
-    maps:get(transit_frames_dropped_no_route, i2p_stats:snapshot(), 0).
+    maps:get(transit_frames_dropped_no_route, i2p_counters:snapshot(), 0).
 
 rand_hash() ->
     crypto:strong_rand_bytes(32).

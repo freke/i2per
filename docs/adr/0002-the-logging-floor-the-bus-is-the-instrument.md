@@ -75,6 +75,14 @@ makes the per-packet SSU2 detail obey `log_level` and removes a bespoke mechanis
 Each row is a symptom an operator would actually report, the facts that must be
 available, and where they live.
 
+The seven bus rows each carry a **second record at `debug`**, beside the `notify/1`
+site that announces them — ten sites, because `lookup_failed` and
+`leaseset_publish_failed` are each announced from more than one place. That is the
+decision's own exception clause, and it is what makes the bus's bound survivable: a
+bound that kills the manager destroys the bus's copy of every fact it was carrying,
+which is exactly when an operator goes looking. The level, not a gate, is what keeps
+them quiet: the shipped `notice` default leaves `debug` off.
+
 | Symptom | Facts required | Carried by |
 |---|---|---|
 | "It won't connect to any peers" | peer hash, why the connect failed, the backoff interval now in force | `peer_connect_failed` |
@@ -110,13 +118,40 @@ thing this ADR exists to prevent. What the row buys is the difference between
 "that peer disconnected" and "that peer stopped accepting our writes", which are
 different faults with different fixes and were the same event.
 
+## The one real overlap, stated explicitly
+
+This ADR says overlaps are "stated explicitly rather than guessed at". There is
+exactly one, and it is deliberate.
+
+**`unhandled_ssu2_block_peer` is on both instruments above `debug`.** The
+`ssu2_block_unhandled` announcement and the `warning` log line describe the same
+occurrences, because `i2per_status` is never started by the router and the log is
+therefore the only instrument that exists for a subscriber-less node — which is
+the same reason the three boot gaps above are log rows in the first place. The
+dedup set is shared, so both instruments fire on exactly the same set of
+`{peer, block kind}` pairs.
+
+It is not an inconsistency with the seven bus rows, and the distinction is the
+point: those are bus-first with a `debug` record for the bound, while this one
+is **log-first**, because the log here is the primary instrument and the bus is
+the copy. `i2p_log_checklist_tests` enforces the asymmetry rather than the
+generalisation — a `debug` record for every `bus` row, and no `debug` shadow
+beneath a `log` row, this one excepted by being a `log` row — so this fact stays
+the single stated exception instead of becoming the first of fifteen.
+
+Whether that overlap should collapse to bus-only was reopened by
+`HPH59JN` and is **not settled by
+this ADR**; it is held open because `i2per_status` not being started by the
+router is a fact about deployment rather than something this decision can fix.
+
 ## Consequences
 
 What this buys:
 
 - The checklist is a build artifact. A fact that is declared and then never emitted
   fails `just check`, which is the only thing that makes a checklist more than a
-  wish.
+  wish. So is a bus row that lost its off-by-default record, and a `log` row that
+  grew one it did not need.
 - An operator who installs the release and attaches nothing still gets a record of
   what the router decided it was doing, and can change the verbosity without a
   restart.
@@ -132,7 +167,9 @@ What it costs, stated honestly:
   re-litigated by someone who cannot find a lookup failure in a log file. The
   counter-argument has to be made somewhere, and this is it: the alternative is
   every event in the log, and `lookup_failed` on a router that cannot reach the
-  network is one line per lookup.
+  network is one line per lookup. The `debug` records above narrow this rather
+  than close it — an operator at the shipped `notice` level still sees none of
+  them, and has to know to turn the level up.
 - **A second observability mechanism dies.** Anyone relying on
   `i2p_ssu2_trace_sink` outside the test tree loses it. Nothing in production does,
   and the test helper is the only registrant.

@@ -24,7 +24,7 @@ them. A list written beside `f:checklist/0` would be a third copy of the same
 declaration, wrong the first time a fact is added -- the duplication this project
 refuses, introduced by the very module meant to prevent it.
 
-## The four things asserted
+## The six things asserted
 
 - every declared **log** row has an `m:i2p_log:emit/3` call site naming it, so the
   fact is written on the instrument the row claims;
@@ -36,7 +36,13 @@ refuses, introduced by the very module meant to prevent it.
 - every `emit/3` call site names its fact as an **atom literal**, because a call
   passing a variable would be invisible to the scan and the scan would then report a
   smaller world than the tree records -- the check passing on incomplete
-  information, which is worse than not having the check.
+  information, which is worse than not having the check;
+- every declared **bus** row also has an `m:i2p_log:debug/2` call site naming it, so
+  the bus's copy is not the only one. ADR 0002 permits the second copy at a level
+  off by default and this is where that permission stops being a claim;
+- no declared **log** row has a `debug/2` shadow beside its `emit/3`, because a fact
+  already recorded at its declared level is recorded, and a second line under it
+  says nothing the first did not.
 
 ## Reading the event type
 
@@ -49,10 +55,21 @@ deliberately fussy about exactly the details that break quietly.
 
 -include_lib("eunit/include/eunit.hrl").
 
+%% `f:debug_call_sites/0` is exported because `i2p_log_tests` answers the other half
+%% of the same partition from it -- see the note on the function.
+-export([debug_call_sites/0]).
+
 %% The one call shape this scan can read. Named so the offset past it is derived from
 %% the needle rather than counted out by hand: a literal count would silently truncate
 %% every fact name, and a truncated fact name reads as a missing fact.
 -define(EMIT, <<"i2p_log:emit(">>).
+
+%% The off-by-default record beside a bus-carried fact. Its first argument is a
+%% `m:i2p_log:label/0`, so at 69 of the sites in the tree today it is a tuple frame
+%% and at the ten this module is here to pin it is the fact's name. Both shapes are
+%% read by the same scanner: a tuple yields `dynamic`, which is what makes "the fact
+%% is named here" a question about atoms rather than about frames.
+-define(DEBUG, <<"i2p_log:debug(">>).
 
 %% How far past the needle to look for the fact name. erlfmt wraps these calls, so
 %% three of the eight put the name on the line *after* the `emit(`, and reading only
@@ -150,6 +167,66 @@ all_bus_carried_rows_are_declared_test() ->
         lists:sort(Bus)
     ).
 
+%%% %%%%% Every bus fact survives the bus's death %%%%% %%%
+
+%% ADR 0002:33-35 permits a bus-carried fact to be written to the log "except at a
+%% level that is off by default". That clause is what the bus's own bound rests on:
+%% a bound that kills the manager destroys the bus's copy of every fact, so a fact
+%% whose only record is the bus is a fact the operator loses at the moment they go
+%% looking for it.
+%%
+%% Until this case existed, the permission was in the ADR and not in the tree --
+%% seven declared rows, one log record, and a green build over the gap. The other
+%% cases here cannot see it: a `bus` row is satisfied by its event existing, and a
+%% missing `debug/2` shadow is not a missing event.
+%%
+%% The label rather than the call is what is checked, because `f:debug/2` takes a
+%% `t:label/0` and 69 of the sites in the tree are frames rather than facts. Naming
+%% the fact as the label is what makes the record findable by the fact's name, which
+%% is the thing a reader at 3am has.
+%%
+%% `f:debug_call_sites/0` is scanned once and the verdict is membership, so the report
+%% and the check cannot disagree about what was found. A `bus` row with ten records
+%% and a row with one both pass, which is right: the promise is that a record
+%% survives the bus, not that exactly one does.
+every_bus_fact_has_an_off_by_default_record_test() ->
+    Recorded = [Fact || {_File, _Line, Fact} <- debug_call_sites()],
+    Missing = [
+        {Fact, "no i2p_log:debug/2 call site in apps/i2per/src naming it"}
+     || Fact <- bus_carried(),
+        not lists:member(Fact, Recorded)
+    ],
+    ?assertEqual([], Missing).
+
+%% The other direction, and the one that keeps the permission from becoming a habit.
+%%
+%% A `log` row is already recorded at a level an operator sees. A `debug/2` line
+%% under it is a second copy of a fact that needed one, which is the duplication
+%% ADR 0002 exists to prevent -- and unlike the shadow above, nothing turns it off,
+%% because whoever is reading `debug` is reading *everything* at `debug`.
+%%
+%% This is the case that fails if the shadow is copied sideways onto a `log` row, and
+%% it is also the one that would have caught `ssu2_block_unhandled` being given a
+%% frame rather than a fact.
+no_log_fact_is_shadowed_at_debug_test() ->
+    Logged = [Fact || {_File, _Line, Fact} <- emit_call_sites()],
+    Shadows = [
+        {File, Line, Fact}
+     || {File, Line, Fact} <- debug_call_sites(),
+        Fact =/= dynamic,
+        lists:member(Fact, Logged)
+    ],
+    OnBoth = [
+        {maps:get(Fact, i2p_log:checklist()), {File, Line}}
+     || {File, Line, Fact} <- Shadows
+    ],
+    ?assertEqual([], OnBoth).
+
+%% The bus-carried rows, as facts rather than as checklist entries.
+-spec bus_carried() -> [atom()].
+bus_carried() ->
+    [Fact || {Fact, #{instrument := bus}} <- maps:to_list(i2p_log:checklist())].
+
 %%% %%%%% The checklist, read against the tree %%%%% %%%
 
 %% One row per declared fact, carrying the verdict and enough context to act on.
@@ -200,20 +277,42 @@ recorded() ->
 %% on any file with a non-ASCII byte before a call site.
 -spec emit_call_sites() -> [{string(), pos_integer(), atom()}].
 emit_call_sites() ->
-    lists:flatmap(fun scan_file/1, core_source_files()).
+    call_sites(?EMIT).
 
--spec scan_file(file:filename_all()) -> [{string(), pos_integer(), atom()}].
-scan_file(File) ->
+%% Every `i2p_log:debug(` in the core tree, with the label it names.
+%%
+%% The same scanner as `f:emit_call_sites/0` over a different needle, because the two
+%% questions are the same shape: a call whose first argument names a fact, read from
+%% the bytes rather than from a list written beside the call.
+%%
+%% A tuple label -- 69 of them, one per frame on the wire -- comes back as `dynamic`,
+%% which is not a failure here. Unlike a variable in an `emit/3` call, a tuple is
+%% *legitimately* not a fact, so there is nothing to report: the check above is "the
+%% fact is named", and a frame naming nothing is that check holding, not breaking.
+%% Exported because `i2p_log_tests` needs the same scan to answer the other half of
+%% the partition: a `debug/2` site naming a checklist fact is a bus fact's record,
+%% and one naming anything else is a frame. Two scanners over one needle would be two
+%% things to keep in step with `f:debug/2`'s call shape, and this is the shape.
+-spec debug_call_sites() -> [{string(), pos_integer(), atom()}].
+debug_call_sites() ->
+    call_sites(?DEBUG).
+
+-spec call_sites(binary()) -> [{string(), pos_integer(), atom()}].
+call_sites(Needle) ->
+    lists:flatmap(fun(File) -> scan_file(File, Needle) end, core_source_files()).
+
+-spec scan_file(file:filename_all(), binary()) -> [{string(), pos_integer(), atom()}].
+scan_file(File, Needle) ->
     {ok, Bin} = file:read_file(File),
     lists:flatmap(
         fun({Offset, _Length}) ->
-            Start = Offset + byte_size(?EMIT),
+            Start = Offset + byte_size(Needle),
             Rest = binary:part(Bin, Start, min(?SCAN_BYTES, byte_size(Bin) - Start)),
             [
                 {filename:basename(File), count_lines(Bin, Offset), fact_of(Rest)}
             ]
         end,
-        binary:matches(Bin, ?EMIT)
+        binary:matches(Bin, Needle)
     ).
 
 count_lines(Bin, Offset) ->

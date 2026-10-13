@@ -209,7 +209,7 @@ rebuild_router_info(Local, NowMs) ->
     #{ri := RI, sign_seed := Seed} = Local,
     Identity = i2p_router_info:identity(RI),
     Addresses = i2p_router_info:addresses(RI),
-    Options = i2p_router_info:options(RI),
+    Options = (i2p_router_info:options(RI))#{<<"caps">> => local_caps()},
     Fresh = i2p_router_info:build(Identity, NowMs, Addresses, Options, Seed),
     Local#{ri => Fresh}.
 
@@ -234,7 +234,7 @@ set_ssu2_introducers(Local = #{intro_key := Intro, static_pub := Pub}, Introduce
     #{ri := RI, sign_seed := Seed} = Local,
     Identity = i2p_router_info:identity(RI),
     Addresses = i2p_router_info:addresses(RI),
-    Options = i2p_router_info:options(RI),
+    Options = (i2p_router_info:options(RI))#{<<"caps">> => local_caps()},
     Published = maps:get(ssu2_addr, Local, undefined),
     NewAddresses = swapped_addresses(Addresses, Published, Introducers, Pub, Intro),
     NowMs = erlang:system_time(millisecond),
@@ -293,14 +293,29 @@ family_host(undefined, Current) ->
 %%%%%%%% %%% Internal %%%%%%%
 
 %% Router-level `caps` value: bandwidth class + reachability + floodfill.
-%% `R` (reachable) only when NTCP2 is published and the operator did not opt
-%% into a private/local host. The default bandwidth class is `L` (overridable
+%% `R` (reachable) only when NTCP2 is published, the operator did not opt
+%% into a private/local host, and no measured peer test has contradicted it.
+%% The default bandwidth class is `L` (overridable
 %% via app env `caps_bandwidth`); `f` is appended for a floodfill.
 local_caps() ->
     Bandwidth = application:get_env(i2per, caps_bandwidth, $L),
-    Reachable = ntcp2_published() andalso not allow_private_host(),
+    Reachable =
+        ntcp2_published() andalso not allow_private_host() andalso not measured_firewalled(),
     Floodfill = i2p_floodfill:is_floodfill(),
     i2p_router_info:caps_string(Bandwidth, Reachable, Floodfill).
+
+%% The measured reachability verdict, written by `m:i2p_ssu2_reachability` on
+%% every measured coarse change. An absent key means no test has yet
+%% contradicted the operator's configured reachability — the static rule in
+%% `f:local_caps/0` is the assertion, and this is what a measurement demotes.
+%% Read at use time, so a demotion lands on the next published RouterInfo
+%% rather than on the next restart, and the published caps can never claim
+%% reachable while the measured verdict says otherwise.
+measured_firewalled() ->
+    case application:get_env(i2per, measured_reachability) of
+        {ok, firewalled} -> true;
+        _ -> false
+    end.
 
 ntcp2_published() ->
     case application:get_env(i2per, ntcp2_published) of

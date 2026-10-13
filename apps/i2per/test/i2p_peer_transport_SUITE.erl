@@ -660,7 +660,7 @@ park_reasons(Events) ->
 %% One counter by name. `f:snapshot/0` reports a registered counter whether or not
 %% it has ever moved, so this cannot fail on the first read of a fresh router.
 counter(Name) ->
-    maps:get(Name, i2p_stats:snapshot(), 0).
+    maps:get(Name, i2p_counters:snapshot(), 0).
 
 %% A UDP endpoint that answers every datagram with a well-formed SSU2 long-header
 %% packet addressed back to the sender -- one this router will classify as its own

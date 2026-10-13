@@ -31,7 +31,7 @@ Block = i2p_peertest:block(1, 0, 0, RouterHash, 2, Nonce, Timestamp, Port, Ip, S
     result/3
 ]).
 
--export_type([address_type/0, result/0, reject/0]).
+-export_type([address_type/0, result/0, reject/0, rung/0, reason/0]).
 
 -define(PROLOGUE, <<"PeerTestValidate">>).
 
@@ -199,9 +199,39 @@ A tested address type: IPv4 or IPv6.
 -type address_type() :: ipv4 | ipv6.
 
 -doc """
-A peer-test reachability result, per the SSU2 spec result table.
+A rung of the reachability ladder.
+
+`unknown` (not determined) · `testing` (a test is in flight) · `unreachable`
+(no path reaches us) · `introducer_only` (a Charlie completes the punch and
+session, but unsolicited inbound fails) · `reachable` (unsolicited inbound
+works). Defined in CONTEXT.md; not reopened by the peer-test policy.
 """.
--type result() :: ok | firewalled | unknown.
+-type rung() :: unknown | testing | unreachable | introducer_only | reachable.
+
+-doc """
+Where the reachability chain broke, per the peer-test policy's typed reasons.
+
+`own_config` (the operator asserted inbound is impossible, so no test ran) ·
+`clock_skew` (the peer's signed timestamp disagrees with ours) ·
+`no_charlie_report` (the Charlie never confirmed the test arrived) ·
+`punch_not_delivered` (it did confirm, but the unsolicited punch never came) ·
+`punch_delivered_no_session` (punch arrived, no session request followed) ·
+`session_incomplete` (both happened, the session never established).
+""".
+-type reason() ::
+    own_config
+    | clock_skew
+    | no_charlie_report
+    | punch_not_delivered
+    | punch_delivered_no_session
+    | session_incomplete.
+
+-doc """
+A concluded peer-test outcome: a ladder rung plus, when the chain broke, the
+reason naming where. An `undefined` reason means the test succeeded — the
+punch landed.
+""".
+-type result() :: {rung(), reason() | undefined}.
 
 -doc """
 A Bob- or Charlie-side peer-test reject status code (see `f:is_reject/1`).
@@ -209,21 +239,33 @@ A Bob- or Charlie-side peer-test reject status code (see `f:is_reject/1`).
 -type reject() :: byte().
 
 -doc """
-Resolve the reachability result of a test from which of messages 4, 5 and 7
-arrived.
+Resolve the reachability outcome of a concluded test.
 
-Input: three booleans — whether the in-session message 4 (Bob's relay of
-Charlie's response or a reject) and the out-of-session messages 5 and 7
-(Charlie→Alice) were received. Waiting a few seconds after message 4 before
-judging lets an absent message 5 still be detected after the settle window.
-Output: `ok | firewalled | unknown` per the implemented result table.
+Input: whether the in-session message 4 was an `accept` or a `reject`, and
+whether the out-of-session messages 5 and 7 (Charlie→Alice) were received.
+Waiting a few seconds after message 4 before judging lets an absent message 5
+still be detected after the settle window.
+
+Output: `{Rung, Reason}` per the implemented matrix — `reachable` when
+Charlie's out-of-session message 5 arrived (unsolicited inbound works),
+`{introducer_only, punch_not_delivered}` when the Charlie confirmed in-session
+(message 4 accepted) but the unsolicited punch never landed — the
+stateful-firewall case (message 7 is the solicited echo of our message 6, so
+its arrival without message 5 is still a punch that did not deliver) — and
+`{unknown, no_charlie_report}` when the test produced no usable evidence
+(nothing arrived, the introducer rejected, or the confirm never came).
+
+The spec is the matrix the clauses enumerate, not the whole of
+`t:result/0`: the ladder's wider vocabulary (`testing`, `unreachable`, the
+remaining reasons) is what the reachability fold and the event type accept,
+and what the relay path's later work populates — not what this function
+produces today.
 """.
--spec result(boolean(), boolean(), boolean()) -> ok | firewalled | unknown.
-result(false, false, false) -> unknown;
-result(true, false, false) -> firewalled;
-result(false, true, false) -> ok;
-result(true, true, false) -> ok;
-result(false, false, true) -> unknown;
-result(true, false, true) -> firewalled;
-result(false, true, true) -> ok;
-result(true, true, true) -> ok.
+-spec result(accept | reject, boolean(), boolean()) ->
+    {unknown, no_charlie_report}
+    | {introducer_only, punch_not_delivered}
+    | {reachable, undefined}.
+result(reject, _S5, _S7) -> {unknown, no_charlie_report};
+result(accept, false, false) -> {unknown, no_charlie_report};
+result(accept, true, _S7) -> {reachable, undefined};
+result(accept, false, true) -> {introducer_only, punch_not_delivered}.
