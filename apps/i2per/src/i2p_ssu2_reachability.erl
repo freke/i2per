@@ -207,8 +207,10 @@ fold_result(AddrType, Rung, Reason, State) when AddrType =:= ipv4; AddrType =:= 
         Rung when Rung =:= introducer_only; Rung =:= unreachable ->
             conclude_demotion(AddrType, Family1#{consecutive => 0}, State);
         _ ->
-            %% `unknown` and anything else unnamed: no evidence, no movement.
-            put_family(AddrType, Family1#{consecutive => 0}, State)
+            %% `unknown` and anything else unnamed carries no evidence, so it
+            %% neither moves the promotion streak nor resets it — matches the
+            %% module documentation.
+            put_family(AddrType, Family1, State)
     end.
 
 test_done(Family) ->
@@ -217,16 +219,24 @@ test_done(Family) ->
 %% A family promoted to `reachable`: the coarse moves, the measured verdict
 %% reaches the caps, and the published address is restored.
 conclude_promotion(AddrType, Family, State) ->
+    Was = maps:get(coarse, Family),
     State1 = put_family(AddrType, Family#{coarse => reachable}, State),
     State2 = emit_coarse_change(State1),
-    drive_reachable(State2).
+    case Was of
+        reachable -> State2;
+        _ -> drive_reachable(State2)
+    end.
 
 %% A family demoted: the coarse moves, the caps follow, and the address swap
 %% runs when introducers are available.
 conclude_demotion(AddrType, Family, State) ->
+    Was = maps:get(coarse, Family),
     State1 = put_family(AddrType, Family#{coarse => firewalled}, State),
     State2 = emit_coarse_change(State1),
-    drive_firewalled(State2).
+    case Was of
+        firewalled -> State2;
+        _ -> drive_firewalled(State2)
+    end.
 
 %% A test went in flight: the rung reads `testing` until its conclusion. The
 %% coarse is untouched — a test in flight is not a verdict about anything, and

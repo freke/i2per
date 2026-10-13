@@ -4,7 +4,7 @@ All notable changes to i2per are recorded here. Versions follow the OTP
 applications' own `{vsn, ...}`; the release tag is `v` + that version, and
 CI refuses a tag that disagrees.
 
-## [Unreleased]
+## [0.3.0] — 2026-10-13
 
 **The Charlie role is implemented.** `i2p_relay_coord` now answers a RelayIntro
 on the tagged session as Charlie: it verifies Alice's RelayRequest signature
@@ -27,6 +27,30 @@ own copy) and the punch gate. `m:i2p_peer` forwards a RouterInfo to both
 coordinators, which is the one shape that is not exclusively owned — the
 peer-test coordinator needs it for a message 1 and the relay coordinator for a
 RelayIntro.
+
+### Fixed
+
+**A review of the Charlie role found several interop and cleanup defects before
+the release.** Charlie's RelayResponse is now signed over the introducer's hash
+rather than this router's own hash, which is the hash Alice signed against.
+The out-of-session HolePunch now carries a usable endpoint: IPv4 addresses stay
+4 bytes, IPv6 addresses stay 16 bytes, and the punch path stops converting
+through a string form that could never be parsed. The address policy also
+rejects IPv4-mapped and IPv4-compatible IPv6 literals instead of treating the
+surrounding zeros as a public address.
+
+A session that dies by monitor `DOWN` now runs the same coordinator cleanup and
+relay-tag removal as a session that closes with an explicit SSU2 termination,
+so dead introducers no longer accumulate in the coordinator's session table.
+The identity rebuild and SSU2 introducer swap recompute the measured capability
+caps instead of carrying the previous verdict into a new RouterInfo. An
+`unknown` peer-test result no longer resets a promotion streak, and repeated
+promotion or demotion transitions no longer re-fire the same coarse change.
+
+The SSU2 listener no longer crashes when a peer-asserted endpoint cannot be
+sent to. The bus registry row is written before the forwarder is attached, and
+the forwarder demonitors its collector on termination. The release profile now
+builds the `0.3.0` relx release.
 
 ### Added
 

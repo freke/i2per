@@ -151,7 +151,8 @@ table and a core forwarder reaching back into the bus's bookkeeping for it is
 the coupling that module argues against.
 """.
 -spec terminate(term(), state()) -> ok.
-terminate(_Arg, _State) ->
+terminate(_Arg, {_Pid, MRef}) ->
+    erlang:demonitor(MRef, [flush]),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->

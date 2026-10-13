@@ -1,6 +1,6 @@
 # Protocol Reference
 
-This document describes the I2P wire formats implemented by i2per 0.2.1.
+This document describes the I2P wire formats implemented by i2per 0.3.0.
 Unsupported formats and release limitations are listed explicitly.
 
 All multi-byte integers in I2P are big-endian unless otherwise noted. Ed25519
@@ -12,14 +12,15 @@ in the [I2P documentation](https://i2p.net/en/docs/).
 
 ## Release boundaries
 
-The 0.2.1 release does not implement NTCP1, SSU1, I2CP, the legacy
+The 0.3.0 release does not implement NTCP1, SSU1, I2CP, the legacy
 ElGamal/AES garlic formats, Datagram2, or a TUN interface. SSU2 path migration,
 RTT-based congestion control, automatic Charlie selection for PeerTest, and a
 session token in the relay accept are also outside this release. The Charlie
 role itself is implemented: a tagged session answers a RelayIntro as Charlie,
 verifies the requester's signature, checks the asserted endpoint, and punches.
-The sections below describe only behavior that is present in 0.2.1. 0.2.1 is a
-patch release over 0.2.0 and changes no wire format.
+The sections below describe only behavior that is present in 0.3.0. 0.3.0 adds
+the Charlie RelayResponse and HolePunch blocks and the measured-reachability
+caps over 0.2.1.
 
 ## Implemented
 
@@ -2106,7 +2107,7 @@ The table below is the exact matrix implemented by
 |---|---|---|---|
 | reject | — | — | `{unknown, no_charlie_report}` |
 | no | no | no | `{unknown, no_charlie_report}` |
-| yes | no | no | `{introducer_only, punch_not_delivered}` |
+| yes | no | no | `{unknown, no_charlie_report}` |
 | no | yes | no | `{reachable, undefined}` |
 | yes | yes | no | `{reachable, undefined}` |
 | no | no | yes | `{unknown, no_charlie_report}` |

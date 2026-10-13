@@ -1196,16 +1196,33 @@ handle_down(MonRef, Reason, State) ->
 
 handle_conn_down(MonRef, State) ->
     case find_peer_by_mon(MonRef, State) of
-        {PeerHash, _PeerState} ->
+        {PeerHash, PeerState} ->
             i2p_events:notify({peer_disconnected, PeerHash}),
-            {State1, _Backoff} = enter_backoff(PeerHash, State),
-            State1;
+            %% A session that dies by monitor `DOWN` (idle timeout, protocol
+            %% error, crash) never sends `{ssu2_closed, ...}`, so the
+            %% coordinators and relay-tag table are notified here as well —
+            %% otherwise they keep stale RouterInfo rows and dead introducers.
+            ConnPid = maps:get(conn, PeerState, undefined),
+            State0 =
+                case ConnPid of
+                    undefined ->
+                        State;
+                    P ->
+                        State1 = drop_relay_tags(PeerHash, State),
+                        forward_coord_closed(P, State1),
+                        State1
+                end,
+            {State2, _Backoff} = enter_backoff(PeerHash, State0),
+            State2;
         not_found ->
             case find_inbound_by_mon(MonRef, State) of
                 {ConnPid, Hash} ->
                     i2p_events:notify({peer_disconnected, Hash}),
-                    Inbound = maps:remove(ConnPid, maps:get(inbound, State, #{})),
-                    State#{inbound := Inbound};
+                    %% Inbound session death, the same cleanup story.
+                    forward_coord_closed(ConnPid, State),
+                    State0 = drop_relay_tags(Hash, State),
+                    Inbound = maps:remove(ConnPid, maps:get(inbound, State0, #{})),
+                    State0#{inbound := Inbound};
                 not_found ->
                     State
             end
