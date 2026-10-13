@@ -156,7 +156,7 @@ router produces.
 
 These are **observations since this service attached**, not router lifetime. That
 is a different clock on purpose: the router's own lifetime totals are in
-`m:i2p_stats` (#0HSTTVC), and presenting these as though they were lifetime would
+`m:i2p_counters` (#0HSTTVC), and presenting these as though they were lifetime would
 make a figure look authoritative when it is not.
 """.
 -type event_counters() :: #{atom() | tuple() => non_neg_integer()}.

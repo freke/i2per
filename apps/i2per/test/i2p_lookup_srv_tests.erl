@@ -388,11 +388,11 @@ send_on_a_live_tunnel_does_not_count_test() ->
 %% would have to treat absent and zero as the same thing.
 lookup_request_counter_is_in_the_read_api_before_anything_moves_test() ->
     with_fresh_stats(fun() ->
-        ?assertMatch(#{lookup_requests_dropped_no_tunnel := 0}, i2p_stats:snapshot())
+        ?assertMatch(#{lookup_requests_dropped_no_tunnel := 0}, i2p_counters:snapshot())
     end).
 
 lookup_request_drops() ->
-    maps:get(lookup_requests_dropped_no_tunnel, i2p_stats:snapshot()).
+    maps:get(lookup_requests_dropped_no_tunnel, i2p_counters:snapshot()).
 
 %% A stub standing in for the tunnel manager, answering the three requests
 %% `f:send_lookup/4` makes and nothing else. The two picks resolve; only the
@@ -433,7 +433,7 @@ lookup_srv_stub(Answer) ->
 %% does it.
 with_fresh_stats(Fun) ->
     ok = stop_stats(),
-    {ok, _} = i2p_stats:start_link(),
+    {ok, _} = i2p_counters:start_link(),
     try
         Fun()
     after
@@ -441,7 +441,7 @@ with_fresh_stats(Fun) ->
     end.
 
 stop_stats() ->
-    case whereis(i2p_stats) of
+    case whereis(i2p_counters) of
         undefined -> ok;
         Pid -> gen_server:stop(Pid)
     end.

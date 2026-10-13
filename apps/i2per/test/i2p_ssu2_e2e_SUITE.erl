@@ -191,7 +191,7 @@ transport_bytes_are_counted(_Config) ->
     Port = i2p_ssu2_listener:port(Listener),
     {ok, Sock} = gen_udp:open(0, [binary, {active, true}]),
     try
-        #{ssu2_bytes_in := In0, ssu2_bytes_out := Out0} = i2p_stats:snapshot(),
+        #{ssu2_bytes_in := In0, ssu2_bytes_out := Out0} = i2p_counters:snapshot(),
 
         %% An out-of-session PeerTest, which a session-less listener answers.
         %% Receiving the answer is the barrier for both charges.
@@ -258,10 +258,10 @@ my_port(Sock) ->
     Port.
 
 ssu2_bytes_in() ->
-    maps:get(ssu2_bytes_in, i2p_stats:snapshot()).
+    maps:get(ssu2_bytes_in, i2p_counters:snapshot()).
 
 ssu2_bytes_out() ->
-    maps:get(ssu2_bytes_out, i2p_stats:snapshot()).
+    maps:get(ssu2_bytes_out, i2p_counters:snapshot()).
 
 %% Data-phase keepalive: with a short keepalive interval the session sends a
 %% path_challenge (type 18) probe and the peer echoes it as a path_response

@@ -339,7 +339,7 @@ transport_bytes_are_counted(_Config) ->
         {ok, CA} = i2p_ntcp2_conn:connect(ri_at(listen_port(Listener), Bob), Alice, #{}),
         {CB, _} = await_ready(),
 
-        #{ntcp2_bytes_out := Out0, ntcp2_bytes_in := In0} = i2p_stats:snapshot(),
+        #{ntcp2_bytes_out := Out0, ntcp2_bytes_in := In0} = i2p_counters:snapshot(),
 
         Probe = <<"probe">>,
         ok = i2p_ntcp2_conn:send(CA, Probe),
@@ -365,7 +365,7 @@ transport_bytes_are_counted(_Config) ->
         %% reports whatever the registry declares, so this is the same names the
         %% view will carry; `m:i2p_read_api_SUITE` covers the view end to end,
         %% and this suite has no reason to boot the parts the view reads.
-        Counters = i2p_stats:snapshot(),
+        Counters = i2p_counters:snapshot(),
         true = (Out1 + Second =:= maps:get(ntcp2_bytes_out, Counters)),
         true = (In1 + Second =:= maps:get(ntcp2_bytes_in, Counters))
     after
@@ -373,10 +373,10 @@ transport_bytes_are_counted(_Config) ->
     end.
 
 ntcp2_bytes_out() ->
-    maps:get(ntcp2_bytes_out, i2p_stats:snapshot()).
+    maps:get(ntcp2_bytes_out, i2p_counters:snapshot()).
 
 ntcp2_bytes_in() ->
-    maps:get(ntcp2_bytes_in, i2p_stats:snapshot()).
+    maps:get(ntcp2_bytes_in, i2p_counters:snapshot()).
 
 %% Multiple frames in one direction stay ordered across the stream.
 multiple_frames_ordered(_Config) ->

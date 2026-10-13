@@ -91,13 +91,13 @@ send_wire_reports_ok_when_the_tunnel_is_gone_test() ->
 %% absent, and a consumer would have to treat absent and zero as the same thing.
 counter_is_in_the_read_api_before_anything_moves_test() ->
     with_client(fun() ->
-        ?assertMatch(#{client_messages_dropped_no_tunnel := 0}, i2p_stats:snapshot())
+        ?assertMatch(#{client_messages_dropped_no_tunnel := 0}, i2p_counters:snapshot())
     end).
 
 %%%%%%%%% Helpers %%%%%%%%%
 
 counter() ->
-    maps:get(client_messages_dropped_no_tunnel, i2p_stats:snapshot()).
+    maps:get(client_messages_dropped_no_tunnel, i2p_counters:snapshot()).
 
 %% A route naming an outbound tunnel the manager does not hold, so
 %% `f:find_outbound/2` answers `error`. The tunnel manager starts with empty
@@ -113,15 +113,15 @@ fixture_route(OutTid) ->
     }.
 
 with_client(Fun) ->
-    ok = stop(i2p_stats),
+    ok = stop(i2p_counters),
     ok = stop(i2p_tunnel_srv),
-    {ok, _} = i2p_stats:start_link(),
+    {ok, _} = i2p_counters:start_link(),
     {ok, _} = i2p_tunnel_srv:start_link(fixture_local()),
     try
         Fun()
     after
         ok = stop(i2p_tunnel_srv),
-        ok = stop(i2p_stats)
+        ok = stop(i2p_counters)
     end.
 
 %% `i2p_peer:local_keys()` is a real RouterInfo, and the tunnel manager's `local`

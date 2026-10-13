@@ -975,7 +975,7 @@ on_data(Num, Blocks, ImmediateAck, RecvDir, State = #{seen_in := SeenIn}) ->
             %% recorded — see `m:i2p_ssu2_recv`. Counted rather than silently
             %% treated as new, because a peer doing this routinely is
             %% retransmitting numbers the spec says it must not reuse.
-            i2p_stats:add(ssu2_stale_packets, 1),
+            i2p_counters:add(ssu2_stale_packets, 1),
             i2p_log:debug(
                 {recv, RecvDir, Num, out_of_window, [block_kind(B) || B <- Blocks]},
                 role(State)

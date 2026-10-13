@@ -55,10 +55,10 @@ suite() ->
 stats_is_a_supervised_child(_Config) ->
     ok = with_router(fun() ->
         Children = supervisor:which_children(i2per_sup),
-        ?assert(lists:keymember(i2p_stats, 1, Children)),
-        {i2p_stats, Pid, worker, _Modules} = lists:keyfind(i2p_stats, 1, Children),
+        ?assert(lists:keymember(i2p_counters, 1, Children)),
+        {i2p_counters, Pid, worker, _Modules} = lists:keyfind(i2p_counters, 1, Children),
         ?assert(is_pid(Pid)),
-        ?assertEqual(Pid, whereis(i2p_stats))
+        ?assertEqual(Pid, whereis(i2p_counters))
     end).
 
 %% Restart-bound, proved by killing it rather than by reading the child spec.
@@ -66,11 +66,11 @@ stats_is_a_supervised_child(_Config) ->
 %% are different claims, and only one of them survives a bad day.
 stats_is_restarted_after_dying(_Config) ->
     ok = with_router(fun() ->
-        Before = whereis(i2p_stats),
+        Before = whereis(i2p_counters),
         exit(Before, kill),
         ok = i2p_ct_helpers:await(
             fun() ->
-                case whereis(i2p_stats) of
+                case whereis(i2p_counters) of
                     undefined -> false;
                     Pid when Pid =:= Before -> false;
                     _ -> true
@@ -78,12 +78,12 @@ stats_is_restarted_after_dying(_Config) ->
             end,
             10000
         ),
-        After = whereis(i2p_stats),
+        After = whereis(i2p_counters),
         ?assertNotEqual(Before, After),
         %% And the counters still work against the new reference, rather than
         %% against the one whose process is gone.
-        ok = i2p_stats:add(events_notified, 2),
-        ?assertEqual(2, maps:get(events_notified, i2p_stats:snapshot()))
+        ok = i2p_counters:add(events_notified, 2),
+        ?assertEqual(2, maps:get(events_notified, i2p_counters:snapshot()))
     end).
 
 %% %%%%% %%% The read API's shape %%%%% %%%
@@ -123,10 +123,10 @@ view_reports_version_and_uptime(_Config) ->
         %% clock on every call, so two reads are only equal within the
         %% millisecond that elapsed between them. Asserting they were equal was a
         %% flake that only showed up when the whole suite ran.
-        ?assertEqual(i2p_stats:boot_time(), maps:get(boot_time, View)),
+        ?assertEqual(i2p_counters:boot_time(), maps:get(boot_time, View)),
         %% What can be said about uptime without racing the clock: a second
         %% reading is never behind the first.
-        ?assert(i2p_stats:uptime_ms() >= maps:get(uptime_ms, View))
+        ?assert(i2p_counters:uptime_ms() >= maps:get(uptime_ms, View))
     end).
 
 %% The other half of the division of labour, asserted from the core's side.
@@ -152,7 +152,7 @@ core_exposes_only_cumulative_values(_Config) ->
         ?assertEqual([], Derived),
         DerivedCounters = [K || K <- maps:keys(maps:get(counters, View)), looks_derived(K)],
         ?assertEqual([], DerivedCounters),
-        ?assertEqual([], [N || N <- i2p_stats:counters(), looks_derived(N)]),
+        ?assertEqual([], [N || N <- i2p_counters:counters(), looks_derived(N)]),
 
         %% Every counter is a plain non-negative integer: a total, not an average.
         Values = maps:values(maps:get(counters, View)),
@@ -200,7 +200,7 @@ core_exposes_only_cumulative_values(_Config) ->
         %% And the gauges are gauges, not counters in disguise: whatever they hold,
         %% every value is an instant's reading, and nothing in them is derived from
         %% the counters. A gauge that were a running total would reintroduce the
-        %% ambiguity `f:i2p_stats:add/2` refuses to create.
+        %% ambiguity `f:i2p_counters:add/2` refuses to create.
         Gauges = maps:get(gauges, View),
         ?assertEqual([], [V || V <- maps:values(Gauges), not is_number(V)])
     end).
@@ -208,7 +208,7 @@ core_exposes_only_cumulative_values(_Config) ->
 %% The bus backlog reaches the read API, on a whole router.
 %%
 %% **This is the case that makes the gauge a read-API figure rather than a
-%% curiosity in `m:i2p_stats`.** `m:i2p_events_tests` covers the sampling and the
+%% curiosity in `m:i2p_counters`.** `m:i2p_events_tests` covers the sampling and the
 %% value under a wedge; that module does not start `m:i2p_tunnel_srv`, so it cannot
 %% call `f:view/0`. Only a whole router can, so only here can it be shown that the
 %% key is carried rather than merely held.
@@ -265,10 +265,10 @@ counters_are_readable_with_no_presentation_app(_Config) ->
     ok = with_router(fun() ->
         ?assertEqual(undefined, whereis(i2per_status_state)),
         Counters = maps:get(counters, i2p_status_data:view()),
-        ?assertEqual(lists:sort(i2p_stats:counters()), lists:sort(maps:keys(Counters))),
+        ?assertEqual(lists:sort(i2p_counters:counters()), lists:sort(maps:keys(Counters))),
         Before = maps:get(events_notified, Counters),
         ok = i2p_events:notify({tunnel_expired, outbound}),
-        ?assertEqual(Before + 1, maps:get(events_notified, i2p_stats:snapshot()))
+        ?assertEqual(Before + 1, maps:get(events_notified, i2p_counters:snapshot()))
     end).
 
 %% The one counter this work shipped, on a path that already existed. Announcing
@@ -277,13 +277,13 @@ counters_are_readable_with_no_presentation_app(_Config) ->
 %% is empty can be asked whether the bus is even being used.
 bus_announcements_are_counted(_Config) ->
     ok = with_router(fun() ->
-        Before = maps:get(events_notified, i2p_stats:snapshot()),
+        Before = maps:get(events_notified, i2p_counters:snapshot()),
         N = 5,
         lists:foreach(
             fun(I) -> ok = i2p_events:notify({tunnel_expired, expired_direction(I)}) end,
             lists:seq(1, N)
         ),
-        ?assertEqual(Before + N, maps:get(events_notified, i2p_stats:snapshot()))
+        ?assertEqual(Before + N, maps:get(events_notified, i2p_counters:snapshot()))
     end).
 
 %% Volatile, and the boot time moves with the counters. A total that survived a
@@ -293,22 +293,22 @@ bus_announcements_are_counted(_Config) ->
 counters_are_volatile_across_a_router_restart(_Config) ->
     ok = start_readable_router(),
     ok = i2p_events:notify({tunnel_expired, outbound}),
-    Before = maps:get(events_notified, i2p_stats:snapshot()),
-    FirstBoot = i2p_stats:boot_time(),
+    Before = maps:get(events_notified, i2p_counters:snapshot()),
+    FirstBoot = i2p_counters:boot_time(),
     %% Let the first run accumulate uptime worth measuring, so an uptime carried
     %% through the stop and start would be visibly different from a restarted
     %% one. Without this the two are both small and the assertion proves nothing.
     timer:sleep(1500),
-    UptimeBefore = i2p_stats:uptime_ms(),
+    UptimeBefore = i2p_counters:uptime_ms(),
     ?assert(UptimeBefore >= 1500),
     ok = stop_readable_router(),
     ok = start_readable_router(),
     try
-        ?assert(maps:get(events_notified, i2p_stats:snapshot()) < Before),
-        ?assert(i2p_stats:boot_time() > FirstBoot),
+        ?assert(maps:get(events_notified, i2p_counters:snapshot()) < Before),
+        ?assert(i2p_counters:boot_time() > FirstBoot),
         %% The new uptime is smaller than the old one, so it restarted: it is
         %% measuring the run happening now, not the run before it.
-        ?assert(i2p_stats:uptime_ms() < UptimeBefore)
+        ?assert(i2p_counters:uptime_ms() < UptimeBefore)
     after
         ok = stop_readable_router()
     end.

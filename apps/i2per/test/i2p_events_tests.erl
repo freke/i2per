@@ -468,7 +468,7 @@ backlog_gauge_reports_a_wedged_manager() ->
         %% read API carries and the two could disagree.
         Depth = i2p_events:sample_backlog(),
         ?assert(Depth > queued_events_needed()),
-        ?assertEqual(Depth, maps:get(bus_backlog, i2p_stats:gauges())),
+        ?assertEqual(Depth, maps:get(bus_backlog, i2p_counters:gauges())),
         %% And it is carried in the read API under `gauges`, beside the counters
         %% rather than inside them. `view/0` itself is not called here: it reaches
         %% `m:i2p_tunnel_srv` through a `gen_server:call`, which this module does not
@@ -736,11 +736,11 @@ sampler_watches_a_subscriber_and_releases_it() ->
         ok = i2p_events:unsubscribe(Collector)
     end.
 
-%% The reading is offered, never pushed. `m:i2p_stats` is an observer of the core and
+%% The reading is offered, never pushed. `m:i2p_counters` is an observer of the core and
 %% not part of it, so nothing in this module may hand it a figure on a timer -- and
 %% with no collector asking, the far-side reading costs the router nothing at all.
 %%
-%% The near side is asserted to be *absent* rather than zero: `m:i2p_stats:gauges/0`
+%% The near side is asserted to be *absent* rather than zero: `m:i2p_counters:gauges/0`
 %% reports a gauge it has never seen as absent, which is the distinction from
 %% "measured, and zero", so a `bus_far_backlog` key appearing at all would mean the
 %% core had started pushing.
@@ -748,7 +748,7 @@ far_backlog_is_offered_and_not_pushed_test() ->
     {ok, _} = application:ensure_all_started(i2per),
     Near = i2p_events:sample_backlog(),
     ?assertEqual(0, i2p_events:sample_far_backlog()),
-    Gauges = i2p_stats:gauges(),
+    Gauges = i2p_counters:gauges(),
     ?assertEqual(Near, maps:get(bus_backlog, Gauges)),
     ?assertNot(maps:is_key(bus_far_backlog, Gauges)),
     %% And the key the read API would carry is the same one the near side uses.

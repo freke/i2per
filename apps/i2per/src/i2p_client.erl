@@ -191,7 +191,7 @@ serialise behind one another, and neither waits on transit frames for other
 routers or on a tunnel build -- the tunnel manager's mailbox is shared with
 all of that.
 
-**The drop is counted, not silent.** `m:i2p_stats` records it as
+**The drop is counted, not silent.** `m:i2p_counters` records it as
 `client_messages_dropped_no_tunnel`, which is the companion to
 `transit_frames_dropped_no_route`: that one is a frame this router could not
 route, this is a message it routed and could not deliver. Not propagating is a
@@ -214,7 +214,7 @@ send_wire(#{out_tid := OutTid, gw := Gw, tid := Tid, dest_pub := DestPub}, Wire)
         }),
     case i2p_tunnel_srv:outbound_injection(OutTid) of
         {ok, Injection} -> i2p_tunnel_srv:inject(Injection, {tunnel, Gw, Tid}, StdMsg);
-        error -> i2p_stats:add(client_messages_dropped_no_tunnel, 1)
+        error -> i2p_counters:add(client_messages_dropped_no_tunnel, 1)
     end.
 
 %% lease_route/2 — finish route resolution once the identity parses.

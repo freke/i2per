@@ -107,7 +107,7 @@ moment of injection.
 appeared to read it — two turned `error` into a counter and returned `ok`, one
 discarded it — but the counter is for the operator and the return is for the
 programmer. Different audiences, both kept. The counter is also the wrong
-instrument for a per-send decision: `i2p_stats.erl` argues that a route whose
+instrument for a per-send decision: `i2p_counters.erl` argues that a route whose
 tunnel has gone fails every subsequent send until the route is re-resolved, so
 these are per-message rates on live paths rather than incidents.
 
