@@ -289,7 +289,7 @@ charlie_accepts_a_verified_intro(_Config) ->
         %%    the port the listener happened to bind.
         CPort = published_port(CharlieLocal),
         ok = wait_charlie_response(
-            BobPid, CharlieHash, Nonce, 0, ASignPub, CharlieLocal, CPort
+            BobPid, BobHash, Nonce, 0, ASignPub, CharlieLocal, CPort
         )
     after
         catch i2p_relay_coord:stop(Coord)
@@ -333,7 +333,7 @@ charlie_punch_budget_bounds_the_replays(_Config) ->
             end,
             Nonces
         ),
-        Codes = wait_charlie_codes(BobPid, CharlieHash, Nonces, ASignPub, CharlieLocal, CPort),
+        Codes = wait_charlie_codes(BobPid, BobHash, Nonces, ASignPub, CharlieLocal, CPort),
         [0, 0, 0, 0, 66] = Codes
     after
         catch i2p_relay_coord:stop(Coord)
@@ -349,9 +349,10 @@ charlie_rejects_an_unverifiable_intro(_Config) ->
     CharlieHash = maps:get(hash, CharlieLocal),
     {ok, Coord} = i2p_relay_coord:start_link(CharlieLocal),
     try
-        {BobPid, _Listener, _BobLocal} = dial_peer(Coord, CharlieLocal),
+        {BobPid, _Listener, BobLocal} = dial_peer(Coord, CharlieLocal),
         Tag = request_tag(BobPid),
         true = Tag > 0,
+        BobHash = i2p_router_info:hash(maps:get(ri, BobLocal)),
 
         {_AliceListener, _APort, AliceLocal} = listen_full_local(<<"127.0.0.1">>),
         AliceRIBin = maps:get(ri_binary, AliceLocal),
@@ -371,7 +372,7 @@ charlie_rejects_an_unverifiable_intro(_Config) ->
         ),
 
         ok = wait_charlie_response(
-            BobPid, CharlieHash, Nonce, 67, maps:get(sign_pub, AliceLocal), CharlieLocal, 0
+            BobPid, BobHash, Nonce, 67, maps:get(sign_pub, AliceLocal), CharlieLocal, 0
         )
     after
         catch i2p_relay_coord:stop(Coord)
@@ -408,7 +409,7 @@ charlie_rejects_a_non_punchable_endpoint(_Config) ->
         ),
 
         ok = wait_charlie_response(
-            BobPid, CharlieHash, Nonce, 65, ASignPub, CharlieLocal, 0
+            BobPid, BobHash, Nonce, 65, ASignPub, CharlieLocal, 0
         )
     after
         catch i2p_relay_coord:stop(Coord)

@@ -1,7 +1,7 @@
 # i2per
 
 `i2per` is an Erlang/OTP implementation of an I2P router with a SAM v3 client
-bridge. This repository contains the 0.2.1 release. It implements the modern
+bridge. This repository contains the 0.3.0 release. It implements the modern
 X25519 and Ed25519 protocol surface, including NTCP2, SSU2, ECIES tunnel
 creation, LeaseSet2, the I2P streaming protocol, and bounded tunnel relay
 participation.
@@ -9,26 +9,19 @@ participation.
 The project interoperates with I2P routers. It does not bundle code from
 `i2pd` or `i2p-java`; the repository's `NOTICE` file records the attribution.
 
-> **Status: 0.2.1 is cut and published.** The release page
+> **Status: 0.3.0 is cut and published.** The release page
 > (<https://github.com/freke/i2per/releases>) carries the relx tarball and its
 > provenance MANIFEST, built by CI from the tag rather than by a person
 > remembering to run `just release`. The documentation site is published from the
 > same tag at <https://freke.github.io/i2per/>. `CHANGELOG.md` records what
 > changed, including the known issues an operator should know about.
 >
-> 0.2.1 is a patch release: one fix, and no change to the wire formats, the
-> configuration keys, the read API's key set or the artifact's layout. It fixes a
-> reseed that could silently leave the NetDb a router short, and adds a log line
-> when a bundle entry is skipped — a defect an operator could not otherwise see.
-> What 0.2.0 added over 0.1.0 is what "operable" means: a versioned public read
-> API over the event bus, the telemetry contract (counters, failure events,
-> node uptime, and a `bus_backlog` gauge), a logging floor that is a build-time
-> gate rather than prose, and a docs site that CI publishes. The external i2pd
-> interoperability suite is never a required gate: 0.3.0, the first release to
-> make protocol claims, carries that claim in hermetic vectors replayed on every
-> push, because i2pd (or any i2p server) does not run in CI/CD and the interop
-> suite remains a local diagnostic for verifying a connection works as intended
-> (see 8AA3BVK).
+> 0.3.0 adds the Charlie relay role, measured SSU2 reachability, and a
+> hermetic protocol gate CI can replay without an i2p server in the pipeline.
+> It also hardens the event bus, fixes the Charlie response signature and punch
+> path, and makes the SSU2 listener survive peer-asserted endpoints it cannot
+> reach. The external i2pd interoperability suite remains a local diagnostic;
+> it is not a required CI gate.
 > See [ADR 0001](https://github.com/freke/i2per/blob/main/docs/adr/0001-data-only-core-with-presentation-apps.md),
 > [ADR 0002](https://github.com/freke/i2per/blob/main/docs/adr/0002-the-logging-floor-the-bus-is-the-instrument.md)
 > and the [changelog](CHANGELOG.md) for the reasoning.
@@ -59,6 +52,24 @@ The project interoperates with I2P routers. It does not bundle code from
   executable rather than prose.
 - **Operations:** offline-safe release defaults, reseed certificate anchors,
   and relx packaging with a provenance MANIFEST.
+
+## Included in 0.3.0
+
+- **Charlie relay role:** answer RelayIntro requests as a Charlie, verify the
+  request against Alice's RouterInfo, and reply in-session or in a HolePunch to
+  her asserted endpoint.
+- **Measured reachability:** peer testing feeds a typed ladder from `unknown`
+  to `reachable`, with hysteresis and the measured verdict reflected in the
+  published RouterInfo caps.
+- **Hermetic protocol gate:** handshake and message vectors are produced
+  offline against a real i2pd and replayed in CI, so protocol claims are
+  checked without running an i2p server in the pipeline.
+- **Bus hardening:** the event bus records every fact it carries, survives a
+  subscriber death, and measures the far-side backlog instead of assuming it
+  cannot grow.
+- **Release hardening:** dead sessions clean up coordinator state, the SSU2
+  listener survives unreachable peer-asserted endpoints, and the relx release
+  builds the `0.3.0` tarball.
 
 The default profile is a local client. It does not contact the live network,
 publish a floodfill RouterInfo, or accept public transit unless an operator
@@ -127,7 +138,7 @@ Wait for `===> Booted i2per`, then run these checks at the Erlang prompt:
 application:ensure_all_started(i2per).
 true = is_pid(whereis(i2per_sup)).
 %% The version string moves with each release; it is the app's own {vsn, ...}.
-{ok, "0.2.1"} = application:get_key(i2per, vsn).
+{ok, "0.3.0"} = application:get_key(i2per, vsn).
 ```
 
 The successful results are `{ok,[i2per]}`, `true`, and `ok`. Leave the shell
@@ -314,7 +325,7 @@ application:set_env(i2per, addressbook, #{
 Values already present in `sys.config` or the application environment take
 precedence over values in `i2per.conf`. In particular, edit the release's
 `releases/<vsn>/sys.config` to change the shipped `./data` directory (the
-directory is named after the release, so it carries the version — `0.2.1` for
+directory is named after the release, so it carries the version — `0.3.0` for
 this release). A
 persistent boot requires `data_dir` and `seeds` in the application environment.
 The release profile sets `live_network = false` and `ntcp2_published = false`;
@@ -425,7 +436,7 @@ part of the normal gate. `just live-smoke` is an offline self-check. Use
 
 ## Release limitations
 
-The 0.2.1 release does not implement NTCP1, SSU1, I2CP, the legacy ElGamal/AES
+The 0.3.0 release does not implement NTCP1, SSU1, I2CP, the legacy ElGamal/AES
 crypto formats, Datagram2, or a TUN interface. Path migration and advanced
 congestion control are outside the current SSU2 data path. Floodfill and
 transit participation are available as bounded features, but they are not
@@ -433,13 +444,13 @@ enabled by the shipped default profile. Automatic NetDb-driven Charlie
 selection is not implemented: the Charlie role itself is (a tagged session
 answers a RelayIntro, verifies the requester's signature and punches), so a
 peer that already holds a tag from i2per can select it. In-place relup
-upgrades are not supported in 0.2.1; upgrading means installing a new tarball.
-Nothing in 0.2.1 changes the wire formats, the configuration keys or the read
-API's key set, so a `data_dir` written by 0.2.0 is read unchanged.
+upgrades are not supported; upgrading means installing a new tarball. 0.3.0
+adds the Charlie RelayResponse and HolePunch blocks and the measured-reachability
+caps; a `data_dir` written by 0.2.1 is read unchanged.
 
 `CHANGELOG.md` lists the known issues for this release: the event bus's far
 side is unbounded if a subscriber node stops draining (OTP 28 offers no cap
-from the router side), and seven bus-carried facts have no log record yet.
+from the router side), and SSU2 congestion control and RTT are 1.0.0 material.
 
 The 1.0.0 target is frozen in [`docs/parity.md`](docs/parity.md), which pins a
 dated i2pd capability snapshot so "parity with i2pd" cannot drift as i2pd moves.

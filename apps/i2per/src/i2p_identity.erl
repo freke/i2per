@@ -209,7 +209,7 @@ rebuild_router_info(Local, NowMs) ->
     #{ri := RI, sign_seed := Seed} = Local,
     Identity = i2p_router_info:identity(RI),
     Addresses = i2p_router_info:addresses(RI),
-    Options = i2p_router_info:options(RI),
+    Options = (i2p_router_info:options(RI))#{<<"caps">> => local_caps()},
     Fresh = i2p_router_info:build(Identity, NowMs, Addresses, Options, Seed),
     Local#{ri => Fresh}.
 
@@ -234,7 +234,7 @@ set_ssu2_introducers(Local = #{intro_key := Intro, static_pub := Pub}, Introduce
     #{ri := RI, sign_seed := Seed} = Local,
     Identity = i2p_router_info:identity(RI),
     Addresses = i2p_router_info:addresses(RI),
-    Options = i2p_router_info:options(RI),
+    Options = (i2p_router_info:options(RI))#{<<"caps">> => local_caps()},
     Published = maps:get(ssu2_addr, Local, undefined),
     NewAddresses = swapped_addresses(Addresses, Published, Introducers, Pub, Intro),
     NowMs = erlang:system_time(millisecond),

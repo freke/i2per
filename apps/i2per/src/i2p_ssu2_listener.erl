@@ -236,7 +236,12 @@ handle_cast({send, Datagram, Endpoint}, State = #{sock := Sock}) ->
     %% the only place a byte can be charged once and counted once. A resend
     %% therefore counts again, which is what bytes-on-the-wire means.
     ok = i2p_counters:add(ssu2_bytes_out, Size),
-    ok = gen_udp:send(Sock, Endpoint, Datagram),
+    %% A send that cannot be made -- an unreachable or unusable endpoint
+    %% asserted by a peer -- is not a failure of this process. Crashing on it
+    %% would take the whole listener down, guaranteeing that the next datagram
+    %% (including one to a reachable peer) gets dropped. The byte count is
+    %% already charged beside it, so only the datagram is lost.
+    _ = gen_udp:send(Sock, Endpoint, Datagram),
     {noreply, State};
 handle_cast({register, Pid, ConnId}, State) ->
     _ = ets:insert(i2p_ssu2_sessions, {ConnId, Pid}),
@@ -260,7 +265,12 @@ handle_cast({charlie_reply, {Datagram, Endpoint}}, State = #{sock := Sock}) ->
     Size = byte_size(Datagram),
     i2p_log:debug({charlie_msg7_reply, Endpoint, Size}, []),
     ok = i2p_counters:add(ssu2_bytes_out, Size),
-    ok = gen_udp:send(Sock, Endpoint, Datagram),
+    %% A send that cannot be made -- an unreachable or unusable endpoint
+    %% asserted by a peer -- is not a failure of this process. Crashing on it
+    %% would take the whole listener down, guaranteeing that the next datagram
+    %% (including one to a reachable peer) gets dropped. The byte count is
+    %% already charged beside it, so only the datagram is lost.
+    _ = gen_udp:send(Sock, Endpoint, Datagram),
     {noreply, State};
 handle_cast({charlie_reply, _Malformed}, State) ->
     {noreply, State};

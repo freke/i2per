@@ -1123,8 +1123,15 @@ classify({'EXIT', Reason}) -> {error, {bus_error, Reason}}.
 %% event twice. See `f:detach_all/2`.
 attach(Collector) ->
     ok = detach_all(Collector),
-    ok = gen_event:add_handler(?MODULE, {i2p_events_forward, Collector}, [Collector]),
-    ok = remember(Collector).
+    %% Write the registry row *before* the handler is added. `bounded/1` kills
+    %% the asker when `?SUBSCRIBE_BOUND_MS` expires, but the add request may
+    %% already be queued ahead of the kill; the forwarder then attaches into a
+    %% bus whose asker is dead and `remember/1` never runs. Doing it first keeps
+    %% the invariant (attached <=> listed) holding either way; the row for a
+    %% handler that never lands is harmless, because the sampler's monitor and
+    %% `detach/1` both remove it.
+    ok = remember(Collector),
+    ok = gen_event:add_handler(?MODULE, {i2p_events_forward, Collector}, [Collector]).
 
 %% Remove every forwarder this collector holds, so the next attach leaves exactly
 %% one.

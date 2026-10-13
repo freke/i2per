@@ -583,12 +583,19 @@ introducer_hash(State = #{tagged_sess := Tagged}) ->
 %% requester's nonce echoed. Sent to the introducer, which relays it to Alice.
 reject_charlie(Tagged, Code, Ver, Nonce, State = #{bob_local := BobLocal}) ->
     Ts = erlang:system_time(second),
-    Sig = i2p_relay:sign_response(
-        maps:get(hash, BobLocal), Ver, Nonce, Ts, 0, <<>>, maps:get(sign_seed, BobLocal)
-    ),
-    Reject = i2p_relay:response_block(Code, Ver, Nonce, Ts, 0, <<>>, Sig, undefined),
-    i2p_ssu2_conn:send_relay(Tagged, Reject),
-    State.
+    %% `bhash` is the introducer's, not our own, and `introducer_hash/1` is
+    %% exactly what `verify_intro/6` already required.
+    case introducer_hash(State) of
+        {ok, IntroHash} ->
+            Sig = i2p_relay:sign_response(
+                IntroHash, Ver, Nonce, Ts, 0, <<>>, maps:get(sign_seed, BobLocal)
+            ),
+            Reject = i2p_relay:response_block(Code, Ver, Nonce, Ts, 0, <<>>, Sig, undefined),
+            i2p_ssu2_conn:send_relay(Tagged, Reject),
+            State;
+        error ->
+            State
+    end.
 
 %% The accept. Charlie's endpoint is this router's own published SSU2 address,
 %% signed with our router signing key — Alice verifies both against the
@@ -604,8 +611,9 @@ accept_intro(Tagged, Ver, Nonce, Port, Ip, State = #{bob_local := BobLocal}) ->
     Ts = erlang:system_time(second),
     case published_endpoint(BobLocal) of
         {ok, OurPort, OurIp} ->
+            {ok, IntroHash} = introducer_hash(State),
             Sig = i2p_relay:sign_response(
-                maps:get(hash, BobLocal),
+                IntroHash,
                 Ver,
                 Nonce,
                 Ts,
@@ -641,11 +649,11 @@ published_endpoint(BobLocal) ->
             error
     end.
 
-%% Relay endpoint bytes, from the IP tuple the listener parsed. An IPv4
-%% literal is 4 bytes and an IPv6 one 8, which is the length the codec fixes an
-%% endpoint at.
+%% Relay endpoint bytes come from the IP tuple the listener parsed. IPv4 is 4
+%% bytes and IPv6 16, which is the length the codec fixes an endpoint at, so
+%% reuse the SSU2 conn encoder rather than truncating.
 ip_bytes(IP) ->
-    iolist_to_binary([<<B>> || B <- tuple_to_list(IP)]).
+    i2p_ssu2_conn:ip_bin(IP).
 
 %% The out-of-session HolePunch (type 11), sent straight to Alice's asserted
 %% endpoint: a long-header datagram AEAD-sealed under **Alice's** introduction
@@ -688,9 +696,17 @@ punch(Nonce, Ts, OurPort, OurIp, Port, Ip, Response, State) ->
 %% internet, or this router emits nothing at all.
 punch_endpoint(Port, Ip) ->
     case i2p_addr_policy:punchable(Port, Ip) of
-        true -> endpoint_tuple(inet:ntoa(list_to_tuple(binary_to_list(Ip))), Port);
+        true -> {ok, {ip_tuple(Ip), Port}};
         false -> error
     end.
+
+%% Build the `inet:ip_address()` the punch datagram needs directly from the
+%% asserted bytes, which `f:i2p_addr_policy:punchable/2` has already fixed at 4
+%% or 16 bytes.
+ip_tuple(<<A, B, C, D>>) ->
+    {A, B, C, D};
+ip_tuple(<<A:16, B:16, C:16, D:16, E:16, F:16, G:16, H:16>>) ->
+    {A, B, C, D, E, F, G, H}.
 
 %% `{IP, Port}` from an address that may be a host string or a literal.
 endpoint_tuple(Host, Port) when is_binary(Host), is_integer(Port), Port > 0 ->

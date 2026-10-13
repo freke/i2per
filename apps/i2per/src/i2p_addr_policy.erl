@@ -77,6 +77,12 @@ would be reasoning about the encoding rather than the answer.
 family(Addr) when is_tuple(Addr), tuple_size(Addr) == 4 -> family4(Addr);
 family({0, 0, 0, 0, 0, 0, 0, 1}) -> loopback;
 family({0, 0, 0, 0, 0, 0, 0, 0}) -> unspecified;
+%% IPv4-mapped (::ffff:a.b.c.d) and the deprecated IPv4-compatible (::a.b.c.d)
+%% ranges carry an IPv4 address in their last 32 bits; classify that embedded
+%% address rather than the surrounding zeros, or a dual-stack socket delivers to
+%% it and the policy fails to protect it.
+family({0, 0, 0, 0, 0, 16#FFFF, G, H}) -> family4({G bsr 8, G band 255, H bsr 8, H band 255});
+family({0, 0, 0, 0, 0, 0, G, H}) -> family4({G bsr 8, G band 255, H bsr 8, H band 255});
 family({Hi, _, _, _, _, _, _, _}) when Hi band 16#FFC0 =:= 16#FE80 -> link_local;
 family({Hi, _, _, _, _, _, _, _}) when Hi band 16#FE00 =:= 16#FC00 -> private;
 family({Hi, _, _, _, _, _, _, _}) when Hi band 16#FF00 =:= 16#FF00 -> multicast;

@@ -140,7 +140,7 @@ beneath a `log` row, this one excepted by being a `log` row — so this fact sta
 the single stated exception instead of becoming the first of fifteen.
 
 Whether that overlap should collapse to bus-only was reopened by
-[HPH59JN](https://github.com/freke/i2per/issues/HPH59JN) and is **not settled by
+`HPH59JN` and is **not settled by
 this ADR**; it is held open because `i2per_status` not being started by the
 router is a fact about deployment rather than something this decision can fix.
 
