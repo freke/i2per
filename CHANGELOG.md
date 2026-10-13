@@ -171,6 +171,24 @@ round trip the far-side sweep already makes, once per subscriber per tick,
 forever. Two processes, one fact: the manager answers "should the bus keep
 calling this pid", the subsampler answers "is it still listed".
 
+**A failed NTCP2 handshake reported `{error, normal}` instead of why it failed.**
+The connection process announces `{connect_failed, PeerHash, {handshake, Reason}}`
+to its owner and then exits `normal` — normally, because an unreachable peer is a
+dial outcome and a crash report per candidate would bury bounded discovery's log.
+But `f:i2p_ntcp2_conn:connect/3` reports its result from the monitor's `DOWN`,
+and an `exit(normal)` carries `normal`: the exit reason of a process that ended
+cleanly, which says nothing about a handshake. The reason was being delivered and
+then thrown away — it sat unread in the caller's own mailbox.
+
+`f:await_connection/2` now reads that announcement before the `DOWN` it precedes
+(the same process sends it and then exits, and signals from one process to
+another are ordered), so `f:connect/3` returns the handshake's own reason:
+`{error, {handshake, {connect_failed, econnrefused}}}` for a dead port rather
+than `{error, normal}`. A caller that passed a different `owner` is not the
+announcement's recipient and still learns only that the connection ended — that
+is the documented remainder of the contract, and the pid that was told why is
+the pid that asked for the dial.
+
 ## [0.2.1] — 2026-10-07
 
 **A patch release, because the defect was a silent one.**
