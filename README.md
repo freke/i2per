@@ -24,9 +24,11 @@ The project interoperates with I2P routers. It does not bundle code from
 > API over the event bus, the telemetry contract (counters, failure events,
 > node uptime, and a `bus_backlog` gauge), a logging floor that is a build-time
 > gate rather than prose, and a docs site that CI publishes. The external i2pd
-> interoperability suite is still not a required gate — that is deferred to
-> 0.3.0, the first release to make protocol claims, because a gate that cannot
-> tell a real failure from a known-broken prerequisite is worse than no gate.
+> interoperability suite is never a required gate: 0.3.0, the first release to
+> make protocol claims, carries that claim in hermetic vectors replayed on every
+> push, because i2pd (or any i2p server) does not run in CI/CD and the interop
+> suite remains a local diagnostic for verifying a connection works as intended
+> (see 8AA3BVK).
 > See [ADR 0001](https://github.com/freke/i2per/blob/main/docs/adr/0001-data-only-core-with-presentation-apps.md),
 > [ADR 0002](https://github.com/freke/i2per/blob/main/docs/adr/0002-the-logging-floor-the-bus-is-the-instrument.md)
 > and the [changelog](CHANGELOG.md) for the reasoning.
