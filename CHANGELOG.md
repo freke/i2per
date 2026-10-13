@@ -117,6 +117,49 @@ by name.** Measured on OTP 28.5: `ets:info(Name, size)` answers `undefined` and
 The table works, holds rows, and cannot be reached by the name every other
 function uses — a silent failure that reads as an empty registry.
 
+### Fixed
+
+**A dead subscriber's forwarder stays on the bus forever.** `i2p_events_forward`
+sent each event to the collector and returned `{ok, State}` — and a send to a
+dead pid is not an error, so a collector that died raised nothing. `gen_event`
+removes a handler for a delete, a stop or a crash, and none of the three fired:
+every subscriber restart left one more forwarder attached, and every event was
+dispatched to all of them. Measured: five attach-and-die cycles left six
+handlers, and one dead forwarder cost 8,951 µs across 20,000 announcements,
+linear in the dead count.
+
+The forwarder now takes itself off. It monitors its collector from `init/1` —
+inside the manager, so the `'DOWN'` is owned there — and returns
+`remove_handler`, which is `gen_event`'s own silent self-removal. The `'DOWN'`
+reaches it because `gen_event:fetch_msg/6` receives with a catch-all and
+`gen_event:handle_msg/3` hands every unrecognised message to every handler's
+`handle_info/2`, so a monitor a handler made is a message the handler is
+handed. That was worth measuring rather than assuming: the natural reading is
+that a stray message accumulates in the manager's mailbox, and it does not.
+
+**Every way a collector can go is covered**, on OTP 28.5 / ERTS 16.4.0.6: the
+process killed locally, the process killed on another node, and the far node
+stopped outright — which is the deployment that leaks in production, since
+`i2per_status_state` runs on its own node and never unsubscribes. In every case
+the handler is gone and the bus still answers.
+
+**It is done inside the manager, and that is the point.** The obvious
+alternatives — a watcher process per subscription, or the subsampler reaping —
+both remove the handler with `gen_event:delete_handler/3`, which is an rpc with
+no timeout and so stops working precisely when the bus is wedged, which is when
+a pile-up matters. A handler removing itself needs no rpc and cannot be blocked
+by one.
+
+**The subscriber registry now drops the dead pid too**, which it did not: the
+row outlived the handler, and `i2per_status_state` restarting on its own node
+grew it once per restart. The subsampler — the process that already owns that
+table, and already exists to hold bus state no `gen_event` call can reach — takes
+a monitor per registered row and drops it when the pid goes. A monitor rather
+than an liveness probe, because the alternative for a *remote* pid is the `erpc`
+round trip the far-side sweep already makes, once per subscriber per tick,
+forever. Two processes, one fact: the manager answers "should the bus keep
+calling this pid", the subsampler answers "is it still listed".
+
 ## [0.2.1] — 2026-10-07
 
 **A patch release, because the defect was a silent one.**
