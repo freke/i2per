@@ -441,6 +441,9 @@ API's key set, so a `data_dir` written by 0.2.0 is read unchanged.
 side is unbounded if a subscriber node stops draining (OTP 28 offers no cap
 from the router side), and seven bus-carried facts have no log record yet.
 
+The 1.0.0 target is frozen in [`docs/parity.md`](docs/parity.md), which pins a
+dated i2pd capability snapshot so "parity with i2pd" cannot drift as i2pd moves.
+
 ## Documentation
 
 - The published documentation site for the current release is
