@@ -24,7 +24,8 @@
     "README.md",
     {"CHANGELOG.md", title: "Changelog"},
     {"docs/documentation.md", title: "Documentation Standards"},
-    {"docs/protocol.md", title: "Protocol Reference"}
+    {"docs/protocol.md", title: "Protocol Reference"},
+    {"docs/parity.md", title: "i2pd Parity Target (1.0.0)"}
   ],
 
   groups_for_modules: [
