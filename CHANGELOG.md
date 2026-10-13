@@ -99,8 +99,19 @@ registry lives with the sampler instead, which is a process the module does star
 `manager_callbacks_test` had asserted all six by direct call, under a comment
 giving the wrong reason for their being unreachable. A case that calls a function
 directly passes whether or not anything calls it, which is how dead callbacks read
-as covered. The comment now says what is actually true, and what the case does
-*not* assert.
+as covered. **All six are now deleted, and so is the case** — together with the
+`-behaviour(gen_event)` declaration, which asserted the same arrangement and which
+dialyzer read as one. `m:i2p_events` is a publisher and a registry owner, not a
+manager, and the module says so with the measurement rather than with six functions
+that cannot run.
+
+Two further measurements settled it rather than the taste of it. `gen_event`'s own
+`init_it/6` still takes the manager's module and arguments and discards both
+(`init_it(Starter, Parent, Name0, _Mod, _Args, Options)`), so the manager-module
+concept is vestigial upstream rather than merely unexposed from `start_link/2`. And
+`gen_event:call/3,4` dispatch to a named **handler**, never to the manager module, so
+`handle_call/2`'s `{error, unsupported}` was a reply to a question no caller could
+ask.
 
 **The backlog sampler survived a bus restart and was started a second time.**
 `start_link/0` runs in the supervisor, so its `spawn_link` linked the sampler to
@@ -131,8 +142,8 @@ linear in the dead count.
 The forwarder now takes itself off. It monitors its collector from `init/1` —
 inside the manager, so the `'DOWN'` is owned there — and returns
 `remove_handler`, which is `gen_event`'s own silent self-removal. The `'DOWN'`
-reaches it because `gen_event:fetch_msg/6` receives with a catch-all and
-`gen_event:handle_msg/3` hands every unrecognised message to every handler's
+reaches it because \`gen_event:fetch_msg/6\` receives with a catch-all and
+\`gen_event:handle_msg/3\` hands every unrecognised message to every handler's
 `handle_info/2`, so a monitor a handler made is a message the handler is
 handed. That was worth measuring rather than assuming: the natural reading is
 that a stray message accumulates in the manager's mailbox, and it does not.

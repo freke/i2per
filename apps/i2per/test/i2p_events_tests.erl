@@ -321,32 +321,34 @@ subscribe_attaches_a_collector_test() ->
         ok = i2p_events:unsubscribe(self())
     end.
 
-manager_callbacks_test() ->
-    %% **None of these are reached by a live bus**, and the module says why: the
-    %% manager is `f:gen_event`'s own module, because no `f:gen_event:start_link/2`
-    %% form both registers the name and names a callback module. Exercised directly
-    %% all the same -- they are exported and documented, and a reader comparing them
-    %% with `f:gen_event`'s defaults should find them spelled out somewhere.
-    %%
-    %% What this case deliberately does **not** assert is that the manager calls them.
-    %% It did once, in a comment that gave the wrong reason, and a case that calls a
-    %% function directly passes either way -- which is how six dead callbacks read as
-    %% tested for as long as they did.
-    ?assertEqual({ok, []}, i2p_events:init([])),
-    ?assertEqual({ok, []}, i2p_events:handle_event(some_event, [])),
-    ?assertEqual({ok, {error, unsupported}, []}, i2p_events:handle_call(query, [])),
-    ?assertEqual({ok, []}, i2p_events:handle_info(irrelevant, [])),
-    ?assertEqual(ok, i2p_events:terminate(any, [])),
-    ?assertEqual({ok, []}, i2p_events:code_change(0, [], [])).
+%% This module is not the event manager, and nothing here may make it look like one.
+%%
+%% **A gate on a recorded decision, not on behaviour (#N722YKK).** `m:i2p_events`
+%% used to declare `-behaviour(gen_event)` and export the six manager callbacks,
+%% and the case that stood here called all six directly -- so it passed whether or
+%% not anything called them, and six functions that cannot run read as covered.
+%% Both are gone; what replaces them is this assertion that they stay gone, because
+%% what was wrong with them is invisible in the code: no `f:gen_event:start_link/2`
+%% form registers a name *and* names a callback module, so the manager runs
+%% `f:gen_event`'s own callbacks (measured in the module note).
+%%
+%% Reading it as a tripwire rather than as a property: putting the attribute back
+%% would be a deliberate act, and this says one has happened, which is the failure
+%% the deleted case was -- inverted so that it fails instead of passing.
+the_manager_is_not_this_module_test() ->
+    ?assertNot(lists:keymember(behaviour, 1, i2p_events:module_info(attributes))),
+    Exports = i2p_events:module_info(exports),
+    Callbacks = [init, handle_event, handle_call, handle_info, terminate, code_change],
+    ?assertEqual([], [C || C <- Callbacks, lists:keymember(C, 1, Exports)]).
 
 %% The registry exists, and it exists because the sampler owns it.
 %%
 %% **This case exists because it very nearly did not, twice.** The manager cannot own
-%% the table -- `f:init/1` never runs, see the module note -- so the sampler does, and
-%% the first version of that used `ets:new(Name, Opts)` without `named_table`, which
-%% on OTP 28 creates a table whose \`ets:info(Name, _)\` is \`undefined\`. The registry
-%% was then permanently empty and every case below passed against it for the wrong
-%% reason.
+%% the table -- this module cannot be the manager, see the module note -- so the
+%% sampler does, and the first version of that used `ets:new(Name, Opts)` without
+%% `named_table`, which on OTP 28 creates a table whose \`ets:info(Name, _)\` is
+%% \`undefined\`. The registry was then permanently empty and every case below
+%% passed against it for the wrong reason.
 %%
 %% So this asserts the table is reachable **by name**, which is the property both bugs
 %% broke and the only one the rest of the module depends on, and then that a
