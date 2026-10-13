@@ -107,22 +107,19 @@ cut(#{buf := <<>>} = Stream, Acc) ->
     {ok, Stream, lists:reverse(Acc)};
 cut(#{buf := <<ObfLen:16/big, _/binary>>, key := Key, sip := Sip, msg := Msg} = Stream, Acc) ->
     case i2p_framing:deobfuscate_length(ObfLen, Sip) of
-        {ok, Len, Sip1} ->
+        {ok, Len, _Sip1} ->
             #{buf := Buf} = Stream,
             case byte_size(Buf) >= Len + 2 of
                 true ->
-                    <<_:2/binary, Sealed:Len/binary, Rest/binary>> = Buf,
-                    case
-                        i2p_crypto:chacha20_poly1305_open(
-                            Key,
-                            i2p_crypto:es_nonce(Msg),
-                            Sealed,
-                            <<>>
-                        )
-                    of
-                        {ok, Payload} ->
+                    <<Frame:(Len + 2)/binary, Rest/binary>> = Buf,
+                    %% Frame-level decryption lives in `i2p_framing`; this module
+                    %% only owns the *partial-frame* buffering contract. Only
+                    %% once a full frame is available does the receive direction
+                    %% call the single shared implementation (see the ticket).
+                    case i2p_framing:decrypt_frame(Key, Msg, Frame, Sip) of
+                        {ok, Payload, Sip2} ->
                             cut(
-                                Stream#{buf => Rest, sip => Sip1, msg => Msg + 1},
+                                Stream#{buf => Rest, sip => Sip2, msg => Msg + 1},
                                 [Payload | Acc]
                             );
                         error ->
