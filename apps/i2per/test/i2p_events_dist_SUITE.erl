@@ -139,7 +139,7 @@ far_backlog_reports_a_non_draining_remote_subscriber(Config) ->
         %% Nothing was published on the way: the core does not hand figures to a
         %% stats process it does not control, so `bus_far_backlog` must not exist even
         %% after a reading this deep.
-        ?assertNot(maps:is_key(bus_far_backlog, i2p_stats:gauges()))
+        ?assertNot(maps:is_key(bus_far_backlog, i2p_counters:gauges()))
     after
         ok = i2p_events:unsubscribe(Collector),
         %% **Kill it, or the next case cannot register the same name.** The collector

@@ -165,7 +165,7 @@ reply_with_no_outbound_tunnel_is_dropped_not_raised(_Config) ->
         },
         ok = i2p_peer:tunnel_lookup_reply(Parsed, a_hash()),
         0 = maps:get(
-            lookup_replies_dropped_no_tunnel, i2p_stats:snapshot(), not_reported
+            lookup_replies_dropped_no_tunnel, i2p_counters:snapshot(), not_reported
         )
     after
         teardown()

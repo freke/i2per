@@ -459,7 +459,7 @@ data_loop(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef) ->
             %% malformed is still counted: it crossed the wire, and a counter
             %% that quietly excluded bytes the router received would be harder to
             %% reconcile against anything.
-            ok = i2p_stats:add(ntcp2_bytes_in, byte_size(Data)),
+            ok = i2p_counters:add(ntcp2_bytes_in, byte_size(Data)),
             case i2p_stream:push(Recv, Data) of
                 {ok, Recv1, Payloads} ->
                     lists:foreach(
@@ -529,7 +529,7 @@ send_payload(Sock, Send, Payload, RemoteHash) ->
     %% not that — and refusing is now an outcome the process can reach and name
     %% rather than a crash, so counting ahead of the write would be counting bytes
     %% this router did not send.
-    ok = i2p_stats:add(ntcp2_bytes_out, byte_size(Wire)),
+    ok = i2p_counters:add(ntcp2_bytes_out, byte_size(Wire)),
     Send#{sip => Sip1, msg => Msg + 1}.
 
 %% The socket would not take the frame, which on a `{delay_send, true}` socket

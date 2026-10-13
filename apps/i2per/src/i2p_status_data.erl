@@ -26,7 +26,7 @@ rather than retyping it. A key added to `f:view/0` without being added to the
 list fails the build, which is the only place drift gets caught before a
 consumer does.
 
-Counters are **cumulative since router start** and come from `m:i2p_stats`.
+Counters are **cumulative since router start** and come from `m:i2p_counters`.
 The core supplies totals and its boot time; deriving a rate is the consumer's
 job, by sampling twice and subtracting. Nothing here computes one.
 """.
@@ -70,7 +70,7 @@ job, by sampling twice and subtracting. Nothing here computes one.
 Aggregate router status.
 
 Output: a map with the read API's `version`, the router's uptime and boot time,
-the cumulative counters and the live gauges from `m:i2p_stats`, our identity
+the cumulative counters and the live gauges from `m:i2p_counters`, our identity
 (base64 destination-style hash encoding of the router hash), the peer,
 tunnel, netdb and SAM-session counts, and the measured reachability detail per
 family. Read-only; safe to call from any process
@@ -96,7 +96,7 @@ reason the two are separate.
         counters := #{atom() => non_neg_integer()},
         %% Live values as of the last sample, beside the cumulative `counters`
         %% rather than inside them: a gauge falls where a counter cannot. See
-        %% `m:i2p_stats:set_gauge/2`. `bus_backlog` is the only gauge today.
+        %% `m:i2p_counters:set_gauge/2`. `bus_backlog` is the only gauge today.
         gauges := #{atom() => number()},
         identity := binary(),
         peers := #{
@@ -127,9 +127,9 @@ view() ->
     Tunnels = i2p_tunnel_srv:status(),
     #{
         version => ?VIEW_VERSION,
-        uptime_ms => i2p_stats:uptime_ms(),
-        boot_time => i2p_stats:boot_time(),
-        counters => i2p_stats:snapshot(),
+        uptime_ms => i2p_counters:uptime_ms(),
+        boot_time => i2p_counters:boot_time(),
+        counters => i2p_counters:snapshot(),
         identity => identity_b64(i2p_peer:router_hash()),
         peers => aggregate_peers(i2p_peer:status()),
         tunnels => #{
@@ -146,7 +146,7 @@ view() ->
         netdb => #{ri => i2p_netdb_srv:count(), ls => i2p_netdb_srv:ls_count()},
         sessions => length(i2p_sam_sup:client_sessions()),
         reachability_detail => i2p_ssu2_reachability:detail(),
-        gauges => i2p_stats:gauges()
+        gauges => i2p_counters:gauges()
     }.
 
 -doc """

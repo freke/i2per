@@ -8,7 +8,7 @@
 %% flood it is causing". The event was left out of that protection, on the
 %% reasoning that "a counter wants the total".
 %%
-%% The total is now `m:i2p_stats:ssu2_blocks_unhandled`, so the reason the event
+%% The total is now `m:i2p_counters:ssu2_blocks_unhandled`, so the reason the event
 %% was left exposed is gone, and what is left is the exposure. This is the
 %% mechanism #HPH59JN names as the practical way a `gen_event` handler gets
 %% wedged: a wedged handler parks the manager, and every event queued behind it
@@ -122,7 +122,7 @@ a_relay_tag_is_stored_not_announced_test() ->
 %% nothing can observe. The read API reports whatever is registered, so this is
 %% the whole of the wiring for a consumer.
 the_counter_is_registered_test() ->
-    ?assert(lists:member(ssu2_blocks_unhandled, i2p_stats:counters())).
+    ?assert(lists:member(ssu2_blocks_unhandled, i2p_counters:counters())).
 
 %% --------------------------------------------------------------------------
 %% Fixtures
@@ -183,7 +183,7 @@ drain(Acc) ->
     end.
 
 blocks_counted() ->
-    maps:get(ssu2_blocks_unhandled, i2p_stats:snapshot(), 0).
+    maps:get(ssu2_blocks_unhandled, i2p_counters:snapshot(), 0).
 
 %% --------------------------------------------------------------------------
 %% Harness
@@ -192,12 +192,12 @@ blocks_counted() ->
 %% Both the bus and the counter home, because these cases assert on two
 %% different instruments: the announce is the event, and the total is the
 %% counter. Starting the counter home itself is what makes the total observable
-%% -- `m:i2p_stats:add/2` is a no-op while it is absent, so a case that did not
+%% -- `m:i2p_counters:add/2` is a no-op while it is absent, so a case that did not
 %% start it would read 0 and pass on the flood bound alone.
 with_bus(Fun) ->
-    ok = stop(i2p_stats),
+    ok = stop(i2p_counters),
     ok = stop(i2p_events),
-    {ok, _} = i2p_stats:start_link(),
+    {ok, _} = i2p_counters:start_link(),
     {ok, _} = i2p_events:start_link(),
     ok = gen_event:add_handler(i2p_events, i2p_events_forward, [self()]),
     try
@@ -205,7 +205,7 @@ with_bus(Fun) ->
     after
         _ = gen_event:delete_handler(i2p_events, i2p_events_forward, []),
         ok = stop(i2p_events),
-        ok = stop(i2p_stats)
+        ok = stop(i2p_counters)
     end.
 
 stop(Name) ->

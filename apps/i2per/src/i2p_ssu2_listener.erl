@@ -235,7 +235,7 @@ handle_cast({send, Datagram, Endpoint}, State = #{sock := Sock}) ->
     %% handshake retransmits and data-phase resends all arrive here — so this is
     %% the only place a byte can be charged once and counted once. A resend
     %% therefore counts again, which is what bytes-on-the-wire means.
-    ok = i2p_stats:add(ssu2_bytes_out, Size),
+    ok = i2p_counters:add(ssu2_bytes_out, Size),
     ok = gen_udp:send(Sock, Endpoint, Datagram),
     {noreply, State};
 handle_cast({register, Pid, ConnId}, State) ->
@@ -259,7 +259,7 @@ handle_cast({register_relay_tag, Tag, Pid, Expires}, State) ->
 handle_cast({charlie_reply, {Datagram, Endpoint}}, State = #{sock := Sock}) ->
     Size = byte_size(Datagram),
     i2p_log:debug({charlie_msg7_reply, Endpoint, Size}, []),
-    ok = i2p_stats:add(ssu2_bytes_out, Size),
+    ok = i2p_counters:add(ssu2_bytes_out, Size),
     ok = gen_udp:send(Sock, Endpoint, Datagram),
     {noreply, State};
 handle_cast({charlie_reply, _Malformed}, State) ->
@@ -271,7 +271,7 @@ handle_info({udp, Sock, IP, PortNum, Datagram}, State = #{sock := Sock}) ->
     %% Charged on arrival, before classification. UDP preserves message
     %% boundaries, so this is the exact datagram size with no framing guesswork
     %% in it.
-    ok = i2p_stats:add(ssu2_bytes_in, byte_size(Datagram)),
+    ok = i2p_counters:add(ssu2_bytes_in, byte_size(Datagram)),
     %% Re-armed before classification, not after. It matters only while the
     %% responder is being started on a probe, which is a supervisor call from
     %% inside this process -- but re-arming first means the socket is already

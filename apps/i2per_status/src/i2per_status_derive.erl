@@ -39,7 +39,7 @@ discards the rate rather than reporting a wrong one:
 - **the router restarted** (`boot_time` changed). Counters are volatile, so the
   later reading is lower than the earlier one for no reason other than a new
   process. Differencing across that would report a large negative rate.
-- **a counter went backwards** within one boot. `m:i2p_stats` refuses to let one
+- **a counter went backwards** within one boot. `m:i2p_counters` refuses to let one
   happen, so this is the guard against a wrong number rather than against a wrong
   code: if it is ever observed, the reading is not believed.
 - **the window is zero**, which is a division by zero rather than a rate.

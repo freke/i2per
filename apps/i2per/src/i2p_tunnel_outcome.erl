@@ -12,7 +12,7 @@ makes that impossible: the only way to announce an outcome is to count it.
 
 ## What the counters mean
 
-`m:i2p_stats` holds cumulative totals since router start. A tunnel success
+`m:i2p_counters` holds cumulative totals since router start. A tunnel success
 ratio is **not** computed here — the core supplies totals and a consumer
 differences and divides them, which is what keeps the counter home free of a
 timer. See #0HSTTVC for the tally and #7YP3QZ4 for the ratio.
@@ -28,7 +28,7 @@ have it.
 
 `f:counter_name/1` turns an event into the counter it charges, and
 `f:counter_names/0` derives the whole set from the same three clauses. The
-registry in `m:i2p_stats` is the authority on what exists; a test asserts the
+registry in `m:i2p_counters` is the authority on what exists; a test asserts the
 derived set is contained in it, so a new direction or a new failure reason fails
 the build rather than a production send.
 """.
@@ -46,7 +46,7 @@ be able to drop a state change.
 """.
 -spec built(i2p_events:direction(), non_neg_integer()) -> ok.
 built(Direction, Hops) ->
-    ok = i2p_stats:add(counter_name({tunnel_built, Direction, Hops}), 1),
+    ok = i2p_counters:add(counter_name({tunnel_built, Direction, Hops}), 1),
     i2p_events:notify({tunnel_built, Direction, Hops}).
 
 -doc """
@@ -57,7 +57,7 @@ when the records did not survive processing). Output: `ok`.
 """.
 -spec failed(i2p_events:direction(), rejected | invalid) -> ok.
 failed(Direction, Why) ->
-    ok = i2p_stats:add(counter_name({tunnel_failed, Direction, Why}), 1),
+    ok = i2p_counters:add(counter_name({tunnel_failed, Direction, Why}), 1),
     i2p_events:notify({tunnel_failed, Direction, Why}).
 
 -doc """
@@ -72,14 +72,14 @@ conclude it is healthy.
 """.
 -spec expired(i2p_events:direction()) -> ok.
 expired(Direction) ->
-    ok = i2p_stats:add(counter_name({tunnel_expired, Direction}), 1),
+    ok = i2p_counters:add(counter_name({tunnel_expired, Direction}), 1),
     i2p_events:notify({tunnel_expired, Direction}).
 
 -doc """
 The counter an event charges.
 
 Input: a tunnel outcome event. Output: the counter name, as the flat atom
-`m:i2p_stats` registers. Exported so the mapping has exactly one definition, and
+`m:i2p_counters` registers. Exported so the mapping has exactly one definition, and
 so a test can check the whole vocabulary at once rather than one call site at a
 time.
 

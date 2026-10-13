@@ -315,7 +315,7 @@ transit_bytes_counted_per_carried_frame(_Config) ->
         ok = create_transit_entry(Router, Next, 930),
         MockPeer = spawn(fun() -> mock_peer_loop(TestPid) end),
         true = register(i2p_peer, MockPeer),
-        #{transit_bytes_in := In0, transit_bytes_out := Out0} = i2p_stats:snapshot(),
+        #{transit_bytes_in := In0, transit_bytes_out := Out0} = i2p_counters:snapshot(),
 
         lists:foreach(
             fun(I) -> deliver_transit_frame(930, I) end,
@@ -325,12 +325,12 @@ transit_bytes_counted_per_carried_frame(_Config) ->
         OnWire = lists:sum([byte_size(W) || W <- Wires]),
 
         %% What left the router is what left the router.
-        ?assertEqual(OnWire, maps:get(transit_bytes_out, i2p_stats:snapshot()) - Out0),
+        ?assertEqual(OnWire, maps:get(transit_bytes_out, i2p_counters:snapshot()) - Out0),
         %% A transit hop does not alter the body, so carried in equals carried
         %% out, frame for frame.
         ?assertEqual(
-            maps:get(transit_bytes_out, i2p_stats:snapshot()) - Out0,
-            maps:get(transit_bytes_in, i2p_stats:snapshot()) - In0
+            maps:get(transit_bytes_out, i2p_counters:snapshot()) - Out0,
+            maps:get(transit_bytes_in, i2p_counters:snapshot()) - In0
         ),
         %% And it is the wire frame, not the payload inside it. Three frames at
         %% the tunnel-data frame size; a fourth would mean the refused frame was
@@ -359,7 +359,7 @@ transit_bytes_counted_when_budget_allows_every_frame(_Config) ->
         ok = create_transit_entry(Router, Next, 931),
         MockPeer = spawn(fun() -> mock_peer_loop(TestPid) end),
         true = register(i2p_peer, MockPeer),
-        #{transit_bytes_in := In0, transit_bytes_out := Out0} = i2p_stats:snapshot(),
+        #{transit_bytes_in := In0, transit_bytes_out := Out0} = i2p_counters:snapshot(),
 
         N = 4,
         lists:foreach(
@@ -367,8 +367,8 @@ transit_bytes_counted_when_budget_allows_every_frame(_Config) ->
             lists:seq(1, N)
         ),
         Wires = receive_frames(N, []),
-        ?assertEqual(N * 1028, maps:get(transit_bytes_out, i2p_stats:snapshot()) - Out0),
-        ?assertEqual(N * 1028, maps:get(transit_bytes_in, i2p_stats:snapshot()) - In0),
+        ?assertEqual(N * 1028, maps:get(transit_bytes_out, i2p_counters:snapshot()) - Out0),
+        ?assertEqual(N * 1028, maps:get(transit_bytes_in, i2p_counters:snapshot()) - In0),
         ?assertEqual(N * 1028, lists:sum([byte_size(W) || W <- Wires]))
     after
         unregister_peer(),
@@ -498,7 +498,7 @@ drive_one_build(Local, Hops) ->
     maps:map(fun(_K, V) -> V - maps:get(_K, Before, 0) end, After).
 
 tunnel_counters() ->
-    Snap = i2p_stats:snapshot(),
+    Snap = i2p_counters:snapshot(),
     maps:with(
         [K || K <- maps:keys(Snap), lists:prefix("tunnels_", atom_to_list(K))],
         Snap

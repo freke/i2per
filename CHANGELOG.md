@@ -234,7 +234,7 @@ release candidate is the same release before the version was final.
 
 ### Added
 
-- **Versioned public read API over the event bus.** `i2p_stats` holds the
+- **Versioned public read API over the event bus.** `i2p_counters` holds the
   counters and node uptime; the read API serves them under
   `i2p_status_data:view/0`, including a `bus_backlog` gauge sampled with
   `process_info/2` so a wedged bus is observable from outside the bus.

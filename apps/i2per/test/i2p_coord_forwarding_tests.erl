@@ -248,9 +248,9 @@ drain_events(Acc) ->
 %% `f:i2p_peer:send_coord/2` finds it. Everything is restored: the names, the
 %% keys, the processes.
 with_sinks(Fun) ->
-    ok = stop(i2p_stats),
+    ok = stop(i2p_counters),
     ok = stop(i2p_events),
-    {ok, _} = i2p_stats:start_link(),
+    {ok, _} = i2p_counters:start_link(),
     {ok, _} = i2p_events:start_link(),
     ok = gen_event:add_handler(i2p_events, i2p_events_forward, [self()]),
     RelaySink = spawn_sink(i2p_relay_coord),
@@ -272,7 +272,7 @@ with_sinks(Fun) ->
         exit(PtSink, kill),
         _ = gen_event:delete_handler(i2p_events, i2p_events_forward, []),
         ok = stop(i2p_events),
-        ok = stop(i2p_stats)
+        ok = stop(i2p_counters)
     end.
 
 stop(Name) ->

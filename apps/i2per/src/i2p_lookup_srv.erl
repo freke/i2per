@@ -380,7 +380,7 @@ send_lookup_wire(OutTid, Delivery, StdBin) ->
         ok ->
             ok;
         error ->
-            ok = i2p_stats:add(lookup_requests_dropped_no_tunnel, 1),
+            ok = i2p_counters:add(lookup_requests_dropped_no_tunnel, 1),
             error
     end.
 

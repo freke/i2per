@@ -64,7 +64,7 @@ events behind it queue without limit while `events_notified` climbs regardless �
 status page silently frozen whose counter still moves.
 
 **That case is reported rather than bounded.** The backlog depth is sampled by
-`f:sample_backlog/0` and published as the `bus_backlog` gauge in `m:i2p_stats`, so it
+`f:sample_backlog/0` and published as the `bus_backlog` gauge in `m:i2p_counters`, so it
 reaches the read API under `i2p_status_data:view/0`'s `gauges` key. The read works on
 a wedged manager — measured at 0us per sample against a depth of 2.8 million —
 because `process_info/2` does not go through the process it describes, while every
@@ -228,7 +228,7 @@ lookup service not being running, where there is no key and nothing was asked fo
 %%
 %% **A handler that wedges the manager is now visible rather than bounded.** The
 %% backlog depth is sampled by `f:sample_backlog/0` and published through
-%% `m:i2p_stats:set_gauge/2` as `bus_backlog`, reaching the read API under
+%% `m:i2p_counters:set_gauge/2` as `bus_backlog`, reaching the read API under
 %% `m:i2p_status_data:view/0`'s `gauges` key.
 %%
 %% **That is possible because the read does not go through the manager**, which is
@@ -394,7 +394,7 @@ discarded deliberately (see the module doc).
 """.
 -spec notify(event()) -> ok.
 notify(Event) ->
-    ok = i2p_stats:add(events_notified, 1),
+    ok = i2p_counters:add(events_notified, 1),
     case whereis(?MODULE) of
         undefined ->
             ok;
@@ -416,7 +416,7 @@ notify(Event) ->
 %%
 %% **A handler that wedges the manager is now visible rather than bounded.** The
 %% backlog depth is sampled by `f:sample_backlog/0` and published through
-%% `m:i2p_stats:set_gauge/2` as `bus_backlog`, reaching the read API under
+%% `m:i2p_counters:set_gauge/2` as `bus_backlog`, reaching the read API under
 %% `m:i2p_status_data:view/0`'s `gauges` key.
 %%
 %% **The read works on a wedged manager, which is the property the bound lacked.**
@@ -486,7 +486,7 @@ rather than an error: there is no backlog when there is no bus.
 -spec sample_backlog() -> non_neg_integer().
 sample_backlog() ->
     Depth = depth(),
-    ok = i2p_stats:set_gauge(bus_backlog, Depth),
+    ok = i2p_counters:set_gauge(bus_backlog, Depth),
     %% Emitted so a future consumer attaches rather than polls. Nothing in this tree
     %% attaches yet, and that is deliberate: the event is the seam, not a feature.
     %% `telemetry:execute/3` with no handler attached is close to free.
@@ -634,7 +634,7 @@ deepest(Depths) ->
 %% handler and no other module to ask; what changed is that holding them in step takes
 %% a monitor rather than only two write sites.
 %%
-%% It deliberately does **not** live in `m:i2p_stats`. That module is an observer of
+%% It deliberately does **not** live in `m:i2p_counters`. That module is an observer of
 %% the core, not part of it -- the core does not hand data to a stats process it does
 %% not control -- so a registry parked there would be the core calling out to its own
 %% observer on the subscription path. It would also mean the bus stopped working when
@@ -741,7 +741,7 @@ forget_all(Collectors) ->
 %% is up rather than after a full tick.
 %%
 %% **A gauge that is absent for its first tick is a fault a reader cannot tell from
-%% a fault it is meant to reveal.** `m:i2p_stats:gauges/0` reports a gauge it has
+%% a fault it is meant to reveal.** `m:i2p_counters:gauges/0` reports a gauge it has
 %% never seen as *absent*, which is the correct distinction from "measured, and
 %% zero" -- but on the bus that means the read API carries no backlog figure at all
 %% for the first 5 seconds of the router's life, and a consumer polling at startup

@@ -593,7 +593,7 @@ sweep(State) ->
     }.
 
 count_expired(0) -> ok;
-count_expired(N) -> i2p_stats:add(pending_sends_expired, N).
+count_expired(N) -> i2p_counters:add(pending_sends_expired, N).
 
 sweep_pending_sends(Pending, NowMs, Kept, Expired) ->
     maps:fold(
@@ -676,7 +676,7 @@ sweep_peers(Peers) ->
     end.
 
 count_evicted(0) -> ok;
-count_evicted(N) -> i2p_stats:add(peers_evicted, N).
+count_evicted(N) -> i2p_counters:add(peers_evicted, N).
 
 idle_peer(Peer) ->
     maps:get(conn, Peer, undefined) =:= undefined andalso
@@ -1048,7 +1048,7 @@ note_unhandled_ssu2_blocks(ConnPid, Blocks, State) ->
 %% must not turn the log into the flood it is causing". The event used to be emitted
 %% per *block*, on the reasoning that "a counter wants the total" -- and it was right
 %% about the want and wrong about the instrument. The total now lives in
-%% `m:i2p_stats:ssu2_blocks_unhandled`, charged on every block, so the announce rate
+%% `m:i2p_counters:ssu2_blocks_unhandled`, charged on every block, so the announce rate
 %% is free to be what it was always supposed to be: a notice.
 %%
 %% **Why that is not merely tidiness.** A wedged `gen_event` handler parks the manager,
@@ -1067,7 +1067,7 @@ note_unhandled_ssu2_blocks(ConnPid, Blocks, State) ->
 %% open.
 note_unhandled_ssu2_block(ConnPid, Block, State) ->
     Name = ssu2_block_name(Block),
-    ok = i2p_stats:add(ssu2_blocks_unhandled, 1),
+    ok = i2p_counters:add(ssu2_blocks_unhandled, 1),
     Identity =
         case find_conn_peer(ConnPid, State) of
             {Hash, _PeerState} -> {peer, base64:encode(Hash)};
@@ -1391,7 +1391,7 @@ handle_dial_down(PeerHash, PeerState, Reason, State) ->
     State1 = clear_dial(PeerHash, State),
     case dial_stranded(PeerState) of
         true ->
-            ok = i2p_stats:add(dials_escaped, 1),
+            ok = i2p_counters:add(dials_escaped, 1),
             handle_connect_failed(PeerHash, {dial_died, Reason}, State1);
         false ->
             State1
@@ -1409,7 +1409,7 @@ handle_dial_expired(PeerHash, TimerRef, State) ->
         {ok, #{dial := {_Pid, _MonRef, TimerRef}} = PeerState} ->
             case dial_stranded(PeerState) of
                 true ->
-                    ok = i2p_stats:add(dials_escaped, 1),
+                    ok = i2p_counters:add(dials_escaped, 1),
                     %% Stop the dial as well as the peer. It has already overrun
                     %% the sum of its own legs, and leaving it running means it can
                     %% later hand a connection to a peer now in backoff — which is
@@ -1485,7 +1485,7 @@ init_connect(PeerHash, #{ri := RemoteRI}, Local) ->
 park_reported(_PeerHash, not_attempted) ->
     ok;
 park_reported(PeerHash, Reason) ->
-    ok = i2p_stats:add(ssu2_dials_parked, 1),
+    ok = i2p_counters:add(ssu2_dials_parked, 1),
     ok = i2p_events:notify({ssu2_dial_parked, PeerHash, Reason}).
 
 %% Tell the manager which transport this dial is about to attempt, before it
@@ -2063,7 +2063,7 @@ requester's retry picks another responder.
 the one the caller can see, and it is handled here. The other is the tunnel
 going away *between* choosing it and sending on it -- a second lookup, which can
 answer `error` after a successful pick -- counted as
-`lookup_replies_dropped_no_tunnel` in `m:i2p_stats`. Neither is this router's
+`lookup_replies_dropped_no_tunnel` in `m:i2p_counters`. Neither is this router's
 fault and neither is worth failing a lookup over, so this function is total by
 design rather than by luck; see #MCVQ6D6 for why that used to be an assertion.
 """.
@@ -2126,7 +2126,7 @@ tunnel_lookup_reply(
 reply_via_outbound(OutTid, Delivery, Wire) ->
     case i2p_tunnel_srv:send_via_outbound(OutTid, Delivery, Wire) of
         ok -> ok;
-        error -> i2p_stats:add(lookup_replies_dropped_no_tunnel, 1)
+        error -> i2p_counters:add(lookup_replies_dropped_no_tunnel, 1)
     end.
 
 handle_db_search_reply(ConnPid, Transport, Body, State) ->
@@ -2511,7 +2511,7 @@ remember_ri(RI, State = #{known := Known}) ->
 trim_known(Known) when map_size(Known) =< ?MAX_KNOWN ->
     Known;
 trim_known(Known) ->
-    ok = i2p_stats:add(known_evicted, 1),
+    ok = i2p_counters:add(known_evicted, 1),
     maps:remove(oldest_known(Known), Known).
 
 %% The hash whose RouterInfo carries the earliest publish time.
@@ -2721,7 +2721,7 @@ enqueue_send(PeerHash, Msg, #{pending_sends := Pending} = State) ->
     Stamped = {at, erlang:system_time(millisecond), Msg},
     case length(Existing) >= ?MAX_PENDING_SENDS_PER_PEER of
         true ->
-            ok = i2p_stats:add(pending_sends_dropped_depth, 1),
+            ok = i2p_counters:add(pending_sends_dropped_depth, 1),
             Trimmed = lists:sublist(Existing, ?MAX_PENDING_SENDS_PER_PEER - 1),
             State#{
                 pending_sends := maps:put(

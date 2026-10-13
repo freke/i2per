@@ -60,7 +60,7 @@ init([]) ->
             %% a documented no-op while this process is absent. The other order left
             %% the read API carrying no backlog at all for the first tick, with an
             %% absent gauge indistinguishable from a sampler that had died.
-            stats_child(),
+            counters_child(),
             events_child(),
             config_srv_child(),
             peer_rep_child(),
@@ -254,18 +254,18 @@ events_child() ->
         modules => [i2p_events]
     }.
 
-%% First child: the counter home. Nothing blocks on it — `i2p_stats:add/2` and
-%% `i2p_stats:set_gauge/2` are no-ops while it is absent — but the counters a
+%% First child: the counter home. Nothing blocks on it — `i2p_counters:add/2` and
+%% `i2p_counters:set_gauge/2` are no-ops while it is absent — but the counters a
 %% transport increments on its first packet should not be the ones lost to a start
 %% order, and the bus samples its backlog gauge once at startup.
-stats_child() ->
+counters_child() ->
     #{
-        id => i2p_stats,
-        start => {i2p_stats, start_link, []},
+        id => i2p_counters,
+        start => {i2p_counters, start_link, []},
         restart => permanent,
         shutdown => 5000,
         type => worker,
-        modules => [i2p_stats]
+        modules => [i2p_counters]
     }.
 
 %% Validated runtime configuration front door (`m:i2p_config_srv`).

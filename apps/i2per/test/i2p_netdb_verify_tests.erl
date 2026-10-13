@@ -126,13 +126,13 @@ start_storing_here(Parent) ->
 %% Brings up a NetDb holding one RouterInfo, then hands the body that
 %% RouterInfo's hash.
 %%
-%% Whatever this starts, it stops. `i2p_stats` and `i2p_netdb_srv` are
+%% Whatever this starts, it stops. `i2p_counters` and `i2p_netdb_srv` are
 %% registered names inside the `i2per` application, and a bare `start_link/0`
 %% leaves one registered that the application controller did not start, which the
 %% next module that boots `i2per` reads as `already_started` and fails on.
 with_netdb(Body) ->
     StartedNetdb = ensure_started(i2p_netdb_srv),
-    StartedStats = ensure_started(i2p_stats),
+    StartedStats = ensure_started(i2p_counters),
     try
         Now = erlang:system_time(millisecond),
         RI = i2p_ct_helpers:floodfill_router_info(Now, <<"192.0.2.10">>),

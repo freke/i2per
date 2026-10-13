@@ -536,7 +536,7 @@ peer_field(Hash, Key, State) ->
     maps:get(Key, maps:get(Hash, maps:get(peers, State))).
 
 dials_escaped() ->
-    maps:get(dials_escaped, i2p_stats:snapshot(), 0).
+    maps:get(dials_escaped, i2p_counters:snapshot(), 0).
 
 %% Counters are process-wide, so a case that asserts on one has to own the window
 %% it reads. The stats process is started for the duration if the tier has not
@@ -547,7 +547,7 @@ with_escape_count(Fun) ->
         Fun(dials_escaped())
     after
         case HadStats of
-            started -> ok = gen_server:stop(whereis(i2p_stats));
+            started -> ok = gen_server:stop(whereis(i2p_counters));
             existing -> ok
         end
     end.
@@ -1363,7 +1363,7 @@ lookup_reply_delivered_does_not_count_test() ->
 %% ----------------------------------------------------------------------------
 
 lookup_reply_drops() ->
-    maps:get(lookup_replies_dropped_no_tunnel, i2p_stats:snapshot()).
+    maps:get(lookup_replies_dropped_no_tunnel, i2p_counters:snapshot()).
 
 with_lookup_reply_count(Answer, Fun) ->
     HadStats = ensure_stats(),
@@ -1386,15 +1386,15 @@ with_lookup_reply_count(Answer, Fun) ->
             _ -> ok
         end,
         case HadStats of
-            started -> ok = gen_server:stop(whereis(i2p_stats));
+            started -> ok = gen_server:stop(whereis(i2p_counters));
             existing -> ok
         end
     end.
 
 ensure_stats() ->
-    case whereis(i2p_stats) of
+    case whereis(i2p_counters) of
         undefined ->
-            {ok, _} = i2p_stats:start_link(),
+            {ok, _} = i2p_counters:start_link(),
             started;
         _Pid ->
             existing
