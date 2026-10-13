@@ -21,7 +21,7 @@ end-to-end cases in `m:i2per_status_tests`.
 -include_lib("eunit/include/eunit.hrl").
 
 %% Both processes are children, not bystanders linked to the supervisor.
-both_processes_are_children_test() ->
+both_processes_are_children() ->
     with_status(fun(_Port) ->
         ?assertEqual(
             [i2per_status_listener, i2per_status_state],
@@ -33,7 +33,7 @@ both_processes_are_children_test() ->
 %% healthy supervisor also handles — and require a different pid serving the same
 %% port within a deadline. Under the old arrangement the port simply stayed
 %% closed while the supervisor reported success throughout.
-listener_is_restarted_after_dying_test() ->
+listener_is_restarted_after_dying() ->
     with_status(fun(Port) ->
         Before = must_live(i2per_status_listener),
         exit(Before, kill),
@@ -52,7 +52,7 @@ listener_is_restarted_after_dying_test() ->
 %% endpoints must answer 503 rather than crash into a 500. This is the state the
 %% ticket called reachable: a live listener and a dead snapshot server, which used
 %% to be an unhandled `exit` in each handler.
-endpoints_answer_503_while_snapshot_server_is_down_test() ->
+endpoints_answer_503_while_snapshot_server_is_down() ->
     with_status(fun(Port) ->
         State = must_live(i2per_status_state),
         exit(State, kill),
@@ -63,7 +63,7 @@ endpoints_answer_503_while_snapshot_server_is_down_test() ->
     end).
 
 %% And the server comes back on its own, being `permanent`.
-snapshot_server_is_restarted_after_dying_test() ->
+snapshot_server_is_restarted_after_dying() ->
     with_status(fun(_Port) ->
         Before = must_live(i2per_status_state),
         exit(Before, kill),
@@ -84,6 +84,19 @@ with_status(Test) ->
     after
         _ = application:stop(i2per_status)
     end.
+
+%% %%%%% EUnit wiring with a raised cold-start tolerance. %%%%%
+both_processes_are_children_test_() ->
+    {timeout, 60, fun both_processes_are_children/0}.
+
+listener_is_restarted_after_dying_test_() ->
+    {timeout, 60, fun listener_is_restarted_after_dying/0}.
+
+endpoints_answer_503_while_snapshot_server_is_down_test_() ->
+    {timeout, 60, fun endpoints_answer_503_while_snapshot_server_is_down/0}.
+
+snapshot_server_is_restarted_after_dying_test_() ->
+    {timeout, 60, fun snapshot_server_is_restarted_after_dying/0}.
 
 must_live(Name) ->
     case whereis(Name) of
