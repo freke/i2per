@@ -89,7 +89,12 @@ The manager carries **no** heap bound. One was measured and removed; the note on
 there is no heap bound* below carries the measurements for and against it.
 """.
 
--behaviour(gen_event).
+%% **No `-behaviour(gen_event)` on purpose, and it was one until #N722YKK removed
+%% it.** This module is not a manager and cannot be one on this OTP -- see *The
+%% manager is `gen_event`'s own module* below -- so the attribute asserted an
+%% arrangement that does not exist. Dialyzer read it as one and was satisfied by
+%% six function heads: a behaviour is checked against what is *defined*, never
+%% against what is *reached*, which is the whole reason those six read as covered.
 
 -export([
     start_link/0,
@@ -100,8 +105,6 @@ there is no heap bound* below carries the measurements for and against it.
     sample_backlog/0,
     sample_far_backlog/0
 ]).
-
--export([init/1, handle_event/2, handle_call/2, handle_info/2, terminate/2, code_change/3]).
 
 -export_type([event/0, direction/0, lookup_kind/0, subscribe_error/0]).
 
@@ -297,15 +300,16 @@ removed heap bound took.
 -dialyzer({nowarn_function, forget_gone/3}).
 -dialyzer({nowarn_function, stop_sampler/0}).
 start_link() ->
-    %% **Only `{local, Name}` registers the manager, and it is the only form this OTP
-    %% accepts together with `Opts`.** Measured against `f:gen_event:start_link/2`:
-    %% `{Mod, Args}`, `{local, Name, Mod}`, `{global, Name, Mod}` and
-    %% `{via, Mod, Name, Args}` each exit `badarg`. So **there is no form that both
-    %% registers the manager and names a callback module**, which means this module's
-    %% own callbacks never run -- see *The manager's own callbacks are dead* below.
+    %% **Only `{local, Name}` registers the manager locally, and it is the only
+    %% form this OTP accepts together with `Opts`.** Measured against
+    %% `f:gen_event:start_link/2`: `{Mod, Args}`, `{local, Name, Mod}`,
+    %% `{global, Name, Mod}` and `{via, Mod, Name, Args}` each exit `badarg`.
+    %% So **there is no form that both registers the manager and names a callback
+    %% module**, which means this module's own callbacks would never run -- see
+    %% *The manager is `f:gen_event`'s own module* below.
     %%
     %% That is why the subscriber registry is owned by the sampler rather than by
-    %% `f:init/1`: there is no hook in the manager process this module can run.
+    %% the manager: there is no hook in the manager process this module can run.
     case gen_event:start_link({local, ?MODULE}, [{spawn_opt, [{async_dist, true}]}]) of
         {ok, Pid} ->
             ok = start_sampler(Pid),
@@ -314,32 +318,73 @@ start_link() ->
             Other
     end.
 
-%% %%%%% %%% The manager's own callbacks are dead %%%%% %%%
+%% %%%%% %%% The manager is `f:gen_event`'s own module %%%%% %%%
 %%
-%% ## Every `f:gen_event` callback here is unreachable, and the suite said otherwise
+%% ## This module is not the manager, and cannot be on this OTP
 %%
-%% `f:init/1`, `f:handle_event/2`, `f:handle_call/2`, `f:handle_info/2`,
-%% `f:terminate/2` and `f:code_change/3` are exported, documented and never executed.
-%% The manager is `f:gen_event`'s own module (see `f:start_link/0`), and
-%% `f:gen_event` calls a manager module only in the `{Mod, Args}` form -- which is
-%% also the only form that does not register the name, and the name is what
-%% `f:notify/1`, `f:bounded/1` and `f:depth/0` resolve the bus through.
+%% `f:gen_event:start_link/2` registers the manager and runs `f:gen_event`'s own
+%% callbacks. **There is no form of it that both registers the name and names a
+%% callback module**, so a caller's `-behaviour(gen_event)` module is never
+%% invoked -- and the name is not optional either, because `f:notify/1`,
+%% `f:bounded/1` and `f:depth/0` all resolve the bus through `whereis(?MODULE)`.
 %%
-%% Measured: a manager started this way reports
-%% `current_function = {gen_event, fetch_msg, 6}`, and an `f:init/1` that prints is
-%% never entered.
+%% Measured on this build at OTP 28.5 / ERTS 16.4.0.6. Every form below was passed
+%% to `f:gen_event:start_link/2`:
 %%
-%% **What hid it.** `m:i2p_events_tests`'s `manager_callbacks_test` exercised all six
-%% by direct call, and its comment gave a reason that was wrong in a way that made it
-%% look deliberate -- it said the callbacks are unreachable "because the manager ships
-%% with no built-in handlers". They are not; the manager is not this module at all.
-%% A case that calls a function directly passes whether or not anything calls it, so
-%% it asserted that the callbacks *behave* and never that they are *reached*.
+%% | GenMod | outcome |
+%% |---|---|
+%% | `{local, Name}` | ok, and the manager is `f:gen_event` |
+%% | `{global, Name}` | ok, registered globally, and the manager is `f:gen_event` |
+%% | `{Mod, Args}` | **badarg** |
+%% | `{local, Name, Mod}` | **badarg** |
+%% | `{global, Name, Mod}` | **badarg** |
+%% | `{via, Mod, Name, Args}` | **badarg** |
 %%
-%% They are left in place rather than deleted, because recording that they do not run
-%% is a different question from removing them, and because `f:handle_call/2`'s
-%% `{error, unsupported}` is the answer a future reader would want if a form that
-%% registers *and* names a module ever appears. Nothing depends on them either way.
+%% **All four badargs are the same badarg**, raised from `f:gen:where/1`, which is
+%% where `f:gen:start/4` turns a GenMod into the lookup it is going to register --
+%% none of the four is a shape it knows. So the two forms that do work are the two
+%% that register, and neither of them says which module the manager runs.
+%%
+%% `{local, Name}` is the form this bus takes, and a manager started that way
+%% reports \`current_function = {gen_event, fetch_msg, 6}\`.
+%%
+%% **And it is not only that `f:gen_event:start_link/2` cannot ask for it.**
+%% `f:gen_event`'s own
+%% `f:init_it/6` still takes the manager's module and its arguments and **throws
+%% both away** -- its head is
+%% `f:init_it(Starter, Parent, Name0, _Mod, _Args, Options)` and it goes straight
+%% into the manager's loop with an empty state. So the manager-module concept is
+%% vestigial upstream rather than merely unexposed, which is why this is a
+%% measurement of OTP rather than a workaround missing here (#N722YKK).
+%%
+%% ## What that costs, and where it put the work
+%%
+%% **There is no hook in the manager process this module can run, so none of the
+%% bus's own state can live in it.** The subscriber registry is owned by the sampler
+%% -- see *The subscriber registry* below -- which is a process this module really
+%% does start, and it dies with the manager because it monitors it.
+%%
+%% **A handler is not the missing hook**, and it is worth saying why rather than
+%% leaving the objection open: `f:add_handler/3` on this module itself *would* run
+%% code inside the manager, and an ETS table created in a handler's `f:init/1` is
+%% owned by the manager and so dies with it. But every event reaches a handler on
+%% the dispatch path, and bookkeeping would then cost a function call per event on
+%% the router's busiest instrument -- to hold a table the sampler already owns.
+%%
+%% ## What was here instead, and why it is gone
+%%
+%% This module used to declare `-behaviour(gen_event)` and export `f:init/1`,
+%% `f:handle_event/2`, `f:handle_call/2`, `f:handle_info/2`, `f:terminate/2` and
+%% `f:code_change/3`. Six functions describing an arrangement that cannot exist, and
+%% a test that called all six directly and so certified them as covered.
+%%
+%% **`f:handle_call/2` was the one that could never have worked even if a form
+%% appeared.** `f:gen_event:call/3` and `f:gen_event:call/4` dispatch to a named
+%% **handler**, never to the manager module -- the manager looks the handler up in
+%% its handler list and calls that one -- so `{error, unsupported}` was a reply to
+%% a question no caller could ask. Writing them again is an afternoon's work if OTP
+%% grows the form; keeping them until then was a comment that had to stay true
+%% (#N722YKK).
 
 -doc """
 Announce a status change.
@@ -1108,30 +1153,3 @@ detach(Collector) ->
         {error, module_not_found} -> ok;
         Other -> Other
     end.
-
-%% %%%%% %%% gen_event callbacks %%%%% %%%
-%% The manager ships without built-in handlers; subscribers attach their own.
-%%
-%% **None of these run, and that is not the reason.** The manager is `f:gen_event`'s
-%% own module -- see *The manager's own callbacks are dead* above for the measurement
-%% and for why no `f:gen_event:start_link/2` form fixes it on this OTP. The
-%% subscriber registry therefore lives with the sampler, which is a process this
-%% module really does start.
-
-init([]) ->
-    {ok, []}.
-
-handle_event(_Event, State) ->
-    {ok, State}.
-
-handle_call(_Query, State) ->
-    {ok, {error, unsupported}, State}.
-
-handle_info(_Info, State) ->
-    {ok, State}.
-
-terminate(_Arg, _State) ->
-    ok.
-
-code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.

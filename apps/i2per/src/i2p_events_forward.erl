@@ -36,8 +36,8 @@ The manager now watches the collector and this handler removes itself.
 
 **The `'DOWN'` really does arrive here, and that is not obvious.** A monitor
 created inside `f:init/1` is owned by the *manager*, so its `'DOWN'` lands in the
-manager's mailbox -- where `gen_event:fetch_msg/6`'s **catch-all** receive
-(\`gen_event.erl:1619\`) picks it up and `gen_event:handle_msg/3` hands to **every**
+manager's mailbox -- where \`gen_event:fetch_msg/6\`'s **catch-all** receive
+(\`gen_event.erl:1619\`) picks it up and \`gen_event:handle_msg/3\` hands to **every**
 handler's `handle_info/2` (\`gen_event.erl:1690-1692\`). So the message is not
 dropped and does not accumulate in a mailbox: it is routed to this handler, which
 matches it against the monitor it owns and ignores every other handler's.
