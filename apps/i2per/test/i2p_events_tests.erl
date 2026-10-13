@@ -38,6 +38,26 @@ notification there would crash those processes and fail those suites.
 %% stops a true hang from taking the tier with it.
 -define(WEDGED_TESTCASE_TIMEOUT_SECONDS, 30).
 
+%% How long a subscriber's death may take to leave the registry.
+%%
+%% **One subsampler tick plus slack, and no more.** The drop is not immediate: the
+%% subsampler installs a monitor when it reconciles, at most `?BACKLOG_TICK_MS` after a
+%% subscription, so a collector that subscribes and dies inside one tick is noticed on
+%% the next pass. This is a hang guard on a barrier, not a sleep -- `f:await/2` returns
+%% the moment the row is gone -- so a number much larger than a tick would cost nothing
+%% but would hide a subsampler that had stopped reconciling at all.
+-define(REGISTRY_SETTLE_MS, 15000).
+
+%% eunit's outer per-testcase bound for the two registry cases.
+%%
+%% **Generous, and for the same reason as `?FLOOD_TESTCASE_TIMEOUT_SECONDS`:** the
+%% wait is for the subsampler to come round, which is up to one tick. Measured 4.992s
+%% for a single dead collector -- which is a tick, and is within a rounding error of
+%% eunit's 5s default. A case that is cancelled by the clock reports as a failure of
+%% the clock rather than of the property, and two of them failing that way is how a
+%% real defect gets attributed to the harness.
+-define(REGISTRY_TESTCASE_TIMEOUT_SECONDS, 60).
+
 %% Collecting gen_event handler: forwards every event to the test process.
 collector_test() ->
     %% The assertion below matches the exact event this test sends. Other
@@ -615,6 +635,105 @@ subscribe_twice_registers_one_subscriber_test() ->
         ok = i2p_events:unsubscribe(Collector)
     end.
 
+%% A collector that dies stops being a subscriber, and nothing has to unsubscribe it.
+%%
+%% **The leak this pins is the one in production, and it is a restart.** `m:i2p_per_status_state`
+%% never calls `f:unsubscribe/1` -- it is on its own node and it is killed when that
+%% node goes -- so every restart of the status service used to add a handler the bus
+%% went on calling forever, and add a row nothing would ever drop. Both halves are
+%% asserted here because they are fixed by two different processes: `m:i2p_events_forward`
+%% takes the handler off from inside the manager, and the subsampler's monitor drops
+%% the row (#DN82Z7J).
+%%
+%% **The tick is not slept past.** `f:await/2` is a barrier, and the row can only go
+%% once the subsampler has been handed the monitor -- which is at most one
+%% `?BACKLOG_TICK_MS`, because that is how often it reconciles. A case that fixed a
+%% sleep long enough to probably have got it would pass against a registry that
+%% happened to be swept by something else.
+a_dead_collector_is_forgotten_without_unsubscribing_test_() ->
+    {timeout, ?REGISTRY_TESTCASE_TIMEOUT_SECONDS,
+        fun a_dead_collector_is_forgotten_without_unsubscribing/0}.
+
+a_dead_collector_is_forgotten_without_unsubscribing() ->
+    {ok, _} = application:ensure_all_started(i2per),
+    Collector = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    ok = i2p_events:subscribe(Collector),
+    try
+        ?assert(lists:member(Collector, i2p_events:subscribers())),
+        exit(Collector, kill),
+        ok = i2p_ct_helpers:await(
+            fun() -> not lists:member(Collector, i2p_events:subscribers()) end,
+            ?REGISTRY_SETTLE_MS
+        )
+    after
+        ok = i2p_events:unsubscribe(Collector)
+    end.
+
+%% Repeated deaths converge rather than accumulate, which is the claim the single
+%% case above cannot make: one subscriber dying is also what a single detach would
+%% look like, and only a restart pattern tells the two apart.
+%%
+%% **Asserted against the whole list each time**, so a sweep that removed only the
+%% pid it happened to be holding -- the shape `f:detach_all/1` had, where each
+%% subscriber cleaned up its own stale handler and nobody else's -- fails here rather
+%% than in production after the third restart.
+repeated_dead_subscribers_do_not_accumulate_test_() ->
+    {timeout, ?REGISTRY_TESTCASE_TIMEOUT_SECONDS,
+        fun repeated_dead_subscribers_do_not_accumulate/0}.
+
+repeated_dead_subscribers_do_not_accumulate() ->
+    {ok, _} = application:ensure_all_started(i2per),
+    Before = i2p_events:subscribers(),
+    [attach_and_die() || _ <- lists:seq(1, 5)],
+    ok = i2p_ct_helpers:await(
+        fun() -> i2p_events:subscribers() =:= Before end, ?REGISTRY_SETTLE_MS
+    ).
+
+%% The subsampler watches a subscriber and hands the monitor back when it unsubscribes,
+%% and this is the only view of that from outside -- the monitors are private state of
+%% `f:reconcile/1`'s loop and nothing published reads them.
+%%
+%% **Both directions, because the release is the half that leaks.** A reconcile that
+%% only ever added a monitor would hold one for every collector that had ever
+%% subscribed and was still alive: the row is gone from ETS so nothing says to drop
+%% it, and the collector has not died so nothing sends a DOWN. The first version of
+%% this was exactly that, and it is invisible to every other check here -- a stale
+%% monitor costs nothing an operator can observe -- so `process_info/2`'s monitor list
+%% is the one place it shows up at all.
+%%
+%% **`process_info/2` rather than a published figure, and it works because the sampler
+%% is local.** A monitor is this process's own state; the read is served by the VM and
+%% does not go through the manager, which is the property every read on this bus is
+%% built on (#VH7Z0KJ).
+sampler_watches_a_subscriber_and_releases_it_test_() ->
+    {timeout, ?REGISTRY_TESTCASE_TIMEOUT_SECONDS,
+        fun sampler_watches_a_subscriber_and_releases_it/0}.
+
+sampler_watches_a_subscriber_and_releases_it() ->
+    {ok, _} = application:ensure_all_started(i2per),
+    Collector = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    ok = i2p_events:subscribe(Collector),
+    Sampler = whereis(i2p_events_sampler),
+    try
+        ok = i2p_ct_helpers:await(
+            fun() -> watched(Sampler, Collector) end, ?REGISTRY_SETTLE_MS
+        ),
+        ok = i2p_events:unsubscribe(Collector),
+        ok = i2p_ct_helpers:await(
+            fun() -> not watched(Sampler, Collector) end, ?REGISTRY_SETTLE_MS
+        )
+    after
+        ok = i2p_events:unsubscribe(Collector)
+    end.
+
 %% The reading is offered, never pushed. `m:i2p_stats` is an observer of the core and
 %% not part of it, so nothing in this module may hand it a figure on a timer -- and
 %% with no collector asking, the far-side reading costs the router nothing at all.
@@ -635,6 +754,32 @@ far_backlog_is_offered_and_not_pushed_test() ->
 
 count_registered(Collector) ->
     length([P || P <- i2p_events:subscribers(), P =:= Collector]).
+
+%% Whether the subsampler is holding a monitor on this collector.
+%%
+%% **`process_info/2` answers `{monitors, [{process, Pid}]}`** for a plain
+%% `erlang:monitor/2`, measured rather than assumed -- an alias monitor would report
+%% differently, and this is the read that would stop matching if the reconciler ever
+%% changed shape. `undefined` is folded to `false` rather than crashing the predicate,
+%% so a sampler that has been replaced reads as "not watching" instead of taking the
+%% case down with it.
+watched(Sampler, Collector) ->
+    case process_info(Sampler, monitors) of
+        {monitors, Monitors} -> lists:member({process, Collector}, Monitors);
+        undefined -> false
+    end.
+
+%% One subscriber that attaches and dies without unsubscribing, which is the whole
+%% of what a status-service restart looks like from the bus's side.
+attach_and_die() ->
+    Collector = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    ok = i2p_events:subscribe(Collector),
+    exit(Collector, kill),
+    ok.
 
 %%% %%%%% Internal helpers %%%%% %%%
 

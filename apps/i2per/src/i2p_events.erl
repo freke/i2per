@@ -270,7 +270,7 @@ removed heap bound took.
 %% unreachable. Knock-on of the same causes as above, not dead code — the
 %% sampler is what reports the backlog (#VH7Z0KJ).
 -dialyzer({nowarn_function, start_sampler/1}).
-%% **The sampler's three internals, and it is the same knock-on as the two above.**
+%% **The sampler's internals, and it is the same knock-on as the two above.**
 %% They are reached only from the fun `f:start_sampler/1` spawns, and with
 %% `f:start_link/0`'s Ok path invisible to dialyzer the spawn is inside a function
 %% whose success typing is `no_return`, so the reference does not count and dialyzer
@@ -278,8 +278,23 @@ removed heap bound took.
 %% `f:start_link/0`'s Ok branch, and the sampler is what owns the subscriber registry
 %% and reports the backlog (#VH7Z0KJ). The clean fix is the `{async_dist, boolean()}`
 %% entry in `proc_lib:start_spawn_option()`'s type, which is OTP's to make.
+%%
+%% **The registry's reconciler is in this class too, which a comment here once
+%% claimed it was not.** `f:reconcile/1`, `f:carry_or_watch/3`, `f:release_all/1`,
+%% `f:release/1` and `f:forget_gone/3` are reached only from `f:tick/3`, which is itself
+%% only reached from the fun `f:start_sampler/1` spawns -- and dialyzer reports "will
+%% never be called" for all of them, measured rather than assumed. It is the same single
+%% root cause as every entry above: one poisoned success typing at the spawn, not a
+%% separate one each. (Counted rather than left to a reader, because a count that drifts
+%% is the same failure this list is fixing: a nowarn that outlives the function it names
+%% is a claim about code that is no longer there.)
 -dialyzer({nowarn_function, sample_loop/1}).
--dialyzer({nowarn_function, watch/1}).
+-dialyzer({nowarn_function, tick/3}).
+-dialyzer({nowarn_function, reconcile/1}).
+-dialyzer({nowarn_function, carry_or_watch/3}).
+-dialyzer({nowarn_function, release_all/1}).
+-dialyzer({nowarn_function, release/1}).
+-dialyzer({nowarn_function, forget_gone/3}).
 -dialyzer({nowarn_function, stop_sampler/0}).
 start_link() ->
     %% **Only `{local, Name}` registers the manager, and it is the only form this OTP
@@ -504,11 +519,14 @@ and by how much.*
 
 **A subscriber whose pid is gone is pruned, and that is a fact about the registry
 rather than about the depth.** `process_info/2` returns `undefined` for a pid that no
-longer exists, and it is the only way a sweep can learn a remote collector died
-without unsubscribing -- `m:i2per_status_state` never unsubscribes, so a restarted
-status service would otherwise leave the registry growing for the life of the router.
-This is not a substitute for #DN82Z7J: that ticket is about the *handler* the bus
-keeps calling, this only stops us *reading* a queue depth from it.
+longer exists, and it is how a sweep learns a remote collector died without
+unsubscribing. **It is the belt to the sampler's braces, not the braces.** The
+subsampler holds a monitor on every registered subscriber and drops the row the moment
+the pid goes -- see *Why the sampler watches every subscriber* -- so this sweep is
+answering for the window between a subscriber being registered and the subsampler
+noticing, and nothing more. What it must *not* become is the only way a dead
+collector leaves the registry: a prune that runs when somebody asks for a reading is a
+prune that runs exactly when an operator is looking at something else.
 
 **A subscriber that cannot be reached is skipped rather than counted as zero**, so a
 node that is down reports as nothing instead of as an idle one -- the single confusion
@@ -563,6 +581,14 @@ deepest(Depths) ->
 %% keep in step and no other module to ask: a collector cannot be listed without
 %% having been attached, and cannot be attached without being listed.
 %%
+%% **There is a third way off the bus now, and it is not a second copy either.**
+%% `m:i2p_events_forward` takes its own handler off when its collector dies (#DN82Z7J),
+%% and it cannot drop the row describing it -- see *Why the sampler watches every
+%% subscriber* for why that half lands here. So the invariant above is now three paths
+%% rather than two, and the sampler's monitor is the third. It is still one row per
+%% handler and no other module to ask; what changed is that holding them in step takes
+%% a monitor rather than only two write sites.
+%%
 %% It deliberately does **not** live in `m:i2p_stats`. That module is an observer of
 %% the core, not part of it -- the core does not hand data to a stats process it does
 %% not control -- so a registry parked there would be the core calling out to its own
@@ -611,6 +637,13 @@ is being measured does not have to reach into the table. **Local subscribers are
 included** even though the sweep skips them: the registry records who attached, and
 which of them this router can usefully measure is the sweep's decision rather than the
 registry's.
+
+**A collector that has died is not on the list, however it died.** Killing the process,
+losing the node it was on, or never unsubscribing at all -- all three are answered by a
+monitor the subsampler holds, so the row goes when the pid does rather than when
+somebody remembers to unsubscribe. A restarted status service used to leave one behind
+per restart (#DN82Z7J), and a list that grows for the life of the router is a list
+nobody can act on.
 """.
 -spec subscribers() -> [pid()].
 subscribers() ->
@@ -631,6 +664,12 @@ remote_subscribers() ->
 %% `ets:delete/2` answer `true` and the callers match on `ok`. Letting the raw
 %% `true` through reads as a failed match in `f:attach/1`, which is the kind of
 %% error that points at the wrong function entirely.
+%%
+%% **This is a plain `{Collector}` row and not a `{Collector, MRef}` one**, because
+%% nothing outside this module reads the subsampler's monitors and a second column
+%% would mean every reader of the table had to know about a piece of one process's
+%% loop state. The monitors live in `f:tick/3`'s argument, where they are private to
+%% the process that owns them.
 remember(Collector) ->
     case ets:info(?SUBSCRIBERS, name) of
         undefined ->
@@ -690,18 +729,168 @@ sample_loop(Bus) ->
     _ = ets:new(?SUBSCRIBERS, [set, public, named_table, {read_concurrency, true}]),
     _ = sample_backlog(),
     true = register(?SAMPLER, self()),
-    watch(Bus).
+    tick(Bus, erlang:monitor(process, Bus), #{}).
 
-watch(Bus) ->
-    MRef = monitor(process, Bus),
+%% The bus is monitored once, outside the loop, so that a subscriber's death cannot
+%% replace it.
+%%
+%% **The \`after\` is restarted by a \`'DOWN'\`,** because a \`receive\` with a timeout
+%% restarts its timeout on every message it takes. With \`?BACKLOG_TICK_MS\` at 5s that
+%% costs a gauge refresh only when subscribers are dying more than once every five
+%% seconds, which is a status service crash-looping rather than a router at work --
+%% and the alternative is a deadline threaded through the loop to avoid it.
+tick(Bus, BusRef, Watched0) ->
+    %% **Reconciled on every pass, not once at startup.** `f:sample_loop/1` calls this
+    %% once, and nothing else does: a subscriber that arrives later would never be
+    %% watched, and its row would outlive it exactly as before -- which is what the
+    %% first version did, and what `m:i2p_events_tests`'s
+    %% `a_dead_collector_is_forgotten_without_unsubscribing/0` caught. Reconciling on
+    %% each pass is what makes "the next tick picks it up" true, and it costs one ETS
+    %% read per pass.
+    Watched = reconcile(Watched0),
     receive
-        {'DOWN', MRef, process, Bus, _Reason} ->
+        {'DOWN', BusRef, process, Bus, _Reason} ->
             ok;
         stop ->
-            ok
+            ok;
+        {'DOWN', MRef, process, Collector, _Reason} ->
+            tick(Bus, BusRef, forget_gone(Collector, MRef, Watched))
     after ?BACKLOG_TICK_MS ->
         _ = sample_backlog(),
-        watch(Bus)
+        tick(Bus, BusRef, Watched)
+    end.
+
+%% %%%%% %%% Why the sampler watches every subscriber %%%%% %%%
+%%
+%% ## The registry outlives its handler, and nothing else would notice
+%%
+%% **A forwarder whose collector has died now takes itself off the bus**
+%% (\`m:i2p_events_forward\` does it, and #DN82Z7J carries the measurement). That is the
+%% bus's half of the question -- *should it keep calling this pid* -- answered in the
+%% one process that can answer it without an rpc, since every \`gen_event\` call has no
+%% timeout and none of them work against a wedged bus.
+%%
+%% This is the other half: *is the pid still a subscriber*. The registry row outlives
+%% the handler, because the forwarder has no way to drop it -- \`f:forget/1\` is private
+%% to this module, and a core forwarder reaching back into the bus's bookkeeping for
+%% it is exactly the coupling this module's notes argue against. Left alone, the row
+%% survives a collector's death for the life of the router, and \`f:subscribers/0\` --
+%% which promises "every subscriber attached to this bus" -- answers with a pid that
+%% has been gone since the last status-service restart.
+%%
+%% **A monitor, not a liveness probe, and that is the whole reason this is cheap.**
+%% The alternative for a *local* pid is \`is_process_alive/1\`, which would be fine; the
+%% alternative for a *remote* pid is the \`erpc\` round trip \`f:sample_far_backlog/0\`
+%% already makes, once per subscriber per tick, forever, for a question with a one-word
+%% answer. A monitor is free, works across a node boundary, and answers exactly that --
+%% including when the far node itself has gone, where it fires with \`noconnection\`
+%% rather than going unanswered. Measured on OTP 28.5, this build.
+%%
+%% ## It is installed from the table rather than announced
+%%
+%% **The registry is the list, so the sampler reads the list.** Asking for a monitor at
+%% \`f:attach/1\` time would need a message to the sampler and would lose the ask if the
+%% sampler was replaced between the write and the send -- the same replacement that
+%% \`f:stop_sampler/0\` exists to survive. Reconciling against ETS cannot: whatever the
+%% table says, the next tick watches all of it, and a monitor installed on a pid that
+%% has already died fires immediately rather than never.
+%%
+%% **The map is the loop's argument and not a table**, because there is exactly one
+%% reader and it is this process: a second table would be a second thing to create,
+%% own and prune, in a process whose whole justification is that it is small enough to
+%% keep working when the bus does not.
+
+%% Watch every registered subscriber this process is not already watching, and release
+%% every monitor on a collector that is no longer registered.
+%%
+%% **Both directions, because a forward-only reconcile leaks.** The obvious shape --
+%% add a monitor for each row we are not watching, leave the rest alone -- holds a
+%% monitor on a collector that has unsubscribed for as long as that collector lives,
+%% because nothing ever drops it from the map: it is still alive, so no DOWN arrives,
+%% and it is gone from ETS, so no row says to release it. `m:i2p_ssu2_reachability`
+%% unsubscribes in `f:terminate/2`, so this is not hypothetical.
+%%
+%% **The new map is built from the registry rather than edited into the old one**, so
+%% "what this loop watches" is "what is registered" by construction, and a map entry
+%% can only survive by being re-derived from a row that still exists.
+%%
+%% **Runs once per `?BACKLOG_TICK_MS` and once per subscription, not once per event.**
+%% A collector that subscribed since the last tick is watched by the next one, so a dead
+%% one is dropped within a tick even if nothing is ever announced again; and the bus
+%% answers `f:notify/1` far more often than either, which is the point -- this is
+%% bookkeeping, and it must not be in the dispatch path.
+reconcile(Watched) ->
+    Registered = subscribers(),
+    release_all(maps:values(maps:without(Registered, Watched))),
+    lists:foldl(
+        fun(Collector, Acc) -> carry_or_watch(Collector, Watched, Acc) end, #{}, Registered
+    ).
+
+%% Carry a collector's existing monitor across, or make one.
+%%
+%% **The lookup is in `Previous`, not in the map being built, and the first version got
+%% that wrong in a way only a failing test caught.** Consulting the accumulator means
+%% only the collectors already folded in are found, so nothing is ever found and every
+%% collector is re-monitored on every pass: the sampler's monitor set grew without
+%% bound, and -- worse -- the `'DOWN'` that finally arrived carried a *stale* MRef,
+%% which `f:forget_gone/3` correctly refused to match, so the row was never dropped.
+%% Symptom, measured: five subscribers attaching and dying left **four** rows behind
+%% rather than none, while the sampler held a monitor per subscriber per tick.
+%%
+%% **Carrying the monitor across is what makes `f:forget_gone/3`'s check sound.** It
+%% compares the monitor in the `'DOWN'` against the one this loop believes it holds; a
+%% second monitor on the same collector would deliver a second `'DOWN'` for one death
+%% and leave that check the only thing between it and a live subscriber's row going.
+carry_or_watch(Collector, Previous, Watched) ->
+    case maps:find(Collector, Previous) of
+        {ok, MRef} -> Watched#{Collector => MRef};
+        error -> Watched#{Collector => erlang:monitor(process, Collector)}
+    end.
+
+%% Hand back every monitor on a collector that is no longer registered.
+%%
+%% **`maps:values/1` and not `maps:foreach/2`,** because the map is keyed by collector
+%% and `maps:foreach/2` calls its fun with *both* key and value. A `release/1` handed
+%% straight to it is an arity error raised inside the sampler on its first
+%% unsubscribe -- which takes the registry table down with it, because the sampler owns
+%% that table. Measured, not reasoned: every registry case in `m:i2p_events_tests` went
+%% red on it, and the first symptom was `ets:info(i2p_events_subscribers, name)`
+%% answering `undefined`.
+release_all(MRefs) ->
+    lists:foreach(fun release/1, MRefs),
+    ok.
+
+%% A collector that unsubscribed is not a subscriber any more, and its monitor is ours
+%% to hand back.
+%%
+%% **`[flush]` because the DOWN may already be in the mailbox.** A monitor that has
+%% already fired is not released by `demonitor/2`, so without the flush the message
+%% would arrive later for a collector this loop has stopped watching -- harmless, since
+%% `f:forget_gone/3` checks the monitor before deleting a row, but it would be a
+%% message in this process's mailbox answering a question nobody asked.
+release(MRef) ->
+    _ = erlang:demonitor(MRef, [flush]),
+    ok.
+
+%% A collector's \`'DOWN'\`, and the one question the table can answer about it.
+%%
+%% **Matching the monitor before deleting anything**, because the \`'DOWN'\` may belong
+%% to a subscriber this process has already stopped watching: \`f:forget_gone/3\` is
+%% reached from a bare \`'DOWN'\` clause, and a row deleted on a monitor that is not
+%% this one's current monitor would remove a *live* subscriber's registration.
+%%
+%% **The handler is not deleted here.** \`m:i2p_events_forward\` has already taken itself
+%% off by the time this runs -- both are driven by the same monitor firing, and the
+%% manager sees its own first because the handler is inside it. So this answers only
+%% the table's half, which is what a caller reaching into another module's bookkeeping
+%% could not do.
+forget_gone(Collector, MRef, Watched) ->
+    case maps:take(Collector, Watched) of
+        {MRef, Rest} ->
+            ok = forget(Collector),
+            Rest;
+        _ ->
+            Watched
     end.
 
 %% Make sure no sampler is left, so the next start creates the registry rather than

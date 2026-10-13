@@ -177,12 +177,20 @@ far_backlog_falls_when_the_remote_subscriber_drains(Config) ->
     end.
 
 %% A subscriber that has died is dropped from the registry, and this is the case that
-%% keeps the registry from growing for the life of the router.
+%% covers the sweep's own path.
 %%
-%% **It matters because nothing else prunes it.** `m:i2per_status_state` never
-%% unsubscribes, so on the deployment this map calls supported -- the status service on
-%% its own node, restarting -- every restart would otherwise leave a pid behind, and
-%% the sweep would go on asking about a dead process forever.
+%% **It used to claim to be the only thing that pruned it, and no longer does.**
+%% `m:i2per_status_state` never unsubscribes, so on the deployment this map calls
+%% supported -- the status service on its own node, restarting -- every restart used to
+%% leave a pid behind. The subsampler now holds a monitor on every registered
+%% subscriber and drops the row the moment the pid goes (#DN82Z7J), which is what makes
+%% that deployment sound.
+%%
+%% **What this still covers is the remote case, and it is the one the subsampler cannot
+%% answer on its own.** The sweep is what turns "this remote pid no longer exists" into
+%% a fact, using the `erpc` that is its whole reason for existing; the subsampler's
+%% monitor would also fire here, and this case is what keeps the sweep's answer honest
+%% rather than assuming the monitor already did the work.
 %%
 %% The collector is killed rather than detached, so the registry genuinely holds a pid
 %% that no longer exists, which is the only input the sweep can learn anything from.
