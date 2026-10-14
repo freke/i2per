@@ -8,13 +8,7 @@ the ECIES session key manager, and tunnel build-record encryption:
 
 - Ed25519 signing (sig type 7, pure RFC 8032).
 - X25519 Diffie-Hellman (crypto type 4, RFC 7748).
-- Elligator2 encoding/decoding of X25519 public keys (ECIES-X25519
-  specification, [`Elligator2`](https://elligator.cr.yp.to/elligator-20130828.pdf)),
-  so handshake ephemeral keys are indistinguishable from uniform random bytes.
-- HKDF-SHA256 (RFC 5869), the Noise-style MixHash/MixKey primitives, and the
-  pure key-derivation steps of the ECIES ratchets: `dh_initialize/2` (tag-set
-  initialization), the session-tag chain, the symmetric-key chain, the DH
-  ratchet tag-set KDF and the New Session Reply tag-set KDF.
+- HKDF-SHA256 (RFC 5869), and the Noise-style MixHash/MixKey primitives.
 - ChaCha20-Poly1305 AEAD (RFC 7539 section 2.8) in both split and sealed
   (ciphertext || tag) forms, with the New Session / New Session Reply zero
   nonce and the Existing Session counter nonce.
@@ -40,20 +34,8 @@ true = i2p_crypto:ed25519_verify(Data, Sig, Pub).
 {BPub, BPriv} = i2p_crypto:x25519_keygen(),
 Shared = i2p_crypto:x25519_dh(APriv, BPub).
 
-%% Elligator2-encoded ephemeral keys for New Session / New Session Reply
-{Pub, Priv, Repr} = i2p_crypto:x25519_keygen_elg2(),
-{ok, Pub} = i2p_crypto:elligator2_decode(Repr).
+%% AEAD sealing of a payload block:
 
-%% Noise initialization for the IK handshake
-{H, Ck} = i2p_crypto:noise_initialize(),
-H1 = i2p_crypto:mixhash(H, Pub),
-{Ck1, K} = i2p_crypto:mixkey(Ck, SharedSecret).
-
-%% A tag set for one direction of an Existing Session
-Tagset = i2p_crypto:dh_initialize(Ck1, K),
-#{next_root_key := RootKey, sess_tag_ck := TagCk, symm_key_ck := KeyCk} = Tagset.
-
-%% AEAD sealing of a payload block
 CT = i2p_crypto:chacha20_poly1305_seal(K, i2p_crypto:zero_nonce(), Payload, H),
 {ok, Payload} = i2p_crypto:chacha20_poly1305_open(K, i2p_crypto:zero_nonce(), CT, H).
 ```
@@ -61,9 +43,7 @@ CT = i2p_crypto:chacha20_poly1305_seal(K, i2p_crypto:zero_nonce(), Payload, H),
 ## Validation
 
 The Ed25519, X25519, HKDF and ChaCha20-Poly1305 primitives are validated
-against the published RFC 8032, RFC 7748, RFC 5869 and RFC 7539 test vectors;
-Elligator2 is validated against the reference `Elligator2.java` vectors. The
-ratchet KDFs are deterministic and preserve the documented state structure.
+against the published RFC 8032, RFC 7748, RFC 5869 and RFC 7539 test vectors.
 """.
 
 -export([
@@ -73,21 +53,9 @@ ratchet KDFs are deterministic and preserve the documented state structure.
     x25519_keygen/0,
     x25519_public_key/1,
     x25519_dh/2,
-    x25519_keygen_elg2/0,
-    elligator2_encode/1,
-    elligator2_encode/2,
-    elligator2_encode/3,
-    elligator2_decode/1,
     hkdf_sha256/4,
     mixhash/2,
     mixkey/2,
-    noise_initialize/0,
-    dh_initialize/2,
-    session_tag_chain_init/1,
-    session_tag_chain_step/2,
-    symmetric_ratchet/1,
-    dh_ratchet_tagset/2,
-    session_reply_tagset/1,
     noise_n_initialize/0,
     noise_n_encrypt/5,
     noise_n_decrypt/6,
@@ -110,7 +78,6 @@ ratchet KDFs are deterministic and preserve the documented state structure.
     ed25519_seed/0,
     ed25519_signature/0,
     shared_secret/0,
-    representative/0,
     key/0,
     nonce/0,
     tag/0,
@@ -122,8 +89,6 @@ ratchet KDFs are deterministic and preserve the documented state structure.
     salt/0,
     hkdf_ikm/0,
     hkdf_info/0,
-    session_tag/0,
-    tagset/0,
     aes_block/0,
     aes_iv/0,
     iv12/0
@@ -149,9 +114,6 @@ ratchet KDFs are deterministic and preserve the documented state structure.
 
 -doc "A 32-byte X25519 shared secret, little endian.".
 -type shared_secret() :: <<_:256>>.
-
--doc "A 32-byte Elligator2 representative (encoded X25519 public key).".
--type representative() :: <<_:256>>.
 
 -doc "A 32-byte symmetric cipher key.".
 -type key() :: <<_:256>>.
@@ -186,22 +148,6 @@ ratchet KDFs are deterministic and preserve the documented state structure.
 -doc "HKDF info (context) string.".
 -type hkdf_info() :: binary().
 
--doc "An 8-byte Existing Session tag.".
--type session_tag() :: <<_:64>>.
-
--doc """
-A tag set derived by `dh_initialize/2` for one direction of a session.
-
-- `next_root_key` — root key input for a subsequent DH ratchet.
-- `sess_tag_ck` — chain key for the session-tag ratchet.
-- `symm_key_ck` — chain key for the symmetric-key ratchet.
-""".
--type tagset() :: #{
-    next_root_key := chaining_key(),
-    sess_tag_ck := chaining_key(),
-    symm_key_ck := chaining_key()
-}.
-
 -doc "A 16-byte AES block (cipher/plaintext block, CBC-NO-PADDING).".
 -type aes_block() :: <<_:128>>.
 
@@ -211,19 +157,7 @@ A tag set derived by `dh_initialize/2` for one direction of a session.
 -doc "A 12-byte raw ChaCha20 initialization vector (I2P tunnel reply record format).".
 -type iv12() :: <<_:96>>.
 
--define(PROTOCOL_NAME, <<"Noise_IKelg2+hs2_25519_ChaChaPoly_SHA256">>).
 -define(NOISE_N_PROTOCOL_NAME, <<"Noise_N_25519_ChaChaPoly_SHA256">>).
-
--define(P, (1 bsl 255) - 19).
--define(P_PLUS_3_DIV_8, (((1 bsl 255) - 19) + 3) div 8).
--define(P_MINUS_1_DIV_2, (((1 bsl 255) - 19) - 1) div 2).
--define(P_MINUS_1_DIV_4, ((((1 bsl 255) - 19) - 1) div 2) div 2).
--define(SQRT_NEG_1_EXP, (((1 bsl 255) - 19) - 1) div 4).
--define(A, 486662).
--define(NEG_A, ((1 bsl 255) - 486681)).
--define(U, 2).
--define(INV_U, ((1 bsl 254) - 9)).
-
 -doc """
 Generate a fresh Ed25519 key pair.
 
@@ -294,138 +228,6 @@ x25519_dh(Priv, Pub) ->
     crypto:compute_key(ecdh, Pub, Priv, x25519).
 
 -doc """
-Generate an X25519 key pair suitable for Elligator2 encoding.
-
-Roughly half of all X25519 public keys cannot be Elligator2-encoded; this
-function retries until a suitable key pair is found, so its runtime is
-geometric. The returned representative uses a random `alternative` bit and
-random high bits, ready for the wire.
-
-Input: none.
-Output: `{PublicKey, PrivateKey, Representative}`.
-""".
--spec x25519_keygen_elg2() -> {x25519_public_key(), x25519_private_key(), representative()}.
-x25519_keygen_elg2() ->
-    {Pub, Priv} = x25519_keygen(),
-    case elligator2_encode(Pub) of
-        {ok, Repr} -> {Pub, Priv, Repr};
-        error -> x25519_keygen_elg2()
-    end.
-
--doc """
-Elligator2-encode an X25519 public key (wire form).
-
-The `alternative` bit and the two high bits of byte 31 are chosen at random,
-so the output looks like 256 uniform random bits. Two out of eight possible
-encodings of the same key require the `alternative` bit to match on decode;
-because the bit is recoverable from the representative, round-tripping is
-unambiguous.
-
-Input: `Pub` — a 32-byte X25519 public key.
-Output: `{ok, Representative}` or `error` if the key cannot be encoded.
-""".
--spec elligator2_encode(x25519_public_key()) -> {ok, representative()} | error.
-elligator2_encode(Pub) ->
-    <<Rand>> = crypto:strong_rand_bytes(1),
-    Alternative = (Rand band 1) =:= 0,
-    elligator2_encode(Pub, Alternative, Rand).
-
--doc """
-Elligator2-encode an X25519 public key with an explicit `alternative` bit.
-
-The two high bits of byte 31 are set to zero. Intended for testing and for
-callers that need to reproduce a specific encoding.
-
-Input: `Pub` — a 32-byte X25519 public key; `Alternative` — the parity bit
-that selects between the two encodings of the key.
-Output: `{ok, Representative}` or `error` if the key cannot be encoded.
-""".
--spec elligator2_encode(x25519_public_key(), boolean()) -> {ok, representative()} | error.
-elligator2_encode(Pub, Alternative) ->
-    elligator2_encode(Pub, Alternative, 0).
-
--doc """
-Elligator2-encode an X25519 public key with full control over the high bits.
-
-Input: `Pub` — a 32-byte X25519 public key; `Alternative` — the parity bit;
-`HighBits` — a byte whose two most significant bits are ORed into byte 31 of
-the representative.
-Output: `{ok, Representative}` or `error` if the key cannot be encoded.
-""".
--spec elligator2_encode(x25519_public_key(), boolean(), byte()) ->
-    {ok, representative()} | error.
-elligator2_encode(Pub, Alternative0, HighBits) ->
-    X = little_int(Pub),
-    Alternative =
-        case X of
-            0 -> false;
-            _ -> Alternative0
-        end,
-    % v = -u*x*(x + A) (mod p), used for the Legendre test
-    V = mod(-?U * X * (X + ?A), ?P),
-    case legendre(V) of
-        -1 ->
-            error;
-        _ ->
-            case encode_r0(X, Alternative) of
-                error ->
-                    error;
-                R0 ->
-                    % r = sqrt(r/u) (mod p), least-representative root
-                    R = square_root(mod(R0 * ?INV_U, ?P)),
-                    Repr0 = little_bin32(R),
-                    <<Rest:31/binary, Last>> = Repr0,
-                    {ok, <<Rest/binary, (Last bor (HighBits band 16#c0))>>}
-            end
-    end.
-
-%% r = -(x + A)/x (alternative) or -x/(x + A); error if the denominator is 0.
-encode_r0(X, true) ->
-    mod(mod(-(X + ?A), ?P) * mod_inv(X, ?P), ?P);
-encode_r0(X, false) ->
-    case mod(X + ?A, ?P) of
-        0 -> error;
-        XA -> mod(X * mod_inv(mod(-XA, ?P), ?P), ?P)
-    end.
-
--doc """
-Elligator2-decode a representative back into an X25519 public key.
-
-The two high bits of byte 31 are masked out before decoding (the ENCODE
-inverse).
-
-Input: `Repr` — a 32-byte representative.
-Output: `{ok, PublicKey}` or `error` if the representative is invalid
-(about 10 of the 2^254 possible representatives fail).
-""".
--spec elligator2_decode(representative()) -> {ok, x25519_public_key()} | error.
-elligator2_decode(Repr) ->
-    <<Rest:31/binary, Last>> = Repr,
-    R = little_int(<<Rest/binary, (Last band 16#3f)>>),
-    case R >= ?P_MINUS_1_DIV_2 of
-        true ->
-            error;
-        false ->
-            Denom = mod(1 + ?U * mod(R * R, ?P), ?P),
-            case Denom of
-                0 ->
-                    error;
-                _ ->
-                    % v = -A / (1 + u*r^2) (mod p)
-                    V = mod(?NEG_A * mod_inv(Denom, ?P), ?P),
-                    % t = v^3 + A*v^2 + v = v^2*(v + A) + v (mod p)
-                    T = mod(mod(V * V, ?P) * mod(V + ?A, ?P) + V, ?P),
-                    E = legendre(T),
-                    X =
-                        case E of
-                            1 -> V;
-                            _ -> mod(?P - V - ?A, ?P)
-                        end,
-                    {ok, little_bin32(X)}
-            end
-    end.
-
--doc """
 HKDF-SHA256 as specified in RFC 5869.
 
 Input: `Salt` — HKDF salt (an empty salt is treated as 32 zero bytes, per
@@ -462,125 +264,6 @@ Output: `{Ck', K}` — the new chaining key and the 32-byte cipher key.
 mixkey(Ck, DH) ->
     <<Ck2:32/binary, K:32/binary>> = hkdf_sha256(Ck, DH, <<>>, 64),
     {Ck2, K}.
-
--doc """
-Noise initialization for the ECIES IK pattern, including the null prologue.
-
-`h = SHA256(protocol_name)`, `ck = h`, then `h = SHA256(h)` (MixHash of the
-empty prologue). `protocol_name` is the 40-byte
-`"Noise_IKelg2+hs2_25519_ChaChaPoly_SHA256"`. Identical for both bound (IK)
-and unbound (N) sessions, and precomputable by both peers for all
-connections.
-
-Input: none.
-Output: `{H, Ck}` — the chaining hash and chaining key after the null
-prologue.
-""".
--spec noise_initialize() -> {hash(), chaining_key()}.
-noise_initialize() ->
-    H0 = crypto:hash(sha256, ?PROTOCOL_NAME),
-    {crypto:hash(sha256, H0), H0}.
-
--doc """
-DH ratchet / tag-set initialization (`DH_INITIALIZE(rootKey, k)`).
-
-Creates a tag set for a single direction and the next root key for a
-subsequent DH ratchet. Used to generate the New Session Reply tag set, the
-two initial Existing Session tag sets, and each post-ratchet tag set.
-
-`keydata = HKDF(RootKey, K, "KDFDHRatchetStep", 64)` then
-`keydata = HKDF(ck, ZEROLEN, "TagAndKeyGenKeys", 64)`.
-
-Input: `RootKey` — the root key (for the first tag sets, the New Session
-payload chaining key); `K` — the tag-set seed (for the first tag sets, the
-`k` from the handshake or Noise `split()`).
-Output: a `t:tagset/0` map.
-""".
--spec dh_initialize(chaining_key(), key()) -> tagset().
-dh_initialize(RootKey, K) ->
-    <<NextRootKey:32/binary, Ck:32/binary>> = hkdf_sha256(RootKey, K, <<"KDFDHRatchetStep">>, 64),
-    <<SessTagCk:32/binary, SymmKeyCk:32/binary>> =
-        hkdf_sha256(Ck, <<>>, <<"TagAndKeyGenKeys">>, 64),
-    #{next_root_key => NextRootKey, sess_tag_ck => SessTagCk, symm_key_ck => SymmKeyCk}.
-
--doc """
-Initialize a session-tag ratchet chain.
-
-`keydata = HKDF(SessTagCk, ZEROLEN, "STInitialization", 64)`; the first 32
-bytes become the chain key and the last 32 bytes the per-tag-set constant.
-
-Input: `SessTagCk` — the `sess_tag_ck` from a `t:tagset/0`.
-Output: `{ChainKey, Constant}` — the chain key and the `SESSTAG_CONSTANT`.
-""".
--spec session_tag_chain_init(chaining_key()) -> {chaining_key(), key()}.
-session_tag_chain_init(SessTagCk) ->
-    <<ChainKey:32/binary, Constant:32/binary>> =
-        hkdf_sha256(SessTagCk, <<>>, <<"STInitialization">>, 64),
-    {ChainKey, Constant}.
-
--doc """
-Advance a session-tag ratchet chain one step.
-
-`keydata = HKDF(ChainKey, Constant, "SessionTagKeyGen", 64)`; the first 32
-bytes become the next chain key and the first 8 bytes of the last 32 the
-session tag.
-
-Input: `ChainKey` — the current chain key; `Constant` — the tag-set constant
-from `session_tag_chain_init/1`.
-Output: `{ChainKey', Tag}` — the next chain key and the 8-byte session tag.
-""".
--spec session_tag_chain_step(chaining_key(), key()) -> {chaining_key(), session_tag()}.
-session_tag_chain_step(ChainKey, Constant) ->
-    <<Next:32/binary, TagData:32/binary>> =
-        hkdf_sha256(ChainKey, Constant, <<"SessionTagKeyGen">>, 64),
-    <<Tag:8/binary, _/binary>> = TagData,
-    {Next, Tag}.
-
--doc """
-Advance the symmetric-key ratchet chain one step.
-
-`keydata = HKDF(SymmKeyCk, ZEROLEN, "SymmetricRatchet", 64)`; the first 32
-bytes become the next chain key and the last 32 bytes the symmetric key.
-
-Input: `SymmKeyCk` — the current `symm_key_ck` chain key.
-Output: `{ChainKey', K}` — the next chain key and the 32-byte session key.
-""".
--spec symmetric_ratchet(chaining_key()) -> {chaining_key(), key()}.
-symmetric_ratchet(SymmKeyCk) ->
-    <<Next:32/binary, K:32/binary>> = hkdf_sha256(SymmKeyCk, <<>>, <<"SymmetricRatchet">>, 64),
-    {Next, K}.
-
--doc """
-DH ratchet tag-set KDF (`XDHRatchetTagSet`).
-
-Derives a new single-direction tag set after new DH keys are exchanged in
-Next Key blocks.
-
-`tagsetKey = HKDF(SharedSecret, ZEROLEN, "XDHRatchetTagSet", 32)` then
-`DH_INITIALIZE(RootKey, tagsetKey)`.
-
-Input: `SharedSecret` — the DH result of the new ratchet keys; `RootKey` —
-the `next_root_key` from the previous tag set in this direction.
-Output: a `t:tagset/0` map for the new tag set.
-""".
--spec dh_ratchet_tagset(shared_secret(), chaining_key()) -> tagset().
-dh_ratchet_tagset(SharedSecret, RootKey) ->
-    TagsetKey = hkdf_sha256(SharedSecret, <<>>, <<"XDHRatchetTagSet">>, 32),
-    dh_initialize(RootKey, TagsetKey).
-
--doc """
-New Session Reply tag-set KDF (`SessionReplyTags`).
-
-`tagsetKey = HKDF(ChainKey, ZEROLEN, "SessionReplyTags", 32)` then
-`DH_INITIALIZE(ChainKey, tagsetKey)`.
-
-Input: `ChainKey` — the chaining key from the New Session message.
-Output: a `t:tagset/0` map whose tags correlate the reply to the session.
-""".
--spec session_reply_tagset(chaining_key()) -> tagset().
-session_reply_tagset(ChainKey) ->
-    TagsetKey = hkdf_sha256(ChainKey, <<>>, <<"SessionReplyTags">>, 32),
-    dh_initialize(ChainKey, TagsetKey).
 
 -doc """
 Initialize the Noise N pattern (`Noise_N_25519_ChaChaPoly_SHA256`).
@@ -862,57 +545,3 @@ expand(Prk, Info, Len, N, Prev, Acc) ->
 
 hmac_sha256(Key, Data) ->
     crypto:mac(hmac, sha256, Key, Data).
-
-%% x^((p+3)/8) (mod p), the square root that is in the lower half of the
-%% field; if the input is not a square this returns a garbage root, so the
-%% caller must have verified the Legendre symbol first.
-square_root(X) ->
-    T = mod_pow(X, ?P_MINUS_1_DIV_4, ?P),
-    Result0 = mod_pow(X, ?P_PLUS_3_DIV_8, ?P),
-    Result1 =
-        case T + 1 =:= ?P of
-            true -> mod(Result0 * sqrt_neg_1(), ?P);
-            false -> Result0
-        end,
-    case Result1 > ?P_MINUS_1_DIV_2 of
-        true -> mod(?P - Result1, ?P);
-        false -> Result1
-    end.
-
-%% Legendre symbol of a (mod p), assuming 0 =< a < p: 1 if a is a nonzero
-%% square, 0 if a = 0, -1 otherwise.
-legendre(0) ->
-    0;
-legendre(A) ->
-    case mod_pow(A, ?P_MINUS_1_DIV_2, ?P) of
-        1 -> 1;
-        _ -> -1
-    end.
-
-%% sqrt(-1) = 2^((p-1)/4) (mod p); cached after first computation.
-sqrt_neg_1() ->
-    case persistent_term:get({?MODULE, sqrt_neg_1}, undefined) of
-        undefined ->
-            V = mod_pow(2, ?SQRT_NEG_1_EXP, ?P),
-            persistent_term:put({?MODULE, sqrt_neg_1}, V),
-            V;
-        V ->
-            V
-    end.
-
-mod_pow(Base, Exp, Mod) ->
-    binary:decode_unsigned(crypto:mod_pow(Base, Exp, Mod)).
-
-%% Multiplicative inverse modulo the prime, by Fermat's little theorem.
-%% Callers must not pass 0.
-mod_inv(A, P) when A =/= 0 ->
-    mod_pow(A, P - 2, P).
-
-mod(X, P) ->
-    (X rem P + P) rem P.
-
-little_int(<<I:256/little-unsigned>>) ->
-    I.
-
-little_bin32(I) ->
-    <<I:256/little-unsigned>>.
