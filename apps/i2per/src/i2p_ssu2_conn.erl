@@ -739,7 +739,7 @@ peek_peertest(Packet, State) ->
     false.
 
 own_type7(Packet, State) ->
-    OwnIntro = maps:get(intro_key, maps:get(local, maps:get(config, State))),
+    OwnIntro = maps:get(intro_key, State),
     case i2p_ssu2:open_long(Packet, OwnIntro, OwnIntro) of
         {ok, <<_Dst:64/big-unsigned-integer, _Num:32, ?TYPE_PEER_TEST:8, _/binary>>} -> true;
         _ -> false
@@ -760,7 +760,7 @@ peek_holepunch(Packet, State) ->
     false.
 
 own_type11(Packet, State) ->
-    OwnIntro = maps:get(intro_key, maps:get(local, maps:get(config, State))),
+    OwnIntro = maps:get(intro_key, State),
     case i2p_ssu2:open_long(Packet, OwnIntro, OwnIntro) of
         {ok, <<_Dst:64/big-unsigned-integer, _Num:32, ?TYPE_HOLE_PUNCH:8, _/binary>>} -> true;
         _ -> false
@@ -772,7 +772,7 @@ own_type11(Packet, State) ->
 %% surfaced to the owner so the relay flow is observable; it carries the
 %% RelayResponse Charlie signed for us (block 8) in its payload.
 holepunch(Packet, State) ->
-    OwnIntro = maps:get(intro_key, maps:get(local, maps:get(config, State))),
+    OwnIntro = maps:get(intro_key, State),
     case i2p_ssu2:decode_holepunch(OwnIntro, Packet) of
         {ok, Info} ->
             i2p_log:debug({holepunch, received}, role(State)),
@@ -789,7 +789,7 @@ holepunch(Packet, State) ->
 %% key and routed here by the nonce-derived connection ID. Match the echoed
 %% nonce against the outstanding test and feed the result state machine.
 out_of_session_peertest(Packet, State = #{pending_test := Pending}) when Pending =/= undefined ->
-    OwnIntro = maps:get(intro_key, maps:get(local, maps:get(config, State))),
+    OwnIntro = maps:get(intro_key, State),
     case i2p_ssu2:decode_peertest(OwnIntro, Packet) of
         {ok, #{blocks := Blocks}} ->
             case lists:keyfind(peertest, 1, Blocks) of
@@ -897,6 +897,10 @@ become_established(HS, Keys, State) ->
     end.
 
 become_established_common(HS, Keys, State) ->
+    OrgConfig = maps:get(config, State),
+    OwnIntro = maps:get(intro_key, maps:get(local, OrgConfig)),
+    RetainedLocal = #{intro_key => OwnIntro, sign_seed => maps:get(sign_seed, maps:get(local, OrgConfig), undefined)},
+    ReducedConfig = OrgConfig#{local => RetainedLocal},
     case maps:get(timer_ref, State, undefined) of
         undefined ->
             ok;
@@ -916,6 +920,13 @@ become_established_common(HS, Keys, State) ->
             reassembly => #{},
             pending_test => undefined,
             pt_target => undefined,
+            %% The steady-state data path reads the introduction key from this
+            %% field rather than descending through config/local per packet.
+            intro_key => OwnIntro,
+            %% The retained configuration is what a data-phase session needs:
+            %% no RouterInfo and no static material. See the retained-local
+            %% note above.
+            config => ReducedConfig,
             %% The handshake's inbound reassembly buffer. It only ever holds
             %% SessionConfirmed fragments, and by here they have all been
             %% consumed, so leaving it resident would keep the last fragment's
@@ -924,7 +935,13 @@ become_established_common(HS, Keys, State) ->
             %% what the handshake happened to leave behind rather than on its
             %% data phase.
             fragments => [],
-            sr_info => undefined
+            sr_info => undefined,
+            %% `remote_ri` was only needed to hand Alice's RouterInfo to the
+            %% owner on establishment; keeping it in the session would mirror
+            %% the very retention this transition exists to drop (NTCP2 hands
+            %% `RemoteRI` over and then holds none). `peer_intro` (the Bob
+            %% side's need) is a derived key and stays.
+            remote_ri => undefined
         },
     State2 = arm_keepalive_timer(arm_idle_timer(State1)),
     case role(State2) of
@@ -944,7 +961,7 @@ data_packet(Packet, State = #{keys := Keys}) ->
             alice -> ba;
             bob -> ab
         end,
-    OwnIntro = maps:get(intro_key, maps:get(local, maps:get(config, State))),
+    OwnIntro = maps:get(intro_key, State),
     case i2p_ssu2:decode_data(Keys, RecvDir, OwnIntro, Packet) of
         {ok, #{pkt_num := Num, immediate_ack := ImmediateAck, blocks := Blocks}} ->
             on_data(Num, Blocks, ImmediateAck, RecvDir, State);
