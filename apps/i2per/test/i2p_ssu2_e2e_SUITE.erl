@@ -449,7 +449,7 @@ receive_window_does_not_grow_with_traffic(_Config) ->
 %% third -- a RouterInfo, a hash, a seed that need not be kept -- fails here by
 %% name instead of becoming per-session retained state that scales with the cap.
 established_session_retains_no_identity_material(_Config) ->
-    {APid, BPid, AliceRI} = establish_pair_with_ri(),
+    {APid, BPid, AliceRI, ASeed, BSeed} = establish_pair_with_ri(),
     AState = sys:get_state(APid),
     BState = sys:get_state(BPid),
 
@@ -464,6 +464,25 @@ established_session_retains_no_identity_material(_Config) ->
         [AState, BState]
     ),
 
+    %% **The key set is a floor, not the claim -- so the values are asserted
+    %% too.** `sign_seed` is retained because the in-session peer-test roles
+    %% sign with it, and a session holding the wrong seed produces signatures
+    %% that fail at the peer rather than at anything local. Checking that the
+    %% key *exists* would pass against `sign_seed => undefined`, which is what
+    %% this fixture used to yield for Bob.
+    ALocal = maps:get(local, maps:get(config, AState)),
+    BLocal = maps:get(local, maps:get(config, BState)),
+    true = (ASeed =:= maps:get(sign_seed, ALocal)),
+    true = (BSeed =:= maps:get(sign_seed, BLocal)),
+    %% And neither side kept the static keypair, which is the rest of what
+    %% `local_keys()` carries and the rest of what the data phase cannot use.
+    lists:foreach(
+        fun(Local) ->
+            [] = [K || K <- [static_priv, static_pub, sign_pub, hash, ri], maps:is_key(K, Local)]
+        end,
+        [ALocal, BLocal]
+    ),
+
     %% **The peer's RouterInfo is not retained.** Bob's `remote_ri` is Alice's
     %% RouterInfo -- the 1,464-byte term the ticket was about -- and Alice's
     %% never had one. Asserted on both so the field cannot come back on either
@@ -474,6 +493,15 @@ established_session_retains_no_identity_material(_Config) ->
     %% on a correct fix that clears by assignment.
     lists:foreach(
         fun(State) -> undefined = maps:get(remote_ri, State, undefined) end,
+        [AState, BState]
+    ),
+
+    %% **Nor is our own encoded RouterInfo.** `config.ri_block` is the block we
+    %% put in our SessionConfirmed -- the same 1.4 KB, retained as our own
+    %% rather than the peer's. It is read exactly once, by `maybe_created/2`,
+    %% and this is the assertion that it stays read exactly once.
+    lists:foreach(
+        fun(State) -> undefined = maps:get(ri_block, maps:get(config, State), undefined) end,
         [AState, BState]
     ),
 
@@ -502,7 +530,6 @@ established_session_retains_no_identity_material(_Config) ->
     %% them. Asserted against the retained `local` map it was derived from, so a
     %% top-level field that disagreed with `config/local` fails here rather than
     %% decrypting nothing correctly.
-    BLocal = maps:get(local, maps:get(config, BState)),
     true = (maps:get(intro_key, BLocal) =:= maps:get(intro_key, BState)).
 
 %% ---------------------------------------------------------------------------
@@ -590,17 +617,32 @@ drain(To) ->
 %% Stand up an Alice and a Bob session over two loopback listeners, with both
 %% owners confirmed and the derived direction keys checked to agree.
 establish_pair() ->
-    {APid, BPid, _AliceRI} = establish_pair_with_ri(),
+    {APid, BPid, _RI, _ASeed, _BSeed} = establish_pair_with_ri(),
     {APid, BPid}.
 
-%% The same pair, also returning Alice's RouterInfo. Bob decodes it out of
-%% SessionConfirmed and keeps its identity hash, so a case that asserts what
-%% Bob retained needs the RouterInfo to compute the expected hash from -- and it
-%% cannot read it off the session, because not retaining it is the claim.
+%% The same pair, also returning Alice's RouterInfo and both signing seeds. Bob
+%% decodes Alice's RouterInfo out of SessionConfirmed and keeps its identity
+%% hash, so a case that asserts what Bob retained needs the RouterInfo to compute
+%% the expected hash from -- and it cannot read it off the session, because not
+%% retaining it is the claim.
+%%
+%% **Both sessions are given a signing seed, and both are returned.** Bob's
+%% fixture originally had none, which made establishment store
+%% `sign_seed => undefined` on his session -- and a test that asserts retained
+%% *key names* cannot tell that from a retained seed. It is the value the two
+%% peer-test roles sign with, so a wrong one is a silent failure, and asserting
+%% `undefined` would have certified it.
 establish_pair_with_ri() ->
     {BPub, BPriv} = i2p_crypto:x25519_keygen(),
+    {BSignPub, BSeed} = i2p_crypto:ed25519_keygen(),
     Bik = crypto:strong_rand_bytes(32),
-    BobLocal = #{static_priv => BPriv, static_pub => BPub, intro_key => Bik},
+    BobLocal = #{
+        static_priv => BPriv,
+        static_pub => BPub,
+        intro_key => Bik,
+        sign_seed => BSeed,
+        sign_pub => BSignPub
+    },
     {ok, BobListener} = i2p_ssu2_listener:listen(<<"127.0.0.1">>, 0, BobLocal, self()),
     BobPort = i2p_ssu2_listener:port(BobListener),
     {ALocal, RIBlock} = alice_local(),
@@ -629,7 +671,7 @@ establish_pair_with_ri() ->
         ),
     unlink(APid),
     unlink(BPid),
-    {APid, BPid, RIBlock}.
+    {APid, BPid, RIBlock, maps:get(sign_seed, ALocal), BSeed}.
 
 %% Wait until `FromPid`'s session delivers the I2NP message `MsgId`/`Body`.
 %% Non-matching session messages are drained; a premature close of the awaited

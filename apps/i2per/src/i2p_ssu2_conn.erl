@@ -43,6 +43,13 @@ handshake completes, and the two halves separate cleanly:
   retained, and neither is the static keypair or the `ri`/`hash` entries of the
   incoming `t:local_keys/0` map.
 
+* **So is our own encoded RouterInfo.** `config.ri_block` is read exactly once,
+  by `maybe_created/2`, to build the block in our own SessionConfirmed, and
+  establishment clears it for the same reason. The one session that keeps it is
+  the requester leg of an indirect dial: `spawn_redirect/4` copies this config
+  into the session it starts, and that session is an Alice too, so it runs its
+  own handshake and needs `ri_block` of its own.
+
 The consequence worth stating: what the handshake leaves behind is not what the
 data phase needs, and a transition that copies rather than reduces preserves
 the larger of the two. A consequence of *that* is that anything later reading a
@@ -939,6 +946,24 @@ become_established_common(HS, Keys, State) ->
         sign_seed => maps:get(sign_seed, maps:get(local, OrgConfig), undefined)
     },
     ReducedConfig = OrgConfig#{local => RetainedLocal},
+    %% **Our own encoded RouterInfo goes the same way as the peer's.** `ri_block`
+    %% is read exactly once, by `maybe_created/2`, to build the RouterInfo block
+    %% in our own SessionConfirmed -- which is what established means it is done.
+    %% Past that point it is ~1.4 KB per session of our own RouterInfo that no
+    %% data-phase code will ever look at, and it scales with
+    %% `max_ssu2_sessions` exactly as the peer's did.
+    %%
+    %% **Except on the requester leg of an indirect dial.** Not because anything
+    %% here reads it: `spawn_redirect/4` copies this config into the session it
+    %% starts, and *that* session is an Alice too, so it runs its own
+    %% `maybe_created/2` and needs `ri_block` for its own SessionConfirmed.
+    %% Clearing it here would leave the redirect with nothing to send and fail
+    %% it at handshake rather than at anything to do with the relay.
+    RetainedConfig =
+        case maps:get(relay_role, OrgConfig, undefined) of
+            requester -> ReducedConfig;
+            _ -> ReducedConfig#{ri_block => undefined}
+        end,
     %% Charlie's in-session reply (message 3) signs over the tested peer's
     %% identity hash, so the hash has to survive establishment even though the
     %% RouterInfo it is derived from does not. Derived here, while
@@ -971,7 +996,7 @@ become_established_common(HS, Keys, State) ->
             %% The retained configuration is what a data-phase session needs:
             %% no RouterInfo and no static material. See the retained-local
             %% note above.
-            config => ReducedConfig,
+            config => RetainedConfig,
             %% The handshake's inbound reassembly buffer. It only ever holds
             %% SessionConfirmed fragments, and by here they have all been
             %% consumed, so leaving it resident would keep the last fragment's
