@@ -128,7 +128,7 @@ which is the same reason the bus is not a checklist row per event.
     loggable_config_keys/0
 ]).
 
--export_type([level/0, fact/0, instrument/0, entry/0, label/0]).
+-export_type([level/0, fact/0, instrument/0, entry/0, label/0, context/0]).
 
 %% The app-env key. Named once here and read by `m:i2p_config`'s whitelist and
 %% `m:i2p_config_srv`'s validator, so the key name is not spelled three times.
@@ -469,6 +469,15 @@ loggable_config_keys() ->
 -type label() :: atom() | tuple().
 
 -doc """
+What a frame's context carries.
+
+Free-form like `t:label/0` and for the same reason: a context is whatever the site
+knows, and pinning it to a union would mean a type edit at every call site. Named
+as a type only so the spec can say what a fun is allowed to return.
+""".
+-type context() :: term().
+
+-doc """
 Record a diagnostic frame at `debug`, or a bus-carried fact's off-by-default record.
 
 Input: a `t:label/0` naming what happened and a `Context` term carrying whatever
@@ -478,6 +487,25 @@ else the site knows -- the role, the peer, the nonce. Output: `ok`.
 symptom, and the SSU2 transport emits one per thing on the wire. What keeps that
 from being a flood is the level, not the gate: `debug` is off at the `notice`
 default, and the `log_level` key is what turns it on.
+
+## The level is checked here, and the argument can be a fun
+
+At `notice` -- the shipped default, and what an operator gets with no
+configuration at all -- **none of these frames is ever recorded**. So the level is
+checked before anything is built, and a site whose `Context` is expensive to
+construct passes a `fun() -> term()` instead of the term. The fun is called only
+if the frame is going to be recorded, so a frame nobody will read costs a level
+check and nothing else. See #XZTYAVX.
+
+The check is \`logger:allow/2\` rather than `f:level/0`, and that is not a
+preference. `f:level/0` reports *intent* -- the configured `log_level` key -- while
+the question here is whether `logger` would take the frame, and the two come
+apart: `config/sys.config` sets `logger_level` directly, and so does anything that
+calls `logger:update_primary_config/1`. A gate on the key would drop frames an
+operator has switched on and a test asserts are visible. \`logger:allow/2\` reads
+the primary level `logger` itself enforces and caches it per module, flushing the
+cache whenever the primary level changes, so it is 0.04 us against 0.16 us for
+reading the app env -- cheaper *and* the honest answer.
 
 The seven bus-carried facts use it as the record the bus's bound does not take
 with it, so their `Label` is the fact's own name -- `transit_denied`, not
@@ -496,9 +524,23 @@ wants `{recv, _, _, new, _}` without parsing text. The two are the same value
 formatted twice inside one call, not two hand-maintained copies: the duplication
 this project refuses is a second declaration that can disagree, and these cannot.
 """.
--spec debug(label(), term()) -> ok.
+-spec debug(label(), context() | fun(() -> context())) -> ok.
 debug(Label, Context) ->
+    case logger:allow(debug, ?MODULE) of
+        true -> record(Label, resolve(Context));
+        false -> ok
+    end.
+
+%% The label goes in the message *and* in the metadata.
+record(Label, Context) ->
     logger:debug("~0p ~0p", [Label, Context], #{label => Label, context => Context}).
+
+%% A context given as a fun is one the site could not afford to build unless the
+%% frame is recorded. Called here rather than at the call site, because a call
+%% site cannot know whether anybody is reading `debug` -- and by the time it did,
+%% the list comprehension that walks a datagram's blocks would already have run.
+resolve(Context) when is_function(Context, 0) -> Context();
+resolve(Context) -> Context.
 
 %% %%%%% Internal %%%%%
 

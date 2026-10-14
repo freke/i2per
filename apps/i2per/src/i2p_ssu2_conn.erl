@@ -963,9 +963,7 @@ data_packet(Packet, State = #{keys := Keys}) ->
 on_data(Num, Blocks, ImmediateAck, RecvDir, State = #{seen_in := SeenIn}) ->
     case i2p_ssu2_recv:add(Num, SeenIn, ?MAX_ACK_RANGES) of
         {new, SeenIn1} ->
-            i2p_log:debug(
-                {recv, RecvDir, Num, new, [block_kind(B) || B <- Blocks]}, role(State)
-            ),
+            i2p_log:debug({recv, RecvDir, Num, new}, frame(State, Blocks)),
             deliver(Num, Blocks, ImmediateAck, State#{seen_in => SeenIn1});
         duplicate ->
             i2p_log:debug({recv, RecvDir, Num, duplicate}, role(State)),
@@ -976,12 +974,31 @@ on_data(Num, Blocks, ImmediateAck, RecvDir, State = #{seen_in := SeenIn}) ->
             %% treated as new, because a peer doing this routinely is
             %% retransmitting numbers the spec says it must not reuse.
             i2p_counters:add(ssu2_stale_packets, 1),
-            i2p_log:debug(
-                {recv, RecvDir, Num, out_of_window, [block_kind(B) || B <- Blocks]},
-                role(State)
-            ),
+            i2p_log:debug({recv, RecvDir, Num, out_of_window}, frame(State, Blocks)),
             deliver(Num, Blocks, ImmediateAck, State)
     end.
+
+%% The context of a per-datagram frame, **as a fun** rather than as a term.
+%%
+%% `m:i2p_log:debug/2` calls it only when the level would record the frame, and at
+%% the `notice` default that is never -- so this is the shape that keeps a frame
+%% nobody is reading off the per-datagram path. Building the term at the call site
+%% instead would walk the datagram's blocks on every datagram to produce a list that
+%% is then discarded by the level, which is the whole cost the ticket names. See
+%% #XZTYAVX.
+%%
+%% The block kinds moved from the label into here for the same reason. They are
+%% what the datagram carried, not what happened to it, and a label carrying them
+%% made the label a payload rather than a name -- which is also why the level
+%% could not be checked before constructing it.
+-spec frame(map(), [tuple()]) -> fun(() -> {atom(), [tuple()] | atom()}).
+frame(State, Blocks) ->
+    fun() -> {role(State), block_kinds(Blocks)} end.
+
+%% One entry per block, for a frame that will be read by somebody at `debug`.
+-spec block_kinds([tuple()]) -> [tuple() | atom].
+block_kinds(Blocks) ->
+    [block_kind(B) || B <- Blocks].
 
 deliver(Num, Blocks, ImmediateAck, State) ->
     State1 = handle_blocks(Blocks, State),
@@ -1128,7 +1145,7 @@ send_packet(Blocks, State = #{keys := Keys, pkt_out := Num}, Track) ->
         Datagram,
         maps:get(endpoint, State)
     ),
-    i2p_log:debug({send, Num, Track, [block_kind(B) || B <- Blocks]}, role(State)),
+    i2p_log:debug({send, Num, Track}, frame(State, Blocks)),
     Out =
         case Track of
             true -> maps:put(Num, Blocks, maps:get(out_pkts, State));
@@ -1609,7 +1626,7 @@ handle_forward(Blocks, State) ->
         [] ->
             ok;
         _ ->
-            i2p_log:debug({forwarded, [block_kind(B) || B <- Forward]}, role(State)),
+            i2p_log:debug(forwarded, frame(State, Forward)),
             _ = Owner ! {ssu2_data, self(), lists:reverse(Forward)},
             ok
     end,
