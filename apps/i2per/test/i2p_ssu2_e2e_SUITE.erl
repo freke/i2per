@@ -19,7 +19,8 @@
     idle_reaps_silent_session/1,
     large_fragmented_message_reassembled/1,
     garbage_datagram_survives/1,
-    receive_window_does_not_grow_with_traffic/1
+    receive_window_does_not_grow_with_traffic/1,
+    established_session_retains_no_identity_material/1
 ]).
 
 -define(APP, i2per).
@@ -56,7 +57,8 @@ all() ->
         idle_reaps_silent_session,
         large_fragmented_message_reassembled,
         garbage_datagram_survives,
-        receive_window_does_not_grow_with_traffic
+        receive_window_does_not_grow_with_traffic,
+        established_session_retains_no_identity_material
     ].
 
 %% ---------------------------------------------------------------------------
@@ -85,6 +87,11 @@ init_per_testcase(transport_bytes_are_counted, Config) ->
     start_app(Config, 30000);
 init_per_testcase(large_fragmented_message_reassembled, Config) ->
     start_app(Config, 60000);
+init_per_testcase(established_session_retains_no_identity_material, Config) ->
+    %% Nothing here needs a timer pinned beyond the handshake: the case reads the
+    %% two sessions' own state and asserts on it, so nothing has to stay up and
+    %% nothing has to finish.
+    start_app(Config, 30000);
 init_per_testcase(garbage_datagram_survives, Config) ->
     start_app(Config, 30000);
 init_per_testcase(receive_window_does_not_grow_with_traffic, Config) ->
@@ -420,6 +427,115 @@ receive_window_does_not_grow_with_traffic(_Config) ->
     OldFlatListWords = 20000 * 4,
     true = LongHeap < OldFlatListWords div 2.
 
+%% ---------------------------------------------------------------------------
+%% What a data-phase session retains (#ER0J6KM)
+%% ---------------------------------------------------------------------------
+
+%% **A steady-state session holds no identity material, and the set of things it
+%% keeps is written out literally rather than measured.**
+%%
+%% The first version of this ticket dropped the RouterInfo and the static keys
+%% from an established session's retained config, and asserted nothing. That is
+%% how it shipped a regression: `peer_hash/1` still read `remote_ri`, so the
+%% cleared field silently became a zeroed hash and every Charlie in-session
+%% peer-test reply went out signed over `<<0:256>>`. The reply was still sent,
+%% still well-formed, and still arrived at the peer -- it just failed
+%% verification there. `i2p_ssu2_peertest_SUITE` caught it; nothing in the eunit
+%% layer did, and the eunit layer is what the ticket's own acceptance criteria
+%% pointed at. This case is the assertion that was missing.
+%%
+%% The claim is stated as an exact key set rather than as a heap size, because a
+%% size cannot name what went wrong: `local` carries exactly two keys now, and a
+%% third -- a RouterInfo, a hash, a seed that need not be kept -- fails here by
+%% name instead of becoming per-session retained state that scales with the cap.
+established_session_retains_no_identity_material(_Config) ->
+    {APid, BPid, AliceRI, ASeed, BSeed} = establish_pair_with_ri(),
+    AState = sys:get_state(APid),
+    BState = sys:get_state(BPid),
+
+    %% Both sides, because the two reach establishment differently: Alice
+    %% learns nothing about Bob's identity in the handshake, Bob decodes
+    %% Alice's RouterInfo out of SessionConfirmed.
+    lists:foreach(
+        fun(State) ->
+            Local = maps:get(local, maps:get(config, State)),
+            [intro_key, sign_seed] = lists:sort(maps:keys(Local))
+        end,
+        [AState, BState]
+    ),
+
+    %% **The key set is a floor, not the claim -- so the values are asserted
+    %% too.** `sign_seed` is retained because the in-session peer-test roles
+    %% sign with it, and a session holding the wrong seed produces signatures
+    %% that fail at the peer rather than at anything local. Checking that the
+    %% key *exists* would pass against `sign_seed => undefined`, which is what
+    %% this fixture used to yield for Bob.
+    ALocal = maps:get(local, maps:get(config, AState)),
+    BLocal = maps:get(local, maps:get(config, BState)),
+    true = (ASeed =:= maps:get(sign_seed, ALocal)),
+    true = (BSeed =:= maps:get(sign_seed, BLocal)),
+    %% And neither side kept the static keypair, which is the rest of what
+    %% `local_keys()` carries and the rest of what the data phase cannot use.
+    lists:foreach(
+        fun(Local) ->
+            [] = [K || K <- [static_priv, static_pub, sign_pub, hash, ri], maps:is_key(K, Local)]
+        end,
+        [ALocal, BLocal]
+    ),
+
+    %% **The peer's RouterInfo is not retained.** Bob's `remote_ri` is Alice's
+    %% RouterInfo -- the 1,464-byte term the ticket was about -- and Alice's
+    %% never had one. Asserted on both so the field cannot come back on either
+    %% path. `maps:get/3`'s default is the point: what is claimed is that no
+    %% RouterInfo is held, and both an explicit `undefined` and an absent key
+    %% satisfy that. Asserting the key is *gone* instead would pin the
+    %% implementation to how the transition happens to spell it, and would fail
+    %% on a correct fix that clears by assignment.
+    lists:foreach(
+        fun(State) -> undefined = maps:get(remote_ri, State, undefined) end,
+        [AState, BState]
+    ),
+
+    %% **Nor is our own encoded RouterInfo.** `config.ri_block` is the block we
+    %% put in our SessionConfirmed -- the same 1.4 KB, retained as our own
+    %% rather than the peer's. It is read exactly once, by `maybe_created/2`,
+    %% and this is the assertion that it stays read exactly once.
+    lists:foreach(
+        fun(State) -> undefined = maps:get(ri_block, maps:get(config, State), undefined) end,
+        [AState, BState]
+    ),
+
+    %% **What the Charlie role needs is derived, and the derivation is
+    %% asserted against the real identity.** `charlie_reply/6` signs the
+    %% message-3 block over the tested peer's identity hash, so the 32-byte hash
+    %% is the one thing from that RouterInfo a data-phase session genuinely
+    %% still needs. Deriving it once at establishment is what keeps the
+    %% RouterInfo droppable; this assertion is what stops the hash being dropped
+    %% along with it, which is the regression above.
+    {ok, #{identity := AliceIdentity}} = i2p_router_info:decode(AliceRI),
+    AliceHash = i2p_keys:hash(AliceIdentity),
+
+    %% **What the Charlie path actually reads, from the established state.**
+    %% This is the assertion the regression needed and did not have. Retaining
+    %% the correct hash as a field is not the claim -- the claim is that the
+    %% signature over it is right, and the signature is produced by a function
+    %% that runs *after* establishment, when `remote_ri` is already cleared. A
+    %% test that stopped at the stored field passed against the broken code,
+    %% because the field was written correctly and then ignored.
+    true = (AliceHash =:= i2p_ssu2_conn:peer_hash(BState)),
+
+    %% **The introduction key is promoted out of the nested config.** The
+    %% steady-state data path reads it once per inbound datagram on four paths,
+    %% and this is the field that removed a three-level descent from each of
+    %% them. Asserted against the retained `local` map it was derived from, so a
+    %% top-level field that disagreed with `config/local` fails here rather than
+    %% decrypting nothing correctly.
+    true = (maps:get(intro_key, BLocal) =:= maps:get(intro_key, BState)).
+
+%% ---------------------------------------------------------------------------
+%% Helpers
+%% ---------------------------------------------------------------------------
+
 %% Stand up a pair, push `N` messages one way, and return the receiving
 %% session's live heap and window size once the whole run has been processed.
 %%
@@ -501,9 +617,32 @@ drain(To) ->
 %% Stand up an Alice and a Bob session over two loopback listeners, with both
 %% owners confirmed and the derived direction keys checked to agree.
 establish_pair() ->
+    {APid, BPid, _RI, _ASeed, _BSeed} = establish_pair_with_ri(),
+    {APid, BPid}.
+
+%% The same pair, also returning Alice's RouterInfo and both signing seeds. Bob
+%% decodes Alice's RouterInfo out of SessionConfirmed and keeps its identity
+%% hash, so a case that asserts what Bob retained needs the RouterInfo to compute
+%% the expected hash from -- and it cannot read it off the session, because not
+%% retaining it is the claim.
+%%
+%% **Both sessions are given a signing seed, and both are returned.** Bob's
+%% fixture originally had none, which made establishment store
+%% `sign_seed => undefined` on his session -- and a test that asserts retained
+%% *key names* cannot tell that from a retained seed. It is the value the two
+%% peer-test roles sign with, so a wrong one is a silent failure, and asserting
+%% `undefined` would have certified it.
+establish_pair_with_ri() ->
     {BPub, BPriv} = i2p_crypto:x25519_keygen(),
+    {BSignPub, BSeed} = i2p_crypto:ed25519_keygen(),
     Bik = crypto:strong_rand_bytes(32),
-    BobLocal = #{static_priv => BPriv, static_pub => BPub, intro_key => Bik},
+    BobLocal = #{
+        static_priv => BPriv,
+        static_pub => BPub,
+        intro_key => Bik,
+        sign_seed => BSeed,
+        sign_pub => BSignPub
+    },
     {ok, BobListener} = i2p_ssu2_listener:listen(<<"127.0.0.1">>, 0, BobLocal, self()),
     BobPort = i2p_ssu2_listener:port(BobListener),
     {ALocal, RIBlock} = alice_local(),
@@ -532,7 +671,7 @@ establish_pair() ->
         ),
     unlink(APid),
     unlink(BPid),
-    {APid, BPid}.
+    {APid, BPid, RIBlock, maps:get(sign_seed, ALocal), BSeed}.
 
 %% Wait until `FromPid`'s session delivers the I2NP message `MsgId`/`Body`.
 %% Non-matching session messages are drained; a premature close of the awaited
