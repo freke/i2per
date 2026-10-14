@@ -22,6 +22,35 @@ Both roles register their connection ID in `i2p_ssu2_sessions` for routing,
 exchange `{ssu2_packet, Datagram}` messages with the listener, and send
 outbound datagrams through it because only the listener owns the socket.
 
+## What an established session retains
+
+An established session holds **no identity material**, and the split is
+deliberate rather than incidental. NTCP2 gets this right already: its data loop
+is handed the owner, socket, cipher state and timers, and nothing else. Here
+`become_established_common/3` reduces the session's `config` the moment the
+handshake completes, and the two halves separate cleanly:
+
+* **A data-phase session needs two keys and one hash.** The introduction key,
+  to open every inbound datagram; the signing seed, because the in-session
+  peer-test roles sign with it; and the peer's 32-byte identity hash, which
+  Charlie's message-3 reply signs over. The first is promoted to a top-level
+  `intro_key` field rather than read back through `config/local` on each of the
+  four inbound paths that need it.
+* **A peer-test role needs a RouterInfo, and only during the handshake.** Alice's
+  RouterInfo arrives in SessionConfirmed, is handed to the owner in
+  `{ssu2_ready, ...}`, and the peer's identity hash is derived from it once. The
+  RouterInfo itself — around 1,464 bytes, times `max_ssu2_sessions` — is not
+  retained, and neither is the static keypair or the `ri`/`hash` entries of the
+  incoming `t:local_keys/0` map.
+
+The consequence worth stating: what the handshake leaves behind is not what the
+data phase needs, and a transition that copies rather than reduces preserves
+the larger of the two. A consequence of *that* is that anything later reading a
+cleared field gets a plausible default instead of an error — which is how
+clearing `remote_ri` in isolation once made every Charlie reply sign over
+`<<0:256>>`. What an established session retains is asserted, not assumed; see
+`established_session_retains_no_identity_material` in `i2p_ssu2_e2e_SUITE`.
+
 ## Messages to the owner
 
 * `{ssu2_ready, Pid, Info, RemoteRI}` — established; `Info` carries the
@@ -46,7 +75,13 @@ outbound datagrams through it because only the listener owns the socket.
     initiate_peertest/4,
     ip_bin/1,
     terminate_session/2,
-    charlie_reply_block/7
+    charlie_reply_block/7,
+    %% Exported for the same reason as `charlie_reply_block/7` above: it is a
+    %% pure function of session state, and "what does a data-phase session
+    %% still know about its peer" is a claim a test can only make by asking.
+    %% Reading `remote_ri` here while establishment clears it is exactly the
+    %% divergence #ER0J6KM shipped, so the answer is asserted, not assumed.
+    peer_hash/1
 ]).
 -export([
     start_link/1,
@@ -899,8 +934,18 @@ become_established(HS, Keys, State) ->
 become_established_common(HS, Keys, State) ->
     OrgConfig = maps:get(config, State),
     OwnIntro = maps:get(intro_key, maps:get(local, OrgConfig)),
-    RetainedLocal = #{intro_key => OwnIntro, sign_seed => maps:get(sign_seed, maps:get(local, OrgConfig), undefined)},
+    RetainedLocal = #{
+        intro_key => OwnIntro,
+        sign_seed => maps:get(sign_seed, maps:get(local, OrgConfig), undefined)
+    },
     ReducedConfig = OrgConfig#{local => RetainedLocal},
+    %% Charlie's in-session reply (message 3) signs over the tested peer's
+    %% identity hash, so the hash has to survive establishment even though the
+    %% RouterInfo it is derived from does not. Derived here, while
+    %% `remote_ri` still holds it -- `peer_hash/1` below reads this field, and
+    %% dropping `remote_ri` without it is what made every Charlie signature
+    %% cover `<<0:256>>`.
+    PeerHash = peer_hash(State),
     case maps:get(timer_ref, State, undefined) of
         undefined ->
             ok;
@@ -936,11 +981,16 @@ become_established_common(HS, Keys, State) ->
             %% data phase.
             fragments => [],
             sr_info => undefined,
+            %% Charlie's in-session peer-test role is the one thing in a
+            %% data-phase session that still needs something derived from the
+            %% peer's identity, and this 32-byte hash is all of it.
+            peer_hash => PeerHash,
             %% `remote_ri` was only needed to hand Alice's RouterInfo to the
             %% owner on establishment; keeping it in the session would mirror
             %% the very retention this transition exists to drop (NTCP2 hands
             %% `RemoteRI` over and then holds none). `peer_intro` (the Bob
-            %% side's need) is a derived key and stays.
+            %% side's need) is a derived key and stays, and `peer_hash` above
+            %% is the one hash derived from the RouterInfo before it went.
             remote_ri => undefined
         },
     State2 = arm_keepalive_timer(arm_idle_timer(State1)),
@@ -1570,10 +1620,19 @@ spawn_redirect(Port, Ip, Token, State) ->
 ip_tuple(Ip) ->
     list_to_tuple(binary_to_list(Ip)).
 
+%% The tested peer's identity hash, as Charlie's in-session reply signs over
+%% it. Once the session is established this reads the hash derived at that
+%% transition; before it, it reads `remote_ri` directly, which is where the
+%% handshake leaves the RouterInfo until then.
 peer_hash(State) ->
-    case maps:get(remote_ri, State, undefined) of
-        #{identity := Identity} -> i2p_keys:hash(Identity);
-        _ -> <<0:256>>
+    case maps:get(peer_hash, State, undefined) of
+        undefined ->
+            case maps:get(remote_ri, State, undefined) of
+                #{identity := Identity} -> i2p_keys:hash(Identity);
+                _ -> <<0:256>>
+            end;
+        Hash ->
+            Hash
     end.
 
 addr_type(Ip) when byte_size(Ip) == 16 -> ipv6;
