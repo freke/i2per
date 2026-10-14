@@ -146,6 +146,22 @@ interop:
 bench-siphash:
     escript bench/bench_siphash.escript
 
+# Measure ingress latency and VM CPU cost for one VM scheduling configuration
+# (#VXRH456). The scheduling flags are emulator flags and go in SCHED_FLAGS;
+# the bench's own options in CPU_COST and PROBE_HZ:
+#   SCHED_FLAGS="+S 1 +sbwt very_short" just bench-sched-latency
+#   SCHED_FLAGS="+S 1" CPU_COST=1 PROBE_HZ=100 just bench-sched-latency
+# The full interleaved matrix (every threshold at +S 1, +S 2 and native) is
+# scripts/bench_sched_latency.sh. Not a gate: it is a measurement, and a gate
+# that depends on machine noise is a flaky gate.
+bench-sched-latency:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    args=""
+    if [ "${CPU_COST:-0}" = "1" ]; then args="$args --cpu-cost"; fi
+    if [ "${PROBE_HZ:-0}" != "0" ]; then args="$args --probe-hz ${PROBE_HZ}"; fi
+    ERL_FLAGS="${SCHED_FLAGS:-}" escript bench/bench_sched_latency.escript $args
+
 # Live-network smoke: boot a throwaway router and emit the network observables
 # (peers / dialed / netdb_router_info_growth / transit_relayed_tunnels) as JSON.
 # Hermetic by default (self-seed, offline); pass --live for a real join from a
