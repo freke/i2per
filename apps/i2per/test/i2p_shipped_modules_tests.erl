@@ -64,6 +64,19 @@ convention that changes makes this case read a comment as a caller, which fails
 closed on the other side -- it reports a module as having a caller it does not
 have.
 
+## The tree is read once
+
+`readers/0` walks the tree once, strips each file's comment lines, and holds the
+result. The scan is then a `binary:match` over what is already in memory.
+
+That ordering is not a style preference. The first version of this case read
+inside the scan, so it paid for the whole tree once per shipped module: 1,836
+`file:read_file` calls over the same 76 files, each one a round trip to the file
+I/O server. It passed here in 0.3 s and hit EUnit's 5 s limit on CI, which is the
+part worth recording. The cost was the number of reads, not the size of the tree,
+so a tree twice this size would not have gone red and this one doubled would not
+have explained itself. Reading once puts the whole case at ~30 ms.
+
 ## It fails closed
 
 If the source tree were unreadable the module set would come back empty and
@@ -103,12 +116,14 @@ trusted, and the needle is checked against a module the tree certainly calls.
 %% Those are different failures with different fixes, and the module doc says
 %% which is which.
 every_shipped_module_has_a_caller_outside_the_test_tree_test() ->
-    ?assert(shipped_sources() =/= []),
-    ?assert(has_caller_outside_the_test_tree(?KNOWN_CALLER, none)),
+    Sources = shipped_sources(),
+    Corpus = corpus(),
+    ?assert(Sources =/= []),
+    ?assert(has_caller_outside_the_test_tree(?KNOWN_CALLER, none, Corpus)),
     Orphans = [
         {filename:basename(File, ".erl"), relative(File)}
-     || File <- shipped_sources(),
-        not has_caller_outside_the_test_tree(filename:basename(File, ".erl"), File)
+     || File <- Sources,
+        not has_caller_outside_the_test_tree(filename:basename(File, ".erl"), File, Corpus)
     ],
     ?assertEqual([], Orphans).
 
@@ -130,15 +145,38 @@ relative(Path) ->
 
 %%%%%%%%%% Has a caller %%%%%%%%%%
 
-%% Whether `Module` is referenced from anywhere in the tree except its own source
+%% Every reader, read once, with its comment lines already gone. The scan below
+%% is a `binary:match` over this, so the cost of the case is one pass over the
+%% tree rather than one pass per module.
+%%
+%% **Read once, because the first version did not and CI timed it out.** Reading
+%% inside the scan meant walking the readers for every module, and every step was
+%% a `file:read_file` plus a comment strip: 1,836 reads of the same 76 files, each
+%% one a round trip to the file I/O server. Locally that was 0.3 s and on CI it
+%% ran past EUnit's 5 s limit, because the cost was the number of reads rather
+%% than the size of the tree.
+%%
+%% A reader that will not open contributes `<<>>`. It is still a reader, it is
+%% still scanned, and it still has nothing to say, which is what the two guards in
+%% the case above are for.
+corpus() ->
+    [
+        {File,
+            case file:read_file(File) of
+                {ok, Bin} -> strip_comment_lines(Bin);
+                {error, _} -> <<>>
+            end}
+     || File <- readers()
+    ].
+
+%% Whether `Name` is referenced from anywhere in the corpus except its own source
 %% and the test tree. The excluded file is an argument because the caller already
 %% has it, and re-deriving it here would be a second answer to the same question.
-has_caller_outside_the_test_tree(Module, none) ->
-    lists:any(fun(File) -> scan_finds(Module, File) end, readers());
-has_caller_outside_the_test_tree(Module, Self) ->
+%% `none` is a value no reader path takes, so it excludes nothing.
+has_caller_outside_the_test_tree(Name, Self, Corpus) ->
     lists:any(
-        fun(File) -> File =/= Self andalso scan_finds(Module, File) end,
-        readers()
+        fun({File, Code}) -> File =/= Self andalso scan_finds(Name, Code) end,
+        Corpus
     ).
 
 %% The shipped sources, the application descriptor, and the repository's
@@ -149,15 +187,11 @@ readers() ->
         [filename:join(root(), ?APP_SRC)] ++
         filelib:wildcard(filename:join(root(), "scripts/*.escript")).
 
-%% Whether `Module` is referenced from `File` as code rather than as prose.
-scan_finds(Module, File) ->
-    case file:read_file(File) of
-        {ok, Bin} ->
-            Code = strip_comment_lines(Bin),
-            lists:any(fun(Needle) -> binary:match(Code, Needle) =/= nomatch end, needles(Module));
-        {error, _} ->
-            false
-    end.
+%% Whether `Name` is referenced from `Code` as code rather than as prose. Two
+%% single-pattern matches rather than one over the pair: `binary:match/2` compiles
+%% a pattern list on every call, and this is the innermost call in the case.
+scan_finds(Name, Code) ->
+    lists:any(fun(Needle) -> binary:match(Code, Needle) =/= nomatch end, needles(Name)).
 
 %% The two reference shapes, as binaries. The trailing `:` and leading `{,` are
 %% what keep `i2p_log` from matching `i2p_log_checklist_tests` and `i2p_log`,
