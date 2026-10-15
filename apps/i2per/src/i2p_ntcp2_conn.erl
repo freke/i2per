@@ -493,17 +493,30 @@ data_loop(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef) ->
     end.
 
 handle_data_message(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef) ->
+    handle_send_batch(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef, 0).
+
+%% Service a short run of queued outbound sends before re-checking the mailbox
+%% for an inbound frame. Scanning for an inbound frame on every single queued
+%% send is O(n) per send, and a 70k-frame flood is enough to blow the suite's
+%% timetrap; batching keeps the scan cost at O(n / 64) while still letting an
+%% inbound frame jump the queue within a few dozen sends.
+handle_send_batch(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef, Count) when
+    Count >= 64
+->
+    data_loop(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef);
+handle_send_batch(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef, Count) ->
     receive
         {send, Payload} ->
             Send1 = send_payload(Sock, Send, Payload, RemoteHash),
-            data_loop(
+            handle_send_batch(
                 Owner,
                 Sock,
                 Send1,
                 Recv,
                 RemoteHash,
                 rearm_idle_timer(IdleRef),
-                KeepaliveRef
+                KeepaliveRef,
+                Count + 1
             );
         {tcp, Sock, Data} ->
             ok = i2p_counters:add(ntcp2_bytes_in, byte_size(Data)),
@@ -526,15 +539,15 @@ handle_data_message(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef) 
                 error ->
                     exit({protocol_error, malformed_frame})
             end;
+        {tcp_closed, Sock} ->
+            exit(closed);
+        {tcp_error, Sock, Reason} ->
+            exit({tcp_error, Reason});
         {stop, From, Ref} ->
             _ = erlang:cancel_timer(IdleRef),
             _ = erlang:cancel_timer(KeepaliveRef),
             From ! {stopped, Ref},
             exit(normal);
-        {tcp_closed, Sock} ->
-            exit(closed);
-        {tcp_error, Sock, Reason} ->
-            exit({tcp_error, Reason});
         handshake_timeout ->
             exit(timeout);
         idle_timeout ->
@@ -550,6 +563,8 @@ handle_data_message(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef) 
                 rearm_idle_timer(IdleRef),
                 arm_keepalive_timer()
             )
+    after 0 ->
+        data_loop(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef)
     end.
 
 send_payload(Sock, Send, Payload, RemoteHash) ->
