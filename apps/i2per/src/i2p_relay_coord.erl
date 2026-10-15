@@ -650,11 +650,11 @@ accept_intro(Tagged, Ver, Nonce, Port, Ip, State = #{bob_local := BobLocal}) ->
 %% dial unable to serve an i2per requester at all, which is why #98GAVQK's
 %% coverage gap mattered: nothing ever ran the two halves against each other.
 %%
-%% The token is not checked against anything on our side. Charlie's own Bob
-%% accepts the redirect's SessionRequest on the connection IDs the requester
-%% reuses, which is what authorises it; the token is carried because the
-%% protocol has the field and a requester may insist on it, not because this
-%% router enforces it.
+%% The token is not checked against anything on our side: Charlie's own Bob
+%% answers the redirect's SessionRequest whatever token it carries, so today the
+%% redirect is authorised by arriving on the nonce-derived connection IDs and
+%% the token is carried because the protocol has the field and a requester may
+%% insist on it. See #BFKFGY0.
 grant_token() ->
     %% `rand:uniform/1` on the full 64-bit range, then +1, so the result is in
     %% 1..2^64-1 and never zero. The same shape as the relay tag at line 396.
