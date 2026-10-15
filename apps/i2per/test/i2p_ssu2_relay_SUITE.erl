@@ -16,6 +16,7 @@
     relay_tag_request_handshake/1,
     relay_request_unknown_tag_rejected/1,
     indirect_dial_through_introducer/1,
+    indirect_dial_requester_leg_completes/1,
     charlie_accepts_a_verified_intro/1,
     charlie_rejects_an_unverifiable_intro/1,
     charlie_rejects_a_non_punchable_endpoint/1,
@@ -26,6 +27,11 @@
 -define(DATA_WINDOW, 25000).
 -define(RELAY_WINDOW, 30000).
 
+%% The session token Charlie grants in an accept, which Alice presents in the
+%% redirect's SessionRequest. Any nonzero value will do; it is fixed so a
+%% failure reads the same every run.
+-define(TEST_TOKEN, 16#0BADF00DCAFEFEED).
+
 suite() ->
     [{timetrap, 30000}].
 
@@ -34,6 +40,7 @@ all() ->
         relay_tag_request_handshake,
         relay_request_unknown_tag_rejected,
         indirect_dial_through_introducer,
+        indirect_dial_requester_leg_completes,
         charlie_accepts_a_verified_intro,
         charlie_rejects_an_unverifiable_intro,
         charlie_rejects_a_non_punchable_endpoint,
@@ -52,6 +59,7 @@ init_per_testcase(Case, Config) ->
         Config,
         case Case of
             indirect_dial_through_introducer -> 40000;
+            indirect_dial_requester_leg_completes -> 40000;
             _ -> 30000
         end
     ).
@@ -221,6 +229,92 @@ indirect_dial_through_introducer(_Config) ->
         %% session between A and T had ever existed up to now.
         {ok, DirectPid, _Keys} = i2p_ssu2_conn:connect(ALocal, TOpts, ARIBlock, AListener),
         unlink(DirectPid)
+    after
+        catch i2p_relay_coord:stop(Coord)
+    end.
+
+%% The requester leg itself, through `f:connect_via_introducer/5` rather than
+%% by hand. The case above proves the relay blocks are correct; this one proves
+%% the **caller** wires them together -- `f:begin_relay/1`, the
+%% `requester_relay_response/2` accept branch, `spawn_redirect/4` and
+%% `await_ssu2_redirect/2` -- which #98GAVQK found had no coverage at all.
+%%
+%% Two things are pinned that the blocks-only case cannot reach:
+%%
+%% * **Charlie's accept must grant a token.** `requester_relay_response/2`
+%%   accepts only `is_integer(Token)`, so an accept with no token falls to the
+%%   reject branch and the dial fails with `{relay_rejected, 0}` -- an accept
+%%   reported as a rejection. `i2p_relay_coord:accept_intro/7` sends
+%%   `undefined`, so this is the case that caught it; see the comment on
+%%   `charlie_accept_carries_a_granted_token/1`.
+%% * **The redirect reaches establishment**, which is only possible if the
+%%   requester leg kept `ri_block` for the session `spawn_redirect/4` copies it
+%%   into. Clear it and the redirect's own `maybe_created/2` has no RouterInfo
+%%   block to send, and this case fails at the handshake.
+indirect_dial_requester_leg_completes(_Config) ->
+    {BobLocal, _} = bob_local(),
+    BobHash = maps:get(hash, BobLocal),
+    {ok, Coord} = i2p_relay_coord:start_link(BobLocal),
+    try
+        %% -- Charlie (T): dials Bob, earns a tag, and publishes the address
+        %%    the redirect will actually dial. Unlike the blocks-only case the
+        %%    endpoint has to be dialable, so it is her real listener port.
+        {TPid, _TListener, TLocal} = dial_peer(Coord, BobLocal),
+        Tag = request_tag(TPid),
+        true = Tag > 0,
+        TRI = maps:get(ri, TLocal),
+        THash = i2p_router_info:hash(TRI),
+        TPort = published_port(TLocal),
+        TIp = <<127, 0, 0, 1>>,
+
+        %% -- Alice (A): her own listener, and the relay material naming Bob,
+        %%    Charlie and the tag. This is the map `f:i2p_peer` assembles.
+        {AListener, AIPort, ALocal} = listen_full_local(<<"127.0.0.1">>),
+        ARIBlock = maps:get(ri_binary, ALocal),
+        AHash = i2p_router_info:hash(maps:get(ri, ALocal)),
+        ASignPub = maps:get(sign_pub, ALocal),
+        Relay = #{
+            bob_hash => BobHash,
+            charlie_hash => THash,
+            charlie_ri => TRI,
+            tag => Tag,
+            our_port => AIPort,
+            our_ip => <<127, 0, 0, 1>>,
+            sign_seed => maps:get(sign_seed, ALocal)
+        },
+        BobOpts = #{
+            host => <<"127.0.0.1">>,
+            port => i2p_relay_coord:port(Coord),
+            static_key => maps:get(static_pub, BobLocal),
+            intro_key => maps:get(intro_key, BobLocal)
+        },
+
+        %% -- The dial under test. It blocks until the redirect establishes or
+        %%    the leg dies, so it runs in its own process and the case plays
+        %%    Charlie in the meantime.
+        Dialer = spawn_dialer(ALocal, BobOpts, ARIBlock, AListener, Relay),
+
+        %% -- Charlie verifies the forwarded intro and accepts, granting a
+        %%    token the redirect will present. The nonce is Alice's, so it is
+        %%    read off the intro rather than chosen.
+        {Nonce, _Ts} = wait_intro_relayed(TPid, AHash, ASignPub, BobHash, THash, Tag),
+        ok = accept_intro(TPid, BobHash, Nonce, TPort, TIp, TLocal, ?TEST_TOKEN),
+
+        %% -- The whole point: the requester leg completes. A live CharliePid
+        %%    is an established session, which is what proves `ri_block`
+        %%    survived establishment in the config `spawn_redirect/4` copied.
+        {ok, BobPid, CharliePid, Keys} = await_dialer(Dialer),
+        true = is_pid(BobPid),
+        true = is_pid(CharliePid),
+        true = CharliePid =/= BobPid,
+        true = is_process_alive(CharliePid),
+        true = is_map(Keys),
+        true = lists:all(fun(K) -> maps:is_key(K, Keys) end, [k_ab, kh2_ab, k_ba, kh2_ba]),
+
+        %% The redirect reuses the introducer leg's connection IDs, so it is
+        %% a different session on the wire even though it shares an ID pair.
+        unlink(CharliePid),
+        unlink(BobPid)
     after
         catch i2p_relay_coord:stop(Coord)
     end.
@@ -425,6 +519,96 @@ published_port(Local) ->
 %% ---------------------------------------------------------------------------
 %% Helpers
 %% ---------------------------------------------------------------------------
+
+%% Run the indirect dial in its own process: `f:connect_via_introducer/5` blocks
+%% until the redirect establishes or the leg dies, and the case has to be free
+%% to play Charlie while it waits. Unlinked, so a failing dial does not take the
+%% case with it -- the result arrives as a message either way.
+spawn_dialer(LocalKeys, BobOpts, RIBlock, Listener, Relay) ->
+    Parent = self(),
+    spawn(fun() ->
+        Parent !
+            {indirect_dial_result,
+                i2p_ssu2_conn:connect_via_introducer(
+                    LocalKeys, BobOpts, RIBlock, Listener, Relay
+                )}
+    end).
+
+await_dialer(Dialer) ->
+    Ref = monitor(process, Dialer),
+    receive
+        {indirect_dial_result, Result} ->
+            erlang:demonitor(Ref, [flush]),
+            Result;
+        {'DOWN', Ref, process, Dialer, Reason} ->
+            erlang:error({dialer_died, Reason})
+    after ?RELAY_WINDOW ->
+        erlang:error(dialer_timeout)
+    end.
+
+%% The two legs Charlie receives, and the RelayIntro's own nonce and timestamp
+%% so the accept can echo them. Alice chooses the nonce inside
+%% `f:begin_relay/1`, so it cannot be supplied from outside; it is read off the
+%% intro and verified as part of her request signature, which is what ties the
+%% accept to the request it answers.
+wait_intro_relayed(TPid, AHash, ASignPub, BobHash, THash, Tag) ->
+    Deadline = erlang:monotonic_time(millisecond) + ?RELAY_WINDOW,
+    wait_intro_relayed(TPid, AHash, ASignPub, BobHash, THash, Tag, false, undefined, Deadline).
+
+%% Both legs, not either: the RouterInfo and the intro arrive as separate Data
+%% messages in either order, so returning on the RI alone would hand back
+%% `undefined` and read as a missing intro on a wire that is merely one message
+%% behind.
+wait_intro_relayed(_TPid, _AHash, _ASignPub, _BobHash, _THash, _Tag, true, Found, _Deadline) when
+    Found =/= undefined
+->
+    Found;
+wait_intro_relayed(TPid, AHash, ASignPub, BobHash, THash, Tag, SeenRI, Found, Deadline) ->
+    case erlang:monotonic_time(millisecond) >= Deadline of
+        true ->
+            erlang:error({no_relay_intro_forwarded, SeenRI});
+        false ->
+            receive
+                {ssu2_data, TPid, Blocks} ->
+                    SeenRI1 = SeenRI orelse has_requester_ri(Blocks, AHash, ASignPub),
+                    Found1 = found_intro(Blocks, BobHash, THash, Tag, ASignPub, Found),
+                    wait_intro_relayed(
+                        TPid, AHash, ASignPub, BobHash, THash, Tag, SeenRI1, Found1, Deadline
+                    );
+                _ ->
+                    wait_intro_relayed(
+                        TPid, AHash, ASignPub, BobHash, THash, Tag, SeenRI, Found, Deadline
+                    )
+            after erlang:max(0, Deadline - erlang:monotonic_time(millisecond)) ->
+                erlang:error({no_relay_intro_forwarded, SeenRI})
+            end
+    end.
+
+%% The intro's nonce/timestamp once it has arrived, having verified Alice's
+%% signature over them against the key her forwarded RouterInfo publishes.
+found_intro(Blocks, BobHash, THash, Tag, ASignPub, undefined) ->
+    case lists:keyfind(relay_intro, 1, Blocks) of
+        {relay_intro, 0, _AHash, Nonce, Tag, Ts, 2, Port, Ip, Sig} ->
+            true = i2p_relay:verify_request(
+                BobHash, THash, 2, Nonce, Tag, Ts, Port, Ip, Sig, ASignPub
+            ),
+            {Nonce, Ts};
+        _ ->
+            undefined
+    end;
+found_intro(_Blocks, _BobHash, _THash, _Tag, _ASignPub, Found) ->
+    Found.
+
+%% Charlie's accept: her own published endpoint, her own signing key, and a
+%% granted token. The token is what the requester dials with, and its absence
+%% is what made an accept read as a rejection -- see the case comment.
+accept_intro(TPid, BobHash, Nonce, TPort, TIp, TLocal, Token) ->
+    Ts = erlang:system_time(second),
+    Sig = i2p_relay:sign_response(BobHash, 2, Nonce, Ts, TPort, TIp, maps:get(sign_seed, TLocal)),
+    i2p_ssu2_conn:send_relay(
+        TPid, i2p_relay:response_block(0, 2, Nonce, Ts, TPort, TIp, Sig, Token)
+    ).
+
 dial_peer(Coord, BobLocal) ->
     {PeerListener, _PeerPort, PeerLocal} = listen_full_local(<<"127.0.0.1">>),
     PeerRIBlock = maps:get(ri_binary, PeerLocal),
@@ -517,6 +701,15 @@ wait_request_relayed(
             end
     end.
 
+%% A RelayResponse grants a session token on accept (code 0) and on no other
+%% code. The codec only admits a token on an accept, so the reject side is
+%% `undefined` by construction -- but it is asserted here rather than assumed,
+%% because the two together are the contract `requester_relay_response/2` acts on.
+granted_token(0, Token) ->
+    is_integer(Token) andalso Token > 0;
+granted_token(Code, undefined) when Code =/= 0 ->
+    true.
+
 %% The forwarded RouterInfo is A's own: same hash, same published signing key.
 has_requester_ri(Blocks, AHash, ASignPub) ->
     case lists:keyfind(router_info, 1, Blocks) of
@@ -546,17 +739,25 @@ has_relay_intro(Blocks, BobHash, THash, Nonce, Tag, Ts, ASignPub) ->
 %% Charlie's own router signing key, code as given, and `csz 0` on a reject.
 %% `ExpectPort` is Charlie's own published endpoint on an accept and `0` on a
 %% reject, where no endpoint follows.
+%%
+%% **The token is asserted, not pattern-matched away.** An accept must carry a
+%% nonzero granted token and a reject must carry none -- `f:requester_relay_response/2`
+%% accepts only `is_integer(Token)`, so a tokenless accept reads downstream as
+%% `{relay_rejected, 0}`. Matching `undefined` here as "whatever this is" is what
+%% let the coordinator ship an accept no requester could act on; #98GAVQK found
+%% it. Pinned in both directions so it cannot regress to either shape.
 wait_charlie_response(Pid, CharlieHash, Nonce, Code, ASignPub, CharlieLocal, ExpectPort) ->
     CSignPub = maps:get(sign_pub, CharlieLocal),
     i2p_ct_helpers:wait_msg(
         fun
             ({ssu2_data, P, Blocks}) when P =:= Pid ->
                 case lists:keyfind(relay_response, 1, Blocks) of
-                    {relay_response, 0, Code, Nonce, Ts, 2, ExpectPort, CIp, Sig, undefined} ->
+                    {relay_response, 0, Code, Nonce, Ts, 2, ExpectPort, CIp, Sig, Token} ->
                         true = i2p_relay:verify_response(
                             CharlieHash, 2, Nonce, Ts, ExpectPort, CIp, Sig, CSignPub
                         ),
                         true = is_binary(ASignPub),
+                        true = granted_token(Code, Token),
                         {true, ok};
                     Other ->
                         erlang:error({unexpected_charlie_response, Code, Other})

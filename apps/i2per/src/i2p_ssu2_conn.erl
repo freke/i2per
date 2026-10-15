@@ -50,6 +50,13 @@ handshake completes, and the two halves separate cleanly:
   into the session it starts, and that session is an Alice too, so it runs its
   own handshake and needs `ri_block` of its own.
 
+* **And so is the static keypair, for the same reason and by the same rule.**
+  A copied config is only as good as what the copy is consumed for, so the
+  fields the *redirect's* `init/1` reads — `static_priv` and `static_pub`, for
+  its own `alice_init/4` — have to survive on the requester leg too. Dropping
+  them cost the redirect at admission, on `{badkey, static_priv}`, before it
+  reached the wire at all.
+
 The consequence worth stating: what the handshake leaves behind is not what the
 data phase needs, and a transition that copies rather than reduces preserves
 the larger of the two. A consequence of *that* is that anything later reading a
@@ -225,7 +232,7 @@ relay it to a Charlie session or reply with the reject itself.
     endpoint => {inet:ip_address(), 0..65535},
     peer_test_role => alice | bob | charlie,
     peer_test_coordinator => pid(),
-    %% Indirec-dial (requester) overrides, set by `f:connect_via_introducer/6`
+    %% Indirect-dial (requester) overrides, set by `f:connect_via_introducer/5`
     %% and the redirect session it spawns.
     src_conn_id => i2p_ssu2:conn_id(),
     dst_conn_id => i2p_ssu2:conn_id(),
@@ -325,7 +332,7 @@ relay tag Charlie published in her introducer address), `our_port`/`our_ip`
 Flow: establish a session with Bob, send block 7 (RelayRequest), wait for the
 RelayResponse (block 8) Charlie's tagged session answers with — the accept
 carries her endpoint and a session token — then spawn the redirect session to
-Charlie reusing the same connection IDs and starting with the granted token.
+Charlie on the nonce-derived connection IDs, starting with the granted token.
 Output: `{ok, BobPid, CharliePid, Keys}` — the introducer leg, the established
 redirect session, and its data keys — or `{error, Reason}` when the relay is
 rejected, the redirect fails, or either session dies before that.
@@ -486,9 +493,10 @@ start_link(Config = #{role := Role}) when Role =:= alice; Role =:= bob ->
 %% Alice: pick connection IDs, register, open with a zero-token
 %% SessionRequest (Bob answers Retry granting a token).
 init(Config = #{role := alice}) ->
-    %% A redirect session (requester leg) reuses the original dial's connection
-    %% IDs and starts the SessionRequest with the relay token instead of a zero
-    %% token; a fresh direct dial keeps the random pair.
+    %% A redirect session (requester leg) arrives with the nonce-derived
+    %% connection IDs `spawn_redirect/4` set, and starts the SessionRequest
+    %% with the relay token instead of a zero token; a fresh direct dial keeps
+    %% the random pair.
     SrcConnId = maps:get(src_conn_id, Config, rand_conn_id()),
     DstConnId = maps:get(dst_conn_id, Config, rand_conn_id(SrcConnId)),
     Remote = maps:get(remote, Config),
@@ -940,11 +948,26 @@ become_established(HS, Keys, State) ->
 
 become_established_common(HS, Keys, State) ->
     OrgConfig = maps:get(config, State),
-    OwnIntro = maps:get(intro_key, maps:get(local, OrgConfig)),
-    RetainedLocal = #{
-        intro_key => OwnIntro,
-        sign_seed => maps:get(sign_seed, maps:get(local, OrgConfig), undefined)
-    },
+    Local = maps:get(local, OrgConfig),
+    OwnIntro = maps:get(intro_key, Local),
+    %% **The requester leg keeps the whole `local` map, and that is the same
+    %% exception as `ri_block` below for the same reason.** `spawn_redirect/4`
+    %% copies this config into the session it starts, and *that* session is an
+    %% Alice too: its `init/1` reads `static_priv` and `static_pub` out of
+    %% `local` to run its own `alice_init/4`. Reducing `local` here leaves the
+    %% redirect with an introduction key and no keypair, and it dies in `init/1`
+    %% on `{badkey, static_priv}` -- at admission, before a byte reaches the
+    %% wire, so nothing on the relay path is even wrong yet. #98GAVQK found it.
+    RetainedLocal =
+        case maps:get(relay_role, OrgConfig, undefined) of
+            requester ->
+                Local;
+            _ ->
+                #{
+                    intro_key => OwnIntro,
+                    sign_seed => maps:get(sign_seed, Local, undefined)
+                }
+        end,
     ReducedConfig = OrgConfig#{local => RetainedLocal},
     %% **Our own encoded RouterInfo goes the same way as the peer's.** `ri_block`
     %% is read exactly once, by `maybe_created/2`, to build the RouterInfo block
@@ -1587,7 +1610,7 @@ requester_relay_response(
     case i2p_relay:verify_response(BobHash, Ver, Nonce, Ts, Port, Ip, Sig, Pub) of
         true when Code =:= 0, is_integer(Token) ->
             i2p_log:debug({relay, response_ok, nonce, Nonce}, role(State)),
-            spawn_redirect(Port, Ip, Token, clear_relay_nonce(State));
+            spawn_redirect(Port, Ip, Token, Nonce, clear_relay_nonce(State));
         true ->
             i2p_log:debug({relay, rejected, code, Code}, role(State)),
             exit({relay_rejected, Code});
@@ -1603,10 +1626,28 @@ clear_relay_nonce(State) ->
     maps:remove(relay_pending, State).
 
 %% Spawn the redirect session to Charlie: an ordinary alice dial at her
-%% asserted endpoint, reusing this leg's connection IDs and starting the
-%% SessionRequest with Charlie's relay token. The session is owned by this
-%% leg; when it establishes it reports back as `{i2p_ssu2_redirect, ...}`.
-spawn_redirect(Port, Ip, Token, State) ->
+%% asserted endpoint, starting the SessionRequest with Charlie's relay token.
+%% The session is owned by this leg; when it establishes it reports back as
+%% `{i2p_ssu2_redirect, ...}`.
+%%
+%% **The connection IDs are the nonce-derived pair, not this leg's.** This used
+%% to copy `src_conn_id`/`dst_conn_id` from the introducer session, which is
+%% wrong in a way only running the whole path exposes: those IDs name the
+%% session with *Bob*, and Charlie's listener has them registered against
+%% Bob's own session, so the redirect's SessionRequest is routed to that
+%% established session instead of spawning a new one. It then arrives as a Data
+%% packet, fails to decode, and the redirect times out at
+%% `{handshake_timeout, session_request}` -- reported as if the relay had failed
+%% when nothing was wrong with it.
+%%
+%% i2pd rewrites the IDs at the moment of the RelayRequest for the same reason
+%% (`SSU2Session::Introduce`: `m_SourceConnID = (nonce << 32) | nonce`,
+%% `m_DestConnID = ~m_SourceConnID`) and `ConnectAfterIntroduction` keeps them
+%% with the comment "keep ConnIDs used for introduction, because Charlie waits
+%% for SessionRequest from us". They are the pair Charlie's HolePunch is already
+%% addressed to, so they are the only IDs on which Charlie can recognise the
+%% redirect as the continuation of this relay. #98GAVQK found it.
+spawn_redirect(Port, Ip, Token, Nonce, State) ->
     Config = maps:get(config, State),
     Relay = maps:get(relay, Config),
     CharlieRI = maps:get(charlie_ri, Relay),
@@ -1623,8 +1664,9 @@ spawn_redirect(Port, Ip, Token, State) ->
         (maps:remove(relay, maps:remove(relay_role, Config)))#{
             owner => self(),
             remote => RemoteC,
-            src_conn_id => maps:get(src_conn_id, State),
-            dst_conn_id => maps:get(dst_conn_id, State),
+            %% The pair Charlie's HolePunch already used; see the note above.
+            src_conn_id => i2p_relay:dst_conn_id(Nonce),
+            dst_conn_id => i2p_relay:src_conn_id(Nonce),
             token => Token
         },
     case i2p_ssu2_sup:start_session(i2p_ssu2_sup:session_child(RedirectConfig)) of
