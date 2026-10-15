@@ -53,6 +53,12 @@ it is answered the way `HandleRelayIntro` in i2pd answers it:
   Alice, and again inside the out-of-session HolePunch (type 11) sent straight
   to her asserted endpoint. Both copies carry the same code, nonce and
   endpoint, so Alice reaches one conclusion whichever path lands.
+* The accept **grants a session token**, and the requester presents it in the
+  redirect's SessionRequest. `f:requester_relay_response/2` accepts only an
+  integer token, so an accept without one is read by the requester as
+  `{relay_rejected, 0}` — Charlie agreeing and the dial reported as refused.
+  Nothing on this side checks the token against anything; it is carried because
+  the protocol has the field and a requester may insist on it. #98GAVQK.
 
 **Two bounds the references do not have.** The punch is a datagram this router
 emits to a third party's address, so a hostile tag-holder must not be able to
@@ -621,7 +627,8 @@ accept_intro(Tagged, Ver, Nonce, Port, Ip, State = #{bob_local := BobLocal}) ->
                 OurIp,
                 maps:get(sign_seed, BobLocal)
             ),
-            Response = i2p_relay:response_block(0, Ver, Nonce, Ts, OurPort, OurIp, Sig, undefined),
+            Token = grant_token(),
+            Response = i2p_relay:response_block(0, Ver, Nonce, Ts, OurPort, OurIp, Sig, Token),
             i2p_log:debug({charlie, accepted, nonce, Nonce}, []),
             i2p_ssu2_conn:send_relay(Tagged, Response),
             punch(Nonce, Ts, OurPort, OurIp, Port, Ip, Response, State);
@@ -631,6 +638,27 @@ accept_intro(Tagged, Ver, Nonce, Port, Ip, State = #{bob_local := BobLocal}) ->
             i2p_log:debug({charlie, refused, nonce, Nonce, no_published_address}, []),
             reject_charlie(Tagged, 70, Ver, Nonce, State)
     end.
+
+%% The session token this accept grants Alice, for the SessionRequest of her
+%% redirect dial. Nonzero, because `requester_relay_response/2` treats `0` and
+%% `undefined` alike and a zero token would buy nothing over the plain dial.
+%%
+%% **The accept has to carry one.** `requester_relay_response/2` gates its accept
+%% branch on `is_integer(Token)`, so a tokenless accept falls through to its
+%% reject arm and the requester exits `{relay_rejected, 0}` — Charlie agreed, and
+%% the dial was reported as refused. That made the Charlie half of an indirect
+%% dial unable to serve an i2per requester at all, which is why #98GAVQK's
+%% coverage gap mattered: nothing ever ran the two halves against each other.
+%%
+%% The token is not checked against anything on our side. Charlie's own Bob
+%% accepts the redirect's SessionRequest on the connection IDs the requester
+%% reuses, which is what authorises it; the token is carried because the
+%% protocol has the field and a requester may insist on it, not because this
+%% router enforces it.
+grant_token() ->
+    %% `rand:uniform/1` on the full 64-bit range, then +1, so the result is in
+    %% 1..2^64-1 and never zero. The same shape as the relay tag at line 396.
+    rand:uniform(16#FFFFFFFFFFFFFFFF) + 1.
 
 %% This router's own published SSU2 endpoint — the address Alice will dial after
 %% the punch opens the path, and the endpoint the accept response carries. Read

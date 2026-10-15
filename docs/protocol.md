@@ -2162,9 +2162,10 @@ introducer's tag registry.
 
 The implementation has the block codec, tag registry, introducer
 coordinator, requester redirect, the Charlie-side responder, and inbound
-HolePunch classification. It does not grant a session token in the accept, and
-the firewalled-mode edge that publishes introducer addresses is the peer-test
-half only. The sequence below is the wire flow.
+HolePunch classification. Charlie's accept grants a session token, which the
+requester presents in the redirect's SessionRequest; the firewalled-mode edge
+that publishes introducer addresses is still the peer-test half only. The
+sequence below is the wire flow.
 
 **Charlie's verdict on a RelayIntro.** The intro arrives on the session the
 introducer holds with the tagged peer, and answering it is what being selected
