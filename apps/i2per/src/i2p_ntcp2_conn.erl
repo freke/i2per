@@ -581,13 +581,24 @@ send_payload(Sock, Send, Payload, RemoteHash) ->
     #{key := Key, sip := Sip, msg := Msg} = Send,
     {Frame, Sip1} = i2p_framing:encrypt_frame(Key, Msg, Payload, Sip),
     Wire = i2p_framing:frame_bytes(Frame),
-    write_frame(Sock, Wire, RemoteHash),
-    %% Charged after the write, not before. The counter's claim is that it reports
-    %% what this router handed to the socket, and a frame the socket refused is
-    %% not that — and refusing is now an outcome the process can reach and name
-    %% rather than a crash, so counting ahead of the write would be counting bytes
-    %% this router did not send.
+    %% Charged before the write (ADR: the counter reports what crossed this
+    %% router's transport boundary). Charging after `gen_tcp:send` races the
+    %% peer's receive path under load: a frame that leaves a fast socket is
+    %% counted at the receiver before this process reaches the increment, which
+    %% showed up as a directional mismatch in `transport_bytes_are_counted`
+    %% (`badmatch,23`) on a loaded runner. Doing it first makes the count precede
+    %% any possible delivery, so a reader downstream of a received frame always
+    %% sees this process's side of the accounting. A refused send exits the
+    %% connection immediately below, so a frame that is never handed to the
+    %% socket is neither counted nor charged: the return status is what decides.
     ok = i2p_counters:add(ntcp2_bytes_out, byte_size(Wire)),
+    try
+        write_frame(Sock, Wire, RemoteHash)
+    catch
+        exit:Reason ->
+            _ = i2p_counters:subtract(ntcp2_bytes_out, byte_size(Wire)),
+            exit(Reason)
+    end,
     Send#{sip => Sip1, msg => Msg + 1}.
 
 %% The socket would not take the frame, which on a `{delay_send, true}` socket
