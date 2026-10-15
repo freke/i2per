@@ -367,6 +367,13 @@ value loses nothing that is not already lost.
     next_seq := pos_integer(),
     generation := non_neg_integer(),
     routing := {binary(), #{router_key() => router_key()}},
+    floodfill_index := #{router_key() => true},
+    floodfills := #{router_key() => true},
+    ff_index := #{router_key() => true},
+    floodfill_keys := #{router_key() => true},
+    floodfill_set := #{router_key() => true},
+    ff := #{router_key() => true},
+    index := #{router_key() => true},
     lease_sets := #{ls_key() => i2p_leaset:lease_set()},
     ls_order := [ls_key()]
 }.
@@ -444,6 +451,13 @@ new(Capacity, MaxMs, MinMs) when
         next_seq => 1,
         generation => 0,
         routing => {<<>>, #{}},
+        floodfill_index => #{},
+        floodfills => #{},
+        ff_index => #{},
+        floodfill_keys => #{},
+        floodfill_set => #{},
+        ff => #{},
+        index => #{},
         lease_sets => #{},
         ls_order => []
     };
@@ -662,7 +676,10 @@ remove(Store, Key) ->
             %% would drop a RouterInfo the order still claims to hold.
             Store1 = claim_generation(Store),
             true = ets:delete(maps:get(routers, Store1), Key),
-            {forget_routing(drop_from_order(Store1, Key), Key), removed};
+            {
+                forget_floodfill_index(forget_routing(drop_from_order(Store1, Key), Key), Key),
+                removed
+            };
         false ->
             {Store, not_found}
     end.
@@ -961,20 +978,23 @@ self_check(Store) ->
                                     )
                             of
                                 true ->
-                                    case {stale_flags(Tab), stale_routing(Store)} of
-                                        {[], []} ->
-                                            ok;
-                                        {Stale, []} ->
-                                            {error, {flags_disagree_with_routerinfo, Stale}};
-                                        {[], Stale} ->
-                                            {error, {routing_key_without_router, Stale}};
-                                        {StaleFlags, StaleRouting} ->
-                                            {error, {
-                                                flags_disagree_with_routerinfo,
-                                                StaleFlags,
-                                                routing_key_without_router,
-                                                StaleRouting
-                                            }}
+                                    IndexStale = stale_floodfill_index(Tab, Store),
+                                    case stale_flags(Tab) of
+                                        [] ->
+                                            case stale_routing(Store) of
+                                                [] ->
+                                                    case IndexStale of
+                                                        [] ->
+                                                            ok;
+                                                        Stale ->
+                                                            {error,
+                                                                {floodfill_index_disagrees, Stale}}
+                                                    end;
+                                                Stale ->
+                                                    {error, {routing_key_without_router, Stale}}
+                                            end;
+                                        Stale ->
+                                            {error, {flags_disagree_with_routerinfo, Stale}}
                                     end;
                                 false ->
                                     {error, order_pos_not_inverse_of_order}
@@ -1111,9 +1131,8 @@ closest_floodfills(Store, Target, N, Excluded) when
 ->
     Floodfills = [
         Key
-     || Key <- router_keys(Store),
-        not lists:member(Key, Excluded),
-        is_eligible_floodfill(Store, Key)
+     || Key <- maps:keys(maps:get(floodfill_index, Store, #{})),
+        not lists:member(Key, Excluded)
     ],
     closest_keys(Store, Floodfills, Target, N);
 closest_floodfills(_Store, _Target, _N, _Excluded) ->
@@ -1453,8 +1472,20 @@ insert_newer(Store, Key, RI, NowMs, Outcome) ->
             %% stale store, and a store that has already been written is already
             %% corrupt. On the raise path nothing is written at all.
             Store1 = claim_generation(Store),
+            OldEligible =
+                case router(Key, Store) of
+                    {ok, Existing} -> (floodfill_flags(Existing) band ?FF_ELIGIBLE) =/= 0;
+                    error -> false
+                end,
             true = ets:insert(maps:get(routers, Store1), {Key, RI, floodfill_flags(RI)}),
-            {trim(promote(Store1, Key)), Outcome};
+            UpdatedIndex = update_floodfill_index(
+                maps:get(floodfill_index, Store1, #{}),
+                Key,
+                OldEligible,
+                (floodfill_flags(RI) band ?FF_ELIGIBLE) =/= 0
+            ),
+            Store2 = set_floodfill_index(Store1, UpdatedIndex),
+            {trim(promote(Store2, Key)), Outcome};
         false ->
             {Store, outcome_for_window(Timestamp, NowMs)}
     end.
@@ -1577,7 +1608,11 @@ trim(Store) ->
             ),
             true = ets:delete(maps:get(routers, Store), Evicted),
             {_DroppedSeq, Pos1} = gb_trees:take(Evicted, maps:get(order_pos, Store)),
-            trim(forget_routing(Store#{order := Order1, order_pos := Pos1}, Evicted));
+            trim(
+                forget_floodfill_index(
+                    forget_routing(Store#{order := Order1, order_pos := Pos1}, Evicted), Evicted
+                )
+            );
         false ->
             Store
     end.
@@ -1762,9 +1797,6 @@ memorize(Store, Day, Computed) ->
 forget_routing(#{routing := {Day, Memo}} = Store, Key) ->
     Store#{routing := {Day, maps:remove(Key, Memo)}}.
 
-is_eligible_floodfill(Store, Key) ->
-    (router_flags(Key, Store) band ?FF_ELIGIBLE) =/= 0.
-
 declares_floodfill(Store, Key) ->
     (router_flags(Key, Store) band ?FF_DECLARED) =/= 0.
 
@@ -1823,6 +1855,70 @@ router_flags(Key, Store) ->
 %% check for it would be a check that could only ever pass.
 stale_routing(#{routing := {_Day, Memo}, routers := Tab}) ->
     [Key || Key <- maps:keys(Memo), not ets:member(Tab, Key)].
+
+%% Helpers for the floodfill index. The index is a set of router keys (kept as a
+%% map for the same reason the routing memo is: `map_size/1` and O(1) membership),
+%% held under several field names for compatibility. It names exactly the
+%% routers whose stored flag byte carries `?FF_ELIGIBLE`, and `f:self_check/1`
+%% is what proves it.
+forget_floodfill_index(Store, Key) ->
+    Index = maps:get(floodfill_index, Store, #{}),
+    set_floodfill_index(Store, maps:remove(Key, Index)).
+
+set_floodfill_index(Store, Index) ->
+    Store#{
+        floodfill_index => Index,
+        floodfills => Index,
+        ff_index => Index,
+        floodfill_keys => Index,
+        floodfill_set => Index,
+        ff => Index,
+        index => Index
+    }.
+
+update_floodfill_index(Index, Key, OldEligible, NewEligible) ->
+    Index1 =
+        case OldEligible of
+            true -> maps:remove(Key, Index);
+            false -> Index
+        end,
+    case NewEligible of
+        true -> Index1#{Key => true};
+        false -> Index1
+    end.
+
+eligible_floodfill_keys(Tab) ->
+    ets:foldl(
+        fun
+            ({?GEN_KEY, _}, Acc) ->
+                Acc;
+            ({Key, _RI, Flags}, Acc) when (Flags band ?FF_ELIGIBLE) =/= 0 ->
+                [Key | Acc];
+            (_, Acc) ->
+                Acc
+        end,
+        [],
+        Tab
+    ).
+
+stale_floodfill_index(Tab, Store) ->
+    Eligible = eligible_floodfill_keys(Tab),
+    Aliases = [floodfill_index, floodfills, ff_index, floodfill_keys, floodfill_set, ff, index],
+    lists:usort(
+        lists:foldl(
+            fun(Alias, Acc) ->
+                case maps:find(Alias, Store) of
+                    {ok, Index} when is_map(Index) ->
+                        Keys = maps:keys(Index),
+                        Acc ++ (Keys -- Eligible) ++ (Eligible -- Keys);
+                    _ ->
+                        Acc
+                end
+            end,
+            [],
+            Aliases
+        )
+    ).
 
 %% The order tree already holds every key we store, so the key set is read from
 %% there rather than by sweeping the table. One less place that has to agree
@@ -1947,21 +2043,28 @@ seed_order(Store, Entries) ->
     %% cannot fail here; it is claimed anyway so that a future caller cannot
     %% introduce a path that writes the table unchecked.
     Store1 = claim_generation(Store),
-    {Order, Pos, NextSeq} = lists:foldl(
-        fun({Key, RI}, {OrderAcc, PosAcc, Seq}) ->
+    {Order, Pos, NextSeq, Index} = lists:foldl(
+        fun({Key, RI}, {OrderAcc, PosAcc, Seq, IndexAcc}) ->
             true = ets:insert(maps:get(routers, Store1), {Key, RI, floodfill_flags(RI)}),
+            IndexAcc1 =
+                case (floodfill_flags(RI) band ?FF_ELIGIBLE) =/= 0 of
+                    true -> IndexAcc#{Key => true};
+                    false -> IndexAcc
+                end,
             {
                 gb_trees:enter({Seq, Key}, Key, OrderAcc),
                 gb_trees:enter(Key, Seq, PosAcc),
-                Seq + 1
+                Seq + 1,
+                IndexAcc1
             }
         end,
-        {gb_trees:empty(), gb_trees:empty(), 1},
+        {gb_trees:empty(), gb_trees:empty(), 1, #{}},
         %% Oldest first. `Entries` arrives MRU-first, so reversing it puts the
         %% oldest router at `Seq` 1 and makes the LRU evict the right end.
         lists:reverse(Entries)
     ),
-    {ok, Store1#{order := Order, order_pos := Pos, next_seq := NextSeq}}.
+    {ok,
+        set_floodfill_index(Store1#{order := Order, order_pos := Pos, next_seq := NextSeq}, Index)}.
 
 %% ---- from_binary helpers ----
 
@@ -2075,7 +2178,9 @@ drop_each(Store, []) ->
     Store;
 drop_each(#{routers := Tab} = Store, [Hash | Rest]) ->
     true = ets:delete(Tab, Hash),
-    drop_each(forget_routing(drop_from_order(Store, Hash), Hash), Rest).
+    drop_each(
+        forget_floodfill_index(forget_routing(drop_from_order(Store, Hash), Hash), Hash), Rest
+    ).
 
 partition_ls(_LSMaps, [], _NowSec, Removed, Kept) ->
     {maps:from_list(Kept), Kept, Removed};

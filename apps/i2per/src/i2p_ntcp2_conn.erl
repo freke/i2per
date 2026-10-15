@@ -450,15 +450,15 @@ sndbuf_opt() ->
     end.
 
 data_loop(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef) ->
+    %% Inbound frames and terminal signals are taken out of the mailbox ahead of
+    %% any queued outbound sends. A fast feeder floods this process with
+    %% `{send, _}` messages, and a plain `receive` that services them in FIFO
+    %% order would let the read side stall until the flood had been written --
+    %% which blows through `?FRAME_BUDGET_MS` on a loaded runner even though
+    %% every frame would otherwise arrive. The socket options still bound
+    %% head-of-line here; this only keeps the send side from swallowing it.
     receive
         {tcp, Sock, Data} ->
-            %% Counted on arrival, before the framing is touched. `Data` is the
-            %% raw socket read, so it may hold a partial frame or several of
-            %% them and either way it is exactly the bytes that arrived. Charging
-            %% it before the parse also means a frame this connection rejects as
-            %% malformed is still counted: it crossed the wire, and a counter
-            %% that quietly excluded bytes the router received would be harder to
-            %% reconcile against anything.
             ok = i2p_counters:add(ntcp2_bytes_in, byte_size(Data)),
             case i2p_stream:push(Recv, Data) of
                 {ok, Recv1, Payloads} ->
@@ -479,10 +479,22 @@ data_loop(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef) ->
                 error ->
                     exit({protocol_error, malformed_frame})
             end;
+        {tcp_closed, Sock} ->
+            exit(closed);
+        {tcp_error, Sock, Reason} ->
+            exit({tcp_error, Reason});
+        {stop, From, Ref} ->
+            _ = erlang:cancel_timer(IdleRef),
+            _ = erlang:cancel_timer(KeepaliveRef),
+            From ! {stopped, Ref},
+            exit(normal)
+    after 0 ->
+        handle_data_message(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef)
+    end.
+
+handle_data_message(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef) ->
+    receive
         {send, Payload} ->
-            %% Serviced in mailbox order, which the framing state requires and the
-            %% socket's send timeout bounds. No reply: the sender is not waiting,
-            %% and a reply here is what made every caller a waiter.
             Send1 = send_payload(Sock, Send, Payload, RemoteHash),
             data_loop(
                 Owner,
@@ -493,6 +505,27 @@ data_loop(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef) ->
                 rearm_idle_timer(IdleRef),
                 KeepaliveRef
             );
+        {tcp, Sock, Data} ->
+            ok = i2p_counters:add(ntcp2_bytes_in, byte_size(Data)),
+            case i2p_stream:push(Recv, Data) of
+                {ok, Recv1, Payloads} ->
+                    lists:foreach(
+                        fun(P) -> Owner ! {ntcp2_frame, self(), P} end,
+                        Payloads
+                    ),
+                    ok = inet:setopts(Sock, [{active, once}]),
+                    data_loop(
+                        Owner,
+                        Sock,
+                        Send,
+                        Recv1,
+                        RemoteHash,
+                        rearm_idle_timer(IdleRef),
+                        KeepaliveRef
+                    );
+                error ->
+                    exit({protocol_error, malformed_frame})
+            end;
         {stop, From, Ref} ->
             _ = erlang:cancel_timer(IdleRef),
             _ = erlang:cancel_timer(KeepaliveRef),
