@@ -110,13 +110,48 @@ clearing `remote_ri` in isolation once made every Charlie reply sign over
 %% Overridable per app via `i2per` env `handshake_retry_ms` /
 %% `handshake_max_resends`.
 -define(MAX_RESENDS, 9).
-%% The indirect (introducer) leg's own bound: how long the redirect to a
-%% firewalled Charlie is waited for before the dial gives up on her introducers
-%% and falls back to NTCP2. Named and exported through `f:dial_budget_ms/0`
-%% because it is the longest single thing an SSU2 dial can block on, and
-%% `m:i2p_peer`'s deadline on `connecting` has to exceed it — a deadline written
-%% as its own number here would be a second copy that drifts.
--define(REDIRECT_TIMEOUT_MS, 60000).
+%% How far above the eager retransmit budget the direct leg's *outer* wait
+%% sits, the margin being `f:handshake_budget_ms/0`.
+%%
+%% `f:await_ssu2_connection/2` is a backstop rather than the bound. A session
+%% that exhausts its retransmits exits `{handshake_timeout, session_request}`,
+%% and the `DOWN` arrives before any outer timeout could — which is exactly why
+%% the 20 s literal this replaces never fired, and why a bound the budget always
+%% beats is the wrong kind of number to leave lying around: it has no reachable
+%% behaviour and no way to notice it is wrong. What it is *for* is a session
+%% that is alive and silent — wedged below the gen_server in a blocking call —
+%% which no timer inside the session can see. So it is derived from the budget
+%% rather than written down, and the two can no longer disagree.
+-define(HANDSHAKE_BACKSTOP_MARGIN_MS, 5000).
+%% The indirect (introducer) leg's own floor: 15 s.
+%%
+%% **Chosen, not derived**, and the reason is worth stating because this
+%% number's provenance is worse than arbitrary. The spec's entire normative
+%% statement on the relay token carries no number at all — the token "must be
+%% used immediately by Alice in the Session Request" — and the RelayResponse
+%% block has no `expires` field, so nothing in the wire format bounds this. The
+%% 60000 this replaces was in the root commit with no message, and is
+%% i2p-java's `RELAY_TOKEN_LIFETIME` exactly, which bounds *Charlie's token
+%% acceptance window*: a different quantity, and a dead one in Java, since
+%% `MAX_OB_ESTABLISH_TIME` is 25 s there and the acceptance window never binds
+%% inside it. Strong evidence the constant was ported and attached to the wrong
+%% thing; the provenance itself is unconfirmable.
+%%
+%% 15 s sits between the two implementations rather than picking a side. i2pd
+%% arms 5 s as its very first action, before it has even connected to Bob, so
+%% one timer spans the whole path; i2p-java allows 25 s for the whole path with
+%% `OB_MESSAGE_TIMEOUT = 15 s` on the relay phase specifically.
+%%
+%% **It is a floor rather than the value**, because this wait covers the direct
+%% handshake with Bob *and then* the relay phase. A flat 15 s would therefore
+%% contain the whole of Bob's retransmit budget, which at the default is 9 s,
+%% leaving the relay itself about six — and an operator who raised
+%% `handshake_max_resends` would have the leg killed before Bob's handshake
+%% could finish. A bound that degrades as it is tuned toward working is not a
+%% bound. `f:dial_budget_ms/0` takes the max of this and the retransmit budget,
+%% so the two cannot disagree, and at the shipped defaults it is 15 s exactly.
+%% See #SV6S264.
+-define(REDIRECT_TIMEOUT_MS, 15000).
 %% How many `{nack, ack}` range pairs a session's ACK blocks may carry. This is
 %% a *policy* choice — the wire format would allow more — and it is deliberately
 %% the single place the number is written down, because the receive window's
@@ -285,11 +320,12 @@ connect(LocalKeys, RemoteOpts, RIBlock, Listener, PeerTestRole) ->
             listener => Listener
         },
     Args = maybe_tag_peertest_role(Args0, PeerTestRole),
+    Timeout = handshake_budget_ms() + ?HANDSHAKE_BACKSTOP_MARGIN_MS,
     case i2p_ssu2_sup:start_session(i2p_ssu2_sup:session_child(Args)) of
         {ok, Pid} ->
-            await_ssu2_connection(Pid, 20000);
+            await_ssu2_connection(Pid, Timeout);
         {ok, Pid, _Extra} ->
-            await_ssu2_connection(Pid, 20000);
+            await_ssu2_connection(Pid, Timeout);
         {error, Reason} ->
             {error, Reason}
     end.
@@ -350,28 +386,49 @@ connect_via_introducer(LocalKeys, BobOpts, RIBlock, Listener, Relay) ->
             relay_role => requester,
             relay => Relay
         },
+    Timeout = dial_budget_ms(),
     case i2p_ssu2_sup:start_session(i2p_ssu2_sup:session_child(Config)) of
         {ok, Pid} ->
-            await_ssu2_redirect(Pid, ?REDIRECT_TIMEOUT_MS);
+            await_ssu2_redirect(Pid, Timeout);
         {ok, Pid, _Extra} ->
-            await_ssu2_redirect(Pid, ?REDIRECT_TIMEOUT_MS);
+            await_ssu2_redirect(Pid, Timeout);
         {error, Reason} ->
             {error, Reason}
     end.
 
+%% The eager retransmit budget as a duration: how long a direct leg's
+%% SessionRequest retries can run before the session gives up. This is the first
+%% of the three parks on an outbound dial and the one the other two are measured
+%% from, so it is asked for here rather than recomputed at each site.
+%%
+%% Private rather than exported: unlike `f:dial_budget_ms/0` no caller outside
+%% this module needs it, and that one names the same quantity in terms of the
+%% app-env keys an operator actually sets.
+-spec handshake_budget_ms() -> pos_integer().
+handshake_budget_ms() ->
+    handshake_retry_ms() * handshake_max_resends().
+
 -doc """
 The longest a single SSU2 leg of one outbound dial can block, in milliseconds.
 
-Two legs exist and they are bounded differently: a direct handshake by its
-retransmit count (`f:handshake_retry_ms/0` times `f:handshake_max_resends/0`),
-and the indirect one through an introducer by a flat wait. The longer of the two
-is what a caller bounding the *whole* dial needs, so it is asked for here rather
-than restated — and it moves when an operator retunes the retransmit settings,
-which a number written down in the caller would not follow.
+Two legs exist and they are bounded differently. A direct handshake is bounded by
+its SessionRequest retransmit budget: `handshake_retry_ms` times
+`handshake_max_resends`, both app-env keys on the `i2per` application. The
+indirect leg through an introducer is bounded by a wait with a 15 s floor. The
+longer of the two is what a caller bounding the *whole* dial needs, so it is
+asked for here rather than restated, and it moves when an operator retunes the
+retransmit settings, which a number written down in the caller would not follow.
+
+This is also the indirect leg's own wait rather than a sibling of it. That is
+not a coincidence to be tidied away later: the indirect leg *is* the whole
+indirect dial, because it covers Bob's direct handshake and then the relay
+phase, so any number it used had to be at least the direct budget anyway. One
+expression for both means the leg and the bound on the dial containing it
+cannot drift apart.
 """.
 -spec dial_budget_ms() -> pos_integer().
 dial_budget_ms() ->
-    max(?REDIRECT_TIMEOUT_MS, handshake_retry_ms() * handshake_max_resends()).
+    max(?REDIRECT_TIMEOUT_MS, handshake_budget_ms()).
 
 -spec await_ssu2_redirect(pid(), timeout()) ->
     {ok, pid(), pid(), i2p_ssu2:data_keys()} | {error, term()}.
