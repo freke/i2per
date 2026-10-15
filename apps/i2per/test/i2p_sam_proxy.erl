@@ -3,6 +3,15 @@
 -moduledoc """
 HTTP GET proxy that fetches URLs through the I2P SAM v3 STREAM interface.
 
+**A test fixture, not a feature.** It lives in the test tree because
+`i2p_sam_SUITE` is the only thing in the repository that calls it. It was in
+`apps/i2per/src/` until #EK2KTKP moved it, which meant the operator's release
+tarball carried it and the generated API reference listed it among the modules
+with a one-line description reading as a capability — which would have had
+whoever wrote the release notes conclude the router has an HTTP proxy. It does
+not. It has a fixture. `i2p_shipped_modules_tests` now fails `just check` if the
+next one lands in `src/`.
+
 Listens on a local TCP port (default 7657), bound to `listen_host` (default
 `127.0.0.1`), and accepts plain HTTP GET
 requests. For each request the proxy opens a SAM STREAM session to the
