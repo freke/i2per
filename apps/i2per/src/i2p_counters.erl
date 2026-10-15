@@ -62,6 +62,7 @@ ok = i2p_counters:add(events_notified, 1),
 -export([
     start_link/0,
     add/2,
+    subtract/2,
     set_gauge/2,
     snapshot/0,
     gauges/0,
@@ -462,6 +463,21 @@ add(Name, Amount) ->
             ok;
         #{ref := Ref, index := Index} ->
             counters:add(Ref, maps:get(Name, Index), Amount)
+    end.
+
+-doc """
+Subtract a previously counted amount, e.g. to roll back a count made ahead of
+a send that was refused. Negative totals are not exposed through `f:add/2` (whose
+amount is non-negative), so this is the only path that turns the counter down.
+""".
+-spec subtract(atom(), non_neg_integer()) -> ok.
+subtract(Name, Amount) ->
+    true = is_integer(Amount) andalso Amount >= 0,
+    case state() of
+        undefined ->
+            ok;
+        #{ref := Ref, index := Index} ->
+            counters:add(Ref, maps:get(Name, Index), -Amount)
     end.
 
 -doc """
