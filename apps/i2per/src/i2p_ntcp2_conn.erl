@@ -206,6 +206,7 @@ not earned.
 %% and an exported function with an unbounded wait is the defect this module just
 %% removed from its send path.
 -define(STOP_TIMEOUT_MS, 1000).
+-define(INBOUND_FAIRNESS, 64).
 -define(SEND_BATCH, 256).
 
 -doc """
@@ -409,7 +410,8 @@ enter_data_phase(Owner, Sock, Keys, SendDir, RecvDir, Timer, RemoteRI) ->
         i2p_stream:new(RecvKey, RecvSip),
         i2p_router_info:hash(RemoteRI),
         arm_idle_timer(),
-        arm_keepalive_timer()
+        arm_keepalive_timer(),
+        0
     ).
 
 %% The data-phase socket is driven by this process and nothing else, so it must
@@ -450,7 +452,11 @@ sndbuf_opt() ->
         _ -> []
     end.
 
-data_loop(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef) ->
+data_loop(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef, InboundRun) when
+    InboundRun >= ?INBOUND_FAIRNESS
+->
+    handle_send_batch(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef, 0);
+data_loop(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef, InboundRun) ->
     %% Inbound frames and terminal signals are taken out of the mailbox ahead of
     %% any queued outbound sends. A fast feeder floods this process with
     %% `{send, _}` messages, and a plain `receive` that services them in FIFO
@@ -475,7 +481,8 @@ data_loop(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef) ->
                         Recv1,
                         RemoteHash,
                         rearm_idle_timer(IdleRef),
-                        KeepaliveRef
+                        KeepaliveRef,
+                        InboundRun + 1
                     );
                 error ->
                     exit({protocol_error, malformed_frame})
@@ -504,7 +511,7 @@ handle_data_message(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef) 
 handle_send_batch(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef, Count) when
     Count >= ?SEND_BATCH
 ->
-    data_loop(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef);
+    data_loop(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef, 0);
 handle_send_batch(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef, Count) ->
     receive
         {send, Payload} ->
@@ -535,7 +542,8 @@ handle_send_batch(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef, Co
                         Recv1,
                         RemoteHash,
                         rearm_idle_timer(IdleRef),
-                        KeepaliveRef
+                        KeepaliveRef,
+                        0
                     );
                 error ->
                     exit({protocol_error, malformed_frame})
@@ -562,10 +570,11 @@ handle_send_batch(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef, Co
                 Recv,
                 RemoteHash,
                 rearm_idle_timer(IdleRef),
-                arm_keepalive_timer()
+                arm_keepalive_timer(),
+                0
             )
     after 0 ->
-        data_loop(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef)
+        data_loop(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef, 0)
     end.
 
 send_payload(Sock, Send, Payload, RemoteHash) ->
