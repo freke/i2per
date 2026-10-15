@@ -293,7 +293,52 @@ check_release_profile() {
             exit 1
         fi
     done
+    check_no_test_only_modules "$artifact" "$vsn"
     echo "  safe-default profile and license-document checks passed"
+}
+
+## A module in the operator's release that only a test calls is a fixture with a
+## module's name on it, and it costs the operator the bytes and costs whoever
+## writes the release notes a feature that does not exist. #EK2KTKP is what
+## `m:i2p_sam_proxy` was: 324 lines of HTTP GET proxy, called by nothing except
+## `i2p_sam_SUITE`, shipped in `lib/i2per-<vsn>/ebin/`.
+##
+## **Derived from the tree, not from a list of known offenders.** A list of module
+## names would be right until the next one, and until then it reads as though the
+## release had been checked. The shipped set is compared against what
+## `apps/i2per/src/` actually contains, so a fixture cannot slip in under a name
+## nobody thought to list.
+##
+## `i2per_status` is absent from this comparison on purpose: rebar.config keeps it
+## out of the release, so it has no ebin here to check. `sasl` is absent for the
+## same reason -- it is a dependency, not one of ours.
+check_no_test_only_modules() {
+    local artifact="$1"
+    local vsn="$2"
+    local shipped stray
+    shipped="$(tar -tzf "$artifact" \
+        | sed -n "s|^lib/i2per-$vsn/ebin/\([A-Za-z0-9_]*\)\.beam$|\1|p" \
+        | sort -u)"
+    [ -n "$shipped" ] || {
+        echo "error: no modules found in the release's i2per ebin -- the check cannot run" >&2
+        exit 1
+    }
+    stray=""
+    while IFS= read -r mod; do
+        [ -n "$mod" ] || continue
+        if [ ! -f "$ROOT/apps/i2per/src/$mod.erl" ]; then
+            stray="$stray $mod"
+        fi
+    done <<<"$shipped"
+    if [ -n "$stray" ]; then
+        echo "error: the release ships modules with no source in apps/i2per/src:" >&2
+        for mod in $stray; do
+            echo "         $mod -- a module nothing in src/ builds is a fixture" >&2
+        done
+        echo "       Move it to apps/i2per/test/, or write down why src/ is right." >&2
+        exit 1
+    fi
+    echo "  every shipped module has a source in apps/i2per/src"
 }
 
 erl_uses_nix_erts() {
