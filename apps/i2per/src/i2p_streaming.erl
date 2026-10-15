@@ -44,10 +44,13 @@ P0 = i2p_streaming:new(0, MyStreamId, 0, 0),
 P1 = i2p_streaming:with_flags(P0, ?FLAG_SYNCHRONIZE bor ?FLAG_FROM_INCLUDED
                                   bor ?FLAG_MAX_PACKET_SIZE_INCLUDED
                                   bor ?FLAG_NO_ACK),
-Syn = i2p_streaming:signed(P1#{from => DestBin,
-                               max_packet_size => 1730,
-                               nacks => i2p_streaming:syn_replay_nacks(BobHash)},
-                           SignSeed),
+Syn = i2p_streaming:signed(
+         i2p_streaming:with_nacks(
+             i2p_streaming:with_max_packet_size(
+                 i2p_streaming:with_from(P1, DestBin),
+                 1730),
+             i2p_streaming:syn_replay_nacks(BobHash)),
+         SignSeed),
 
 %% Receiver side
 {ok, Pkt} = i2p_streaming:decode(Syn),
@@ -59,7 +62,21 @@ Payload = i2p_streaming:payload(Pkt).
 """.
 -export([
     new/4,
+    with_send_id/2,
+    with_recv_id/2,
+    with_seq/2,
+    with_seq_num/2,
+    with_ack_through/2,
+    with_nacks/2,
+    with_resend_delay/2,
     with_flags/2,
+    with_from/2,
+    with_delay_ms/2,
+    with_max_packet_size/2,
+    with_signature/2,
+    with_payload/2,
+    with_binary/2,
+    with_sig_offset/2,
     has_flag/2,
     encode/1,
     signed/2,
@@ -79,6 +96,9 @@ Payload = i2p_streaming:payload(Pkt).
     max_packet_size/1,
     signature/1,
     payload/1,
+    binary/1,
+    sig_offset/1,
+    seq/1,
     flag_synchronize/0,
     flag_close/0,
     flag_reset/0,
@@ -174,6 +194,76 @@ Output: the updated packet.
 -spec with_flags(packet(), 0..16#FFFF) -> packet().
 with_flags(Packet, Bits) ->
     Packet#{flags => (maps:get(flags, Packet, 0) bor Bits) band 16#FFFF}.
+
+-doc "Set the sender's stream ID.".
+-spec with_send_id(packet(), 0..16#FFFFFFFF) -> packet().
+with_send_id(Packet, V) ->
+    Packet#{send_id => V}.
+
+-doc "Set the receiver's stream ID.".
+-spec with_recv_id(packet(), 0..16#FFFFFFFF) -> packet().
+with_recv_id(Packet, V) ->
+    Packet#{recv_id => V}.
+
+-doc "Set the sequence number.".
+-spec with_seq(packet(), 0..16#FFFFFFFF) -> packet().
+with_seq(Packet, V) ->
+    Packet#{seq => V}.
+
+-doc "See `f:with_seq/2`.".
+-spec with_seq_num(packet(), 0..16#FFFFFFFF) -> packet().
+with_seq_num(Packet, V) ->
+    with_seq(Packet, V).
+
+-doc "Set the acknowledged-through sequence number.".
+-spec with_ack_through(packet(), 0..16#FFFFFFFF) -> packet().
+with_ack_through(Packet, V) ->
+    Packet#{ack_through => V}.
+
+-doc "Set the NACK list.".
+-spec with_nacks(packet(), [0..16#FFFFFFFF]) -> packet().
+with_nacks(Packet, V) ->
+    Packet#{nacks => V}.
+
+-doc "Set the advised retransmission delay in seconds.".
+-spec with_resend_delay(packet(), 0..255) -> packet().
+with_resend_delay(Packet, V) ->
+    Packet#{resend_delay => V}.
+
+-doc "Set the FROM option destination.".
+-spec with_from(packet(), binary()) -> packet().
+with_from(Packet, V) ->
+    Packet#{from => V}.
+
+-doc "Set the delay value in milliseconds.".
+-spec with_delay_ms(packet(), 0..16#FFFF) -> packet().
+with_delay_ms(Packet, V) ->
+    Packet#{delay_ms => V}.
+
+-doc "Set the maximum packet size.".
+-spec with_max_packet_size(packet(), 0..16#FFFF) -> packet().
+with_max_packet_size(Packet, V) ->
+    Packet#{max_packet_size => V}.
+
+-doc "Set the signature option.".
+-spec with_signature(packet(), i2p_crypto:ed25519_signature()) -> packet().
+with_signature(Packet, V) ->
+    Packet#{signature => V}.
+
+-doc "Set the payload.".
+-spec with_payload(packet(), binary()) -> packet().
+with_payload(Packet, V) ->
+    Packet#{payload => V}.
+
+-doc "Set the raw wire bytes.".
+-spec with_binary(packet(), binary()) -> packet().
+with_binary(Packet, V) ->
+    Packet#{binary => V}.
+
+-doc "Set the signature offset.".
+-spec with_sig_offset(packet(), non_neg_integer()) -> packet().
+with_sig_offset(Packet, V) ->
+    Packet#{sig_offset => V}.
 
 -doc "Test whether a packet carries the flag bit `Flag`.".
 -spec has_flag(packet(), 0..16#FFFF) -> boolean().
@@ -482,6 +572,18 @@ signature(Packet) -> maps:get(signature, Packet, undefined).
 -doc "The payload bytes following the options region.".
 -spec payload(packet()) -> binary().
 payload(Packet) -> maps:get(payload, Packet, <<>>).
+
+-doc "The raw wire bytes attached to a decoded packet.".
+-spec binary(packet()) -> binary().
+binary(Packet) -> maps:get(binary, Packet, <<>>).
+
+-doc "The offset of the signature region in the raw wire bytes.".
+-spec sig_offset(packet()) -> non_neg_integer().
+sig_offset(Packet) -> maps:get(sig_offset, Packet, 0).
+
+-doc "See `f:seq_num/1`.".
+-spec seq(packet()) -> 0..16#FFFFFFFF.
+seq(Packet) -> seq_num(Packet).
 
 %%%%%%% %%% Flag constants %%%%%%%
 

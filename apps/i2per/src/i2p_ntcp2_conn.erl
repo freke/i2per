@@ -206,6 +206,8 @@ not earned.
 %% and an exported function with an unbounded wait is the defect this module just
 %% removed from its send path.
 -define(STOP_TIMEOUT_MS, 1000).
+-define(INBOUND_FAIRNESS, 64).
+-define(SEND_BATCH, 256).
 
 -doc """
 Establish a connection to a peer as the initiator.
@@ -408,7 +410,8 @@ enter_data_phase(Owner, Sock, Keys, SendDir, RecvDir, Timer, RemoteRI) ->
         i2p_stream:new(RecvKey, RecvSip),
         i2p_router_info:hash(RemoteRI),
         arm_idle_timer(),
-        arm_keepalive_timer()
+        arm_keepalive_timer(),
+        0
     ).
 
 %% The data-phase socket is driven by this process and nothing else, so it must
@@ -449,16 +452,20 @@ sndbuf_opt() ->
         _ -> []
     end.
 
-data_loop(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef) ->
+data_loop(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef, InboundRun) when
+    InboundRun >= ?INBOUND_FAIRNESS
+->
+    handle_send_batch(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef, 0);
+data_loop(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef, InboundRun) ->
+    %% Inbound frames and terminal signals are taken out of the mailbox ahead of
+    %% any queued outbound sends. A fast feeder floods this process with
+    %% `{send, _}` messages, and a plain `receive` that services them in FIFO
+    %% order would let the read side stall until the flood had been written --
+    %% which blows through `?FRAME_BUDGET_MS` on a loaded runner even though
+    %% every frame would otherwise arrive. The socket options still bound
+    %% head-of-line here; this only keeps the send side from swallowing it.
     receive
         {tcp, Sock, Data} ->
-            %% Counted on arrival, before the framing is touched. `Data` is the
-            %% raw socket read, so it may hold a partial frame or several of
-            %% them and either way it is exactly the bytes that arrived. Charging
-            %% it before the parse also means a frame this connection rejects as
-            %% malformed is still counted: it crossed the wire, and a counter
-            %% that quietly excluded bytes the router received would be harder to
-            %% reconcile against anything.
             ok = i2p_counters:add(ntcp2_bytes_in, byte_size(Data)),
             case i2p_stream:push(Recv, Data) of
                 {ok, Recv1, Payloads} ->
@@ -474,34 +481,82 @@ data_loop(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef) ->
                         Recv1,
                         RemoteHash,
                         rearm_idle_timer(IdleRef),
-                        KeepaliveRef
+                        KeepaliveRef,
+                        InboundRun + 1
                     );
                 error ->
                     exit({protocol_error, malformed_frame})
             end;
+        {tcp_closed, Sock} ->
+            exit(closed);
+        {tcp_error, Sock, Reason} ->
+            exit({tcp_error, Reason});
+        {stop, From, Ref} ->
+            _ = erlang:cancel_timer(IdleRef),
+            _ = erlang:cancel_timer(KeepaliveRef),
+            From ! {stopped, Ref},
+            exit(normal)
+    after 0 ->
+        handle_data_message(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef)
+    end.
+
+handle_data_message(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef) ->
+    handle_send_batch(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef, 0).
+
+%% Service a short run of queued outbound sends before re-checking the mailbox
+%% for an inbound frame. Scanning for an inbound frame on every single queued
+%% send is O(n) per send, and a 70k-frame flood is enough to blow the suite's
+%% timetrap; batching keeps the scan cost at O(n / 64) while still letting an
+%% inbound frame jump the queue within a few dozen sends.
+handle_send_batch(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef, Count) when
+    Count >= ?SEND_BATCH
+->
+    data_loop(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef, 0);
+handle_send_batch(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef, Count) ->
+    receive
         {send, Payload} ->
-            %% Serviced in mailbox order, which the framing state requires and the
-            %% socket's send timeout bounds. No reply: the sender is not waiting,
-            %% and a reply here is what made every caller a waiter.
             Send1 = send_payload(Sock, Send, Payload, RemoteHash),
-            data_loop(
+            handle_send_batch(
                 Owner,
                 Sock,
                 Send1,
                 Recv,
                 RemoteHash,
                 rearm_idle_timer(IdleRef),
-                KeepaliveRef
+                KeepaliveRef,
+                Count + 1
             );
+        {tcp, Sock, Data} ->
+            ok = i2p_counters:add(ntcp2_bytes_in, byte_size(Data)),
+            case i2p_stream:push(Recv, Data) of
+                {ok, Recv1, Payloads} ->
+                    lists:foreach(
+                        fun(P) -> Owner ! {ntcp2_frame, self(), P} end,
+                        Payloads
+                    ),
+                    ok = inet:setopts(Sock, [{active, once}]),
+                    data_loop(
+                        Owner,
+                        Sock,
+                        Send,
+                        Recv1,
+                        RemoteHash,
+                        rearm_idle_timer(IdleRef),
+                        KeepaliveRef,
+                        0
+                    );
+                error ->
+                    exit({protocol_error, malformed_frame})
+            end;
+        {tcp_closed, Sock} ->
+            exit(closed);
+        {tcp_error, Sock, Reason} ->
+            exit({tcp_error, Reason});
         {stop, From, Ref} ->
             _ = erlang:cancel_timer(IdleRef),
             _ = erlang:cancel_timer(KeepaliveRef),
             From ! {stopped, Ref},
             exit(normal);
-        {tcp_closed, Sock} ->
-            exit(closed);
-        {tcp_error, Sock, Reason} ->
-            exit({tcp_error, Reason});
         handshake_timeout ->
             exit(timeout);
         idle_timeout ->
@@ -515,8 +570,11 @@ data_loop(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef) ->
                 Recv,
                 RemoteHash,
                 rearm_idle_timer(IdleRef),
-                arm_keepalive_timer()
+                arm_keepalive_timer(),
+                0
             )
+    after 0 ->
+        data_loop(Owner, Sock, Send, Recv, RemoteHash, IdleRef, KeepaliveRef, 0)
     end.
 
 send_payload(Sock, Send, Payload, RemoteHash) ->
