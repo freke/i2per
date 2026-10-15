@@ -409,7 +409,7 @@ send_plain_ack(#{peer_id := PeerId} = State) ->
     P =
         case current_gaps(State) of
             [] -> P0;
-            Gaps -> P0#{nacks => Gaps}
+            Gaps -> i2p_streaming:with_nacks(P0, Gaps)
         end,
     transmit(i2p_streaming:encode(P), State),
     State.
@@ -629,13 +629,12 @@ syn_packet(S) ->
             i2p_streaming:flag_no_ack(),
     P1 = i2p_streaming:with_flags(P0, Flags),
     %% Replay prevention binds the SYN to the RECIPIENT's destination hash.
-    P1#{
-        from => maps:get(dest_bin, S),
-        max_packet_size => maps:get(mtu, S),
-        nacks => i2p_streaming:syn_replay_nacks(
-            maps:get(remote_dest_hash, S)
-        )
-    }.
+    P2 = i2p_streaming:with_from(P1, maps:get(dest_bin, S)),
+    P3 = i2p_streaming:with_max_packet_size(P2, maps:get(mtu, S)),
+    i2p_streaming:with_nacks(
+        P3,
+        i2p_streaming:syn_replay_nacks(maps:get(remote_dest_hash, S))
+    ).
 
 syn_ack_packet(S) ->
     %% Our outgoing sendStreamId field carries the PEER's ID (which arrived
@@ -646,10 +645,8 @@ syn_ack_packet(S) ->
             i2p_streaming:flag_from_included() bor
             i2p_streaming:flag_max_packet_size_included(),
     P1 = i2p_streaming:with_flags(P0, Flags),
-    P1#{
-        from => maps:get(dest_bin, S),
-        max_packet_size => maps:get(mtu, S)
-    }.
+    P2 = i2p_streaming:with_from(P1, maps:get(dest_bin, S)),
+    i2p_streaming:with_max_packet_size(P2, maps:get(mtu, S)).
 
 data_packet(Seq, Chunk, State) ->
     P0 = i2p_streaming:new(
@@ -658,10 +655,11 @@ data_packet(Seq, Chunk, State) ->
         Seq,
         maps:get(recv_contig, State)
     ),
-    P1 = P0#{resend_delay => ?RESEND_MS div 1000, payload => Chunk},
+    P1 = i2p_streaming:with_resend_delay(P0, ?RESEND_MS div 1000),
+    P2 = i2p_streaming:with_payload(P1, Chunk),
     case current_gaps(State) of
-        [] -> P1;
-        Gaps -> P1#{nacks => Gaps}
+        [] -> P2;
+        Gaps -> i2p_streaming:with_nacks(P2, Gaps)
     end.
 
 control_packet(FlagBit, State) ->
