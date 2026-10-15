@@ -138,7 +138,7 @@ Wait for `===> Booted i2per`, then run these checks at the Erlang prompt:
 application:ensure_all_started(i2per).
 true = is_pid(whereis(i2per_sup)).
 %% The version string moves with each release; it is the app's own {vsn, ...}.
-{ok, "0.3.0"} = application:get_key(i2per, vsn).
+{ok, "0.4.0"} = application:get_key(i2per, vsn).
 ```
 
 The successful results are `{ok,[i2per]}`, `true`, and `ok`. Leave the shell
