@@ -47,7 +47,7 @@
 -define(TRAFFIC_CHUNK, 200).
 
 suite() ->
-    [].
+    [{timetrap, 30000}].
 
 all() ->
     [
@@ -68,11 +68,11 @@ all() ->
 %% ---------------------------------------------------------------------------
 
 init_per_testcase(full_handshake_and_data, Config) ->
-    start_app(Config, 60000);
+    start_app(Config, 30000);
 init_per_testcase(keepalive_roundtrip, Config) ->
     ok = application:set_env(?APP, keepalive_interval_ms, 300),
     ok = application:set_env(?APP, idle_timeout_ms, 60000),
-    start_app(Config, 120000);
+    start_app(Config, 30000);
 init_per_testcase(idle_reaps_silent_session, Config) ->
     ok = application:set_env(?APP, idle_timeout_ms, 1000),
     ok = application:set_env(?APP, keepalive_interval_ms, 60000),
@@ -86,7 +86,7 @@ init_per_testcase(transport_bytes_are_counted, Config) ->
     %% its assertions a hope rather than a synchronisation.
     start_app(Config, 30000);
 init_per_testcase(large_fragmented_message_reassembled, Config) ->
-    start_app(Config, 60000);
+    start_app(Config, 30000);
 init_per_testcase(established_session_retains_no_identity_material, Config) ->
     %% Nothing here needs a timer pinned beyond the handshake: the case reads the
     %% two sessions' own state and asserts on it, so nothing has to stay up and
@@ -106,7 +106,7 @@ init_per_testcase(receive_window_does_not_grow_with_traffic, Config) ->
     %% the trace itself would dominate the runtime and fill the log with more
     %% than a hundred thousand lines. Nothing in this case reads the trace.
     {ok, _} = application:ensure_all_started(?APP),
-    [{timetrap, 300000} | Config].
+    [{timetrap, 60000} | Config].
 
 start_app(Config, Timetrap) ->
     i2p_ct_helpers:start_ssu2_trace(),
@@ -572,6 +572,12 @@ drive_traffic(N) ->
     },
     true = is_process_alive(Sender),
     true = is_process_alive(Receiver),
+    %% Tear the two sessions down here, while the case still owns them. Left to
+    %% `end_per_testcase`, `application:stop/1` walks a sup tree that is still
+    %% holding 20,000 in-flight datagrams and takes minutes; an explicit close
+    %% makes the teardown as cheap as the rest of the case.
+    i2p_ssu2_conn:terminate_session(Sender, 0),
+    i2p_ssu2_conn:terminate_session(Receiver, 0),
     Reading.
 
 chunks([], _Size) ->

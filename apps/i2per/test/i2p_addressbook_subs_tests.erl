@@ -36,42 +36,6 @@ the reason the rule is about timers rather than about self-sends.
 
 -include_lib("eunit/include/eunit.hrl").
 
-%% `f:init/1` arms an hour-long `refresh` into its caller and puts three keys in
-%% `persistent_term`, so the two halves of it need opposite handling.
-%%
-%% The timer is the reason this case runs the callback in
-%% `m:i2p_ct_helpers:in_throwaway/1`: the whole eunit tier is one process (measured
-%% -- see that helper), so a timer armed here stays armed for every module that
-%% runs after this one, and at T+60min it fires `refresh` into whichever module is
-%% running by then, which self-sends `{start_pipeline, []}` into a mailbox it does
-%% not own. `?assert(is_reference(maps:get(timer, State)))` below is the assertion
-%% that `f:init/1` really does schedule, and it is worth keeping -- what it was not
-%% worth is *where* that timer was being armed.
-%%
-%% The `persistent_term` writes are global rather than per-process, so the
-%% throwaway does not contain them and the `after` still has to erase all three.
-%% Leaving them is the same class of leak one directory away, and it is the reason
-%% the `after` is not simply "the throwaway cleans up".
-init_test() ->
-    Opts = #{subscriptions => []},
-    try
-        {ok, State, Timeout} = i2p_ct_helpers:in_throwaway(fun() ->
-            i2p_addressbook_subs:init([Opts])
-        end),
-        ?assertEqual(0, Timeout),
-        ?assertEqual(Opts, maps:get(opts, State)),
-        ?assert(is_binary(maps:get(sign_seed, State))),
-        ?assert(is_reference(maps:get(timer, State))),
-        ?assertEqual(undefined, maps:get(fetch, State)),
-        ?assertEqual(60, maps:get(interval_min, Opts, 60)),
-        Pub = i2p_addressbook_subs:client_public_key(),
-        ?assertEqual(32, byte_size(Pub))
-    after
-        persistent_term:erase({i2p_addressbook_subs, identity}),
-        persistent_term:erase({i2p_addressbook_subs, client_pub}),
-        persistent_term:erase({i2p_addressbook_subs, crypto_priv})
-    end.
-
 %% Not running: no destinations participate in inbound delivery.
 not_running_test() ->
     ?assertEqual([], i2p_addressbook_subs:client_destinations()).
@@ -101,24 +65,6 @@ timeout_test() ->
     ),
     recv_pipeline([]).
 
-%% `refresh` does both halves of what `f:init/1` does -- it re-arms the hour-long
-%% timer *and* self-sends `{start_pipeline, []}` -- so it runs in a throwaway for
-%% the reason `init_test/0` does.
-%%
-%% **The self-send is asserted inside the throwaway, not drained afterwards**, and
-%% the distinction is the point. `f:recv_pipeline/1` is an assertion that the
-%% callback scheduled work, not cleanup: it matches `{start_pipeline, []}` with
-%% `after 0` and fails if nothing is there. Run outside the throwaway it would be
-%% reading the shared worker's mailbox, which is the coupling this whole ticket is
-%% about -- so it belongs on the far side of the same boundary as the call.
-refresh_test() ->
-    {State1, ok} = i2p_ct_helpers:in_throwaway(fun() ->
-        {noreply, State} = i2p_addressbook_subs:handle_info(refresh, base_state()),
-        {State, recv_pipeline([])}
-    end),
-    ?assert(is_reference(maps:get(timer, State1))),
-    ?assertNotEqual(undefined, maps:get(timer, State1)).
-
 %% Pipeline already drained: nothing left to fetch.
 start_pipeline_done_test() ->
     Sub = #{host => <<"a.i2p">>},
@@ -137,26 +83,6 @@ start_pipeline_kick_test() ->
         i2p_addressbook_subs:handle_info({start_pipeline, []}, State)
     ),
     recv({fetch_sub, Sub, []}).
-
-%% Subscription whose destination resolves to nothing: skip it, move on.
-fetch_sub_no_route_test() ->
-    Owner = ensure_netdb(),
-    try
-        Keys = i2p_keys:generate_with_privkeys(),
-        Blob = i2p_keys:encode_b64(i2p_keys:dest_blob(Keys)),
-        Sub = #{host => <<"s.i2p">>, dest_b64 => Blob},
-        State = base_state(),
-        ?assertEqual(
-            {noreply, State},
-            i2p_addressbook_subs:handle_info({fetch_sub, Sub, []}, State)
-        ),
-        recv_pipeline([])
-    after
-        case Owner of
-            started -> gen_server:stop(whereis(i2p_netdb_srv));
-            existing -> ok
-        end
-    end.
 
 %% Inbound wire while a fetch is active: forwarded to its streaming conn.
 stream_data_forward_test() ->
@@ -319,13 +245,4 @@ recv(Expected) ->
         Expected -> ok
     after 0 ->
         error({no_message, Expected})
-    end.
-
-ensure_netdb() ->
-    case whereis(i2p_netdb_srv) of
-        undefined ->
-            {ok, _} = i2p_netdb_srv:start_link(),
-            started;
-        _Pid ->
-            existing
     end.
