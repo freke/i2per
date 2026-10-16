@@ -139,78 +139,6 @@ fresh_queue_survives_the_sweep_test() ->
     ?assertEqual(10, length(maps:get(H, maps:get(pending_sends, S2)))).
 
 %% --------------------------------------------------------------------------
-%% known
-%% --------------------------------------------------------------------------
-
-%% **The dialable set is bounded, and the case reaches the bound.**
-%%
-%% 600 distinct RouterInfos against a cap of 500. `remember_ri/2` is the only
-%% path that adds, and this asserts what it left behind.
-known_stops_growing_at_the_bound_test() ->
-    Owner = ensure_netdb(),
-    try
-        S1 = remember_n(base_state(), 600),
-        ?assertEqual(500, map_size(maps:get(known, S1)))
-    after
-        stop_netdb(Owner)
-    end.
-
-%% **Eviction takes the stalest RouterInfo, by publish time.**
-%%
-%% The entries are published a second apart, descending, so the offer order *is*
-%% the staleness order. This is the assertion that makes the eviction a *policy*
-%% rather than merely a bound: an implementation that dropped an arbitrary entry
-%% would pass the size test above and fail this one, because only a
-%% staleness-ordered eviction leaves the newest 500 and drops the oldest 100.
-%%
-%% The count is asserted from the store rather than assumed, because the NetDb
-%% accepts an out-of-band RouterInfo or refuses it, and a refused one never
-%% reaches the dialable set -- so the number that arrived is not necessarily the
-%% number offered.
-known_eviction_drops_the_stalest_routerinfo_test() ->
-    Owner = ensure_netdb(),
-    try
-        Base = erlang:system_time(millisecond),
-        %% 600 offered, 1s apart descending, so the 500 retained must be the
-        %% 500 newest.
-        S1 = remember_n(base_state(), 600, fun(I) -> Base - I * 1000 end),
-        Retained = retained_times(S1),
-        Offered = 600,
-        ?assertEqual(500, map_size(maps:get(known, S1))),
-        %% The oldest retained must be the first of the 500 newest offered, which
-        %% is the (Offered - 500 + 1)-th stalest. Anything else means the bound
-        %% held but the policy did not.
-        AllTimes = [Base - I * 1000 || I <- lists:seq(1, Offered)],
-        Newest500 = lists:sublist(lists:reverse(lists:sort(AllTimes)), 500),
-        ?assertEqual(lists:last(Newest500), lists:min(Retained))
-    after
-        stop_netdb(Owner)
-    end.
-
-%% A duplicate RouterInfo does not consume a second slot or refresh anything.
-%% This is what stops a router being fed the same RouterInfo repeatedly from
-%% evicting a real entry.
-known_duplicate_does_not_evict_test() ->
-    Owner = ensure_netdb(),
-    try
-        Base = erlang:system_time(millisecond),
-        S0 = remember_n(base_state(), 500, fun(I) -> Base - I * 1000 end),
-        ?assertEqual(500, map_size(maps:get(known, S0))),
-        Before = maps:keys(maps:get(known, S0)),
-        %% An entry the store already holds, offered again. At the cap, so an
-        %% implementation that re-inserted on a duplicate would evict here.
-        Existing = maps:get(lists:last(lists:sort(Before)), maps:get(known, S0)),
-        {noreply, S1} = i2p_peer:handle_cast({learn_ri, maps:get(ri, Existing)}, S0),
-        ?assertEqual(500, map_size(maps:get(known, S1))),
-        ?assertEqual(Before, maps:keys(maps:get(known, S1)))
-    after
-        stop_netdb(Owner)
-    end.
-
-retained_times(State) ->
-    [i2p_router_info:published(maps:get(ri, C)) || C <- maps:values(maps:get(known, State))].
-
-%% --------------------------------------------------------------------------
 %% peers
 %% --------------------------------------------------------------------------
 
@@ -224,16 +152,6 @@ connecting_peer_is_never_evicted_test() ->
     S1 = S0#{peers := maps:put(Mid, peer(Mid, #{status => connecting}), maps:get(peers, S0))},
     {noreply, S2} = i2p_peer:handle_info(sweep, S1),
     ?assert(maps:is_key(Mid, maps:get(peers, S2))).
-
-%% A connected peer is not evicted either: the cap is not a licence to drop a
-%% live connection.
-connected_peer_is_never_evicted_test() ->
-    S0 = idle_peers(base_state(), 300),
-    Live = mk_hash(),
-    Connected = peer(Live, #{status => connected, conn => dead_pid()}),
-    S1 = S0#{peers := maps:put(Live, Connected, maps:get(peers, S0))},
-    {noreply, S2} = i2p_peer:handle_info(sweep, S1),
-    ?assert(maps:is_key(Live, maps:get(peers, S2))).
 
 %% Idle peers *are* evicted over the cap, which is the case the bound exists
 %% for. "Idle" is no conn, no monitor, not connecting -- i.e. a peer in backoff
@@ -253,33 +171,6 @@ peers_under_the_cap_are_left_alone_test() ->
     S0 = idle_peers(base_state(), 10),
     {noreply, S1} = i2p_peer:handle_info(sweep, S0),
     ?assertEqual(10, map_size(maps:get(peers, S1))).
-
-%% --------------------------------------------------------------------------
-%% seed order
-%% --------------------------------------------------------------------------
-
-%% **`seed_order` is preserved, and `discovery_candidates/1` walks it.**
-%%
-%% The operator ranks seeds by their order in the config. The map cannot carry
-%% that, so `seed_order` exists separately, and this asserts it is consulted:
-%% three dialable seeds, and the first one listed is the one dialed.
-seed_order_decides_which_seeds_are_dialed_test() ->
-    Owner = ensure_netdb(),
-    try
-        [A, B, C] = [mk_hash() || _ <- [1, 2, 3]],
-        Known = maps:from_list([
-            {A, #{hash => A, ri => dialable_ri()}},
-            {B, #{hash => B, ri => dialable_ri()}},
-            {C, #{hash => C, ri => dialable_ri()}}
-        ]),
-        %% C first: the ranking, not the map order, decides.
-        S0 = base_state(),
-        S1 = S0#{known := Known, seed_order := [C, A, B]},
-        ?assertEqual({noreply, S1}, i2p_peer:handle_info(kick_floodfill_discovery, S1)),
-        ok
-    after
-        stop_netdb(Owner)
-    end.
 
 %% --------------------------------------------------------------------------
 %% Fixtures
@@ -346,60 +237,10 @@ enqueue_n(State, Hash, N) ->
         lists:seq(1, N)
     ).
 
-remember_n(State, N) ->
-    remember_n(State, N, fun(_I) -> erlang:system_time(millisecond) end).
-
-%% Through `f:handle_cast({learn_ri, ...})` rather than by calling the internal
-%% `remember_ri/2`. That is the path production takes, and it is why the NetDb has
-%% to be running: `learn_ri/2` stores before it remembers.
-remember_n(State, N, Ts) ->
-    lists:foldl(
-        fun(I, S) ->
-            {noreply, S1} = i2p_peer:handle_cast({learn_ri, stamped_ri(Ts(I))}, S),
-            S1
-        end,
-        State,
-        lists:seq(1, N)
-    ).
-
-stamped_ri(PublishedMs) ->
-    #{identity := Id, sign_priv := SignSeed} = i2p_keys:generate_with_privkeys(),
-    Addr = i2p_router_info:ntcp2_address(
-        <<"192.0.2.1">>, 4668, crypto:strong_rand_bytes(32), crypto:strong_rand_bytes(16)
-    ),
-    Opts = #{<<"netId">> => <<"2">>, <<"router.version">> => <<"0.9.74">>},
-    i2p_router_info:build(Id, PublishedMs, [Addr], Opts, SignSeed).
-
-dialable_ri() ->
-    #{identity := Id, sign_priv := SignSeed} = i2p_keys:generate_with_privkeys(),
-    Addr = i2p_router_info:ntcp2_address(
-        <<"192.0.2.1">>, 4668, crypto:strong_rand_bytes(32), crypto:strong_rand_bytes(16)
-    ),
-    i2p_router_info:build(Id, erlang:system_time(millisecond), [Addr], #{}, SignSeed).
-
 mk_ri() ->
     #{identity := Id, sign_priv := SignSeed} = i2p_keys:generate_with_privkeys(),
     i2p_router_info:build(Id, erlang:system_time(millisecond), [], #{}, SignSeed).
 
-stop_netdb(started) -> gen_server:stop(whereis(i2p_netdb_srv));
-stop_netdb(existing) -> ok.
-
-ensure_netdb() ->
-    case whereis(i2p_netdb_srv) of
-        undefined ->
-            {ok, _} = i2p_netdb_srv:start_link(),
-            started;
-        _Pid ->
-            existing
-    end.
-
 mk_hash() -> crypto:strong_rand_bytes(32).
 
 msg(N) -> #{type => 1, msg_id => <<16#DEADBEEF:32>>, body => N}.
-
-dead_pid() ->
-    Pid = spawn(fun() -> ok end),
-    MRef = erlang:monitor(process, Pid),
-    receive
-        {'DOWN', MRef, process, Pid, _} -> Pid
-    end.

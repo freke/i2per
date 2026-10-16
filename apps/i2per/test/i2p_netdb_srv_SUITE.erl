@@ -6,6 +6,7 @@
 -module(i2p_netdb_srv_SUITE).
 
 -include_lib("kernel/include/file.hrl").
+-include_lib("eunit/include/eunit.hrl").
 
 -export([all/0, suite/0, init_per_testcase/2]).
 
