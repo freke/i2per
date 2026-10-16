@@ -13,7 +13,7 @@
 %% NetDb is exactly what makes it reach for the network.
 
 -module(i2p_coordinator_SUITE).
-
+-include_lib("eunit/include/eunit.hrl").
 -export([all/0, suite/0, init_per_testcase/2, end_per_testcase/2]).
 -export([
     disabled_by_default/1,

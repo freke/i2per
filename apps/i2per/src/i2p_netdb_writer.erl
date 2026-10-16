@@ -179,8 +179,8 @@ write_snapshot(Snapshot, ReportTo, State) ->
     {State2, Result} = attempt(Snapshot, ReportTo, State, ?MAX_ATTEMPTS),
     {report(State2, Result, ReportTo), Result}.
 
-report(_State, _Result, undefined) ->
-    ok;
+report(State, _Result, undefined) ->
+    State;
 report(State, Result, Pid) when is_pid(Pid) ->
     Pid ! {save_result, Result},
     State.

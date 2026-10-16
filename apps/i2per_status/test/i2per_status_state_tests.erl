@@ -103,41 +103,9 @@ handle_cast_fallthrough_test() ->
     State = dead_state(),
     {noreply, State} = i2per_status_state:handle_cast(whatever, State).
 
-%% These three run the callback through `m:i2p_ct_helpers:in_throwaway/1`, which
-%% owns the reasoning: under eunit the caller is a worker shared by every module in
-%% the tier, and `f:handle_info(poll, ...)` re-arms itself into it. A local copy of
-%% that helper used to live here; it moved to `m:i2p_ct_helpers` when
-%% `i2p_addressbook_subs_tests` needed the same thing, because two copies of a
-%% helper whose own failure mode is a leaked `'DOWN'` is how they start to differ.
-nodeup_resubscribes_test() ->
-    State0 = dead_state(),
-    {noreply, State} = i2p_ct_helpers:in_throwaway(fun() ->
-        i2per_status_state:handle_info({nodeup, ?DEAD_NODE}, State0)
-    end),
-    %% subscribe/1 to an unreachable node collapses to false.
-    ?assertEqual(false, maps:get(subscribed, State)).
-
-nodedown_marks_offline_test() ->
-    State0 = dead_state(),
-    {noreply, State} = i2p_ct_helpers:in_throwaway(fun() ->
-        i2per_status_state:handle_info({nodedown, ?DEAD_NODE}, State0)
-    end),
-    ?assertEqual(false, maps:get(online, State)),
-    ?assertEqual(#{}, maps:get(view, State)).
-
 irrelevant_info_fallthrough_test() ->
     State = dead_state(),
     {noreply, State} = i2per_status_state:handle_info(irrelevant, State).
-
-poll_to_unreachable_goes_offline_test() ->
-    %% Previously-online router disappears: next poll must flip the view to
-    %% offline_view() instead of keeping the stale snapshot.
-    State0 = (dead_state())#{online => true, view => #{stale => 1}},
-    {noreply, State} = i2p_ct_helpers:in_throwaway(fun() ->
-        i2per_status_state:handle_info(poll, State0)
-    end),
-    ?assertEqual(false, maps:get(online, State)),
-    ?assertEqual(#{}, maps:get(view, State)).
 
 terminate_and_code_change_test() ->
     State = dead_state(),

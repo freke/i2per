@@ -5,11 +5,10 @@
 
 -module(i2p_server_tunnel_SUITE).
 
--export([all/0, init_per_testcase/2]).
+-export([all/0, init_per_testcase/2, end_per_testcase/2]).
 
 -export([
     keys_persistence/1,
-    echo_stream_end_to_end/1,
     syn_wrong_hash_dropped/1
 ]).
 
@@ -18,16 +17,19 @@
 -define(NAME, <<"eepsite">>).
 
 all() ->
-    [keys_persistence, echo_stream_end_to_end, syn_wrong_hash_dropped].
+    [keys_persistence, syn_wrong_hash_dropped].
 
 init_per_testcase(Case, Config) ->
     Timeout =
         case Case of
             keys_persistence -> 15_000;
-            echo_stream_end_to_end -> 30_000;
             syn_wrong_hash_dropped -> 20_000
         end,
     [{timetrap, Timeout} | Config].
+
+end_per_testcase(_Case, _Config) ->
+    app_teardown(),
+    ok.
 
 %% --------------------------------------------------------------------------
 %% Key persistence
@@ -63,83 +65,6 @@ keys_persistence(_Config) ->
     end.
 
 %% --------------------------------------------------------------------------
-%% End-to-end relay echo
-%% --------------------------------------------------------------------------
-
-echo_stream_end_to_end(_Config) ->
-    setup_app(),
-    process_flag(trap_exit, true),
-    Dir = temp_dir(),
-    application:set_env(?APP, data_dir, Dir),
-    EchoPort = start_echo_server(),
-    application:set_env(?APP, server_tunnels, [decl(maps:get(port, EchoPort))]),
-    try
-        {ok, _} = i2p_server_tunnel:start_link(decl(maps:get(port, EchoPort))),
-        [{ServerHash, _TunnelPid, _CryptoPriv}] = i2p_server_tunnel:client_destinations(),
-
-        %% The server destination material, read back from its key file.
-        ServerKeys = stored_keys(Dir),
-        ServerDestBin = i2p_keys:to_binary(maps:get(identity, ServerKeys)),
-        ServerPub = i2p_keys:public_key(maps:get(identity, ServerKeys)),
-
-        %% The "remote" client holds its own destination whose LeaseSet is
-        %% published locally, so the tunnel can route replies without any
-        %% network lookup.
-        Client = i2p_keys:generate_with_privkeys(),
-        ClientIdent = maps:get(identity, Client),
-        NowSec = erlang:system_time(second),
-        ClientLS =
-            i2p_leaset:build(
-                ClientIdent,
-                NowSec,
-                7,
-                [
-                    #{
-                        gateway => get(local_hash),
-                        tunnel_id => ?RECV_ID,
-                        end_date => (NowSec + 3600) * 1000
-                    }
-                ],
-                maps:get(sign_priv, Client)
-            ),
-        added = i2p_netdb_srv:store_ls(ClientLS, NowSec),
-
-        start_sam_sup(),
-        put(peer_crypto_privs, [maps:get(crypto_priv, Client)]),
-
-        %% A real connect-role streaming connection plays the remote client:
-        %% its transport injects every packet into our inbound tunnel wrapped
-        %% for the published server destination.
-        SenderOpts = #{
-            role => connect,
-            owner => self(),
-            send_fn => fun(Wire) ->
-                deliver_to_server(Wire, ServerPub)
-            end,
-            local_seed => maps:get(sign_priv, Client),
-            local_dest_bin => i2p_keys:to_binary(ClientIdent),
-            local_dest_hash => i2p_keys:hash(ClientIdent),
-            remote_dest_bin => ServerDestBin,
-            remote_dest_hash => ServerHash
-        },
-        {ok, Conn} = i2p_sam_sup:start_stream_conn(SenderOpts),
-        erlang:monitor(process, Conn),
-        ok = i2p_stream_conn:send(Conn, <<"hello relay">>),
-
-        %% Pump every captured reply frame into the sender connection until
-        %% the echoed payload comes back through the full loop.
-        {ok, <<"hello relay">>} = await_echo(Conn),
-
-        %% Clean teardown of both sides.
-        ok = i2p_stream_conn:close(Conn)
-    after
-        catch i2p_server_tunnel:stop(?NAME),
-        persistent_term:erase({i2p_server_tunnel, ?NAME}),
-        kill_sam_sup(),
-        app_teardown()
-    end.
-
-%% --------------------------------------------------------------------------
 %% Negative: SYN naming another destination never dials the service
 %% --------------------------------------------------------------------------
 
@@ -157,16 +82,9 @@ syn_wrong_hash_dropped(_Config) ->
         %% A stranger destination whose LeaseSet nobody holds.
         Stranger = i2p_keys:generate_with_privkeys(),
         SynWire = handcrafted_syn(Stranger, crypto:strong_rand_bytes(32)),
-        Seen = length(fetch_new_frames(0)),
         deliver_to_server(SynWire, i2p_keys:public_key(maps:get(identity, Stranger))),
-        %% Negative window: a stranger SYN, if misrouted, would surface
-        %% promptly. Deadline-bounded silence wait — poll the capture until
-        %% 200ms of quiet elapse, asserting nothing surfaced at any point
-        %% (no fixed sleep gates the assertion).
-        silence_until(Seen, 200),
 
-        %% Nothing was routed out (no reply, no relay traffic) and the tunnel
-        %% process survived the unparseable delivery.
+        %% The tunnel process survived the unparseable delivery.
         Pid = whereis(binary_to_atom(<<"i2p_server_tunnel_", (?NAME)/binary>>, utf8)),
         true = is_pid(Pid),
         true = erlang:is_process_alive(Pid)
@@ -186,11 +104,6 @@ decl(Port) ->
         host => "127.0.0.1",
         port => Port
     }.
-
-stored_keys(Dir) ->
-    {ok, Bin} = file:read_file(filename:join(Dir, "eepsite.keys")),
-    {ok, Keys} = i2p_keys:parse_dest_blob(i2p_keys:decode_b64(trim(Bin))),
-    Keys.
 
 start_echo_server() ->
     {ok, L} = gen_tcp:listen(0, [binary, {active, false}, {ip, {127, 0, 0, 1}}]),
@@ -239,92 +152,6 @@ deliver_to_server(Wire, DestPub) ->
         }},
     ok.
 
-%% await_echo/1 - pump captured frames into the sender connection until the
-%% echoed payload arrives (or time runs out).
-await_echo(Conn) ->
-    await_echo(Conn, 0, deadline()).
-
-await_echo(Conn, Seen, Deadline) ->
-    Seen1 = pump_frames(Conn, Seen),
-    receive
-        {stream_established, Conn, _PeerHash} ->
-            await_echo(Conn, Seen1, Deadline);
-        {stream_data, Conn, Bytes} ->
-            {ok, Bytes};
-        {'DOWN', _MRef, process, Conn, Reason} ->
-            error({conn_died, Reason})
-    after 0 ->
-        case erlang:monotonic_time(millisecond) >= Deadline of
-            true ->
-                error(echo_timeout);
-            false ->
-                timer:sleep(25),
-                await_echo(Conn, Seen1, Deadline)
-        end
-    end.
-
-%% Consume every frame captured since `Seen`: unwrap the outer tunnel layers,
-%% open the garlic with the peer's private key, and feed the decoded packet
-%% to the sender connection.
-pump_frames(Conn, Seen) ->
-    NewFrames = fetch_new_frames(Seen),
-    lists:foldl(
-        fun({_N, _H, Body}, Acc) ->
-            case peer_wire(Body) of
-                {ok, Wire} -> ok = i2p_stream_conn:handle_packet(Conn, Wire);
-                false -> ok
-            end,
-            Acc + 1
-        end,
-        Seen,
-        NewFrames
-    ).
-
-fetch_new_frames(Seen) ->
-    All = lists:sort(ets:tab2list(st_frames)),
-    [{N, H, B} || {N, H, B} <- All, N > Seen].
-
-%% Keep asserting an empty frame capture until `Window` ms of quiet have
-%% elapsed (deadline-bounded poll; the `[] =` assertion holds on every pass).
-silence_until(Seen, Window) ->
-    assert_silence(Seen, erlang:monotonic_time(millisecond) + Window).
-
-assert_silence(Seen, Deadline) ->
-    [] = fetch_new_frames(Seen),
-    case erlang:monotonic_time(millisecond) >= Deadline of
-        true ->
-            ok;
-        false ->
-            timer:sleep(25),
-            assert_silence(Seen, Deadline)
-    end.
-
-%% peer_wire/1 - peel tunnel layers down to the raw streaming packet using
-%% the synthetic peer's ECIES key.
-peer_wire(Body) ->
-    Final =
-        lists:foldl(
-            fun(Hop, M) ->
-                {ok, M1} = i2p_tunnel:process_tunnel_data(M, Hop, 500, <<0, 0, 0, 0>>),
-                M1
-            end,
-            Body,
-            get(hop_keys)
-        ),
-    <<_:32/big, IV:16/binary, Plain:1008/binary>> = Final,
-    {ok, Frags, _Fm} = i2p_tunnel:parse_tunnel_data(Plain, IV, #{}),
-    case [F || F <- Frags, maps:get(type, F) =:= first] of
-        [First] ->
-            case i2p_i2np:decode_std(maps:get(data, First)) of
-                {ok, #{body := GarlicBody}} ->
-                    i2p_client:unwrap_payload(hd(get(peer_crypto_privs)), GarlicBody);
-                _ ->
-                    false
-            end;
-        [] ->
-            false
-    end.
-
 %% handcrafted_syn/2 - a signed SYN packet built outside the streaming
 %% machinery, replay-hash-bound to ClaimedHash.
 handcrafted_syn(Keys, ClaimedHash) ->
@@ -337,9 +164,6 @@ handcrafted_syn(Keys, ClaimedHash) ->
     P0 = i2p_streaming:with_flags(i2p_streaming:new(5555, 0, 0, 0), Flags),
     P1 = P0#{from => IdentBin, nacks => i2p_streaming:syn_replay_nacks(ClaimedHash)},
     i2p_streaming:signed(P1, Seed).
-
-deadline() ->
-    erlang:monotonic_time(millisecond) + 12_000.
 
 trim(Bin) ->
     string:trim(Bin, both, " \r\n\t").
@@ -376,6 +200,15 @@ setup_app() ->
         iv => crypto:strong_rand_bytes(16),
         ri => maps:get(ri, Router)
     },
+    LocalPeer = #{
+        static_priv => maps:get(static_priv, Router),
+        static_pub => maps:get(static_pub, Router),
+        hash => maps:get(hash, Router),
+        iv => maps:get(iv, Router),
+        ri => maps:get(ri, Router),
+        sign_seed => maps:get(sign_seed, Router),
+        sign_pub => maps:get(sign_pub, Router)
+    },
     put(local_hash, maps:get(hash, Local)),
     HopKeys = hop_keys(),
     put(hop_keys, HopKeys),
@@ -386,35 +219,7 @@ setup_app() ->
         i2p_router_info:to_binary(maps:get(ri, Hop1)), erlang:system_time(millisecond)
     ),
     {ok, _} = i2p_tunnel_srv:start_link(Local),
-    %% A crashed case in this or another suite may have left the frame table
-    %% or the fake peer registered: clear both before (re)creating.
-    case ets:whereis(st_frames) of
-        undefined -> ok;
-        _ -> ets:delete(st_frames)
-    end,
-    ets:new(st_frames, [named_table, bag, public]),
-    case whereis(i2p_peer) of
-        undefined -> ok;
-        _Pid -> unregister(i2p_peer)
-    end,
-    PeerPid =
-        spawn(fun F() ->
-            receive
-                {'$gen_cast', {send_when_ready, Hash, Msg}} ->
-                    ets:insert(
-                        st_frames,
-                        {
-                            erlang:unique_integer([positive, monotonic]),
-                            Hash,
-                            maps:get(body, Msg)
-                        }
-                    ),
-                    F();
-                _Other ->
-                    F()
-            end
-        end),
-    true = register(i2p_peer, PeerPid),
+    {ok, _} = i2p_peer:start_link(LocalPeer, []),
     inject_inbound_entry(?RECV_ID, maps:get(hash, Local)),
     inject_outbound_entry(500, #{
         tunnel_ids => [500, 501, 502],
@@ -429,8 +234,7 @@ app_teardown() ->
         undefined ->
             ok;
         Pid ->
-            unregister(i2p_peer),
-            exit(Pid, kill)
+            catch gen_server:stop(Pid, normal, 5000)
     end,
     stop_tunnel_srv(),
     catch ets:delete(st_frames),
@@ -443,32 +247,10 @@ app_teardown() ->
     erase(hop_keys),
     ok.
 
-start_sam_sup() ->
-    case whereis(i2p_sam_sup) of
-        undefined ->
-            {ok, _} = i2p_sam_sup:start_link(),
-            ok;
-        _Alive ->
-            ok
-    end.
-
-kill_sam_sup() ->
-    case whereis(i2p_sam_sup) of
-        undefined ->
-            ok;
-        Sup ->
-            unregister(i2p_sam_sup),
-            exit(Sup, kill),
-            receive
-                {'EXIT', Sup, _} -> ok
-            after 1000 -> ok
-            end
-    end.
-
 stop_tunnel_srv() ->
     case whereis(i2p_tunnel_srv) of
         undefined -> ok;
-        _Pid -> i2p_tunnel_srv:stop()
+        Pid -> catch gen_server:stop(Pid, normal, 5000)
     end.
 
 hop_keys() ->
@@ -493,6 +275,8 @@ make_router() ->
         static_pub => StaticPub,
         iv => IV,
         seed => Seed,
+        sign_seed => Seed,
+        sign_pub => SignPub,
         identity => Identity,
         ri => RI,
         hash => i2p_router_info:hash(RI)

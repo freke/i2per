@@ -100,9 +100,26 @@ smoke-test: lint
 # half have to be produced by one run of each in the same profile to merge.
 #
 # Run everything: lint, docs, all eunit, all PropEr, all CT, coverage.
+#
+# **CT coverage is taken per tier, not in one run.** A single `ct --cover` over
+# all 29 suites in one VM reproduced, on this tree and on its base, a run where
+# CT's own logger hook died at the `i2p_ssu2_e2e` → `i2p_ssu2_handshake`
+# boundary and every later suite was poisoned — and a second run died in
+# rebar's cover export. Per-tier runs each stay inside the budgets they were
+# measured at; `rebar3 cover` merges every `.coverdata` in the directory, so
+# the merged report sees both tiers.
+#
+# The floor is the gate, not a decoration: coverage that quietly fell from one
+# PR's deletions (74.8% after the test-hygiene PR removed eleven test files)
+# stays invisible until a reader diffs the HTML. A red gate on the total is the
+# only signal that arrives on its own.
 test: lint doc
-    rebar3 as test do eunit --cover, ct --cover --sname i2per_ct
-    rebar3 cover
+    rebar3 as test do eunit --cover
+    rebar3 ct --cover --sname i2per_ct --suite="$(bash scripts/ct-suites.sh smoke)"
+    mv _build/test/cover/ct.coverdata _build/test/cover/ct-smoke.coverdata
+    rebar3 ct --cover --sname i2per_ct --suite="$(bash scripts/ct-suites.sh slow)"
+    mv _build/test/cover/ct.coverdata _build/test/cover/ct-slow.coverdata
+    rebar3 cover --min_coverage 70
 
 # %%%%% The slow tier %%%%%
 #

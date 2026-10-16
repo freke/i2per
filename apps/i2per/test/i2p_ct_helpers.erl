@@ -653,8 +653,15 @@ summ_block(B) ->
 -spec start_ssu2_trace() -> ok.
 start_ssu2_trace() ->
     ok = stop_collector(),
+    %% **Read the previous level before raising the verbosity.** `f:start_frame_collector/0`
+    %% captures the level its collector will restore on teardown, so calling it
+    %% after `f:set_level/1` would make the collector remember `debug` as the
+    %% level to put back -- and every case after the first one would then run the
+    %% whole tree at `debug`, which is how a 20,000-datagram case turned into a
+    %% 2 GB log and a minutes-long `ct_logs` process.
+    Before = current_level(),
     ok = i2p_log:set_level(debug),
-    _Collector = start_frame_collector(),
+    _Collector = start_frame_collector(Before),
     ok.
 
 %% The collector on its own, with the handler attached.
@@ -667,7 +674,12 @@ start_ssu2_trace() ->
 %% `debug` and stops there sees the same frames.
 -spec start_frame_collector() -> pid().
 start_frame_collector() ->
-    Collector = spawn(fun() -> frame_collector({[], current_level(), undefined}) end),
+    start_frame_collector(current_level()).
+
+%% The collector, with the level to restore on teardown given by the caller.
+-spec start_frame_collector(i2p_log:level()) -> pid().
+start_frame_collector(Before) ->
+    Collector = spawn(fun() -> frame_collector({[], Before, undefined}) end),
     true = register(?SSU2_FRAMES, Collector),
     {ok, HandlerId} = i2p_log_tests_collector:start(Collector),
     Collector ! {handler, HandlerId},
