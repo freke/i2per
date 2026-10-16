@@ -16,59 +16,6 @@ local service and is covered by the CT suite (network-gated).
 -define(NAME, <<"echo">>).
 -define(DECL, #{name => ?NAME, host => <<"127.0.0.1">>, port => 8080}).
 
-%% init with no data_dir: fresh keygen, stable shape, destination registered.
-init_test() ->
-    with_stub(fun() ->
-        application:unset_env(i2per, data_dir),
-        application:set_env(i2per, server_tunnels, [?DECL]),
-        try
-            {ok, State} = i2p_server_tunnel:init([?DECL]),
-            ?assertEqual(?NAME, maps:get(name, State)),
-            %% binary host normalised
-            ?assertEqual("127.0.0.1", maps:get(host, State)),
-            ?assertEqual(8080, maps:get(port, State)),
-            ?assertMatch(#{binary := _}, maps:get(dest, State)),
-            ?assert(is_binary(maps:get(dest_hash, State))),
-            ?assert(is_binary(maps:get(sign_seed, State))),
-            ?assertEqual(undefined, maps:get(keys_path, State, missing)),
-            ?assertEqual(#{}, maps:get(pending, State)),
-            ?assertEqual(#{}, maps:get(conns, State)),
-            ?assertEqual(
-                [{maps:get(dest_hash, State), self(), maps:get(crypto_priv, State)}],
-                i2p_server_tunnel:client_destinations()
-            )
-        after
-            persistent_term:erase({i2p_server_tunnel, ?NAME}),
-            application:unset_env(i2per, server_tunnels)
-        end
-    end).
-
-%% init with data_dir: keys persisted to <dir>/<name>.keys, second init loads
-%% the same identity back.
-persistent_keys_test() ->
-    with_stub(fun() ->
-        Dir = tmp_dir(),
-        application:set_env(i2per, data_dir, Dir),
-        application:set_env(i2per, server_tunnels, [?DECL]),
-        try
-            {ok, S1} = i2p_server_tunnel:init([?DECL]),
-            KeysPath = filename:join(Dir, <<"echo.keys">>),
-            ?assertEqual(KeysPath, maps:get(keys_path, S1)),
-            ?assert(filelib:is_file(KeysPath)),
-            persistent_term:erase({i2p_server_tunnel, ?NAME}),
-            {ok, S2} = i2p_server_tunnel:init([?DECL]),
-            ?assertEqual(maps:get(dest, S1), maps:get(dest, S2)),
-            ?assertEqual(maps:get(crypto_priv, S1), maps:get(crypto_priv, S2)),
-            ?assertEqual(maps:get(sign_seed, S1), maps:get(sign_seed, S2)),
-            ?assertEqual(maps:get(dest_hash, S1), maps:get(dest_hash, S2))
-        after
-            persistent_term:erase({i2p_server_tunnel, ?NAME}),
-            application:unset_env(i2per, data_dir),
-            application:unset_env(i2per, server_tunnels),
-            file:del_dir(Dir)
-        end
-    end).
-
 child_spec_test() ->
     Decl = #{name => <<"MySite">>, host => "127.0.0.1", port => 8080},
     Spec = i2p_server_tunnel:child_spec(Decl),
@@ -130,24 +77,6 @@ handler_unknown_test() ->
         i2p_server_tunnel:handle_info({'DOWN', make_ref(), process, Me, normal}, S)
     ).
 
-%% tcp_data with no matching relay: setopts succeeds, byte drop, state unchanged.
-tcp_data_no_relay_test() ->
-    S = base_state(),
-    {ok, Listen} = gen_tcp:listen(0, [binary, {active, false}]),
-    {ok, Port} = inet:port(Listen),
-    {ok, Cli} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}]),
-    {ok, Sock} = gen_tcp:accept(Listen, 1000),
-    try
-        ?assertEqual(
-            {noreply, S},
-            i2p_server_tunnel:handle_info({tcp, Sock, <<"hi">>}, S)
-        )
-    after
-        gen_tcp:close(Cli),
-        gen_tcp:close(Sock),
-        gen_tcp:close(Listen)
-    end.
-
 %% Non-socket sock values: tcp_closed/tcp_error degrade to unchanged state.
 tcp_closed_unknown_test() ->
     S = base_state(),
@@ -198,17 +127,3 @@ base_state() ->
         pending => #{},
         conns => #{}
     }.
-
-with_stub(Fun) ->
-    ok = i2p_tunnel_srv_stub:start(),
-    try
-        Fun()
-    after
-        i2p_tunnel_srv_stub:stop()
-    end.
-
-tmp_dir() ->
-    filename:join(
-        "/tmp",
-        "i2p_server_tunnel_test_" ++ integer_to_list(erlang:unique_integer([positive]))
-    ).

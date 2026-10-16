@@ -1,25 +1,47 @@
--module(i2p_ssu2_reachability_tests).
+%% Reachability-verdict tests for `m:i2p_ssu2_reachability`.
+%%
+%% Ported from the EUnit module of the same subject: every case here (re)boots
+%% the whole router under a configured `allow_private_host` value, which is
+%% Common Test territory, not EUnit. The decision under test is asynchronous
+%% after a peertest event, so every assertion polls to a deadline and a timeout
+%% is a failure, not a pass.
 
--moduledoc """
-Tests for the `m:i2p_ssu2_reachability` decision: the private-host boot rule,
-the `{peertest_result, _AddrType, {Rung, Reason}}` folds, the asymmetric
-hysteresis (one `introducer_only` demotes, `peertest_promote_after` consecutive
-`reachable` promote), the measured detail, and the effects the verdict drives
-(app env `measured_reachability` for the caps, the address swap).
+-module(i2p_ssu2_reachability_SUITE).
 
-The app is (re)started under each configured `allow_private_host` value and
-torn down afterwards so the explicit test mode (no peer, no listeners) never
-binds anything; the events bus is the router's own.
-""".
+-compile(export_all).
 
+-include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
+
+-export([all/0, suite/0]).
+-export([
+    boot_firewalled_when_private_host/1,
+    peertest_results_reachability/1,
+    one_firewalled_demotion_demotes_immediately/1,
+    measured_reachability_drives_the_caps/1,
+    test_in_flight_moves_the_rung_to_testing/1
+]).
+
+-define(APP, i2per).
+
+suite() ->
+    [{timetrap, 30000}].
+
+all() ->
+    [
+        boot_firewalled_when_private_host,
+        peertest_results_reachability,
+        one_firewalled_demotion_demotes_immediately,
+        measured_reachability_drives_the_caps,
+        test_in_flight_moves_the_rung_to_testing
+    ].
 
 %% A loopback/private-host boot is firewalled by construction: it cannot accept
 %% inbound SSU2, so the decision is immediate, on both families, with the
 %% aggregate `{reachability, ssu2, firewalled}` event. The measured detail is
 %% the honest answer for a profile pinned that way: no test ran, so the rung
 %% reads `unknown` with reason `own_config`.
-boot_firewalled_when_private_host_test() ->
+boot_firewalled_when_private_host(_Config) ->
     start_app(true),
     try
         ?assertEqual(firewalled, i2p_ssu2_reachability:status()),
@@ -40,7 +62,7 @@ boot_firewalled_when_private_host_test() ->
 %% One `reachable` conclusion moves the family's rung but not the coarse
 %% verdict — the hysteresis promotes at `peertest_promote_after` consecutive
 %% conclusions, because one lucky test promoting us is the expensive mistake.
-peertest_results_reachability_test() ->
+peertest_results_reachability(_Config) ->
     start_app(false),
     try
         ?assertEqual(unknown, i2p_ssu2_reachability:status()),
@@ -73,7 +95,7 @@ peertest_results_reachability_test() ->
 %% — the Charlie confirmed, the punch never landed) demotes the coarse verdict
 %% immediately, and it also resets the consecutive count, so a promotion
 %% streak in progress cannot carry a later demotion with it.
-one_firewalled_demotion_demotes_immediately_test() ->
+one_firewalled_demotion_demotes_immediately(_Config) ->
     start_app(false),
     try
         ok = gen_event:add_handler(i2p_events, i2p_events_tests_collector, [self()]),
@@ -112,12 +134,12 @@ one_firewalled_demotion_demotes_immediately_test() ->
 %% says otherwise. A promotion writes `reachable` back. With no identity the
 %% boot runs no peer manager, so the swap itself is a skip — the caps are the
 %% half that follows here.
-measured_reachability_drives_the_caps_test() ->
+measured_reachability_drives_the_caps(_Config) ->
     start_app(false),
     try
         %% Absent before any measurement: the operator's configured
         %% reachability is the answer, and no test has contradicted it.
-        ?assertEqual(undefined, application:get_env(i2per, measured_reachability)),
+        ?assertEqual(undefined, application:get_env(?APP, measured_reachability)),
 
         i2p_events:notify({peertest_result, ipv4, {introducer_only, punch_not_delivered}}),
         ?assertEqual(firewalled, wait_status(status, firewalled)),
@@ -136,7 +158,7 @@ measured_reachability_drives_the_caps_test() ->
 %% which is the difference between "we don't know yet" and "we know and the
 %% answer is unknown". The coarse verdict is untouched: a test in flight is
 %% not a verdict about anything.
-test_in_flight_moves_the_rung_to_testing_test() ->
+test_in_flight_moves_the_rung_to_testing(_Config) ->
     start_app(false),
     try
         ?assertEqual(unknown, wait_detail_rung(ipv4)),
@@ -152,16 +174,16 @@ test_in_flight_moves_the_rung_to_testing_test() ->
 %% Fixture
 
 start_app(AllowPrivateHost) ->
-    catch application:stop(i2per),
-    ok = application:set_env(i2per, allow_private_host, AllowPrivateHost),
-    {ok, _} = application:ensure_all_started(i2per),
+    catch application:stop(?APP),
+    ok = application:set_env(?APP, allow_private_host, AllowPrivateHost),
+    {ok, _} = application:ensure_all_started(?APP),
     ?assert(is_pid(whereis(i2p_ssu2_reachability))),
     ok.
 
 stop_app() ->
-    _ = application:stop(i2per),
-    _ = application:unset_env(i2per, allow_private_host),
-    _ = application:unset_env(i2per, measured_reachability),
+    _ = application:stop(?APP),
+    _ = application:unset_env(?APP, allow_private_host),
+    _ = application:unset_env(?APP, measured_reachability),
     ok.
 
 %% Poll `Query` until it equals `Expected`, or fail after 2 s. The decision is
@@ -205,7 +227,7 @@ wait_env(Key, Expected) ->
     wait_env(Key, Expected, Deadline).
 
 wait_env(Key, Expected, Deadline) ->
-    Current = application:get_env(i2per, Key),
+    Current = application:get_env(?APP, Key),
     Value =
         case Current of
             {ok, V} -> V;

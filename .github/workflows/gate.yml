@@ -182,7 +182,7 @@ jobs:
   # %%%%% The main tier %%%%%
   #
   # `main` only. Everything, no time limit: lint, docs, dialyzer, every eunit
-  # including the property layer, and all 25 CT suites including the two the
+  # including the property layer, and every CT suite including the two the
   # smoke tier holds back.
   #
   # **Separate from `smoke` rather than a superset step in it.** On `main` the

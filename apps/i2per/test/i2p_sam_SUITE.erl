@@ -108,7 +108,7 @@
 -define(ORDINARY_ACCEPTOR_ENDS, [normal, killed]).
 
 suite() ->
-    [{timetrap, 120000}].
+    [{timetrap, 30000}].
 
 all() ->
     [
