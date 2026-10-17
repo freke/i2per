@@ -618,24 +618,40 @@ maybe_notify(Msg) ->
             ok
     end.
 
-%% try_stream_delivery/1 — offer an undecryptable garlic body to every
-%% registered session: the first destination whose ECIES private key
-%% opens it receives the payload as {stream_data, Payload}. The owning
+%% try_stream_delivery/1 — offer an undecryptable garlic body to the
+%% registered destinations: the destination whose ECIES private key opens
+%% it receives the payload as {stream_data, Payload}. The owning
 %% session dispatches by style (streaming packets vs datagrams).
+%%
+%% A garlic is AEAD-encrypted to a single recipient's static key, so at
+%% most one candidate can open it; the scan stops at the first success and
+%% never tries the candidates behind it. (A candidate that does not open
+%% pays one ECIES open either way — there is no demux key in the wire
+%% format, so key-trial is the only correct way to find the owner.) The
+%% destination count is already bounded by the session/server-tunnel caps.
 -spec try_stream_delivery(binary()) -> ok.
 try_stream_delivery(GarlicBody) ->
-    lists:foreach(
-        fun({_DestHash, Pid, CryptoPriv}) ->
-            case i2p_client:unwrap_payload(CryptoPriv, GarlicBody) of
-                {ok, Payload} -> Pid ! {stream_data, Payload};
-                error -> ok
-            end
-        end,
+    Candidates =
         i2p_sam_sup:client_sessions() ++
             i2p_addressbook_subs:client_destinations() ++
-            i2p_server_tunnel:client_destinations()
-    ),
-    ok.
+            i2p_server_tunnel:client_destinations(),
+    try_stream_delivery_loop(Candidates, GarlicBody).
+
+%% try_stream_delivery_loop/2 — try candidates in order; stop at the first
+%% one whose key opens the garlic. Returns ok.
+-spec try_stream_delivery_loop(
+    [{binary(), pid(), i2p_crypto:x25519_private_key()}], binary()
+) -> ok.
+try_stream_delivery_loop([], _GarlicBody) ->
+    ok;
+try_stream_delivery_loop([{_DestHash, Pid, CryptoPriv} | Rest], GarlicBody) ->
+    case i2p_client:unwrap_payload(CryptoPriv, GarlicBody) of
+        {ok, Payload} ->
+            Pid ! {stream_data, Payload},
+            ok;
+        error ->
+            try_stream_delivery_loop(Rest, GarlicBody)
+    end.
 
 %% handle_tunnel_gateway/2 — inject a TunnelGateway payload into a tunnel
 %% whose inbound gateway is our transit entry: fragment into plaintext
