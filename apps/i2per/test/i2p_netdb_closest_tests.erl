@@ -125,6 +125,70 @@ load_computes_the_floodfill_flags_test() ->
     ).
 
 %%% --------------------------------------------------------------------------
+%%% The floodfill index is a value the mutators move, not a scan at read time
+%%% --------------------------------------------------------------------------
+
+%% The index is not rebuilt from the table at lookup time: it is a value the same
+%% expressions that write the table move. So the case that matters is a router
+%% whose eligibility changes under a key the store already holds, and the
+%% assertion is on what the next lookup returns rather than on the map itself.
+%%
+%% One identity throughout, so all three versions share a router hash and the
+%% store sees replacements rather than three routers.
+floodfill_index_follows_a_router_into_and_out_of_the_set_test() ->
+    Now = erlang:system_time(millisecond),
+    Target = crypto:strong_rand_bytes(32),
+    {Identity, Seed} = identity(),
+    Plain = identical(Identity, Seed, Now, <<"O">>),
+    Key = i2p_router_info:hash(Plain),
+    Store0 = i2p_netdb:new(20),
+
+    %% Plain: declared nothing, so the index and the lookup both omit it.
+    {Store1, added} = i2p_netdb:store(Store0, Plain, Now),
+    ?assertEqual([], hashes_of(i2p_netdb:closest_floodfills(Store1, Target, 10, []))),
+    ok = i2p_netdb:self_check(Store1),
+
+    %% Into the set: the same key, republished as an eligible floodfill.
+    {Store2, updated} = i2p_netdb:store(
+        Store1, identical(Identity, Seed, Now + 1, <<"Of">>), Now + 1
+    ),
+    ?assertEqual([Key], hashes_of(i2p_netdb:closest_floodfills(Store2, Target, 10, []))),
+    ok = i2p_netdb:self_check(Store2),
+
+    %% Out again: declared, but the unreachable flag fails eligibility.
+    {Store3, updated} = i2p_netdb:store(
+        Store2, identical(Identity, Seed, Now + 2, <<"OUf">>), Now + 2
+    ),
+    ?assertEqual([], hashes_of(i2p_netdb:closest_floodfills(Store3, Target, 10, []))),
+    ?assertEqual(ok, i2p_netdb:self_check(Store3)).
+
+%% `f:self_check/1` is where the index invariant lives, so the case has to show it
+%% refusing a store whose index disagrees with the table -- the drift a missed
+%% call site would leave. Both directions, because they are different bugs: a key
+%% the index omits, and a key it names that no eligible router backs.
+self_check_catches_a_floodfill_index_that_disagrees_with_the_table_test() ->
+    Now = erlang:system_time(millisecond),
+    FF = floodfill(Now, "g"),
+    Store = stored([FF], i2p_netdb:new(20), Now),
+    ok = i2p_netdb:self_check(Store),
+    Key = i2p_router_info:hash(FF),
+
+    %% The table still holds an eligible floodfill the index has stopped naming.
+    Missing = Store#{floodfill_index => #{}},
+    ?assertEqual(
+        {error, {floodfill_index_disagrees, [Key]}},
+        i2p_netdb:self_check(Missing)
+    ),
+
+    %% The other way: a key the index names that no eligible router backs.
+    Ghost = crypto:strong_rand_bytes(32),
+    Extra = Store#{floodfill_index => #{Key => true, Ghost => true}},
+    ?assertEqual(
+        {error, {floodfill_index_disagrees, [Ghost]}},
+        i2p_netdb:self_check(Extra)
+    ).
+
+%%% --------------------------------------------------------------------------
 %%% The memo
 %%% --------------------------------------------------------------------------
 
@@ -309,17 +373,32 @@ plain(Now, Tag) ->
     with_caps(Now, Tag, <<"O">>).
 
 with_caps(Now, Tag, Caps) ->
-    {{SPub, Seed}, {CPub, _}} =
-        {i2p_crypto:ed25519_keygen(), i2p_crypto:x25519_keygen()},
+    {Identity, Seed} = identity(),
+    build_ri(Identity, Seed, Now, host_hash(Tag), Caps).
+
+%% One router identity at a named publish time, capability set and host.
+%%
+%% A case that wants to replace one version of a router with another reuses
+%% `identity/0` and `identical/4`, which keeps the router hash and makes the
+%% store see an update rather than a second router.
+identical(Identity, Seed, Now, Caps) ->
+    build_ri(Identity, Seed, Now, host_hash(Caps), Caps).
+
+identity() ->
+    {SPub, Seed} = i2p_crypto:ed25519_keygen(),
+    {CPub, _} = i2p_crypto:x25519_keygen(),
+    {i2p_keys:from_keys(CPub, SPub), Seed}.
+
+build_ri(Identity, Seed, Now, Host, Caps) ->
     Addr = i2p_router_info:ntcp2_address(
-        host_hash(Tag), 4668, crypto:strong_rand_bytes(32), crypto:strong_rand_bytes(16)
+        Host, 4668, crypto:strong_rand_bytes(32), crypto:strong_rand_bytes(16)
     ),
     Opts = #{
         <<"netId">> => <<"2">>,
         <<"router.version">> => <<"0.9.74">>,
         <<"caps">> => Caps
     },
-    i2p_router_info:build(i2p_keys:from_keys(CPub, SPub), Now, [Addr], Opts, Seed).
+    i2p_router_info:build(Identity, Now, [Addr], Opts, Seed).
 
 %% A host derived from a tag rather than an index, so two fixtures built with the
 %% same index in different cases do not collide into one RouterInfo.
