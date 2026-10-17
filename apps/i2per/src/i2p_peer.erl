@@ -2013,13 +2013,13 @@ reply_to_store(#{reply_token := 0}, _MsgID, _State) ->
     ok;
 reply_to_store(#{reply_token := 16#FFFFFFFF}, _MsgID, _State) ->
     ok;
-reply_to_store(#{reply_token := _, reply := {0, Gateway}}, MsgID, State) ->
+reply_to_store(#{reply_token := ReplyToken, reply := {0, Gateway}}, _MsgID, State) ->
     case find_peer_by_hash(Gateway, State) of
         {ok, TargetConn, TargetTransport} ->
             send_i2np(
                 TargetConn,
                 TargetTransport,
-                i2p_i2np:delivery_status(MsgID, erlang:system_time(millisecond))
+                i2p_i2np:delivery_status(<<ReplyToken:32/big>>, erlang:system_time(millisecond))
             );
         error ->
             ok
