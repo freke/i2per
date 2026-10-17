@@ -148,9 +148,10 @@ delivery_status_replies(_Config) ->
             body => StoreBody
         },
         send_i2np(CB, StoreMsg),
-        %% A must reply with a DeliveryStatus acknowledging that exact message ID.
-        {delivery_status, AckedMsgID2, _} = db_msg(recv_msg(CB)),
-        AckedMsgID = AckedMsgID2,
+        %% A must reply with a DeliveryStatus whose message ID is the store's
+        %% reply token (4242), not the store's own I2NP message id.
+        {delivery_status, AckedReplyToken, _} = db_msg(recv_msg(CB)),
+        <<4242:32/big>> = AckedReplyToken,
         %% The 0xFFFFFFFF reply token must not be acknowledged.
         IgnoreBody =
             <<BHash/binary, 0:8, 16#FFFFFFFF:32/big, 0:32/big, BHash/binary, Data/binary>>,
