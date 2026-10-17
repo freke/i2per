@@ -4,6 +4,14 @@ All notable changes to i2per are recorded here. Versions follow the OTP
 applications' own `{vsn, ...}`; the release tag is `v` + that version, and
 CI refuses a tag that disagrees.
 
+## [Unreleased]
+
+### Changed
+
+- The floodfill lookup walks a floodfill-only index, so it no longer scans every
+  stored router to find the floodfills and no longer sorts the whole store
+  (#13EY2MQ).
+
 ## [0.3.0] — 2026-10-13
 
 **The Charlie role is implemented.** `i2p_relay_coord` now answers a RelayIntro
@@ -320,8 +328,7 @@ release candidate is the same release before the version was final.
 - The RouterInfo expiry horizon slides with store size (#RA5PVR1); the
   closest-peer lookup no longer rehashes per comparison (#8YGZFB8); the
   floodfill lookup no longer hashes per candidate, via a day-tagged routing-key
-  memo (#8YGZFB8). The floodfill-only index and the sort over the floodfill set
-  are still to come (#13EY2MQ).
+  memo (#8YGZFB8).
 
 ### Known issues
 
