@@ -48,7 +48,7 @@ Rows are one verdict, not prose: **done** (implemented and exercised),
 | Datagram2 | absent | correctness gap, deferred |
 | Addressbook (subscribe) | done | |
 | Addressbook (publish) | absent | deferred |
-| Charlie / introducer role | partial | in-session half implemented; hole-punch half is 1.0.0 material |
+| Charlie / introducer role | done | in-session RelayResponse and out-of-session HolePunch (type 11), rate-limited and endpoint-checked (`A740VAB`) |
 | Automatic NetDb-driven Charlie selection | absent | 1.0.0 material |
 | Peer testing | done | measured reachability ladder |
 | Measured reachability | done | see `CD7ZBVH` |
@@ -61,11 +61,9 @@ Rows are one verdict, not prose: **done** (implemented and exercised),
 
 - `RC68AGE` — SSU2 congestion control and RTT estimation.
 - Tunnel build v2 with NetDb-driven Charlie selection.
-- Hole punching as a Charlie (out-of-session half).
 - LeaseSet v1, EncryptedLeaseSet, MetaLeaseSet.
 - SOCKS / HTTP proxy / BOB / I2PControl console.
 - TUN interface.
-- Automatic NetDb-driven Charlie selection.
 
 ## Freshness
 
