@@ -352,6 +352,12 @@ does — a second ETS table would be side-effect state, and the property that on
 function stands between every mutation and every derived structure would be lost.
 See `f:closest_keys/4`.
 
+`floodfill_index` is the set of router keys whose stored flag byte carries
+`?FF_ELIGIBLE`, kept so `f:closest_floodfills/4` selects the replication set by
+the index rather than by scanning every stored router and re-sorting the whole
+set. Like the flags it is derived data, and `f:self_check/1` proves it stays in
+step with the table across every path that writes one.
+
 LeaseSets keep a plain map and list. Nothing on the data path asks about them
 per frame, so they gain nothing from a table and would only pay for it. They also
 need no generation: they live in the store map, so a dropped LeaseSet return
@@ -368,12 +374,6 @@ value loses nothing that is not already lost.
     generation := non_neg_integer(),
     routing := {binary(), #{router_key() => router_key()}},
     floodfill_index := #{router_key() => true},
-    floodfills := #{router_key() => true},
-    ff_index := #{router_key() => true},
-    floodfill_keys := #{router_key() => true},
-    floodfill_set := #{router_key() => true},
-    ff := #{router_key() => true},
-    index := #{router_key() => true},
     lease_sets := #{ls_key() => i2p_leaset:lease_set()},
     ls_order := [ls_key()]
 }.
@@ -452,12 +452,6 @@ new(Capacity, MaxMs, MinMs) when
         generation => 0,
         routing => {<<>>, #{}},
         floodfill_index => #{},
-        floodfills => #{},
-        ff_index => #{},
-        floodfill_keys => #{},
-        floodfill_set => #{},
-        ff => #{},
-        index => #{},
         lease_sets => #{},
         ls_order => []
     };
@@ -1858,23 +1852,14 @@ stale_routing(#{routing := {_Day, Memo}, routers := Tab}) ->
 
 %% Helpers for the floodfill index. The index is a set of router keys (kept as a
 %% map for the same reason the routing memo is: `map_size/1` and O(1) membership),
-%% held under several field names for compatibility. It names exactly the
-%% routers whose stored flag byte carries `?FF_ELIGIBLE`, and `f:self_check/1`
-%% is what proves it.
+%% naming exactly the routers whose stored flag byte carries `?FF_ELIGIBLE`.
+%% `f:self_check/1` is what proves it stays in step with the table.
 forget_floodfill_index(Store, Key) ->
     Index = maps:get(floodfill_index, Store, #{}),
     set_floodfill_index(Store, maps:remove(Key, Index)).
 
 set_floodfill_index(Store, Index) ->
-    Store#{
-        floodfill_index => Index,
-        floodfills => Index,
-        ff_index => Index,
-        floodfill_keys => Index,
-        floodfill_set => Index,
-        ff => Index,
-        index => Index
-    }.
+    Store#{floodfill_index => Index}.
 
 update_floodfill_index(Index, Key, OldEligible, NewEligible) ->
     Index1 =
@@ -1903,22 +1888,8 @@ eligible_floodfill_keys(Tab) ->
 
 stale_floodfill_index(Tab, Store) ->
     Eligible = eligible_floodfill_keys(Tab),
-    Aliases = [floodfill_index, floodfills, ff_index, floodfill_keys, floodfill_set, ff, index],
-    lists:usort(
-        lists:foldl(
-            fun(Alias, Acc) ->
-                case maps:find(Alias, Store) of
-                    {ok, Index} when is_map(Index) ->
-                        Keys = maps:keys(Index),
-                        Acc ++ (Keys -- Eligible) ++ (Eligible -- Keys);
-                    _ ->
-                        Acc
-                end
-            end,
-            [],
-            Aliases
-        )
-    ).
+    Indexed = maps:keys(maps:get(floodfill_index, Store, #{})),
+    lists:usort((Indexed -- Eligible) ++ (Eligible -- Indexed)).
 
 %% The order tree already holds every key we store, so the key set is read from
 %% there rather than by sweeping the table. One less place that has to agree
