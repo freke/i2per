@@ -11,11 +11,23 @@
 %% `f:maybe_replicate/5`'s own comment already claimed it fired only on `added`
 %% or `updated`. These cases are what make that true.
 %%
+%% There is a second half to "allowed to push on", and it is not about the entry
+%% at all: the store's reply token. Both references forward only a store that
+%% asked to be forwarded — i2pd's `if (replyToken && context.IsFloodfill () &&
+%% updated)` (`libi2pd/NetDb.cpp:925`), Java's `floodfillEnabled() &&
+%% getReplyToken() > 0` (`HandleFloodfillDatabaseStoreMessageJob.java:486`) — and
+%% `f:i2p_floodfill:flood_requested/1` is that condition. So a case that is about
+%% *which entries* may be pushed on has to send a token, or the gate would
+%% suppress the store first and the case would pass without ever testing its
+%% claim. `store_without_reply_token_does_not_replicate` is the case about the
+%% gate itself, and it is the only one that sends none.
+%%
 %% Replication is observed by tracing `f:i2p_floodfill:replication_outbox/5`,
-%% which is the single point every forwarded entry passes through. The NetDb,
-%% the event bus and the peer manager are started standalone: starting the whole
-%% application would leave `i2p_tunnel_srv` running and fail the suites that
-%% follow, which start it themselves.
+%% which is the single point every forwarded entry passes through, and by reading
+%% the two replication counters the same decision moves. The NetDb,
+%% the event bus, the counters and the peer manager are started standalone:
+%% starting the whole application would leave `i2p_tunnel_srv` running and fail
+%% the suites that follow, which start it themselves.
 
 -module(i2p_peer_replication_SUITE).
 
@@ -23,6 +35,7 @@
 
 -export([
     stored_router_info_replicates_exactly_once/1,
+    store_without_reply_token_does_not_replicate/1,
     unimplemented_store_type_does_not_replicate/1,
     refused_router_info_does_not_replicate/1,
     undecodable_store_does_not_replicate/1,
@@ -44,6 +57,12 @@
 %% I2NP DatabaseStore message type (see i2p_i2np:db_store/5).
 -define(I2NP_DB_STORE, 1).
 
+%% The reply token on the stores that are meant to be forwarded. The value only
+%% has to be nonzero — one value is enough because `f:i2p_floodfill:flood_requested/1`
+%% does not branch on it — and the reply gateway is a random hash no peer here
+%% answers as, so the DeliveryStatus goes nowhere and nothing else moves.
+-define(REPLY_TOKEN, 16#5EEDCAFE).
+
 %% Enough floodfills for the 3 replication targets to exist alongside self and
 %% the originator, which `f:i2p_floodfill:replication_outbox/5` excludes.
 -define(POOL, 6).
@@ -54,6 +73,7 @@ suite() ->
 all() ->
     [
         stored_router_info_replicates_exactly_once,
+        store_without_reply_token_does_not_replicate,
         unimplemented_store_type_does_not_replicate,
         refused_router_info_does_not_replicate,
         undecodable_store_does_not_replicate,
@@ -65,6 +85,13 @@ init_per_testcase(_Case, Config) ->
     {ok, Netdb} = i2p_netdb_srv:start_link(),
     {ok, _Events} = i2p_events:start_link(),
     ok = gen_event:add_handler(i2p_events, i2p_events_forward, [self()]),
+    %% Standalone, like the rest of the tree here. `f:i2p_counters:add/2` is
+    %% documented to no-op when this process is not running, so a suite that
+    %% starts part of the tree is allowed to leave it out -- but then the two
+    %% replication counters are asserted against nothing and a gate that never
+    %% counted would pass. This case is about what the decision *reports*, so the
+    %% reporter is running.
+    {ok, _Counters} = i2p_counters:start_link(),
     Dir = i2p_ct_helpers:temp_data_dir(Config),
     {ok, Id} = i2p_identity:ensure_identity(Dir),
     Local = i2p_identity:build_local(Id, <<"127.0.0.1">>, 9150, maps:get(sign_seed, Id)),
@@ -87,6 +114,10 @@ end_per_testcase(_Case, _Config) ->
     _ = catch i2p_peer:stop(),
     _ = catch gen_event:stop(i2p_events),
     teardown_netdb(whereis(i2p_netdb_srv)),
+    %% Not under the application supervisor here, so `stop_app/0` does not reach
+    %% it, and leaving it up would keep `persistent_term` holding a state whose
+    %% owner is gone.
+    _ = catch gen_server:stop(i2p_counters),
     ok = i2p_ct_helpers:stop_app(),
     ok.
 
@@ -97,21 +128,48 @@ end_per_testcase(_Case, _Config) ->
 %% The entry we actually stored is the one entry we push on, and we push it
 %% once. Before, it went out twice: `f:handle_ri_store/4` replicated through
 %% `f:replicate_if_new/6` and `f:handle_db_store/4` replicated again.
+%%
+%% The token is what asks for the forward, and the two counters are the same
+%% decision reported: one entry forwarded, none withheld.
 stored_router_info_replicates_exactly_once(Config) ->
     Peer = ?config(peer, Config),
     Now = ?config(now, Config),
     Key = crypto:strong_rand_bytes(32),
-    send(Peer, i2p_ct_helpers:db_store_block(0, Key, fresh(Now))),
-    ?assertEqual([0], forwards(?SETTLE_MS)).
+    send(Peer, i2p_ct_helpers:db_store_block(0, Key, ?REPLY_TOKEN, fresh(Now))),
+    ?assertEqual([0], forwards(?SETTLE_MS)),
+    ?assertEqual(1, counter(netdb_replications_sent)),
+    ?assertEqual(0, counter(netdb_replications_suppressed_no_token)).
+
+%% The gate, and the case that holds it. A token-free store is a direct
+%% announcement — a peer telling us its own RouterInfo, or i2pd's "tell floodfill
+%% about us" — and the references store it and stop. We used to forward it, which
+%% asks the network to hold an entry nobody requested and, because the forwarded
+%% copy also carries no token, hands the same entry on again from the floodfill
+%% that receives it. The entry is stored; nothing goes out; the suppression is
+%% reported, because a router that stopped forwarding silently would look
+%% identical to one that never had anything to forward.
+store_without_reply_token_does_not_replicate(Config) ->
+    Peer = ?config(peer, Config),
+    Now = ?config(now, Config),
+    send(Peer, i2p_ct_helpers:db_store_block(0, crypto:strong_rand_bytes(32), fresh(Now))),
+    ?assertEqual([], forwards(?SETTLE_MS)),
+    ?assertEqual(0, counter(netdb_replications_sent)),
+    ?assertEqual(1, counter(netdb_replications_suppressed_no_token)).
 
 %% The defect the ticket is named for. ELS2 (type 5) decodes, and we do not
 %% implement it — so we hold nothing, and we may not ask three other routers to
-%% hold it for us. The type byte went out intact.
+%% hold it for us. The type byte went out intact. The token is set so that what
+%% stops this is the entry, not the gate.
 unimplemented_store_type_does_not_replicate(Config) ->
     Peer = ?config(peer, Config),
     lists:foreach(
         fun(Type) ->
-            send(Peer, i2p_ct_helpers:db_store_block(Type, crypto:strong_rand_bytes(32), <<"x">>)),
+            send(
+                Peer,
+                i2p_ct_helpers:db_store_block(
+                    Type, crypto:strong_rand_bytes(32), ?REPLY_TOKEN, <<"x">>
+                )
+            ),
             ?assertEqual([], forwards(?SETTLE_MS))
         end,
         [5, 7]
@@ -124,7 +182,9 @@ refused_router_info_does_not_replicate(Config) ->
     Now = ?config(now, Config),
     send(
         Peer,
-        i2p_ct_helpers:db_store_block(0, crypto:strong_rand_bytes(32), fresh(Now - ?TOO_OLD_MS))
+        i2p_ct_helpers:db_store_block(
+            0, crypto:strong_rand_bytes(32), ?REPLY_TOKEN, fresh(Now - ?TOO_OLD_MS)
+        )
     ),
     ?assertEqual([], forwards(?SETTLE_MS)).
 
@@ -209,6 +269,11 @@ await_not_stored(Timeout) ->
     after Timeout ->
         {error, timeout}
     end.
+
+%% One counter, read through the public snapshot rather than the registry, so a
+%% counter that is registered but not reported fails here instead of reading 0.
+counter(Name) ->
+    maps:get(Name, i2p_counters:snapshot()).
 
 %% --------------------------------------------------------------------------
 %% Fixtures

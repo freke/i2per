@@ -1919,12 +1919,18 @@ reason a `not_stored` carries.
 %%
 %% So: replicate once, on `stored`, and report everything else with its reason
 %% so an operator can tell a refusal from a corruption and neither from silence.
+%%
+%% `stored` is necessary and not sufficient. `f:m:i2p_floodfill:flood_requested/1`
+%% is the other half: only a store that arrived with a reply token asked to be
+%% distributed, and a token-free one is a direct announcement the references
+%% store and stop on. That half needs the token, which is why
+%% `f:replicate_stored/6` carries it.
 handle_db_store(ConnPid, MsgID, Body, State) ->
     case i2p_i2np:decode_db_store(Body) of
-        {ok, #{key := Key, store_type := StoreType, data := Data} = Store} ->
+        {ok, #{key := Key, store_type := StoreType, data := Data, reply_token := Token} = Store} ->
             reply_to_store(Store, MsgID, State),
             Result = store_entry(StoreType, Data, ConnPid, State),
-            replicate_stored(StoreType, Key, Data, Result, ConnPid);
+            replicate_stored(StoreType, Key, Data, Token, Result, ConnPid);
         error ->
             %% A DatabaseStore we cannot even parse came from a peer that is
             %% not speaking the protocol. Nothing is replicated and nothing is
@@ -1979,10 +1985,10 @@ netdb_outcome(Outcome, State) -> {not_stored, {refused_with_reason, Outcome}, St
 %% else is reported, because an entry that arrived and was not kept is the fact
 %% an operator needs: silently dropping it is indistinguishable from a peer that
 %% never sent anything.
-replicate_stored(StoreType, Key, Data, {stored, State}, ConnPid) ->
-    _ = maybe_replicate(StoreType, Key, Data, ConnPid, State),
+replicate_stored(StoreType, Key, Data, Token, {stored, State}, ConnPid) ->
+    _ = maybe_replicate(StoreType, Key, Data, Token, ConnPid, State),
     State;
-replicate_stored(_StoreType, _Key, _Data, {not_stored, Reason, State}, _ConnPid) ->
+replicate_stored(_StoreType, _Key, _Data, _Token, {not_stored, Reason, State}, _ConnPid) ->
     %% The announcement is the instrument; the `debug` line beside it is the
     %% off-by-default record ADR 0002 permits alongside one. It is there because the
     %% bus's bound kills the manager, and with it every fact the bus was carrying --
@@ -2181,27 +2187,55 @@ send_store(ConnPid, Transport, Key, RI, Token, Reply) ->
     send_i2np(ConnPid, Transport, i2p_i2np:db_store(Key, 0, Token, Reply, Data)).
 
 %% Floodfill replication: forward a stored entry to the 3 closest eligible
-%% floodfills (excluding self and the sender).
+%% floodfills (excluding self and the sender) — when the floodfill role and the
+%% store's own reply token together ask for it.
 %%
-%% The caller is what makes this safe: `f:replicate_stored/6` reaches here only
-%% on a `stored` outcome, so the `added`/`updated` filter this comment used to
-%% describe now lives in one place, at the point where the decision is made,
-%% rather than in a helper every caller had to remember to use.
-maybe_replicate(StoreType, Key, Data, ConnPid, State) ->
+%% The caller is what makes the first half safe: `f:replicate_stored/6` reaches
+%% here only on a `stored` outcome, so the `added`/`updated` filter this comment
+%% used to describe now lives in one place, at the point where the decision is
+%% made, rather than in a helper every caller had to remember to use. The token
+%% is the other half and the caller carries it for the same reason: i2pd and Java
+%% both refuse to forward a store that asked for nothing (see
+%% `f:m:i2p_floodfill:flood_requested/1`), and forwarding one anyway is us
+%% telling the network to hold an entry nobody requested.
+%%
+%% Both halves are decided here so they can be counted apart — a router that is
+%% not a floodfill and a floodfill withholding an unrequested forward are
+%% different facts, and only the second one is a suppression.
+maybe_replicate(StoreType, Key, Data, Token, ConnPid, State) ->
     case i2p_floodfill:is_floodfill() of
         false ->
+            %% Not our role. Nothing asked and nothing was withheld, so no
+            %% counter moves: a zero here is the default configuration and not a
+            %% fault, and a number that could not tell the two apart would read
+            %% as one.
             ok;
         true ->
-            OurHash = maps:get(our_hash, State),
-            SenderHash = sender_hash(ConnPid, State),
-            Outbox = i2p_floodfill:replication_outbox(StoreType, Key, Data, OurHash, SenderHash),
+            case i2p_floodfill:flood_requested(Token) of
+                false ->
+                    i2p_counters:add(netdb_replications_suppressed_no_token, 1);
+                true ->
+                    send_replication(StoreType, Key, Data, ConnPid, State)
+            end
+    end.
+
+%% The forward itself. An empty outbox is not a suppression — the token did ask,
+%% and no eligible floodfill was reachable — so it moves no counter and the
+%% counter that says what a peer actually received stays true.
+send_replication(StoreType, Key, Data, ConnPid, State) ->
+    OurHash = maps:get(our_hash, State),
+    SenderHash = sender_hash(ConnPid, State),
+    case i2p_floodfill:replication_outbox(StoreType, Key, Data, OurHash, SenderHash) of
+        [] ->
+            ok;
+        Outbox ->
+            i2p_counters:add(netdb_replications_sent, 1),
             lists:foreach(
                 fun({Target, Msg}) ->
                     i2p_peer:send_when_ready(Target, Msg)
                 end,
                 Outbox
-            ),
-            ok
+            )
     end.
 
 %% A RouterInfo the NetDb accepted, which also means we should be willing to

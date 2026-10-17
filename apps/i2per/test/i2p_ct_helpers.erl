@@ -40,6 +40,7 @@
     render_log_event/1,
     floodfill_router_info/2,
     db_store_block/3,
+    db_store_block/4,
     %% One SU3 signing identity for the whole run. See `su3_keypair/0`.
     su3_keypair/0,
     %% A second, distinct identity, for the tests that assert a container is
@@ -279,6 +280,14 @@ floodfill_router_info(TimestampMs, Host) ->
 -spec db_store_block(byte(), i2p_crypto:hash(), i2p_router_info:router_info() | binary()) ->
     {i2np, byte(), non_neg_integer(), non_neg_integer(), binary()}.
 
+%% The same block with a reply token, and the reply gateway/tunnel that a nonzero
+%% token requires. The gateway is random because no case here follows the reply:
+%% what the token changes is the receiving router's decision to forward.
+-spec db_store_block(
+    byte(), i2p_crypto:hash(), 0..16#FFFFFFFF, i2p_router_info:router_info() | binary()
+) ->
+    {i2np, byte(), non_neg_integer(), non_neg_integer(), binary()}.
+
 %% The SU3 signing keypair every reseed-shaped test signs with, generated once
 %% per run.
 %%
@@ -403,7 +412,21 @@ silent_ntcp2_idle(Sock) ->
 db_store_block(0, Key, RI) when is_map(RI) ->
     db_store_block(0, Key, i2p_i2np:router_info_data(i2p_router_info:to_binary(RI)));
 db_store_block(Type, Key, Data) when is_binary(Data) ->
-    #{body := Body} = i2p_i2np:db_store(Key, Type, 0, undefined, Data),
+    db_store_block(Type, Key, 0, Data).
+
+%% The same store with a chosen reply token. The token lives in the
+%% DatabaseStore body rather than in the SSU2 block, and it is the only thing
+%% that asks a receiving floodfill to forward the entry on — so a case about
+%% replication needs to choose it rather than inherit the token-free default.
+db_store_block(Type, Key, Token, RI) when is_map(RI) ->
+    db_store_block(Type, Key, Token, i2p_i2np:router_info_data(i2p_router_info:to_binary(RI)));
+db_store_block(Type, Key, Token, Data) when is_binary(Data) ->
+    Reply =
+        case Token of
+            0 -> undefined;
+            _ -> {0, crypto:strong_rand_bytes(32)}
+        end,
+    #{body := Body} = i2p_i2np:db_store(Key, Type, Token, Reply, Data),
     {i2np, 1, 7, 0, Body}.
 
 %% %%%%% Running a callback where its side effects die with it %%%%% %%%
