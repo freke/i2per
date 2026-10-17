@@ -298,13 +298,19 @@ listener and publishes the address in the RouterInfo while outbound dials still
 go to NTCP2 first. The fourth combination — serve nothing, dial UDP — is not
 offered, since there would be no address to dial.
 
-**The choice is boot-time and there is no runtime escape.** The listener is bound
-and the RouterInfo address published from the value read at start; changing the
-key while the router runs changes nothing, and a restart is the only way to
-change it. The running setting is on the boot's `config in force` line. Choosing
-`prefer_udp` on a UDP-blocked network therefore has no way back but a reboot, so
-it is worth deciding deliberately. The configuration value read at boot is
-rejected if it is not one of the three, rather than falling back to the default.
+**Availability is boot-time; the dial preference is hot.** The listener is bound
+and the RouterInfo address published from the value read at start, so serving
+UDP (whether this router publishes an SSU2 address at all) is fixed for the
+life of the process and a restart is the only way to change it. The *dial*
+preference -- which transport this router reaches for first -- is not: it can be
+flipped at runtime with `i2p_config_srv:set(ssu2_preferred, true | false)`
+without disturbing in-flight dials or established connections, and the new value
+is what `f:i2p_identity:ssu2_preferred/0` reports and what the status view
+shows. The running boot-time setting is on the boot's `config in force` line.
+Choosing `prefer_udp` on a UDP-blocked network therefore no longer needs a
+reboot to undo, but the availability half still does, so it is worth deciding
+deliberately. The configuration value read at boot is rejected if it is not one
+of the three, rather than falling back to the default.
 
 The deprecated boolean `ssu2_enabled` is still read when `ssu2` is unset, and
 means what it always meant: `true` is `prefer_udp`, `false` is `no_udp`. Setting
