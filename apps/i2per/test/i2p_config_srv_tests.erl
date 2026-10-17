@@ -150,15 +150,19 @@ valid_values_test() ->
         {addressbook, #{subscriptions => [<<"http://a.i2p">>]}, {ok, pending_restart}},
         {server_tunnels, [<<"eepsite1">>, <<"eepsite2">>], {ok, pending_restart}}
     ],
-    lists:foreach(
-        fun({Key, Value, Expected}) ->
-            Reply = i2p_config_srv:handle_call({set, Key, Value}, from(), #{}),
-            ?assertEqual({reply, Expected, #{}}, Reply)
-        end,
-        Cases
-    ),
-    ?assertEqual({ok, 4}, application:get_env(i2per, transit_max_tunnels)),
-    ok = restore_env(all_keys()).
+    Prior = env_snapshot(all_keys()),
+    try
+        lists:foreach(
+            fun({Key, Value, Expected}) ->
+                Reply = i2p_config_srv:handle_call({set, Key, Value}, from(), #{}),
+                ?assertEqual({reply, Expected, #{}}, Reply)
+            end,
+            Cases
+        ),
+        ?assertEqual({ok, 4}, application:get_env(i2per, transit_max_tunnels))
+    after
+        ok = restore_env(Prior)
+    end.
 
 %% Every key this module's cases set, unset at the end.
 %%
@@ -200,8 +204,17 @@ all_keys() ->
         server_tunnels
     ].
 
-restore_env(Keys) ->
-    lists:foreach(fun(Key) -> application:unset_env(i2per, Key) end, Keys).
+env_snapshot(Keys) ->
+    [{Key, application:get_env(i2per, Key)} || Key <- Keys].
+
+restore_env(Snapshot) ->
+    lists:foreach(
+        fun
+            ({Key, undefined}) -> application:unset_env(i2per, Key);
+            ({Key, {ok, Value}}) -> application:set_env(i2per, Key, Value)
+        end,
+        Snapshot
+    ).
 
 invalid_values_test() ->
     Cases = [
