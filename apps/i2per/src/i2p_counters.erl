@@ -406,6 +406,40 @@ counters() ->
         %% that says a router is being sent more streams than it will hold.
         stream_conns_refused_limit,
 
+        %% %%%%% NetDb replication %%%%%
+        %%
+        %% **The re-flood, and the suppression of it.** `f:m:i2p_peer` forwards a
+        %% stored entry on to the 3 closest floodfills only when this router is a
+        %% floodfill *and* the store arrived with a reply token, which is the
+        %% condition both references use and the one `m:i2p_floodfill` states
+        %% (`f:flood_requested/1`). See #EPQVQA7.
+        %%
+        %% One unit is **one stored entry**, not one message, in both counters,
+        %% so a ratio of the two is the fraction of eligible entries withheld. An
+        %% entry that is forwarded reaches up to 3 peers; the per-message volume
+        %% is a transport question and the byte counters above answer it.
+        %%
+        %% `netdb_replications_sent` moves only when there was somebody to send
+        %% to. A token that asked for a flood and found no reachable floodfill is
+        %% neither a send nor a suppression, and counting it as either would make
+        %% this pair disagree with what a peer received.
+        %%
+        %% `netdb_replications_suppressed_no_token` moves when a floodfill is
+        %% handed a store that asked for nothing. That is the ordinary case, not
+        %% a fault: most inbound stores are direct announcements — a peer telling
+        %% us its own RouterInfo, or i2pd's "tell floodfill about us"
+        %% (`NetDbRequests.cpp:503`) — and the references store those and stop.
+        %% A router that forwarded them anyway would be asking the network to hold
+        %% entries nobody requested, and its forwarded copies carry no token, so
+        %% the next floodfill would hand them on again.
+        %%
+        %% Counters rather than events because the suppressed rate is a steady
+        %% state driven by what peers choose to send: an event each time would be
+        %% one per inbound announcement, which is exactly the traffic the gate
+        %% exists to keep off the wire.
+        netdb_replications_sent,
+        netdb_replications_suppressed_no_token,
+
         %% %%%%% Tunnel lifecycle %%%%%
         %%
         %% Cumulative since router start, and **not** a ratio: the ratio is the
