@@ -38,6 +38,25 @@ outbox_empty_when_not_floodfill_test() ->
     Data = crypto:strong_rand_bytes(64),
     ?assertEqual([], i2p_floodfill:replication_outbox(0, Key, Data, Key, Key)).
 
+%%%%%%%%% The reply token is the flood request %%%%%%%%%
+
+%% Zero asks for nothing: a token-free store is a direct announcement, which the
+%% references store and stop on. Every other value asks. No timing, no process:
+%% this is the whole gate, and the integration that consults it is observed in
+%% `i2p_peer_replication_SUITE`.
+flood_requested_is_the_token_being_nonzero_test() ->
+    ?assertNot(i2p_floodfill:flood_requested(0)),
+    ?assert(i2p_floodfill:flood_requested(1)),
+    ?assert(i2p_floodfill:flood_requested(16#DEADBEEF)),
+    ?assert(i2p_floodfill:flood_requested(16#7FFFFFFF)).
+
+%% `16#FFFFFFFF` is the value i2pd does not *reply* to, and it is a common place
+%% to assume the opposite of what it means. i2pd skips only the DeliveryStatus
+%% (`NetDb.cpp:822`) and floods anyway, so a gate that treated it as a refusal
+%% would diverge from the implementation it exists to match.
+flood_requested_accepts_the_ignore_reply_token_test() ->
+    ?assert(i2p_floodfill:flood_requested(16#FFFFFFFF)).
+
 %%%%%%%%% Floodfill caps wiring through i2p_identity %%%%%%%%%
 
 %% When floodfill=true, build_local includes a spec-valid `caps` with the `f`
