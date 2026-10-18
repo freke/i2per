@@ -1997,12 +1997,23 @@ finish_data(KRecv, Header, CTWithMac) ->
 %% replies Retry. A SessionRequest carrying a token not present here (or past
 %% its expiry) is rejected with a Retry granting a fresh one, so a granted
 %% token authorises the dial and a random one does not.
+%%
+%% Tokens are drawn from `crypto:strong_rand_bytes/1` rather than `rand`,
+%% because `rand:uniform/1` is not uniform over a 64-bit range (the default
+%% algorithm's integer range is 2^58, so the result is scaled and has gaps)
+%% and is not cryptographically secure, which matters for a value that
+%% authorises a dial. A zero result is retried so the value stays nonzero.
 -spec grant_token() -> pos_integer().
 grant_token() ->
-    Token = rand:uniform(16#FFFFFFFFFFFFFFFF) + 1,
-    Expiry = os:system_time(second) + 600,
-    ets:insert(i2p_ssu2_tokens, {Token, Expiry}),
-    Token.
+    <<Raw:64/big-unsigned-integer>> = crypto:strong_rand_bytes(8),
+    case Raw of
+        0 ->
+            grant_token();
+        _ ->
+            Expiry = os:system_time(second) + 600,
+            ets:insert(i2p_ssu2_tokens, {Raw, Expiry}),
+            Raw
+    end.
 
 -spec token_valid(token()) -> boolean().
 token_valid(Token) when is_integer(Token), Token > 0 ->
