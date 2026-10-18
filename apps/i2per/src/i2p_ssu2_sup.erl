@@ -93,6 +93,10 @@ bootstrap_tables() ->
                 i2p_ssu2_relay_tags,
                 [named_table, public, set, {read_concurrency, true}]
             ),
+            _ = ets:new(
+                i2p_ssu2_tokens,
+                [named_table, public, set, {read_concurrency, true}]
+            ),
             ok;
         _Existing ->
             ok
