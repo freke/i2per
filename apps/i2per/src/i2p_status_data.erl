@@ -47,7 +47,11 @@ job, by sampling twice and subtracting. Nothing here computes one.
 %% typed reason per family (#CD7ZBVH). The coarse `reachability` stays on the
 %% bus event and in `m:i2p_ssu2_reachability:status/0,1` untouched, deprecated
 %% later on a real major bump once a second consumer exists.
--define(VIEW_VERSION, 3).
+%%
+%% 4 added `ssu2_preferred` — the dial transport preference in force
+%% (#0JJ375C), so an operator (and a consumer) can see which transport the
+%% router reaches for first without asking the node. Additive only.
+-define(VIEW_VERSION, 4).
 
 %% `underspecs` is off for the read API's two functions, deliberately, and this
 %% is the one place in the tree where that is the right call.
@@ -115,6 +119,10 @@ reason the two are separate.
             },
         netdb := #{ri := non_neg_integer(), ls := non_neg_integer()},
         sessions := non_neg_integer(),
+        %% The dial transport preference currently in force: whether this router
+        %% reaches for SSU2 first when dialing. Boot-time availability is a
+        %% separate fact, so this can be flipped at runtime without changing it.
+        ssu2_preferred := boolean(),
         %% The measured reachability per family: the latest concluded test's
         %% ladder rung and, when the chain broke, the typed reason. The coarse
         %% verdict smooths this with hysteresis; this is the raw measurement.
@@ -145,6 +153,7 @@ view() ->
         },
         netdb => #{ri => i2p_netdb_srv:count(), ls => i2p_netdb_srv:ls_count()},
         sessions => length(i2p_sam_sup:client_sessions()),
+        ssu2_preferred => i2p_identity:ssu2_preferred(),
         reachability_detail => i2p_ssu2_reachability:detail(),
         gauges => i2p_counters:gauges()
     }.
@@ -168,6 +177,7 @@ view_keys() ->
         peers,
         reachability_detail,
         sessions,
+        ssu2_preferred,
         tunnels,
         uptime_ms,
         version

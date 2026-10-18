@@ -69,7 +69,13 @@ writes configuration files.
     %% it: going through `application:set_env/3` alone would record the new level
     %% without applying it, and the router would appear to have accepted a verbosity
     %% change it had not made.
-    log_level
+    log_level,
+    %% Hot dial preference. Stored as a boolean override of `f:i2p_identity:ssu2_preferred/0`:
+    %% `true` makes outbound dials reach for SSU2 first, `false` NTCP2 first, without
+    %% touching the boot-time SSU2 availability (listener binding / published address),
+    %% which stays governed by the `ssu2` application-env setting. Consumers re-read
+    %% `f:i2p_identity:ssu2_preferred/0` at use time, so the flip lands on the next dial.
+    ssu2_preferred
 ]).
 
 %% Every key this service will acknowledge, hot or not.
@@ -90,7 +96,8 @@ writes configuration files.
             max_sam_sessions,
             max_ssu2_sessions,
             max_stream_connections,
-            ntcp2_keepalive_interval_ms
+            ntcp2_keepalive_interval_ms,
+            ssu2_preferred
         ]
 ).
 
@@ -154,6 +161,7 @@ set(Key, Value) ->
     | max_ssu2_sessions
     | max_stream_connections
     | ntcp2_keepalive_interval_ms
+    | ssu2_preferred
     | log_level
     | relay_coord
     | peertest_coord
@@ -282,6 +290,7 @@ validate_value(Key, Value) ->
         {max_ssu2_sessions, V} when is_integer(V), V > 0 -> ok;
         {max_stream_connections, V} when is_integer(V), V > 0 -> ok;
         {ntcp2_keepalive_interval_ms, V} when is_integer(V), V > 0 -> ok;
+        {ssu2_preferred, V} when is_boolean(V) -> ok;
         {floodfill, V} when is_boolean(V) -> ok;
         {ntcp2_published, V} when is_boolean(V) -> ok;
         {live_network, V} when is_boolean(V) -> ok;
