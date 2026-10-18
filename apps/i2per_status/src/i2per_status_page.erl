@@ -86,7 +86,8 @@ rows(Snap) ->
             {"transit tunnels", count(Snap, tunnels, transit)},
             {"netdb router infos", count(Snap, netdb, ri)},
             {"netdb leasesets", count(Snap, netdb, ls)},
-            {"SAM sessions", sessions(Snap)}
+            {"SAM sessions", sessions(Snap)},
+            {"SSU2 dials UDP first", ssu2_preferred(Snap)}
         ] ++
             [
                 {"reachability", reachability(Snap)},
@@ -220,5 +221,12 @@ count(Snap, Section, Key) ->
 sessions(Snap) ->
     case maps:find(sessions, Snap) of
         {ok, N} when is_integer(N) -> integer_to_binary(N);
+        _ -> <<"n/a">>
+    end.
+
+ssu2_preferred(Snap) ->
+    case maps:find(ssu2_preferred, Snap) of
+        {ok, true} -> <<"yes">>;
+        {ok, false} -> <<"no">>;
         _ -> <<"n/a">>
     end.

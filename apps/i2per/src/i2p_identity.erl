@@ -416,7 +416,10 @@ a session. A router may serve both transports and reach for one of them.
 """.
 -spec ssu2_preferred() -> boolean().
 ssu2_preferred() ->
-    ssu2_setting() =:= prefer_udp.
+    case application:get_env(i2per, ssu2_preferred) of
+        {ok, V} when is_boolean(V) -> V;
+        _ -> ssu2_setting() =:= prefer_udp
+    end.
 
 %% SSU2 UDP port: defaults to the configured TCP port (like real routers,
 %% which serve both transports on the same port number).
