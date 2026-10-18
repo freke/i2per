@@ -63,9 +63,11 @@ The project interoperates with I2P routers. It does not bundle code from
 - **Measured reachability:** peer testing feeds a typed ladder from `unknown`
   to `reachable`, with hysteresis and the measured verdict reflected in the
   published RouterInfo caps.
-- **Hermetic protocol gate:** handshake and message vectors are produced
-  offline against a real i2pd and replayed in CI, so protocol claims are
-  checked without running an i2p server in the pipeline.
+- **Hermetic protocol gate:** the SSU2 data phase is captured from a real i2pd
+  and committed, then replayed on every push by `i2p_ssu2_vectors_SUITE`, so
+  the ACK accounting is checked against another router's bytes rather than
+  against our own encoder — without running an i2p server in the pipeline.
+  `scripts/capture_i2pd_vectors.sh` takes the capture; the gate never runs it.
 - **Bus hardening:** the event bus records every fact it carries, survives a
   subscriber death, and measures the far-side backlog instead of assuming it
   cannot grow.
@@ -449,8 +451,23 @@ it beyond the local machine.
 
 ## Interoperability and live checks
 
-The normal `just check` gate is hermetic. To run the explicit interop suite
-against a real i2pd instance:
+The normal `just check` gate is hermetic, but it is not self-referential: some
+of what it checks is replayed from a real i2pd. `apps/i2per/test/fixtures/
+i2pd_ssu2_data_phase.term` holds SSU2 data-phase datagrams — a real peer's ACK
+blocks, its RouterInfo, its I2NP messages — together with the session keys that
+make them readable, and `i2p_ssu2_vectors_SUITE` replays them with no i2pd and
+no network. To recapture against a different i2pd:
+
+```sh
+I2PD_BIN=/path/to/i2pd just capture-vectors
+```
+
+The capture needs an i2pd binary and nothing else: it boots a throwaway router
+with an empty NetDb, records one SSU2 session, and rewrites the fixture. It is
+run by hand, on purpose, for the same reason the interop suite below is — a
+fixture regenerated on every push would be a fixture nobody reads.
+
+To run the explicit interop suite against a real i2pd instance:
 
 ```sh
 I2PD_BIN=/path/to/i2pd scripts/interop_i2pd.sh
