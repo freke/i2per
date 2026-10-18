@@ -1997,7 +1997,7 @@ finish_data(KRecv, Header, CTWithMac) ->
 %% replies Retry. A SessionRequest carrying a token not present here (or past
 %% its expiry) is rejected with a Retry granting a fresh one, so a granted
 %% token authorises the dial and a random one does not.
--spec grant_token() -> token().
+-spec grant_token() -> pos_integer().
 grant_token() ->
     Token = rand:uniform(16#FFFFFFFFFFFFFFFF) + 1,
     Expiry = os:system_time(second) + 600,
