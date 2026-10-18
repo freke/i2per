@@ -103,7 +103,16 @@ expired_charges_and_announces_test() ->
 %% measuring.
 an_outcome_is_announced_while_the_counter_home_is_absent_test() ->
     ok = drain(),
-    ok = start(i2p_events),
+    CountersOwner = ensure_counters_absent(),
+    EventsOwner =
+        case whereis(i2p_events) of
+            undefined -> absent;
+            _ -> present
+        end,
+    case EventsOwner of
+        absent -> ok = start(i2p_events);
+        present -> ok
+    end,
     ok = gen_event:add_handler(i2p_events, i2p_events_tests_collector, [self()]),
     ?assertEqual(undefined, whereis(i2p_counters)),
     try
@@ -111,7 +120,11 @@ an_outcome_is_announced_while_the_counter_home_is_absent_test() ->
         ?assertMatch({tunnel_built, outbound, 1}, next_event())
     after
         _ = gen_event:delete_handler(i2p_events, i2p_events_tests_collector, []),
-        ok = stop(i2p_events)
+        case EventsOwner of
+            absent -> ok = stop(i2p_events);
+            present -> ok
+        end,
+        restore_counters(CountersOwner)
     end.
 
 %% %%%%% %%% Internal helpers %%%%% %%%
@@ -125,7 +138,16 @@ all_events() ->
 %% so this module can take the counter home away again and have it stay away.
 with_bus_and_counters(Fun) ->
     ok = drain(),
-    ok = stop(i2p_counters),
+    CountersOwner = ensure_counters_absent(),
+    EventsOwner =
+        case whereis(i2p_events) of
+            undefined -> absent;
+            _ -> present
+        end,
+    case EventsOwner of
+        absent -> ok;
+        present -> ok = stop(i2p_events)
+    end,
     ok = start(i2p_events),
     ok = start(i2p_counters),
     %% The handler goes on before any outcome is announced, so an event that was
@@ -136,7 +158,16 @@ with_bus_and_counters(Fun) ->
     after
         _ = gen_event:delete_handler(i2p_events, i2p_events_tests_collector, []),
         ok = stop(i2p_counters),
-        ok = stop(i2p_events)
+        ok = stop(i2p_events),
+        restore_counters(CountersOwner),
+        case EventsOwner of
+            present ->
+                {ok, Pid} = i2p_events:start_link(),
+                true = unlink(Pid),
+                ok;
+            absent ->
+                ok
+        end
     end.
 
 %% EUnit runs every case in one process, and the collector forwards into that
@@ -172,6 +203,27 @@ stop(Module) ->
             after 5000 -> ok
             end
     end.
+
+ensure_counters_absent() ->
+    case whereis(i2p_counters) of
+        undefined ->
+            absent;
+        Pid ->
+            MRef = erlang:monitor(process, Pid),
+            _ = gen_server:stop(Pid),
+            receive
+                {'DOWN', MRef, process, Pid, _} -> ok
+            after 5000 -> ok
+            end,
+            present
+    end.
+
+restore_counters(absent) ->
+    ok;
+restore_counters(present) ->
+    {ok, Pid} = i2p_counters:start_link(),
+    true = unlink(Pid),
+    ok.
 
 %% The next event the bus delivered to this process. A bare receive: the handler
 %% was added before the outcome was announced, so its arrival is ordered by the
