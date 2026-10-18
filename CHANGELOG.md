@@ -4,13 +4,56 @@ All notable changes to i2per are recorded here. Versions follow the OTP
 applications' own `{vsn, ...}`; the release tag is `v` + that version, and
 CI refuses a tag that disagrees.
 
-## [Unreleased]
+## [0.4.0] — 2026-10-18
+
+**The hardening release.** 0.3.0 added protocol surface; 0.4.0 pays for it:
+every dial is bounded, the SSU2 hot path is cheaper, and the dead weight is
+gone. No wire-format or configuration-key changes, so a 0.3.0 `data_dir` is
+read unchanged.
 
 ### Changed
 
-- The floodfill lookup walks a floodfill-only index, so it no longer scans every
-  stored router to find the floodfills and no longer sorts the whole store
-  (#13EY2MQ).
+- **Dial convergence and routing.** The three dial parks (transit, peer-test,
+  tunnel-build) are each bounded by a single derived number rather than a
+  configuration knob (#SV6S264). The dial transport preference can now be
+  flipped at runtime without disturbing in-flight dials or established
+  connections; only the boot-time availability half stays boot-only (#0JJ375C).
+  The two coordinators' supervision shape and enable key are settled (#33KNKEC).
+  `connect_via_introducer/5` gained coverage, and the three defects it found
+  (requester leg wiring, Charlie's granted token, RouterInfo retention on the
+  redirect) are fixed (#98GAVQK). The re-flood is gated on a nonzero
+  DatabaseStore reply token in `i2p_peer` as well as in both references and
+  `docs/protocol.md` (#EPQVQA7). Bob now rejects a SessionRequest whose token
+  it has not granted, answering with a Retry that grants a fresh one, so a
+  granted relay token actually authorises the dial (#BFKFGY0). A token'd
+  DatabaseStore is answered with a DeliveryStatus carrying the reply token
+  instead of the store's own message id (#9TN7XF2).
+- **Hot path cost.** Dirty-scheduler crypto flags are shipped (#VXRH456).
+  Per-datagram syscall and log allocation in the SSU2 hot path is removed
+  (#XZTYAVX). An SSU2 session no longer retains a RouterInfo it is not using
+  (#ER0J6KM). Undecryptable garlic stops scanning destinations at the first
+  open instead of paying a full ECIES open per candidate (#YN2RZNN). The
+  floodfill lookup walks a floodfill-only index instead of scanning and
+  sorting the whole store (#13EY2MQ).
+- **Simplification.** The unused Noise XX ratchet and ElG2 surface is removed
+  (#SHX43XC). `i2p_sam_proxy` no longer ships as a documented feature
+  (#EK2KTKP). `i2p_streaming`'s field accessors are read through and written
+  around, closing parity's "streaming protocol: partial" row (#C252TF7).
+- **Test gate.** The eunit layer's shared-state cases are isolated, so
+  `counters_are_unique_test` and `add_is_a_no_op_while_the_owner_is_absent_test`
+  can no longer be order-dependent (#PJZZFKR).
+- **Doc truth.** `docs/parity.md` no longer bills the Charlie hole punch as
+  1.0.0 material; 0.3.0 shipped it (#SMD2V01).
+
+### Fixed
+
+- RouterRequestStatus (I2NP type 20) is confirmed absent from i2pd, Java I2P
+  and the I2NP spec; the slot it vacated is taken by #EPQVQA7 (#GF37P50,
+  no code change).
+
+## [Unreleased]
+
+_(nothing yet)_
 
 ## [0.3.0] — 2026-10-13
 
