@@ -52,6 +52,7 @@ disagree with what is alive.
     start_charlie/1,
     session_count/0,
     session_limit/0,
+    rtt_summary/0,
     init/1
 ]).
 
@@ -178,6 +179,53 @@ session_count() ->
                 tuple_size(Id) > 0,
                 element(1, Id) =:= ssu2_conn
             ])
+    end.
+
+-doc """
+Summarise the RTT and congestion state of the live SSU2 sessions.
+
+Output: a map with the number of live sessions, the average RTT in
+milliseconds across them (0 when there are none), and the total congestion
+window in bytes. Reads each session's state with a bounded timeout, so a
+session that is busy or dying is skipped rather than stalling the caller.
+Used by `m:i2p_status_data:view/0` to surface congestion state.
+""".
+-spec rtt_summary() ->
+    #{sessions := non_neg_integer(), rtt_ms := non_neg_integer(), cwnd := non_neg_integer()}.
+rtt_summary() ->
+    case whereis(?MODULE) of
+        undefined ->
+            #{sessions => 0, rtt_ms => 0, cwnd => 0};
+        Sup ->
+            Sessions = [
+                Pid
+             || {Id, Pid, _Type, _Modules} <- supervisor:which_children(Sup),
+                is_pid(Pid),
+                is_tuple(Id),
+                tuple_size(Id) > 0,
+                element(1, Id) =:= ssu2_conn
+            ],
+            {Rtts, Cwnds} = lists:foldl(
+                fun(Pid, {Rs, Cs}) ->
+                    case (catch sys:get_state(Pid, 100)) of
+                        State when is_map(State) ->
+                            R = maps:get(rtt_ms, State, maps:get(rtt, State, 0)),
+                            C = maps:get(cwnd, State, 0),
+                            {[R | Rs], [C | Cs]};
+                        _ ->
+                            {Rs, Cs}
+                    end
+                end,
+                {[], []},
+                Sessions
+            ),
+            N = length(Rtts),
+            AvgRtt =
+                case N of
+                    0 -> 0;
+                    _ -> lists:sum(Rtts) div N
+                end,
+            #{sessions => N, rtt_ms => AvgRtt, cwnd => lists:sum(Cwnds)}
     end.
 
 -doc """
