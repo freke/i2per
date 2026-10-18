@@ -550,30 +550,55 @@ init(Config = #{role := bob}) ->
     Res = i2p_ssu2:receive_session_request(State0, SRPacket),
     case Res of
         {ok, SRInfo, State1} ->
-            %% Bob is addressed by the Destination Connection ID Alice
-            %% chose for him, which lands in our dst_conn_id slot.
-            true =
-                ets:insert(
-                    i2p_ssu2_sessions,
-                    {maps:get(dst_conn_id, State1), self()}
-                ),
-            erlang:monitor(process, Listener),
-            case answer_session_created(State1, Listener, Endpoint) of
-                {ok, HS2, SCPacket} ->
-                    {ok, #{
-                        hs => HS2,
-                        config => Config,
-                        phase => confirmed_wait,
-                        fragments => [],
-                        endpoint => Endpoint,
-                        listener => Listener,
-                        sr_info => SRInfo,
-                        last_packet => SCPacket,
-                        timer_phase => created_sent,
-                        resends => 0,
-                        pkt_out => 0,
-                        seen_in => i2p_ssu2_recv:new()
-                    }}
+            Token = maps:get(token, SRInfo),
+            case i2p_ssu2:token_valid(Token) of
+                true ->
+                    %% Bob is addressed by the Destination Connection ID Alice
+                    %% chose for him, which lands in our dst_conn_id slot.
+                    true =
+                        ets:insert(
+                            i2p_ssu2_sessions,
+                            {maps:get(dst_conn_id, State1), self()}
+                        ),
+                    erlang:monitor(process, Listener),
+                    case answer_session_created(State1, Listener, Endpoint) of
+                        {ok, HS2, SCPacket} ->
+                            {ok, #{
+                                hs => HS2,
+                                config => Config,
+                                phase => confirmed_wait,
+                                fragments => [],
+                                endpoint => Endpoint,
+                                listener => Listener,
+                                sr_info => SRInfo,
+                                last_packet => SCPacket,
+                                timer_phase => created_sent,
+                                resends => 0,
+                                pkt_out => 0,
+                                seen_in => i2p_ssu2_recv:new()
+                            }}
+                    end;
+                false ->
+                    %% Token not granted (or expired): reject with a Retry that
+                    %% grants a fresh one. The requester's existing Retry path
+                    %% (phase `session_request`) re-sends the SessionRequest
+                    %% carrying it. A token of 0 (direct dial) lands here too.
+                    NewToken = i2p_ssu2:grant_token(),
+                    Bik = maps:get(bik, State0),
+                    RetryBlocks = [
+                        {datetime, unix_now()},
+                        {address, element(2, Endpoint), ip_bin(element(1, Endpoint))}
+                    ],
+                    {ok, RetryPacket} = i2p_ssu2:encode_retry(
+                        Bik,
+                        rand32(),
+                        maps:get(src_conn_id, State1),
+                        maps:get(dst_conn_id, State1),
+                        NewToken,
+                        RetryBlocks
+                    ),
+                    i2p_ssu2_listener:send(Listener, RetryPacket, Endpoint),
+                    ignore
             end;
         error ->
             exit({protocol_error, session_request})
