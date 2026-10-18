@@ -19,10 +19,9 @@ also outside this release. The Charlie role is implemented: a tagged session
 answers a RelayIntro as Charlie, verifies the requester's signature, checks the
 asserted endpoint, and punches, and the relay accept now grants a session token
 that Bob validates on the redirect (see #BFKFGY0, #98GAVQK).
-The sections below describe only behavior that is present in 0.3.0. 0.3.0 adds
-the Charlie RelayResponse and HolePunch blocks and the measured-reachability
-caps over 0.2.1.
-
+The sections below describe only behavior that is present in 0.4.0. 0.4.0 makes
+no wire-format changes over 0.3.0: the Charlie RelayResponse and HolePunch
+blocks and the measured-reachability caps remain as shipped in 0.3.0.
 ## Implemented
 
 ### NTCP2 data-phase frames
