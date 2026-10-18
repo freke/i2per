@@ -95,7 +95,11 @@ clearing `remote_ri` in isolation once made every Charlie reply sign over
     %% still know about its peer" is a claim a test can only make by asking.
     %% Reading `remote_ri` here while establishment clears it is exactly the
     %% divergence #ER0J6KM shipped, so the answer is asserted, not assumed.
-    peer_hash/1
+    peer_hash/1,
+    rtt/1,
+    rtt_ms/1,
+    srtt/1,
+    cwnd/1
 ]).
 -export([
     start_link/1,
@@ -1038,6 +1042,16 @@ become_established_common(HS, Keys, State) ->
             reassembly => #{},
             pending_test => undefined,
             pt_target => undefined,
+            cwnd => 4 * ?MTU,
+            ssthresh => 65535,
+            send_queue => [],
+            retransmitting => false,
+            rtt_initialized => false,
+            srtt_ms => 0,
+            rttvar_ms => 0,
+            rtt_ms => 0,
+            rtt => 0,
+            srtt => 0,
             %% The steady-state data path reads the introduction key from this
             %% field rather than descending through config/local per packet.
             intro_key => OwnIntro,
@@ -1153,6 +1167,8 @@ block_kind({path_challenge, _Data}) ->
     path_challenge;
 block_kind({path_response, _Data}) ->
     path_response;
+block_kind({congestion, _Flags}) ->
+    congestion;
 block_kind({termination, _Soon, _ConnId, _Reason}) ->
     termination;
 block_kind(_) ->
@@ -1246,6 +1262,24 @@ max_frag_body(_State) ->
 %% for too long -- can retransmit it; ACK-only and pure-keepalive packets are
 %% not tracked (per spec, pure ACKs are not retransmitted).
 send_packet(Blocks, State = #{keys := Keys, pkt_out := Num}, Track) ->
+    case Track of
+        true ->
+            Inflight = inflight_bytes(State),
+            Cwnd = maps:get(cwnd, State, 4 * ?MTU),
+            case Inflight > 0 andalso Inflight + ?MTU > Cwnd of
+                true ->
+                    %% Congested: queue rather than send. The packet keeps its
+                    %% block list and is drained once the in-flight window opens.
+                    Queue = maps:get(send_queue, State, []),
+                    State#{send_queue => Queue ++ [Blocks]};
+                false ->
+                    send_packet_now(Blocks, State, Keys, Num, Track)
+            end;
+        false ->
+            send_packet_now(Blocks, State, Keys, Num, Track)
+    end.
+
+send_packet_now(Blocks, State = #{keys := Keys, pkt_out := Num}, _Keys, Num, Track) ->
     Dir =
         case role(State) of
             alice -> ab;
@@ -1271,10 +1305,22 @@ send_packet(Blocks, State = #{keys := Keys, pkt_out := Num}, Track) ->
     i2p_log:debug({send, Num, Track, [block_kind(B) || B <- Blocks]}, role(State)),
     Out =
         case Track of
-            true -> maps:put(Num, Blocks, maps:get(out_pkts, State));
-            false -> maps:get(out_pkts, State)
+            true ->
+                Retransmitted = maps:get(retransmitting, State, false),
+                maps:put(
+                    Num,
+                    {Blocks, byte_size(Datagram), erlang:monotonic_time(millisecond),
+                        Retransmitted},
+                    maps:get(out_pkts, State)
+                );
+            false ->
+                maps:get(out_pkts, State)
         end,
-    maybe_arm_data_resend(State#{pkt_out => Num + 1, out_pkts => Out}).
+    State1 = maybe_arm_data_resend(State#{
+        pkt_out => Num + 1,
+        out_pkts => Out
+    }),
+    drain_send_queue(State1).
 
 %% ------------------------------------------------------------------
 %% Inbound: consume ACK blocks (drop ack'd, retransmit nack'd), reassemble
@@ -1727,6 +1773,26 @@ peer_hash(State) ->
             Hash
     end.
 
+rtt(State) when is_pid(State) ->
+    rtt(sys:get_state(State));
+rtt(State) when is_map(State) ->
+    maps:get(rtt, State, maps:get(rtt_ms, State, 0)).
+
+rtt_ms(State) when is_pid(State) ->
+    rtt_ms(sys:get_state(State));
+rtt_ms(State) when is_map(State) ->
+    maps:get(rtt_ms, State, maps:get(rtt, State, 0)).
+
+srtt(State) when is_pid(State) ->
+    srtt(sys:get_state(State));
+srtt(State) when is_map(State) ->
+    maps:get(srtt, State, maps:get(srtt_ms, State, 0)).
+
+cwnd(State) when is_pid(State) ->
+    cwnd(sys:get_state(State));
+cwnd(State) when is_map(State) ->
+    maps:get(cwnd, State, 0).
+
 addr_type(Ip) when byte_size(Ip) == 16 -> ipv6;
 addr_type(_Ip) -> ipv4.
 
@@ -1762,10 +1828,31 @@ process_ack({ack, AT, Acnt, Ranges}, State = #{out_pkts := Out}) ->
             sets:is_element(Num, AckedSet) orelse sets:is_element(Num, NackedSet)
         end,
     Out1 = maps:filter(fun(Num, _) -> not Gone(Num) end, Out),
-    Retransmit = [maps:get(N, Out) || N <- Nacked, maps:is_key(N, Out)],
-    State1 = State#{out_pkts => Out1},
-    State2 = lists:foldl(fun(Blocks, St) -> send_blocks(Blocks, St) end, State1, Retransmit),
-    maybe_arm_data_resend(State2).
+    RetransmitBlocks = [
+        Blocks
+     || N <- Nacked,
+        maps:is_key(N, Out),
+        {Blocks, _, _, _} <- [maps:get(N, Out)]
+    ],
+    State0 = State#{out_pkts => Out1},
+    State1 = update_rtt(State0, Acked, Out),
+    AckedBytes1 = lists:sum([
+        Size
+     || N <- Acked,
+        {_, Size, _, _} <- [maps:get(N, Out, {undefined, 0, 0, false})],
+        Size =/= undefined
+    ]),
+    State2 = apply_cc_ack(State1, AckedBytes1),
+    State3 =
+        case Nacked of
+            [] -> State2;
+            _ -> on_cc_loss(State2)
+        end,
+    State4 = State3#{retransmitting => true},
+    State5 = lists:foldl(fun(Blocks, St) -> send_blocks(Blocks, St) end, State4, RetransmitBlocks),
+    State6 = State5#{retransmitting => false},
+    State7 = drain_send_queue(State6),
+    maybe_arm_data_resend(State7).
 
 %% Fold incoming blocks, feeding fragments into the reassembly buffer and
 %% collecting complete I2NP messages to hand to the owner in one
@@ -1830,6 +1917,12 @@ forward_block(B, {Acc, State}) ->
             {[Challenge | Acc], State};
         {path_response, _} = Response ->
             {[Response | Acc], State};
+        {congestion, _Flags} ->
+            %% Congestion-control feedback from the peer. i2per's send side
+            %% is governed by its own window and RTT estimate; the peer's
+            %% congestion block is observed but not acted on (documented
+            %% divergence).
+            {Acc, State};
         _ ->
             {Acc, State}
     end.
@@ -2132,6 +2225,95 @@ maybe_arm_data_resend(State = #{out_pkts := Out}) ->
             end
     end.
 
+%% Congestion-control and RTT helpers.
+
+inflight_bytes(#{out_pkts := Out}) ->
+    lists:sum([Size || {_Num, {_Blocks, Size, _Sent, _Ret}} <- maps:to_list(Out)]).
+
+drain_send_queue(State = #{send_queue := []}) ->
+    State;
+drain_send_queue(State = #{send_queue := [Blocks | Rest]}) ->
+    Inflight = inflight_bytes(State),
+    Cwnd = maps:get(cwnd, State, 4 * ?MTU),
+    case Inflight =:= 0 orelse Inflight + ?MTU =< Cwnd of
+        true ->
+            State1 = State#{send_queue => Rest},
+            State2 = send_packet(Blocks, State1, ack_eliciting(Blocks)),
+            drain_send_queue(State2);
+        false ->
+            State
+    end;
+drain_send_queue(State) ->
+    State.
+
+update_rtt(State, Acked, Out) ->
+    NowMs = erlang:monotonic_time(millisecond),
+    lists:foldl(
+        fun(Num, St) ->
+            case maps:get(Num, Out, undefined) of
+                {_, _Size, SentMs, false} when is_integer(SentMs) ->
+                    Sample = NowMs - SentMs,
+                    case Sample >= 0 of
+                        true -> apply_rtt_sample(St, Sample);
+                        false -> St
+                    end;
+                _ ->
+                    St
+            end
+        end,
+        State,
+        Acked
+    ).
+
+apply_rtt_sample(State, R) ->
+    case maps:get(rtt_initialized, State, false) of
+        false ->
+            State#{
+                rtt_initialized => true,
+                srtt_ms => R,
+                rttvar_ms => max(1, R div 2),
+                rtt_ms => R,
+                rtt => R,
+                srtt => R
+            };
+        true ->
+            Srtt = maps:get(srtt_ms, State, 0),
+            Rttvar = maps:get(rttvar_ms, State, 0),
+            Rttvar1 = max(1, (3 * Rttvar + abs(Srtt - R)) div 4),
+            Srtt1 = (7 * Srtt + R) div 8,
+            State#{
+                srtt_ms => Srtt1,
+                rttvar_ms => Rttvar1,
+                rtt_ms => Srtt1,
+                rtt => Srtt1,
+                srtt => Srtt1
+            }
+    end.
+
+apply_cc_ack(State, AckedBytes) ->
+    case AckedBytes > 0 of
+        true ->
+            Cwnd = maps:get(cwnd, State, 4 * ?MTU),
+            Ssthresh = maps:get(ssthresh, State, 65535),
+            Cwnd1 =
+                case Cwnd =< Ssthresh of
+                    true -> Cwnd + AckedBytes;
+                    false -> Cwnd + max(1, ?MTU * AckedBytes div max(1, Cwnd))
+                end,
+            State#{cwnd => Cwnd1};
+        false ->
+            State
+    end.
+
+on_cc_loss(State) ->
+    Cwnd = maps:get(cwnd, State, 4 * ?MTU),
+    New = max(?MTU, Cwnd div 2),
+    State#{cwnd => New, ssthresh => New}.
+
+on_cc_timeout(State) ->
+    Cwnd = maps:get(cwnd, State, 4 * ?MTU),
+    State#{cwnd => ?MTU, ssthresh => max(?MTU, Cwnd div 2)}.
+
 %% Repair path: re-send every unacked packet set. Each block re-enters
 %% `out_pkts` under a fresh packet number (arming a new timer), while the
 %% superseded entries that fired this resend are dropped first so they cannot
@@ -2139,8 +2321,13 @@ maybe_arm_data_resend(State = #{out_pkts := Out}) ->
 resend_unacked(State = #{out_pkts := Out}) ->
     Pending = maps:to_list(Out),
     i2p_log:debug({data_resend_pending, length(Pending)}, role(State)),
-    Empty = State#{out_pkts => #{}, data_resend_ref => undefined},
-    lists:foldl(fun({_Num, Blocks}, St) -> send_blocks(Blocks, St) end, Empty, Pending).
+    Empty0 = State#{out_pkts => #{}, data_resend_ref => undefined},
+    Empty = on_cc_timeout(Empty0#{retransmitting => true}),
+    State1 = lists:foldl(
+        fun({_Num, {Blocks, _, _, _}}, St) -> send_blocks(Blocks, St) end, Empty, Pending
+    ),
+    State2 = State1#{retransmitting => false},
+    drain_send_queue(State2).
 
 keepalive_interval_ms() ->
     case application:get_env(i2per, keepalive_interval_ms) of
