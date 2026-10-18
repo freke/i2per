@@ -10,7 +10,7 @@ are not in scope and do not change 1.0.0. See `3M0RBXX` for the decision and
 
 - **i2pd version:** 2.61.0
 - **Date taken:** 2026-10-07 (interop suite run, see `ENFW64W`)
-- **i2per release at snapshot:** 0.3.0
+- **i2per release at snapshot:** 0.4.0
 - **Source of the capability list:** i2pd 2.61.0 release notes plus the
   capabilities exercised by `scripts/interop_i2pd.sh` and
   `docs/protocol.md`.
