@@ -194,22 +194,28 @@ a_refused_fetch_does_not_take_the_fetcher_down(_Config) ->
         #{host => <<"after.i2p">>, dest_b64 => OtherB64}
     ],
     application:set_env(?APP, addressbook, #{subscriptions => Subs}),
+    %% Cap must be in place before the fetcher starts: its init/1 schedules an
+    %% automatic fetch on the next scheduler slot (timeout 0), and that fetch
+    %% must see the cap too, otherwise it can open a stream connection before
+    %% we ever call fetch_now/0.
+    application:set_env(?APP, max_stream_connections, 0),
     start_book(undefined),
     {ok, Fetcher} = i2p_addressbook_subs:start_link(#{subscriptions => Subs}),
     put(site_crypto_privs, [maps:get(crypto_priv, Site)]),
 
     MRef = erlang:monitor(process, Fetcher),
-    application:set_env(?APP, max_stream_connections, 0),
+    Baseline = i2p_sam_sup:stream_conn_count(),
     try
         ok = i2p_addressbook_subs:fetch_now(),
-        %% The refusal is synchronous inside the fetcher, so a `DOWN` here would
-        %% be the badmatch. Asserted as an absence after a gen_server:call, which
-        %% is a barrier: the fetch has been handled by the time it answers.
         assert_fetcher_alive(Fetcher, MRef),
         ok = i2p_addressbook_subs:fetch_now(),
         assert_fetcher_alive(Fetcher, MRef),
+        %% fetch_now/0 is asynchronous: the gen_server:call only schedules the
+        %% pipeline. Wait for it to drain before reading the count, otherwise
+        %% the assertion races the fetcher and can observe a stale value.
+        wait_fetcher_idle(Fetcher, 5000),
         %% And nothing was admitted against the cap it refused at.
-        0 = i2p_sam_sup:stream_conn_count()
+        Baseline = i2p_sam_sup:stream_conn_count()
     after
         erlang:demonitor(MRef, [flush]),
         application:unset_env(?APP, max_stream_connections),
@@ -233,6 +239,27 @@ assert_fetcher_alive(Fetcher, MRef) ->
         ok
     end.
 
+%% Wait for the fetcher's asynchronous pipeline to drain (its `fetch` field
+%% goes back to `undefined`). Polls rather than sleeping once, so a slow
+%% pipeline cannot make the subsequent count assertion race it.
+wait_fetcher_idle(Fetcher, Timeout) ->
+    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    wait_fetcher_idle_loop(Fetcher, Deadline).
+
+wait_fetcher_idle_loop(Fetcher, Deadline) ->
+    case (catch sys:get_state(Fetcher)) of
+        #{fetch := undefined} ->
+            ok;
+        _ ->
+            Now = erlang:monotonic_time(millisecond),
+            if
+                Now >= Deadline ->
+                    ct:fail({fetcher_did_not_drain, 5000});
+                true ->
+                    timer:sleep(25),
+                    wait_fetcher_idle_loop(Fetcher, Deadline)
+            end
+    end.
 %% --------------------------------------------------------------------------
 %% Harness
 %% --------------------------------------------------------------------------
