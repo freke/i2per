@@ -120,6 +120,8 @@ B0 = i2p_ssu2:bob_init(BskPriv, Bpk, Bik),
     decode_token_request/2,
     encode_retry/6,
     decode_retry/2,
+    grant_token/0,
+    token_valid/1,
     encode_peertest/5,
     decode_peertest/2,
     encode_holepunch/5,
@@ -1989,3 +1991,37 @@ finish_data(KRecv, Header, CTWithMac) ->
         _ ->
             error
     end.
+
+%% Granted-token store. Tokens are 64-bit nonzero values handed out either by
+%% Charlie when he accepts a relay (via i2p_relay_coord) or by Bob when he
+%% replies Retry. A SessionRequest carrying a token not present here (or past
+%% its expiry) is rejected with a Retry granting a fresh one, so a granted
+%% token authorises the dial and a random one does not.
+%%
+%% Tokens are drawn from `crypto:strong_rand_bytes/1` rather than `rand`,
+%% because `rand:uniform/1` is not uniform over a 64-bit range (the default
+%% algorithm's integer range is 2^58, so the result is scaled and has gaps)
+%% and is not cryptographically secure, which matters for a value that
+%% authorises a dial. A zero result is retried so the value stays nonzero.
+-spec grant_token() -> pos_integer().
+grant_token() ->
+    <<Raw:64/big-unsigned-integer>> = crypto:strong_rand_bytes(8),
+    case Raw of
+        0 ->
+            grant_token();
+        _ ->
+            Expiry = os:system_time(second) + 600,
+            ets:insert(i2p_ssu2_tokens, {Raw, Expiry}),
+            Raw
+    end.
+
+-spec token_valid(token()) -> boolean().
+token_valid(Token) when is_integer(Token), Token > 0 ->
+    case ets:lookup(i2p_ssu2_tokens, Token) of
+        [{Token, Expiry}] ->
+            os:system_time(second) =< Expiry;
+        [] ->
+            false
+    end;
+token_valid(_) ->
+    false.

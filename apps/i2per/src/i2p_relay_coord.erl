@@ -627,7 +627,7 @@ accept_intro(Tagged, Ver, Nonce, Port, Ip, State = #{bob_local := BobLocal}) ->
                 OurIp,
                 maps:get(sign_seed, BobLocal)
             ),
-            Token = grant_token(),
+            Token = i2p_ssu2:grant_token(),
             Response = i2p_relay:response_block(0, Ver, Nonce, Ts, OurPort, OurIp, Sig, Token),
             i2p_log:debug({charlie, accepted, nonce, Nonce}, []),
             i2p_ssu2_conn:send_relay(Tagged, Response),
@@ -650,15 +650,9 @@ accept_intro(Tagged, Ver, Nonce, Port, Ip, State = #{bob_local := BobLocal}) ->
 %% dial unable to serve an i2per requester at all, which is why #98GAVQK's
 %% coverage gap mattered: nothing ever ran the two halves against each other.
 %%
-%% The token is not checked against anything on our side: Charlie's own Bob
-%% answers the redirect's SessionRequest whatever token it carries, so today the
-%% redirect is authorised by arriving on the nonce-derived connection IDs and
-%% the token is carried because the protocol has the field and a requester may
-%% insist on it. See #BFKFGY0.
-grant_token() ->
-    %% `rand:uniform/1` on the full 64-bit range, then +1, so the result is in
-    %% 1..2^64-1 and never zero. The same shape as the relay tag at line 396.
-    rand:uniform(16#FFFFFFFFFFFFFFFF) + 1.
+%% Charlie's grant now goes through `i2p_ssu2:grant_token/0`, so it lands in the
+%% shared granted-token store and Bob validates the redirect's SessionRequest
+%% against it. See #BFKFGY0.
 
 %% This router's own published SSU2 endpoint — the address Alice will dial after
 %% the punch opens the path, and the endpoint the accept response carries. Read
