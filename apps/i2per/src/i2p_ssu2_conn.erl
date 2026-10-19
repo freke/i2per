@@ -722,6 +722,7 @@ handle_info(_Other, State) ->
     {noreply, State}.
 
 terminate(_Reason, State) ->
+    _ = i2p_ssu2_sup:remove_metrics(self()),
     cancel_timer_field(keepalive_ref, State),
     cancel_timer_field(idle_ref, State),
     cancel_timer_field(data_resend_ref, State),
@@ -1085,6 +1086,7 @@ become_established_common(HS, Keys, State) ->
             remote_ri => undefined
         },
     State2 = arm_keepalive_timer(arm_idle_timer(State1)),
+    _ = i2p_ssu2_sup:update_metrics(self(), 0, false, 4 * ?MTU, established),
     case role(State2) of
         %% Alice's SessionConfirmed already consumed packet zero; her first
         %% Data packet must be numbered one (spec: Alice 0 = Session
@@ -1277,7 +1279,7 @@ send_packet(Blocks, State = #{keys := Keys, pkt_out := Num}, Track) ->
                     Queue = maps:get(send_queue, State, queue:new()),
                     case queue:len(Queue) >= ?MAX_SEND_QUEUE of
                         true ->
-                            i2p_log:warning({send_queue_full, dropping}, role(State)),
+                            i2p_log:debug(send_queue_full, #{role => role(State)}),
                             State;
                         false ->
                             State#{send_queue => queue:in(Blocks, Queue)}
@@ -2242,7 +2244,7 @@ drain_send_queue(State = #{send_queue := Q}) ->
         true ->
             State;
         false ->
-            {value, Blocks, Rest} = queue:out(Q),
+            {{value, Blocks}, Rest} = queue:out(Q),
             Inflight = inflight_bytes(State),
             Cwnd = maps:get(cwnd, State, 4 * ?MTU),
             case Inflight =:= 0 orelse Inflight + ?MTU =< Cwnd of
@@ -2257,7 +2259,7 @@ drain_send_queue(State = #{send_queue := Q}) ->
 
 update_rtt(State, Acked, Out) ->
     NowMs = erlang:monotonic_time(millisecond),
-    lists:foldl(
+    State1 = lists:foldl(
         fun(Num, St) ->
             case maps:get(Num, Out, undefined) of
                 {_, _Size, SentMs, false} when is_integer(SentMs) ->
@@ -2272,7 +2274,15 @@ update_rtt(State, Acked, Out) ->
         end,
         State,
         Acked
-    ).
+    ),
+    _ = i2p_ssu2_sup:update_metrics(
+        self(),
+        maps:get(rtt_ms, State1, 0),
+        maps:get(rtt_initialized, State1, false),
+        maps:get(cwnd, State1, 0),
+        maps:get(phase, State1, undefined)
+    ),
+    State1.
 
 apply_rtt_sample(State, R) ->
     case maps:get(rtt_initialized, State, false) of
@@ -2300,28 +2310,53 @@ apply_rtt_sample(State, R) ->
     end.
 
 apply_cc_ack(State, AckedBytes) ->
-    case AckedBytes > 0 of
-        true ->
-            Cwnd = maps:get(cwnd, State, 4 * ?MTU),
-            Ssthresh = maps:get(ssthresh, State, 65535),
-            Cwnd1 =
-                case Cwnd =< Ssthresh of
-                    true -> Cwnd + AckedBytes;
-                    false -> Cwnd + max(1, ?MTU * AckedBytes div max(1, Cwnd))
-                end,
-            State#{cwnd => Cwnd1};
-        false ->
-            State
-    end.
+    State1 =
+        case AckedBytes > 0 of
+            true ->
+                Cwnd = maps:get(cwnd, State, 4 * ?MTU),
+                Ssthresh = maps:get(ssthresh, State, 65535),
+                Cwnd1 =
+                    case Cwnd =< Ssthresh of
+                        true -> Cwnd + AckedBytes;
+                        false -> Cwnd + max(1, ?MTU * AckedBytes div max(1, Cwnd))
+                    end,
+                State#{cwnd => Cwnd1};
+            false ->
+                State
+        end,
+    _ = i2p_ssu2_sup:update_metrics(
+        self(),
+        maps:get(rtt_ms, State1, 0),
+        maps:get(rtt_initialized, State1, false),
+        maps:get(cwnd, State1, 0),
+        maps:get(phase, State1, undefined)
+    ),
+    State1.
 
 on_cc_loss(State) ->
     Cwnd = maps:get(cwnd, State, 4 * ?MTU),
     New = max(?MTU, Cwnd div 2),
-    State#{cwnd => New, ssthresh => New}.
+    State1 = State#{cwnd => New, ssthresh => New},
+    _ = i2p_ssu2_sup:update_metrics(
+        self(),
+        maps:get(rtt_ms, State1, 0),
+        maps:get(rtt_initialized, State1, false),
+        maps:get(cwnd, State1, 0),
+        maps:get(phase, State1, undefined)
+    ),
+    State1.
 
 on_cc_timeout(State) ->
     Cwnd = maps:get(cwnd, State, 4 * ?MTU),
-    State#{cwnd => ?MTU, ssthresh => max(?MTU, Cwnd div 2)}.
+    State1 = State#{cwnd => ?MTU, ssthresh => max(?MTU, Cwnd div 2)},
+    _ = i2p_ssu2_sup:update_metrics(
+        self(),
+        maps:get(rtt_ms, State1, 0),
+        maps:get(rtt_initialized, State1, false),
+        maps:get(cwnd, State1, 0),
+        maps:get(phase, State1, undefined)
+    ),
+    State1.
 
 %% Repair path: re-send every unacked packet set. Each block re-enters
 %% `out_pkts` under a fresh packet number (arming a new timer), while the

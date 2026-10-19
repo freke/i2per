@@ -53,6 +53,8 @@ disagree with what is alive.
     session_count/0,
     session_limit/0,
     rtt_summary/0,
+    update_metrics/5,
+    remove_metrics/1,
     init/1
 ]).
 
@@ -96,6 +98,10 @@ bootstrap_tables() ->
             ),
             _ = ets:new(
                 i2p_ssu2_tokens,
+                [named_table, public, set, {read_concurrency, true}]
+            ),
+            _ = ets:new(
+                i2p_ssu2_metrics,
                 [named_table, public, set, {read_concurrency, true}]
             ),
             ok;
@@ -186,8 +192,8 @@ Summarise the RTT and congestion state of the live SSU2 sessions.
 
 Output: a map with the number of live sessions, the average RTT in
 milliseconds across them (0 when there are none), and the total congestion
-window in bytes. Reads each session's state with a bounded timeout, so a
-session that is busy or dying is skipped rather than stalling the caller.
+window in bytes. Metrics are pushed by sessions into the public ETS table
+`i2p_ssu2_metrics`, so this read never blocks on a session process.
 Used by `m:i2p_status_data:view/0` to surface congestion state.
 """.
 -spec rtt_summary() ->
@@ -206,33 +212,34 @@ rtt_summary() ->
                 element(1, Id) =:= ssu2_conn
             ],
             SessionsCount = length(Sessions),
+            Table = ets:whereis(i2p_ssu2_metrics),
+            Rows =
+                case Table of
+                    undefined -> [];
+                    _ -> ets:tab2list(i2p_ssu2_metrics)
+                end,
             {Rtts, Cwnds} = lists:foldl(
-                fun(Pid, {Rs, Cs}) ->
-                    case (catch sys:get_state(Pid, 100)) of
-                        State when is_map(State) ->
-                            RttInit = maps:get(rtt_initialized, State, false),
-                            Phase = maps:get(phase, State, undefined),
+                fun({Pid, RttMs, RttInit, Cwnd, Phase}, {Rs, Cs}) ->
+                    case is_process_alive(Pid) of
+                        false ->
+                            _ = ets:delete(i2p_ssu2_metrics, Pid),
+                            {Rs, Cs};
+                        true ->
                             Rs1 =
                                 case RttInit of
-                                    true ->
-                                        [maps:get(rtt_ms, State, maps:get(rtt, State, 0)) | Rs];
-                                    false ->
-                                        Rs
+                                    true -> [RttMs | Rs];
+                                    false -> Rs
                                 end,
                             Cs1 =
                                 case Phase of
-                                    established ->
-                                        [maps:get(cwnd, State, 0) | Cs];
-                                    _ ->
-                                        Cs
+                                    established -> [Cwnd | Cs];
+                                    _ -> Cs
                                 end,
-                            {Rs1, Cs1};
-                        _ ->
-                            {Rs, Cs}
+                            {Rs1, Cs1}
                     end
                 end,
                 {[], []},
-                Sessions
+                Rows
             ),
             N = length(Rtts),
             AvgRtt =
@@ -241,6 +248,35 @@ rtt_summary() ->
                     _ -> lists:sum(Rtts) div N
                 end,
             #{sessions => SessionsCount, rtt_ms => AvgRtt, cwnd => lists:sum(Cwnds)}
+    end.
+
+-doc """
+Record the current RTT/congestion metrics for a session. Called by
+`m:i2p_ssu2_conn` whenever its RTT or congestion state changes. Safe to call
+when the table is absent.
+""".
+-spec update_metrics(pid(), non_neg_integer(), boolean(), non_neg_integer(), atom()) -> ok.
+update_metrics(Pid, RttMs, RttInit, Cwnd, Phase) ->
+    case ets:whereis(i2p_ssu2_metrics) of
+        undefined ->
+            ok;
+        _ ->
+            ets:insert(i2p_ssu2_metrics, {Pid, RttMs, RttInit, Cwnd, Phase}),
+            ok
+    end.
+
+-doc """
+Remove a session's metrics row. Called from `m:i2p_ssu2_conn`'s terminate
+callback; dead rows are also pruned lazily by `f:rtt_summary/0`.
+""".
+-spec remove_metrics(pid()) -> ok.
+remove_metrics(Pid) ->
+    case ets:whereis(i2p_ssu2_metrics) of
+        undefined ->
+            ok;
+        _ ->
+            ets:delete(i2p_ssu2_metrics, Pid),
+            ok
     end.
 
 -doc """
