@@ -1,6 +1,6 @@
 # Protocol Reference
 
-This document describes the I2P wire formats implemented by i2per 0.4.0.
+This document describes the I2P wire formats implemented by i2per 0.5.0.
 Unsupported formats and release limitations are listed explicitly.
 
 All multi-byte integers in I2P are big-endian unless otherwise noted. Ed25519
@@ -12,15 +12,17 @@ in the [I2P documentation](https://i2p.net/en/docs/).
 
 ## Release boundaries
 
-The 0.4.0 release does not implement NTCP1, SSU1, I2CP, the legacy
-ElGamal/AES garlic formats, Datagram2, or a TUN interface. SSU2 path migration,
-RTT-based congestion control, and automatic Charlie selection for PeerTest are
+The 0.5.0 release does not implement NTCP1, SSU1, I2CP, the legacy
+ElGamal/AES garlic formats, Datagram2, or a TUN interface. SSU2 path migration
+and automatic Charlie selection for PeerTest are
 also outside this release. The Charlie role is implemented: a tagged session
 answers a RelayIntro as Charlie, verifies the requester's signature, checks the
 asserted endpoint, and punches, and the relay accept now grants a session token
 that Bob validates on the redirect (see #BFKFGY0, #98GAVQK).
-The sections below describe only behavior that is present in 0.4.0. 0.4.0 makes
-no wire-format changes over 0.3.0: the Charlie RelayResponse and HolePunch
+The sections below describe only behavior that is present in 0.5.0. 0.5.0 makes
+no wire-format changes over 0.4.0: SSU2 gains RTT estimation and window-based
+congestion control, which are transport-layer behaviour rather than wire format;
+the Charlie RelayResponse and HolePunch
 blocks and the measured-reachability caps remain as shipped in 0.3.0.
 ## Implemented
 
