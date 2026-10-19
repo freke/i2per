@@ -1,7 +1,7 @@
 # i2per
 
 `i2per` is an Erlang/OTP implementation of an I2P router with a SAM v3 client
-bridge. This repository contains the 0.4.0 release. It implements the modern
+bridge. This repository contains the 0.5.0 release. It implements the modern
 X25519 and Ed25519 protocol surface, including NTCP2, SSU2, ECIES tunnel
 creation, LeaseSet2, the I2P streaming protocol, and bounded tunnel relay
 participation.
@@ -9,21 +9,20 @@ participation.
 The project interoperates with I2P routers. It does not bundle code from
 `i2pd` or `i2p-java`; the repository's `NOTICE` file records the attribution.
 
-> **Status: 0.4.0 is cut and published.** The release page
-> (<https://github.com/freke/i2per/releases>) carries the relx tarball and its
+> **Status: 0.5.0 is in preparation.** The release page
+> (<https://github.com/freke/i2per/releases>) will carry the relx tarball and its
 > provenance MANIFEST, built by CI from the tag rather than by a person
 > remembering to run `just release`. The documentation site is published from the
 > same tag at <https://freke.github.io/i2per/>. `CHANGELOG.md` records what
 > changed, including the known issues an operator should know about.
 >
-> 0.4.0 is the hardening release: every dial is bounded, the SSU2 hot path is
-> cheaper, and the dead weight is gone. It adds a hot-flippable dial transport
-> preference, validates the granted relay token on Bob's side, bounds the three
-> dial parks, removes per-datagram allocation in the SSU2 hot path, drops the
-> retained RouterInfo and the unused Noise XX/ElG2 surface, and walks a
-> floodfill-only index. No wire-format or configuration-key changes, so a 0.3.0
-> `data_dir` is read unchanged. The external i2pd interoperability suite remains
-> a local diagnostic; it is not a required CI gate.
+> 0.5.0 is the performance release: SSU2 gains RTT estimation and window-based
+> congestion control, so a router manages its own throughput instead of relying
+> on a fixed resend timer. It also captures the SSU2 data-phase vectors from a
+> real i2pd and surfaces RTT and congestion state in `i2p_status_data:view/0`.
+> No wire-format or configuration-key changes, so a 0.4.0 `data_dir` is read
+> unchanged. The external i2pd interoperability suite remains a local
+> diagnostic; it is not a required CI gate.
 > See [ADR 0001](https://github.com/freke/i2per/blob/main/docs/adr/0001-data-only-core-with-presentation-apps.md),
 > [ADR 0002](https://github.com/freke/i2per/blob/main/docs/adr/0002-the-logging-floor-the-bus-is-the-instrument.md)
 > and the [changelog](CHANGELOG.md) for the reasoning.
@@ -88,6 +87,18 @@ The project interoperates with I2P routers. It does not bundle code from
   around.
 - **Test gate:** eunit shared-state cases isolated.
 - **Doc truth:** parity.md no longer bills the Charlie hole punch as 1.0.0.
+
+## Included in 0.5.0
+
+- **SSU2 congestion control and RTT:** SSU2 estimates RTT and runs window-based
+  congestion control, so a router manages its own throughput instead of relying
+  on a fixed resend timer.
+- **Hermetic protocol gate:** the SSU2 data phase is captured from a real i2pd
+  and committed, then replayed on every push by `i2p_ssu2_vectors_SUITE`.
+- **Observability:** `i2p_status_data:view/0` (view version 5) reports aggregate
+  SSU2 RTT and congestion window, and the status page surfaces them.
+- **Scope:** 0.5.0 anchors on RC68AGE alone; NetDb-driven Charlie selection is
+  deferred to 0.6.0.
 
 The default profile is a local client. It does not contact the live network,
 publish a floodfill RouterInfo, or accept public transit unless an operator
@@ -156,7 +167,7 @@ Wait for `===> Booted i2per`, then run these checks at the Erlang prompt:
 application:ensure_all_started(i2per).
 true = is_pid(whereis(i2per_sup)).
 %% The version string moves with each release; it is the app's own {vsn, ...}.
-{ok, "0.4.0"} = application:get_key(i2per, vsn).
+{ok, "0.5.0"} = application:get_key(i2per, vsn).
 ```
 
 The successful results are `{ok,[i2per]}`, `true`, and `ok`. Leave the shell
@@ -349,7 +360,7 @@ application:set_env(i2per, addressbook, #{
 Values already present in `sys.config` or the application environment take
 precedence over values in `i2per.conf`. In particular, edit the release's
 `releases/<vsn>/sys.config` to change the shipped `./data` directory (the
-directory is named after the release, so it carries the version — `0.4.0` for
+directory is named after the release, so it carries the version — `0.5.0` for
 this release). A
 persistent boot requires `data_dir` and `seeds` in the application environment.
 The release profile sets `live_network = false` and `ntcp2_published = false`;
@@ -475,19 +486,18 @@ part of the normal gate. `just live-smoke` is an offline self-check. Use
 
 ## Release limitations
 
-The 0.4.0 release does not implement NTCP1, SSU1, I2CP, the legacy ElGamal/AES
-crypto formats, Datagram2, or a TUN interface. Path migration and advanced
-congestion control are outside the current SSU2 data path. Floodfill and
-transit participation are available as bounded features, but they are not
-enabled by the shipped default profile. Automatic NetDb-driven Charlie
-selection is not implemented: the Charlie role itself is (a tagged session
-answers a RelayIntro, verifies the requester's signature and punches), so a
-peer that already holds a tag from i2per can select it. In-place relup
-upgrades are not supported; upgrading means installing a new tarball. 0.4.0
-keeps the 0.3.0 Charlie and reachability surface and adds bounded dial parks,
-a hot-flippable dial preference, granted-token validation, a cheaper SSU2 hot
-path, and a floodfill-only index; a `data_dir` written by 0.3.0 is read
-unchanged.
+The 0.5.0 release does not implement NTCP1, SSU1, I2CP, the legacy ElGamal/AES
+crypto formats, Datagram2, or a TUN interface. SSU2 path migration and automatic
+NetDb-driven Charlie selection are outside this release. Floodfill and transit
+participation are available as bounded features, but they are not enabled by
+the shipped default profile. Automatic NetDb-driven Charlie selection is not
+implemented: the Charlie role itself is (a tagged session answers a RelayIntro,
+verifies the requester's signature and punches), so a peer that already holds a
+tag from i2per can select it. In-place relup upgrades are not supported;
+upgrading means installing a new tarball. 0.5.0 keeps the 0.4.0 dial and hot
+path surface and adds SSU2 RTT estimation and window-based congestion control,
+hermetic SSU2 vectors, and status-page visibility; a `data_dir` written by
+0.4.0 is read unchanged.
 
 `CHANGELOG.md` lists the known issues for this release: the event bus's far
 side is unbounded if a subscriber node stops draining (OTP 28 offers no cap
