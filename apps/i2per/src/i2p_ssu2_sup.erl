@@ -205,13 +205,28 @@ rtt_summary() ->
                 tuple_size(Id) > 0,
                 element(1, Id) =:= ssu2_conn
             ],
+            SessionsCount = length(Sessions),
             {Rtts, Cwnds} = lists:foldl(
                 fun(Pid, {Rs, Cs}) ->
                     case (catch sys:get_state(Pid, 100)) of
                         State when is_map(State) ->
-                            R = maps:get(rtt_ms, State, maps:get(rtt, State, 0)),
-                            C = maps:get(cwnd, State, 0),
-                            {[R | Rs], [C | Cs]};
+                            RttInit = maps:get(rtt_initialized, State, false),
+                            Phase = maps:get(phase, State, undefined),
+                            Rs1 =
+                                case RttInit of
+                                    true ->
+                                        [maps:get(rtt_ms, State, maps:get(rtt, State, 0)) | Rs];
+                                    false ->
+                                        Rs
+                                end,
+                            Cs1 =
+                                case Phase of
+                                    established ->
+                                        [maps:get(cwnd, State, 0) | Cs];
+                                    _ ->
+                                        Cs
+                                end,
+                            {Rs1, Cs1};
                         _ ->
                             {Rs, Cs}
                     end
@@ -225,7 +240,7 @@ rtt_summary() ->
                     0 -> 0;
                     _ -> lists:sum(Rtts) div N
                 end,
-            #{sessions => N, rtt_ms => AvgRtt, cwnd => lists:sum(Cwnds)}
+            #{sessions => SessionsCount, rtt_ms => AvgRtt, cwnd => lists:sum(Cwnds)}
     end.
 
 -doc """

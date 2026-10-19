@@ -27,7 +27,7 @@ Rows are one verdict, not prose: **done** (implemented and exercised),
 | NTCP1 (legacy) | absent | excluded by maintainer decision |
 | SSU2 transport (handshake + data phase) | done | session establishment verified in interop; data phase replayed hermetically from committed i2pd vectors |
 | SSU2 path migration | absent | excluded; blocks 18/19 stay keepalive-echo |
-| SSU2 congestion control / RTT | absent | 1.0.0 material (`RC68AGE`) |
+| SSU2 congestion control / RTT | done | window-based congestion control and RTT estimation (`RC68AGE`) |
 | SSU1 (legacy) | absent | excluded by maintainer decision |
 | ECIES encryption / garlic | done | LeaseSet2, garlic clove handling |
 | ElGamal / AES legacy crypto | absent | excluded by maintainer decision |
@@ -59,7 +59,6 @@ Rows are one verdict, not prose: **done** (implemented and exercised),
 
 ## 1.0.0 material explicitly listed
 
-- `RC68AGE` — SSU2 congestion control and RTT estimation.
 - Tunnel build v2 with NetDb-driven Charlie selection.
 - LeaseSet v1, EncryptedLeaseSet, MetaLeaseSet.
 - SOCKS / HTTP proxy / BOB / I2PControl console.
