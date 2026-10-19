@@ -51,7 +51,12 @@ job, by sampling twice and subtracting. Nothing here computes one.
 %% 4 added `ssu2_preferred` — the dial transport preference in force
 %% (#0JJ375C), so an operator (and a consumer) can see which transport the
 %% router reaches for first without asking the node. Additive only.
--define(VIEW_VERSION, 4).
+%%
+%% 5 added `ssu2` — aggregate RTT and congestion state across the live SSU2
+%% sessions (session count, average RTT in ms, total congestion window), so
+%% the read API surfaces the congestion control #RC68AGE added rather than
+%% leaving it process-local. Additive only.
+-define(VIEW_VERSION, 5).
 
 %% `underspecs` is off for the read API's two functions, deliberately, and this
 %% is the one place in the tree where that is the right call.
@@ -123,6 +128,14 @@ reason the two are separate.
         %% reaches for SSU2 first when dialing. Boot-time availability is a
         %% separate fact, so this can be flipped at runtime without changing it.
         ssu2_preferred := boolean(),
+        %% Aggregate RTT and congestion state across the live SSU2 sessions,
+        %% surfaced so the congestion control #RC68AGE added is observable
+        %% rather than process-local.
+        ssu2 := #{
+            sessions := non_neg_integer(),
+            rtt_ms := non_neg_integer(),
+            cwnd := non_neg_integer()
+        },
         %% The measured reachability per family: the latest concluded test's
         %% ladder rung and, when the chain broke, the typed reason. The coarse
         %% verdict smooths this with hysteresis; this is the raw measurement.
@@ -154,6 +167,7 @@ view() ->
         netdb => #{ri => i2p_netdb_srv:count(), ls => i2p_netdb_srv:ls_count()},
         sessions => length(i2p_sam_sup:client_sessions()),
         ssu2_preferred => i2p_identity:ssu2_preferred(),
+        ssu2 => i2p_ssu2_sup:rtt_summary(),
         reachability_detail => i2p_ssu2_reachability:detail(),
         gauges => i2p_counters:gauges()
     }.
@@ -177,6 +191,7 @@ view_keys() ->
         peers,
         reachability_detail,
         sessions,
+        ssu2,
         ssu2_preferred,
         tunnels,
         uptime_ms,

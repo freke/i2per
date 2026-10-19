@@ -87,7 +87,10 @@ rows(Snap) ->
             {"netdb router infos", count(Snap, netdb, ri)},
             {"netdb leasesets", count(Snap, netdb, ls)},
             {"SAM sessions", sessions(Snap)},
-            {"SSU2 dials UDP first", ssu2_preferred(Snap)}
+            {"SSU2 dials UDP first", ssu2_preferred(Snap)},
+            {"SSU2 sessions", ssu2_sessions(Snap)},
+            {"SSU2 RTT (ms)", ssu2_rtt(Snap)},
+            {"SSU2 cwnd (bytes)", ssu2_cwnd(Snap)}
         ] ++
             [
                 {"reachability", reachability(Snap)},
@@ -228,5 +231,23 @@ ssu2_preferred(Snap) ->
     case maps:find(ssu2_preferred, Snap) of
         {ok, true} -> <<"yes">>;
         {ok, false} -> <<"no">>;
+        _ -> <<"n/a">>
+    end.
+
+ssu2_sessions(Snap) ->
+    case maps:find(ssu2, Snap) of
+        {ok, #{sessions := N}} when is_integer(N) -> integer_to_binary(N);
+        _ -> <<"n/a">>
+    end.
+
+ssu2_rtt(Snap) ->
+    case maps:find(ssu2, Snap) of
+        {ok, #{rtt_ms := N}} when is_integer(N) -> integer_to_binary(N);
+        _ -> <<"n/a">>
+    end.
+
+ssu2_cwnd(Snap) ->
+    case maps:find(ssu2, Snap) of
+        {ok, #{cwnd := N}} when is_integer(N) -> integer_to_binary(N);
         _ -> <<"n/a">>
     end.

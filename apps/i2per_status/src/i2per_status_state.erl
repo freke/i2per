@@ -484,6 +484,7 @@ known_view_keys() ->
         peers,
         reachability_detail,
         sessions,
+        ssu2,
         ssu2_preferred,
         tunnels,
         uptime_ms,

@@ -159,6 +159,15 @@ repeat suite n:
 interop:
     scripts/interop_i2pd.sh
 
+# Recapture the committed SSU2 vectors from a real i2pd. Explicit opt-in, like
+# `interop` and for a related reason: it rewrites a committed fixture, and a
+# fixture refreshed automatically is a fixture nobody reads. What the gate runs
+# is the replay (`i2p_ssu2_vectors_SUITE`), which needs only the committed bytes.
+#
+# Needs an i2pd binary (I2PD_BIN, or one on PATH) and no network.
+capture-vectors:
+    scripts/capture_i2pd_vectors.sh
+
 # Run SipHash micro-benchmark (pure-Erlang NTCP2 frame-length obfuscation)
 bench-siphash:
     escript bench/bench_siphash.escript

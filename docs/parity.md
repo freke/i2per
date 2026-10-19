@@ -25,9 +25,9 @@ Rows are one verdict, not prose: **done** (implemented and exercised),
 |---|---|---|
 | NTCP2 transport (incl. data phase) | done | `apps/i2per` NTCP2; see `docs/protocol.md` |
 | NTCP1 (legacy) | absent | excluded by maintainer decision |
-| SSU2 transport (handshake + data phase) | done | session establishment verified in interop |
+| SSU2 transport (handshake + data phase) | done | session establishment verified in interop; data phase replayed hermetically from committed i2pd vectors |
 | SSU2 path migration | absent | excluded; blocks 18/19 stay keepalive-echo |
-| SSU2 congestion control / RTT | absent | 1.0.0 material (`RC68AGE`) |
+| SSU2 congestion control / RTT | done | window-based congestion control and RTT estimation (`RC68AGE`) |
 | SSU1 (legacy) | absent | excluded by maintainer decision |
 | ECIES encryption / garlic | done | LeaseSet2, garlic clove handling |
 | ElGamal / AES legacy crypto | absent | excluded by maintainer decision |
@@ -59,7 +59,6 @@ Rows are one verdict, not prose: **done** (implemented and exercised),
 
 ## 1.0.0 material explicitly listed
 
-- `RC68AGE` — SSU2 congestion control and RTT estimation.
 - Tunnel build v2 with NetDb-driven Charlie selection.
 - LeaseSet v1, EncryptedLeaseSet, MetaLeaseSet.
 - SOCKS / HTTP proxy / BOB / I2PControl console.
@@ -70,3 +69,37 @@ Rows are one verdict, not prose: **done** (implemented and exercised),
 A goal with no recorded date leaks. This file is refreshed whenever i2pd
 publishes a release that changes the capability surface; the maintainer opens a
 follow-up ticket at that point so the refresh is scheduled rather than hoped for.
+
+## Recapturing the committed vectors
+
+`apps/i2per/test/fixtures/i2pd_ssu2_data_phase.term` holds SSU2 data-phase
+datagrams captured from i2pd 2.61.0 — the version pinned above — and
+`i2p_ssu2_vectors_SUITE` replays them in the hermetic gate. The capture is
+tied to this snapshot, so it is refreshed on the same cadence as this file:
+
+```sh
+I2PD_BIN=/path/to/i2pd just capture-vectors
+```
+
+It needs an i2pd binary and no network. Three things about it are not obvious
+and each cost a capture to find:
+
+- **`reservedrange` must be `false`.** i2pd admits an inbound SSU2 datagram only
+  when `!IsInReservedRange(addr)` (`SSU2.cpp:775`), which that flag turns on,
+  and its reserved list covers 127/8 and 100.64/10 among others
+  (`util.cpp:793`). With the flag left at its default every packet from a
+  loopback capture is dropped with "incoming packet received from invalid or
+  banned endpoint" and the handshake never starts.
+- **`reseed.file`, not `reseed.urls`.** Pointed at a local SU3, i2pd reads it,
+  finds every RouterInfo stale, and starts transports immediately. Pointed at
+  servers, it retries for `RESEED_GIVEUP_TIMEOUT` (180 s, `Reseed.cpp:26`)
+  before giving up. An empty NetDb costs the capture nothing either way: SSU2
+  answers a SessionRequest without peers.
+- **One of our packets is dropped on purpose.** An ACK over a contiguous run of
+  packet numbers has an empty range list, and the NACK ranges are the part that
+  exercises ACK accounting. The capture swallows one packet so i2pd emits them.
+
+Review the regenerated diff rather than taking it on trust: the ACK accounting
+the suite asserts is only meaningful if the capture still contains the loss, and
+`a_dropped_packet_stays_a_nack_range` is what fails if a re-capture stopped
+producing it.
