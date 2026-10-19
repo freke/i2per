@@ -293,6 +293,13 @@ check_release_profile() {
             exit 1
         fi
     done
+    for required_script in \
+        scripts/soak.escript scripts/live_smoke.escript scripts/soak_tunnels.escript; do
+        if ! tar -tzf "$artifact" | grep -Fx "$required_script" >/dev/null; then
+            echo "error: release is missing $required_script" >&2
+            exit 1
+        fi
+    done
     check_no_test_only_modules "$artifact" "$vsn"
     echo "  safe-default profile and license-document checks passed"
 }
