@@ -62,11 +62,6 @@ The project interoperates with I2P routers. It does not bundle code from
 - **Measured reachability:** peer testing feeds a typed ladder from `unknown`
   to `reachable`, with hysteresis and the measured verdict reflected in the
   published RouterInfo caps.
-- **Hermetic protocol gate:** the SSU2 data phase is captured from a real i2pd
-  and committed, then replayed on every push by `i2p_ssu2_vectors_SUITE`, so
-  the ACK accounting is checked against another router's bytes rather than
-  against our own encoder — without running an i2p server in the pipeline.
-  `scripts/capture_i2pd_vectors.sh` takes the capture; the gate never runs it.
 - **Bus hardening:** the event bus records every fact it carries, survives a
   subscriber death, and measures the far-side backlog instead of assuming it
   cannot grow.

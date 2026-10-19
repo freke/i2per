@@ -176,6 +176,7 @@ clearing `remote_ri` in isolation once made every Charlie reply sign over
 -define(MAX_FRAG_BODY, ?MAX_PAYLOAD - 12).
 %% Upper bound on in-flight reassembly buffers for uncompleted fragments.
 -define(MAX_REASSEMBLY, 128).
+-define(MAX_SEND_QUEUE, 128).
 
 -doc """
 Local SSU2 identity material: the X25519 static keypair plus the
@@ -632,7 +633,10 @@ handle_cast(
     %% ignored until the outstanding one resolves.
     {noreply, State};
 handle_cast({terminate, Reason}, State = #{phase := established}) ->
-    _ = send_termination(Reason, State),
+    %% Termination is sent untracked: it is the last thing this process
+    %% does, so it cannot be retransmitted, and it must not be queued
+    %% behind a full congestion window (which would drop it on the floor).
+    _ = send_packet([{termination, 0, Reason, <<>>}], State, false),
     {stop, normal, State};
 handle_cast({set_owner, Owner}, State) ->
     Config = maps:get(config, State),
@@ -1044,7 +1048,7 @@ become_established_common(HS, Keys, State) ->
             pt_target => undefined,
             cwnd => 4 * ?MTU,
             ssthresh => 65535,
-            send_queue => [],
+            send_queue => queue:new(),
             retransmitting => false,
             rtt_initialized => false,
             srtt_ms => 0,
@@ -1270,8 +1274,14 @@ send_packet(Blocks, State = #{keys := Keys, pkt_out := Num}, Track) ->
                 true ->
                     %% Congested: queue rather than send. The packet keeps its
                     %% block list and is drained once the in-flight window opens.
-                    Queue = maps:get(send_queue, State, []),
-                    State#{send_queue => Queue ++ [Blocks]};
+                    Queue = maps:get(send_queue, State, queue:new()),
+                    case queue:len(Queue) >= ?MAX_SEND_QUEUE of
+                        true ->
+                            i2p_log:warning({send_queue_full, dropping}, role(State)),
+                            State;
+                        false ->
+                            State#{send_queue => queue:in(Blocks, Queue)}
+                    end;
                 false ->
                     send_packet_now(Blocks, State, Keys, Num, Track)
             end;
@@ -1844,7 +1854,7 @@ process_ack({ack, AT, Acnt, Ranges}, State = #{out_pkts := Out}) ->
     ]),
     State2 = apply_cc_ack(State1, AckedBytes1),
     State3 =
-        case Nacked of
+        case RetransmitBlocks of
             [] -> State2;
             _ -> on_cc_loss(State2)
         end,
@@ -2041,9 +2051,6 @@ dir_keys(#{k_ba := Kba, kh2_ba := KH2Ba}, ba) -> {Kba, KH2Ba}.
 
 data_nonce(N) -> <<0:32, N:64/little>>.
 
-send_termination(Reason, State) ->
-    send_blocks([{termination, 0, Reason, <<>>}], State).
-
 ack_packet_zero(_Keys, State = #{seen_in := SeenIn}) ->
     %% Alice's SessionConfirmed is her data-phase packet zero; record its
     %% receipt and ACK it with Bob's first Data packet (spec: Bob 0 = ACK).
@@ -2230,21 +2237,23 @@ maybe_arm_data_resend(State = #{out_pkts := Out}) ->
 inflight_bytes(#{out_pkts := Out}) ->
     lists:sum([Size || {_Num, {_Blocks, Size, _Sent, _Ret}} <- maps:to_list(Out)]).
 
-drain_send_queue(State = #{send_queue := []}) ->
-    State;
-drain_send_queue(State = #{send_queue := [Blocks | Rest]}) ->
-    Inflight = inflight_bytes(State),
-    Cwnd = maps:get(cwnd, State, 4 * ?MTU),
-    case Inflight =:= 0 orelse Inflight + ?MTU =< Cwnd of
+drain_send_queue(State = #{send_queue := Q}) ->
+    case queue:is_empty(Q) of
         true ->
-            State1 = State#{send_queue => Rest},
-            State2 = send_packet(Blocks, State1, ack_eliciting(Blocks)),
-            drain_send_queue(State2);
+            State;
         false ->
-            State
-    end;
-drain_send_queue(State) ->
-    State.
+            {value, Blocks, Rest} = queue:out(Q),
+            Inflight = inflight_bytes(State),
+            Cwnd = maps:get(cwnd, State, 4 * ?MTU),
+            case Inflight =:= 0 orelse Inflight + ?MTU =< Cwnd of
+                true ->
+                    State1 = State#{send_queue => Rest},
+                    State2 = send_packet(Blocks, State1, ack_eliciting(Blocks)),
+                    drain_send_queue(State2);
+                false ->
+                    State#{send_queue => queue:in_r(Blocks, Rest)}
+            end
+    end.
 
 update_rtt(State, Acked, Out) ->
     NowMs = erlang:monotonic_time(millisecond),
