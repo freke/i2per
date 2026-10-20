@@ -25,6 +25,22 @@ changes, so a 0.4.0 `data_dir` is read unchanged.
   is deferred to 0.6.0 unless it lands small (#01T1WWE). The i2pd interop
   suite stays a local diagnostic, not a required CI gate (#HD80K76).
 
+### Fixed
+
+- **Send queue fairness.** A full SSU2 send queue now drops its oldest queued
+  packet (rather than the newest) and announces/logs the drop instead of
+  discarding silently (#7NRF872).
+- **Status page coverage.** The four SSU2 rows are tested and the `n/a`
+  metric list updated with them (#DQ40YW8).
+- **Documentation truth.** `config/sys.config` no longer claims the hot
+  transport flip is an unbuilt ticket, and `docs/parity.md` marks the
+  streaming protocol done (#EAZB4CS).
+- **Cleanup.** Dead `rtt`/`rtt_ms`/`srtt`/`cwnd` accessors, an unused
+  listener registration path, and two orphaned test helpers are removed
+  (#WDJ7NV1).
+- **Test reliability.** The NTCP2 70k-frame flood hang guard is widened
+  (#SM1MJN0).
+
 ## [Unreleased]
 
 _(nothing yet)_
