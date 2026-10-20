@@ -24,6 +24,7 @@
     full_seven_message_peertest_loopback/1,
     charlie_dial_failure_returns_error/1,
     auto_select_dial_failure_rejects_alice/1,
+    auto_select_excludes_alice_herself/1,
     auto_select_sends_alice_ri_before_msg2/1
 ]).
 
@@ -46,6 +47,7 @@ all() ->
         full_seven_message_peertest_loopback,
         charlie_dial_failure_returns_error,
         auto_select_dial_failure_rejects_alice,
+        auto_select_excludes_alice_herself,
         auto_select_sends_alice_ri_before_msg2
     ].
 
@@ -556,6 +558,56 @@ auto_select_dial_failure_rejects_alice(_Config) ->
     after
         ok = application:unset_env(?APP, handshake_retry_ms),
         ok = application:unset_env(?APP, handshake_max_resends)
+    end.
+
+%% The auto-select path must exclude Alice herself. Alice is an ordinary router
+%% publishing an SSU2 address with `B`, so her own RouterInfo is in our NetDb and
+%% the uniform draw could return her -- she would then test herself, and messages
+%% 5-7 would run Alice-to-Alice, which is not evidence about her reachability.
+%% With Alice the *only* qualifying candidate, the correct answer is the code-2
+%% reject, not a dial to her.
+auto_select_excludes_alice_herself(_Config) ->
+    {BobLocal, _BobRIBlock} = bob_local(),
+    {ok, Coord} = i2p_peertest_coord:start_link(BobLocal),
+    try
+        BobPort = i2p_peertest_coord:port(Coord),
+
+        {AliceListener, _APort, AliceLocal} = listen_full_local(<<"127.0.0.1">>),
+        AliceRIBlock = maps:get(ri_binary, AliceLocal),
+        AlicePort = i2p_ssu2_listener:port(AliceListener),
+        %% Alice's RI is the sole candidate in the NetDb.
+        {ok, _} = i2p_netdb_srv:store_binary(
+            i2p_router_info:to_binary(maps:get(ri, AliceLocal)),
+            erlang:system_time(millisecond)
+        ),
+        RemoteOpts =
+            #{
+                host => <<"127.0.0.1">>,
+                port => BobPort,
+                static_key => maps:get(static_pub, BobLocal),
+                intro_key => maps:get(intro_key, BobLocal)
+            },
+        {ok, AlicePid, _} =
+            i2p_ssu2_conn:connect(AliceLocal, RemoteOpts, AliceRIBlock, AliceListener, alice),
+        unlink(AlicePid),
+
+        BobHash = maps:get(hash, BobLocal),
+        Ip = <<127, 0, 0, 1>>,
+        ok = i2p_ssu2_conn:send_router_info(AlicePid, 0, AliceRIBlock),
+        ok = i2p_ssu2_conn:initiate_peertest(AlicePid, BobHash, AlicePort, Ip),
+
+        ok = wait_no_charlie_reject(AlicePid, Ip),
+        true = is_process_alive(Coord),
+        Counters = i2p_counters:snapshot(),
+        1 = maps:get(charlie_selections_attempted, Counters, 0),
+        %% The discriminating assertion: Alice is the only NetDb candidate, so
+        %% selection ran out of candidates. A successful selection of Alice
+        %% herself would instead show a dial (succeeded, or no_candidate = 0).
+        1 = maps:get(charlie_selections_no_candidate, Counters, 0),
+        0 = maps:get(charlie_selections_succeeded, Counters, 0),
+        1 = maps:get(charlie_selections_rejected, Counters, 0)
+    after
+        catch i2p_peertest_coord:stop(Coord)
     end.
 
 %% Wait for the in-session message-4 code-2 "no Charlie available" reject.

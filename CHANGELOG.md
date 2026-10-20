@@ -48,7 +48,7 @@ changes, so a 0.4.0 `data_dir` is read unchanged.
 - **Automatic NetDb-driven Charlie selection.** Bob (the introducer) now
   selects a Charlie from the NetDb on an inbound PeerTest message 1 instead of
   requiring the operator to supply one: SSU2 address with the `B` peer-test
-  capability and a public host/port, uniform random, one Charlie per cycle,
+  capability and a published host/port, uniform random, one Charlie per cycle,
   per-Alice 60s rate limit, and the deterministic "no Charlie available" reject
   (code 2) on any failure. The manual `dial_charlie/3` path remains for tests
   and operators (#6TGF083).

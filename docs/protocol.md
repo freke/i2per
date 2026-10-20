@@ -2009,7 +2009,7 @@ implementation keeps the deterministic "no Charlie available" reject.
 
 Alice-outbound initiation is implemented. The coordinator now selects a
 qualifying Charlie from the NetDb automatically (SSU2 address with the `B`
-peer-test capability and a public host/port, uniform random, one per cycle,
+peer-test capability and a published host/port, uniform random, one per cycle,
 per-Alice 60s rate limit, code-2 reject on failure); the manual `dial_charlie/3`
 path remains for tests and operators.
 

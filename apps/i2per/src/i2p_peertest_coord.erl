@@ -16,8 +16,9 @@ routes them:
 
 Charlie selection is now NetDb-driven: when a message 1 arrives and no Charlie
 session is dialed yet, the coordinator selects a qualifying RouterInfo from the
-NetDb (SSU2 address with the `B` peer-test capability and a public host/port),
-dials it, and relays. Alice's RouterInfo, held from the moment it was learned,
+NetDb (SSU2 address with the `B` peer-test capability and a published
+host/port — "published" means the address carries a host and port, not that it
+is publicly reachable), dials it, and relays. Alice's RouterInfo, held from the moment it was learned,
 goes to the freshly dialed session ahead of message 2 as the spec requires.
 A manual path remains via `f:dial_charlie/3` for tests
 and operators. The coordinator binds the intro-side listener as both its owner
@@ -435,15 +436,27 @@ send_held_alice_ri(CharlieSess, State) ->
     end.
 
 %% Pick one qualifying Charlie from the NetDb: SSU2 address with the `B`
-%% peer-test capability and a public host/port, excluding ourselves. Uniform
-%% random among candidates.
--spec select_charlie(#{hash := i2p_crypto:hash(), _ => _}) ->
+%% peer-test capability and a published host/port, excluding ourselves and
+%% Alice. Uniform random among candidates.
+%%
+%% Alice is excluded because she is an ordinary router that publishes an SSU2
+%% address with `B`, so her own RouterInfo is in our NetDb and the draw can
+%% otherwise return her: she would then test herself, and messages 5-7 would run
+%% Alice-to-Alice, which says nothing about her reachability. The chance rises as
+%% the NetDb shrinks.
+%%
+%% `published` here means `f:i2p_router_info:ssu2_address_options/1` reported a
+%% host and port present -- loopback and private addresses included -- not that
+%% the address is publicly reachable. That is deliberate: the local test harness
+%% advertises `127.0.0.1` candidates, so a reachability filter would break it.
+-spec select_charlie(#{hash := i2p_crypto:hash(), _ => _}, i2p_crypto:hash() | undefined) ->
     {ok, i2p_router_info:router_info(), map()} | {error, no_candidate}.
-select_charlie(#{hash := OurHash}) ->
+select_charlie(#{hash := OurHash}, AliceHash) ->
     Candidates = [
         RI
      || RI <- i2p_netdb_srv:routers(),
         i2p_router_info:hash(RI) =/= OurHash,
+        i2p_router_info:hash(RI) =/= AliceHash,
         {ok, Opts} <- [i2p_router_info:ssu2_address_options(RI)],
         maps:get(peer_test, Opts, false) =:= true,
         maps:get(published, Opts, false) =:= true
@@ -490,8 +503,9 @@ auto_select_charlie(Pid, Code, Flags, Ver, Nonce, Ts, Port, Ip, Sig, AliceHash, 
             };
         false ->
             BobLocal = maps:get(bob_local, State),
-            case select_charlie(BobLocal) of
+            case select_charlie(BobLocal, AliceHash) of
                 {error, no_candidate} ->
+                    _ = i2p_counters:add(charlie_selections_no_candidate, 1),
                     _ = i2p_counters:add(charlie_selections_rejected, 1),
                     i2p_log:debug({coord_msg1, auto_select, no_candidate}, []),
                     reply_reject(AlicePid, Nonce, Ts, Port, Ip),
