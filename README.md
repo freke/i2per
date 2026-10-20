@@ -9,7 +9,7 @@ participation.
 The project interoperates with I2P routers. It does not bundle code from
 `i2pd` or `i2p-java`; the repository's `NOTICE` file records the attribution.
 
-> **Status: 0.5.0 is in preparation.** The release page
+> **Status: 0.5.0 is cut and published.** The release page
 > (<https://github.com/freke/i2per/releases>) will carry the relx tarball and its
 > provenance MANIFEST, built by CI from the tag rather than by a person
 > remembering to run `just release`. The documentation site is published from the
