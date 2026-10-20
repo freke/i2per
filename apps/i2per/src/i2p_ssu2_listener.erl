@@ -11,9 +11,13 @@ does not hold, so a short header's type at offset 12 decodes to noise here.
 1. Unmask bytes 0..7 with our introduction key and look up
    `i2p_ssu2_sessions`; a known connection ID is forwarded verbatim to that
    session process. Exact for both header forms.
-2. Otherwise look up `i2p_ssu2_pending` by source endpoint. That is how a
-   `SessionCreated` or `Retry` reaches the dialer waiting for it, and it needs
-   no header interpretation at all, so it is exact too.
+2. Otherwise look up `i2p_ssu2_pending` by this listener and the source
+   endpoint. That is how a `SessionCreated` or `Retry` reaches the dialer
+   waiting for it, and it needs no header interpretation at all, so it is exact
+   too. The listener is part of the key because the table is node-global while
+   the socket is not: without it, a datagram arriving here would be claimed by
+   a dialer whose SessionRequest went out through a *different* listener whose
+   local endpoint happens to be the same (see #2SE5SNW).
 3. Only for a datagram from an endpoint nothing is waiting on is the type byte
    trustworthy: there, and only there, unmasking header bytes 8..15 with the
    introduction key reflects what an out-of-session peer actually did. That one
@@ -236,7 +240,9 @@ handle_cast({send, Datagram, Endpoint}, State = #{sock := Sock}) ->
     _ = gen_udp:send(Sock, Endpoint, Datagram),
     {noreply, State};
 handle_cast({register_pending, Pid, Endpoint}, State) ->
-    _ = ets:insert(i2p_ssu2_pending, {Endpoint, Pid}),
+    %% Keyed by this listener (self()) as well as the endpoint: the table is
+    %% node-global, the socket is not. See #2SE5SNW.
+    _ = ets:insert(i2p_ssu2_pending, {{self(), Endpoint}, Pid}),
     erlang:monitor(process, Pid),
     {noreply, State};
 handle_cast({register_relay_tag, Tag, Pid, Expires}, State) ->
@@ -404,12 +410,18 @@ ensure_charlie(State = #{charlie := Charlie}) ->
 %%
 %% So resolve in order of certainty. A live session is matched by connection ID,
 %% which is exact: both header forms mask bytes 0..7 with our intro key. A
-%% pending outbound session is matched by source endpoint, also exact, and that
-%% is the path a SessionCreated or Retry must take. Only once neither matches --
-%% a datagram from an endpoint nothing is waiting on -- is an out-of-session
-%% PeerTest possible, and only there does unmasking the whole header with the
-%% intro key reflect what the out-of-session sender actually did, so only there
-%% is the type byte trustworthy.
+%% pending outbound session is matched by this listener and the source endpoint,
+%% also exact, and that is the path a SessionCreated or Retry must take. The
+%% listener is in the key because the pending table is node-global while each
+%% socket is not: without it, a SessionRequest leaving through one listener's
+%% socket could be claimed by a dialer registered under another listener whose
+%% remote endpoint names that same source -- the peertest misroute behind
+%% #2SE5SNW, where Alice's row for Bob's endpoint swallowed the coordinator's
+%% outbound Charlie dial and Charlie never spawned. Only once neither matches --
+%% a datagram from an endpoint nothing is waiting on at this socket -- is an
+%% out-of-session PeerTest possible, and only there does unmasking the whole
+%% header with the intro key reflect what the out-of-session sender actually
+%% did, so only there is the type byte trustworthy.
 %%
 %% **One unmask per datagram, at the point the answer needs it.** `f:classify/5`
 %% recovers the connection id with a single ChaCha20 pass (`f:open_conn_id/3`) and
@@ -427,8 +439,8 @@ route_or_handshake(ListenerPid, ConnId, Datagram, IP, PortNum, State) ->
             Pid ! {ssu2_packet, Datagram},
             State;
         [] ->
-            case ets:lookup(i2p_ssu2_pending, {IP, PortNum}) of
-                [{_Ep, PendingPid}] ->
+            case ets:lookup(i2p_ssu2_pending, {ListenerPid, {IP, PortNum}}) of
+                [{_Key, PendingPid}] ->
                     i2p_log:debug({route_or_handshake, pending, {IP, PortNum}}, []),
                     PendingPid ! {ssu2_packet, Datagram},
                     State;
