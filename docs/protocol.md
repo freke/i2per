@@ -2007,9 +2007,11 @@ relays Charlie's message 3 (+ his RouterInfo) back to Alice as message 4
 carrying Charlie's router hash. When a session has no coordinator, the
 implementation keeps the deterministic "no Charlie available" reject.
 
-Alice-outbound initiation is implemented for setup only. The coordinator is
-handed Charlie's RouterInfo to relay; automatic NetDb-driven Charlie selection
-is not implemented in this release.
+Alice-outbound initiation is implemented. The coordinator now selects a
+qualifying Charlie from the NetDb automatically (SSU2 address with the `B`
+peer-test capability and a public host/port, uniform random, one per cycle,
+per-Alice 60s rate limit, code-2 reject on failure); the manual `dial_charlie/3`
+path remains for tests and operators.
 
 ##### Peer Test block (type 10)
 
