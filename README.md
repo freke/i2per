@@ -501,7 +501,7 @@ hermetic SSU2 vectors, and status-page visibility; a `data_dir` written by
 
 `CHANGELOG.md` lists the known issues for this release: the event bus's far
 side is unbounded if a subscriber node stops draining (OTP 28 offers no cap
-from the router side), and SSU2 congestion control and RTT are 1.0.0 material.
+from the router side).
 
 The 1.0.0 target is frozen in [`docs/parity.md`](docs/parity.md), which pins a
 dated i2pd capability snapshot so "parity with i2pd" cannot drift as i2pd moves.

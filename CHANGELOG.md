@@ -4,6 +4,31 @@ All notable changes to i2per are recorded here. Versions follow the OTP
 applications' own `{vsn, ...}`; the release tag is `v` + that version, and
 CI refuses a tag that disagrees.
 
+## [0.5.0] — 2026-10-19
+
+**The performance release.** 0.4.0 hardened the dial and hot path; 0.5.0 adds
+throughput management: SSU2 estimates RTT and runs window-based congestion
+control instead of a fixed resend timer. No wire-format or configuration-key
+changes, so a 0.4.0 `data_dir` is read unchanged.
+
+### Changed
+
+- **SSU2 congestion control and RTT.** SSU2 now estimates RTT and runs
+  window-based congestion control, so a router manages its own throughput
+  instead of relying on a fixed resend timer (#RC68AGE).
+- **Hermetic protocol gate.** The SSU2 data phase is captured from a real i2pd
+  and committed, then replayed on every push (#3TC871W).
+- **Observability.** `i2p_status_data:view/0` now reports aggregate SSU2 RTT
+  and congestion window (view version 5), and the status page surfaces them
+  (#3HWTDQV).
+- **Scope.** 0.5.0 anchors on RC68AGE alone; NetDb-driven Charlie selection
+  is deferred to 0.6.0 unless it lands small (#01T1WWE). The i2pd interop
+  suite stays a local diagnostic, not a required CI gate (#HD80K76).
+
+## [Unreleased]
+
+_(nothing yet)_
+
 ## [0.4.0] — 2026-10-18
 
 **The hardening release.** 0.3.0 added protocol surface; 0.4.0 pays for it:
@@ -50,31 +75,6 @@ read unchanged.
 - RouterRequestStatus (I2NP type 20) is confirmed absent from i2pd, Java I2P
   and the I2NP spec; the slot it vacated is taken by #EPQVQA7 (#GF37P50,
   no code change).
-
-## [0.5.0] — 2026-10-19
-
-**The performance release.** 0.4.0 hardened the dial and hot path; 0.5.0 adds
-throughput management: SSU2 estimates RTT and runs window-based congestion
-control instead of a fixed resend timer. No wire-format or configuration-key
-changes, so a 0.4.0 `data_dir` is read unchanged.
-
-### Changed
-
-- **SSU2 congestion control and RTT.** SSU2 now estimates RTT and runs
-  window-based congestion control, so a router manages its own throughput
-  instead of relying on a fixed resend timer (#RC68AGE).
-- **Hermetic protocol gate.** The SSU2 data phase is captured from a real i2pd
-  and committed, then replayed on every push (#3TC871W).
-- **Observability.** `i2p_status_data:view/0` now reports aggregate SSU2 RTT
-  and congestion window (view version 5), and the status page surfaces them
-  (#3HWTDQV).
-- **Scope.** 0.5.0 anchors on RC68AGE alone; NetDb-driven Charlie selection
-  is deferred to 0.6.0 unless it lands small (#01T1WWE). The i2pd interop
-  suite stays a local diagnostic, not a required CI gate (#HD80K76).
-
-## [Unreleased]
-
-_(nothing yet)_
 
 ## [0.3.0] — 2026-10-13
 
