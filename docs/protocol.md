@@ -1341,7 +1341,8 @@ explicit zero is a protocol error because it cannot carry payload. The local
 value is used as supplied. Each side then sets its outbound payload chunk size
 to the smaller of its local value and the normalized peer offer. The negotiated value limits application payload
 chunks; the streaming header and options are added around each chunk. This
-release has no RTT-based or window-based congestion control.
+release has no RTT-based or window-based congestion control in the streaming
+layer; SSU2 gained both in 0.5.0.
 
 **SAM integration.** `STREAM CONNECT` first tries same-router listener
 pairing, which reports `RESULT=OK` immediately. Otherwise it resolves the
@@ -1939,8 +1940,7 @@ covers it. Retransmission is idempotent to the receiver: fragments overwrite
 the same message-id/fragment-number slots, and whole blocks are re-forwarded
 at most idempotently by message identity. Pure ACK and keepalive
 (`path_challenge`/`path_response`) packets are never recorded, so they cannot
-feedback-loop. This release uses a fixed resend period. RTT estimation,
-window-based congestion control, and path migration are not implemented.
+feedback-loop. This release uses a fixed resend period. RTT estimation and window-based congestion control shipped in 0.5.0; path migration is not implemented.
 
 Unknown payload block types and padding are ignored by
 `i2p_ssu2:decode_blocks/1`, as required for forward compatibility. A malformed
