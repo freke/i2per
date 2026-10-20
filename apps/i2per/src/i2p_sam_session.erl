@@ -43,9 +43,16 @@ Sessions are spawned by `m:i2p_sam_listener` and are not started directly.
 -define(MAX_DATAGRAM, 32768).
 
 %% Tunnel-length bounds for SESSION CREATE options: values are clamped into
-%% 1..7 hops, matching the router's maximum tunnel budget (?NUM_HOPS in
+%% 1..7 hops, matching the router's maximum tunnel budget (?MAX_HOPS in
 %% m:i2p_tunnel_srv).
 -define(MAX_HOPS, 7).
+
+%% The hop count an absent length option means. Not the maximum: a session that
+%% asks only for `inbound.length=2` is stating no opinion about its outbound
+%% side, and "no opinion" is the router's ordinary default build, which is 3
+%% (m:i2p_tunnel_build). Feeding ?MAX_HOPS in for a side the caller never named
+%% made every half-specified session demand a 7-hop pool for the other side.
+-define(DEFAULT_HOPS, 3).
 
 -doc "A SAM session identifier (the ID= value from SESSION CREATE).".
 -type session_id() :: binary().
@@ -347,21 +354,25 @@ handle_session_create(Style, Id, DestBlob64, Lengths, State) ->
             exit({protocol_error, bad_destination})
     end.
 
-%% register_lengths/1 — hand non-default length demands to the tunnel
+%% register_lengths/1 — hand this session's length demands to the tunnel
 %% manager so its pool tick builds matching tunnels while this session
-%% lives. Absent options mean "no opinion" and register nothing.
+%% lives. Absent options mean "no opinion" and take the router default, not
+%% the maximum: a one-sided request must not drag the other side up to 7
+%% hops.
 -spec register_lengths(tunnel_lengths()) -> ok.
 register_lengths(Lengths) when map_size(Lengths) =:= 0 ->
     ok;
 register_lengths(Lengths) ->
-    InLen = maps:get(in_len, Lengths, ?MAX_HOPS),
-    OutLen = maps:get(out_len, Lengths, ?MAX_HOPS),
+    InLen = maps:get(in_len, Lengths, ?DEFAULT_HOPS),
+    OutLen = maps:get(out_len, Lengths, ?DEFAULT_HOPS),
     ok = i2p_tunnel_srv:set_lengths(self(), InLen, OutLen).
 
 %% in_len/1 — a session's demanded inbound hop count for lease publication.
+%% An absent option is the router default, so a session with no length
+%% options steers its lease to the ordinary 3-hop inbound tunnel.
 -spec in_len(tunnel_lengths()) -> 1..?MAX_HOPS.
 in_len(Lengths) ->
-    maps:get(in_len, Lengths, ?MAX_HOPS).
+    maps:get(in_len, Lengths, ?DEFAULT_HOPS).
 
 -spec handle_stream_connect(session_id(), binary(), state()) -> state().
 handle_stream_connect(Id, TargetB64, #{session_id := Id} = State) ->

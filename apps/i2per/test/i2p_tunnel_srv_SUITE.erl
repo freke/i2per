@@ -56,6 +56,7 @@
     leaseset_publish_with_no_inbound_tunnel_reports_failure/1,
     pending_publication_is_announced_once/1,
     publish_retries_on_pool_tick/1,
+    publish_without_options_prefers_default_length/1,
     publish_prefers_demanded_length/1
 ]).
 
@@ -109,6 +110,7 @@ all() ->
         leaseset_publish_with_no_inbound_tunnel_reports_failure,
         pending_publication_is_announced_once,
         publish_retries_on_pool_tick,
+        publish_without_options_prefers_default_length,
         publish_prefers_demanded_length
     ].
 
@@ -2310,6 +2312,51 @@ await_publication_store(PeerHash, Key) ->
         end,
         5000
     ).
+
+%% publish_lease_set/2 — the no-option path — prefers the ordinary 3-hop inbound
+%% tunnel even when a fresher 7-hop tunnel is active.
+%%
+%% `publish_lease_set/2` carries no length because the caller stated no
+%% preference, so it must fall back to the router default, not the maximum. It
+%% used to pass ?NUM_HOPS, which K62PQHJ had raised to 7, so a destination with
+%% no length options silently had its lease steered onto a 7-hop tunnel whenever
+%% one existed. `f:freshest_inbound_lease/2` falls back to any active tunnel, so
+%% nothing failed -- the destination just shifted.
+publish_without_options_prefers_default_length(_Config) ->
+    [Local | _] = [make_router() || _ <- lists:seq(1, 4)],
+    lists:foreach(
+        fun(R) -> store_netdb(maps:get(ri, R)) end,
+        [Local]
+    ),
+    {Pid, _Local} = start_tunnel_srv(Local),
+    try
+        %% A 3-hop tunnel is inserted first (older); a 7-hop tunnel second
+        %% (fresher). The no-option path asks for the default 3, so the older
+        %% tunnel is the one the lease must name -- and the fresher 7-hop one
+        %% must be the loser, not absent.
+        Three = entry(300, 3),
+        Seven = entry(700, 7),
+        ok = inject_inbound_entry(16#0303, Three),
+        timer:sleep(1100),
+        ok = inject_inbound_entry(16#0707, Seven),
+        #{inbound := Active} = i2p_tunnel_srv:status(),
+        ?assert(lists:member(16#0303, maps:keys(Active))),
+        ?assert(lists:member(16#0707, maps:keys(Active))),
+        Floodfill = make_floodfill(),
+        ok = store_netdb(maps:get(ri, Floodfill)),
+        #{identity := Id, sign_priv := Seed} = i2p_keys:generate_with_privkeys(),
+        DestHash = i2p_keys:hash(Id),
+        ok = i2p_tunnel_srv:publish_lease_set(Id, Seed),
+        ok = wait_for_ls(DestHash),
+        {ok, LS} = i2p_netdb_srv:find_ls(DestHash),
+        [Lease] = i2p_leaset:leases(LS),
+        ?assertEqual(hd(maps:get(tunnel_ids, Three)), maps:get(tunnel_id, Lease)),
+        ?assertNotEqual(hd(maps:get(tunnel_ids, Seven)), maps:get(tunnel_id, Lease)),
+        ?assert(is_process_alive(whereis(i2p_tunnel_srv)))
+    after
+        unregister_peer(),
+        stop_tunnel_srv(Pid)
+    end.
 
 %% publish_lease_set/3 pins the lease to an inbound tunnel of the demanded
 %% hop count even when a fresher tunnel of another length exists.

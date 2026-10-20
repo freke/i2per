@@ -205,7 +205,13 @@ ok = i2p_tunnel_srv:stop().
     length_demand/0
 ]).
 
+%% The maximum hop count a length demand may ask for.
 -define(NUM_HOPS, 7).
+%% The hop count an unnamed length means. Not the maximum: `publish_lease_set/2`
+%% carries no length because the caller stated no preference, and the ordinary
+%% build is 3 hops (m:i2p_tunnel_build). Passing ?NUM_HOPS here made the
+%% no-option path prefer a 7-hop inbound tunnel whenever one existed.
+-define(DEFAULT_HOPS, 3).
 -define(SWEEP_INTERVAL_MS, 60000).
 -define(POOL_TICK_MS, 30000).
 
@@ -695,7 +701,7 @@ handle_cast(build_inbound, State) ->
     {noreply, i2p_tunnel_build:do_build_inbound(State)};
 handle_cast({publish_lease_set, Dest, Seed}, State) ->
     DestHash = i2p_keys:hash(Dest),
-    {noreply, i2p_tunnel_publish:publish_into(Dest, Seed, DestHash, ?NUM_HOPS, State)};
+    {noreply, i2p_tunnel_publish:publish_into(Dest, Seed, DestHash, ?DEFAULT_HOPS, State)};
 handle_cast({publish_lease_set, Dest, Seed, InLen}, State) ->
     DestHash = i2p_keys:hash(Dest),
     {noreply, i2p_tunnel_publish:publish_into(Dest, Seed, DestHash, InLen, State)};
