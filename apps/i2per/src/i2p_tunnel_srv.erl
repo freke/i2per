@@ -121,7 +121,7 @@ NetDb lookups and their tunnel-delivered replies run over a short-hops
 `exploratory` / `exploratory_in` pool instead of the client tunnels, so
 tunnel gossip never competes with client traffic for lease/capacity slots.
 The same `tunnel_pool` env map optionally declares `exploratory => N`
-(the size, default 2 when present) and `exploratory_hops => H` (1..3,
+(the size, default 2 when present) and `exploratory_hops => H` (1..7,
 default 2); without the `exploratory` key the pool stays off. When
 configured, the tick keeps `N` active-or-pending tunnels per exploratory
 direction at `H` hops. Reply paths stay inside the exploratory pool. Lookups
@@ -205,7 +205,7 @@ ok = i2p_tunnel_srv:stop().
     length_demand/0
 ]).
 
--define(NUM_HOPS, 3).
+-define(NUM_HOPS, 7).
 -define(SWEEP_INTERVAL_MS, 60000).
 -define(POOL_TICK_MS, 30000).
 
@@ -386,7 +386,7 @@ least one active or pending tunnel per direction at the demanded hop count
 while the session lives. The demand is monitor-tracked and disappears with
 the session process.
 
-Input: `Pid` — the session process; `InLen`/`OutLen` — hop counts, 1..3.
+Input: `Pid` — the session process; `InLen`/`OutLen` — hop counts, 1..7.
 Output: `ok` once recorded.
 """.
 -spec set_lengths(pid(), 1..?NUM_HOPS, 1..?NUM_HOPS) -> ok.

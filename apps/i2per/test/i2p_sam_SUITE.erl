@@ -734,7 +734,7 @@ session_create_explicit_dest(_Config) ->
     ?assert(binary:match(Reply, <<"SESSION STATUS RESULT=OK">>) =/= nomatch),
     gen_tcp:close(Sock).
 
-%% Length options are accepted, clamped into 1..3 hops, and registered as a
+%% Length options are accepted, clamped into 1..7 hops, and registered as a
 %% demand on the tunnel manager for the life of the session.
 session_create_length_options(_Config) ->
     Port = start_sam_listener(),
@@ -752,7 +752,7 @@ session_create_length_options(_Config) ->
     ?assertMatch(#{in_len := 2, out_len := 1}, maps:get(Pid, Demands)),
     gen_tcp:close(Sock).
 
-%% Out-of-range values clamp into the 1..3 hop budget.
+%% Out-of-range values clamp into the 1..7 hop budget.
 session_create_length_clamp(_Config) ->
     Port = start_sam_listener(),
     {ok, Sock} = connect_sam(Port),
@@ -766,7 +766,7 @@ session_create_length_clamp(_Config) ->
     ?assert(binary:match(Reply, <<"SESSION STATUS RESULT=OK">>) =/= nomatch),
     {ok, {Pid, _DestHash, datagram}} = i2p_sam_sup:session_lookup(<<"lenclamp">>),
     Demands = i2p_tunnel_srv:demands(),
-    ?assertMatch(#{in_len := 3, out_len := 1}, maps:get(Pid, Demands)),
+    ?assertMatch(#{in_len := 7, out_len := 1}, maps:get(Pid, Demands)),
     gen_tcp:close(Sock).
 
 %% A non-integer length is a protocol violation: I2P_ERROR reply and the

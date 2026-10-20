@@ -43,9 +43,9 @@ Sessions are spawned by `m:i2p_sam_listener` and are not started directly.
 -define(MAX_DATAGRAM, 32768).
 
 %% Tunnel-length bounds for SESSION CREATE options: values are clamped into
-%% 1..3 hops, matching the router's practical tunnel budget (?NUM_HOPS in
+%% 1..7 hops, matching the router's maximum tunnel budget (?NUM_HOPS in
 %% m:i2p_tunnel_srv).
--define(MAX_HOPS, 3).
+-define(MAX_HOPS, 7).
 
 -doc "A SAM session identifier (the ID= value from SESSION CREATE).".
 -type session_id() :: binary().
@@ -61,7 +61,7 @@ Sessions are spawned by `m:i2p_sam_listener` and are not started directly.
 
 -doc """
 Tunnel-length options parsed from SESSION CREATE (`inbound.length` /
-`outbound.length`, clamped to 1..3 hops). Only explicitly given keys appear.
+`outbound.length`, clamped to 1..7 hops). Only explicitly given keys appear.
 """.
 -type tunnel_lengths() :: #{in_len => 1..?MAX_HOPS, out_len => 1..?MAX_HOPS}.
 

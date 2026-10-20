@@ -358,7 +358,7 @@ optional_pos({ok, E}, _V) when is_integer(E), E > 0 -> true;
 optional_pos(error, _V) -> true;
 optional_pos(_, _V) -> false.
 
-%% optional_hops/2 — exploratory_hops: absent is fine, present must be 1..3.
-optional_hops({ok, H}, _V) when is_integer(H), H >= 1, H =< 3 -> true;
+%% optional_hops/2 — exploratory_hops: absent is fine, present must be 1..7.
+optional_hops({ok, H}, _V) when is_integer(H), H >= 1, H =< 7 -> true;
 optional_hops(error, _V) -> true;
 optional_hops(_, _V) -> false.

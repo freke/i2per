@@ -32,7 +32,7 @@ tunnel_build_rate = 2          # accepted build decisions per second
 outbound = 3
 inbound = 3
 exploratory = 2          # optional: enables the lookup pool at this size
-exploratory_hops = 2     # optional: lookup tunnel hops, 1..3 (default 2)
+exploratory_hops = 2     # optional: lookup tunnel hops, 1..7 (default 2)
 
 [reseed]
 enabled = false        # live_network/reseed must be explicitly enabled
@@ -529,7 +529,7 @@ tunnel_pool_pairs(Entries) ->
     end.
 
 %% fold_pool_extras/2 — optional `exploratory` (pool size) and
-%% `exploratory_hops` (1..3) on top of the required outbound/inbound pair;
+%% `exploratory_hops` (1..7) on top of the required outbound/inbound pair;
 %% anything else in the section is a hard error like everywhere else.
 -spec fold_pool_extras(#{binary() := binary()}, map()) ->
     {ok, [{tunnel_pool, map()}]} | {error, term()}.
@@ -550,7 +550,7 @@ pool_extra(<<"exploratory">>, V, {ok, Pool}) ->
     end;
 pool_extra(<<"exploratory_hops">>, V, {ok, Pool}) ->
     case coerce_int(exploratory_hops, V) of
-        {ok, {exploratory_hops, H}} when H >= 1, H =< 3 ->
+        {ok, {exploratory_hops, H}} when H >= 1, H =< 7 ->
             {ok, Pool#{exploratory_hops => H}};
         {ok, _} ->
             {error, {bad_value, exploratory_hops, V}};
