@@ -175,6 +175,7 @@ lookup service not being running, where there is no key and nothing was asked fo
     | {peertest_result, i2p_peertest:address_type(), i2p_peertest:result()}
     | {reachability, ssu2, firewalled | reachable | unknown}
     | {ssu2_block_unhandled, atom()}
+    | {ssu2_send_queue_full, atom()}
     | {db_store_not_stored, i2p_peer:store_not_stored_reason()}
     %% A lookup that did not produce the record it was asked for. The reason is the
     %% whole point: `no_answer` means nobody answered, while `{not_stored, _}` means

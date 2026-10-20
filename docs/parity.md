@@ -37,7 +37,7 @@ Rows are one verdict, not prose: **done** (implemented and exercised),
 | Transit tunnel participation | partial | available, bounded, off by default |
 | Inbound gateway role | done | |
 | Outbound gateway role | done | client send runs in caller process (ADR 0003) |
-| Streaming protocol | partial | implemented; field accessors being hardened |
+| Streaming protocol | done | implemented; field accessors read through and written around (#C252TF7) |
 | NetDb (lookup / store) | done | RI and LeaseSet lookups |
 | Floodfill participation | partial | available, off by default |
 | LeaseSet v2 | done | |

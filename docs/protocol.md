@@ -1942,6 +1942,14 @@ at most idempotently by message identity. Pure ACK and keepalive
 (`path_challenge`/`path_response`) packets are never recorded, so they cannot
 feedback-loop. This release uses a fixed resend period. RTT estimation and window-based congestion control shipped in 0.5.0; path migration is not implemented.
 
+**Send queue under congestion.** When the congestion window is closed,
+`send_packet/3` queues the block list instead of sending it, up to
+`?MAX_SEND_QUEUE` (128) entries. A queue that reaches that bound drops its
+oldest entry to make room for the newest, announces
+`{ssu2_send_queue_full, Role}` on the event bus, and logs a warning, so a
+stalled session sheds stale traffic rather than the freshest. The drop is
+counted as an event, not silently discarded.
+
 Unknown payload block types and padding are ignored by
 `i2p_ssu2:decode_blocks/1`, as required for forward compatibility. A malformed
 TLV length, truncated block, or malformed ACK/relay block is an error. The

@@ -86,7 +86,6 @@ each datagram re-arms the socket. Sessions send through this process
     port/1,
     stop/1,
     send/3,
-    register_session/2,
     register_relay_tag/4,
     start_link/5,
     init/1,
@@ -150,13 +149,6 @@ stop(Pid) ->
 -doc "Send one datagram to `Endpoint` through the listener's socket.".
 send(Pid, Datagram, Endpoint = {_IP, _Port}) when is_binary(Datagram) ->
     gen_server:cast(Pid, {send, Datagram, Endpoint}).
-
--doc """
-Register a session for connection-id routing and start monitoring it; the
-entry is removed automatically when the session dies.
-""".
-register_session(Pid, ConnId) ->
-    gen_server:cast(Pid, {register, self(), ConnId}).
 
 -doc """
 Register a handed-out relay tag against the session holding it.
@@ -242,10 +234,6 @@ handle_cast({send, Datagram, Endpoint}, State = #{sock := Sock}) ->
     %% (including one to a reachable peer) gets dropped. The byte count is
     %% already charged beside it, so only the datagram is lost.
     _ = gen_udp:send(Sock, Endpoint, Datagram),
-    {noreply, State};
-handle_cast({register, Pid, ConnId}, State) ->
-    _ = ets:insert(i2p_ssu2_sessions, {ConnId, Pid}),
-    erlang:monitor(process, Pid),
     {noreply, State};
 handle_cast({register_pending, Pid, Endpoint}, State) ->
     _ = ets:insert(i2p_ssu2_pending, {Endpoint, Pid}),
