@@ -21,7 +21,9 @@
     explicit_peer_test_role_override/1,
     router_info_block_delivered_to_owner/1,
     coordinator_relay_loopback/1,
-    full_seven_message_peertest_loopback/1
+    full_seven_message_peertest_loopback/1,
+    charlie_dial_failure_returns_error/1,
+    auto_select_dial_failure_rejects_alice/1
 ]).
 
 -define(APP, i2per).
@@ -40,7 +42,9 @@ all() ->
         explicit_peer_test_role_override,
         router_info_block_delivered_to_owner,
         coordinator_relay_loopback,
-        full_seven_message_peertest_loopback
+        full_seven_message_peertest_loopback,
+        charlie_dial_failure_returns_error,
+        auto_select_dial_failure_rejects_alice
     ].
 
 %% ---------------------------------------------------------------------------
@@ -466,6 +470,107 @@ full_seven_message_peertest_loopback(_Config) ->
         end
     end.
 
+%% A dial to an unreachable Charlie must answer the caller with a tagged
+%% error and leave the coordinator alive: candidates come from the NetDb, so
+%% an unreachable one is the ordinary case, and this gen_server owns the
+%% intro-side listener. The handshake budget is shrunk so the failure lands
+%% in milliseconds instead of the default ~9 s.
+charlie_dial_failure_returns_error(_Config) ->
+    ok = application:set_env(?APP, handshake_retry_ms, 100),
+    ok = application:set_env(?APP, handshake_max_resends, 1),
+    try
+        {BobLocal, _BobRIBlock} = bob_local(),
+        {ok, Coord} = i2p_peertest_coord:start_link(BobLocal),
+        try
+            DeadPort = i2p_ct_helpers:free_port(),
+            {CharlieLocal, CharlieRI} = charlie_local(),
+            CharlieOpts =
+                #{
+                    host => <<"127.0.0.1">>,
+                    port => DeadPort,
+                    static_key => maps:get(static_pub, CharlieLocal),
+                    intro_key => maps:get(intro_key, CharlieLocal)
+                },
+            {error, {dial_failed, _Reason}} =
+                i2p_peertest_coord:dial_charlie(Coord, CharlieOpts, CharlieRI),
+            %% The coordinator survived the failed dial and still answers.
+            true = is_process_alive(Coord),
+            BobPort = i2p_peertest_coord:port(Coord),
+            true = is_integer(BobPort)
+        after
+            catch i2p_peertest_coord:stop(Coord)
+        end
+    after
+        ok = application:unset_env(?APP, handshake_retry_ms),
+        ok = application:unset_env(?APP, handshake_max_resends)
+    end.
+
+%% The auto-select path against an unreachable NetDb candidate: the dial
+%% fails, and Alice — who asked for a peer test — receives the deterministic
+%% code-2 "no Charlie available" reject instead of silence, the coordinator
+%% survives, and the rejected counter records the failure.
+auto_select_dial_failure_rejects_alice(_Config) ->
+    ok = application:set_env(?APP, handshake_retry_ms, 100),
+    ok = application:set_env(?APP, handshake_max_resends, 1),
+    try
+        {BobLocal, _BobRIBlock} = bob_local(),
+        {ok, Coord} = i2p_peertest_coord:start_link(BobLocal),
+        try
+            %% One qualifying candidate in the NetDb, on a dead port: the
+            %% ordinary unreachable-candidate case the selection draws from.
+            CharlieLocal = charlie_local_on(i2p_ct_helpers:free_port()),
+            {ok, _} = i2p_netdb_srv:store_binary(
+                i2p_router_info:to_binary(maps:get(ri, CharlieLocal)),
+                erlang:system_time(millisecond)
+            ),
+            BobPort = i2p_peertest_coord:port(Coord),
+
+            {AliceListener, _APort, AliceLocal} = listen_full_local(<<"127.0.0.1">>),
+            AliceRIBlock = maps:get(ri_binary, AliceLocal),
+            AlicePort = i2p_ssu2_listener:port(AliceListener),
+            RemoteOpts =
+                #{
+                    host => <<"127.0.0.1">>,
+                    port => BobPort,
+                    static_key => maps:get(static_pub, BobLocal),
+                    intro_key => maps:get(intro_key, BobLocal)
+                },
+            {ok, AlicePid, _} =
+                i2p_ssu2_conn:connect(AliceLocal, RemoteOpts, AliceRIBlock, AliceListener, alice),
+            unlink(AlicePid),
+
+            BobHash = maps:get(hash, BobLocal),
+            Ip = <<127, 0, 0, 1>>,
+            ok = i2p_ssu2_conn:send_router_info(AlicePid, 0, AliceRIBlock),
+            ok = i2p_ssu2_conn:initiate_peertest(AlicePid, BobHash, AlicePort, Ip),
+
+            ok = wait_no_charlie_reject(AlicePid, Ip),
+            true = is_process_alive(Coord),
+            Counters = i2p_counters:snapshot(),
+            1 = maps:get(charlie_selections_rejected, Counters, 0)
+        after
+            catch i2p_peertest_coord:stop(Coord)
+        end
+    after
+        ok = application:unset_env(?APP, handshake_retry_ms),
+        ok = application:unset_env(?APP, handshake_max_resends)
+    end.
+
+%% Wait for the in-session message-4 code-2 "no Charlie available" reject.
+wait_no_charlie_reject(AlicePid, Ip) ->
+    i2p_ct_helpers:wait_msg(
+        fun
+            ({ssu2_data, P, Blocks}) when P =:= AlicePid ->
+                case lists:keyfind(peertest, 1, Blocks) of
+                    {peertest, 4, 2, 0, _, 2, _Nonce, _Ts, _Port, Ip, _Sig} -> {true, ok};
+                    _ -> false
+                end;
+            (_) ->
+                false
+        end,
+        ?DATA_WINDOW
+    ).
+
 %% ---------------------------------------------------------------------------
 %% PeerTest relay helpers
 %% ---------------------------------------------------------------------------
@@ -681,3 +786,28 @@ listen_full_local(Host) ->
 charlie_local() ->
     #{ri := RI} = Local = peer_local(),
     {Local, RI}.
+
+%% Like `peer_local/0`, but the published SSU2 address advertises `Port` —
+%% so a selection fixture can point a candidate at a dead endpoint.
+charlie_local_on(Port) ->
+    {Pub, Priv} = i2p_crypto:x25519_keygen(),
+    {SignPub, Seed} = i2p_crypto:ed25519_keygen(),
+    IntroKey = crypto:strong_rand_bytes(32),
+    Identity = i2p_keys:from_keys(Pub, SignPub),
+    Addr = i2p_router_info:ssu2_address(<<"127.0.0.1">>, Port, Pub, IntroKey),
+    RI = i2p_router_info:build(
+        Identity,
+        erlang:system_time(millisecond),
+        [Addr],
+        #{<<"netId">> => <<"2">>, <<"router.version">> => <<"0.9.74">>},
+        Seed
+    ),
+    #{
+        static_priv => Priv,
+        static_pub => Pub,
+        intro_key => IntroKey,
+        sign_seed => Seed,
+        sign_pub => SignPub,
+        hash => i2p_router_info:hash(RI),
+        ri => RI
+    }.

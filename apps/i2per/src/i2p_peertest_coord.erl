@@ -107,9 +107,11 @@ relay to Alice before message 4 (its `ri` must be a `m:i2p_router_info` map).
 The SessionConfirmed routes Bob's own RouterInfo. Returns once the session is
 established. In attach mode the dial sends through the running router's SSU2
 listener, resolved by name; with no listener up the answer is
-`{error, no_listener}`.
+`{error, no_listener}`, and an unreachable or slow Charlie answers
+`{error, {dial_failed, Reason}}` — the coordinator survives either way.
 """.
--spec dial_charlie(pid(), map(), term()) -> ok | {error, no_listener}.
+-spec dial_charlie(pid(), map(), term()) ->
+    ok | {error, no_listener | {dial_failed, term()}}.
 dial_charlie(Coord, CharlieOpts, CharlieRI) ->
     gen_server:call(Coord, {dial_charlie, CharlieOpts, CharlieRI}).
 
@@ -157,6 +159,8 @@ handle_call(
     case dial_charlie_in_state(State, CharlieOpts, CharlieRI) of
         {error, no_listener} ->
             {reply, {error, no_listener}, State};
+        {error, {dial_failed, Reason}} ->
+            {reply, {error, {dial_failed, Reason}}, State};
         {ok, State1} ->
             {reply, ok, State1}
     end;
@@ -379,8 +383,13 @@ alice_session_pid(_Pid, State) ->
     maps:get(alice_sess, State, undefined).
 
 %% Dial Charlie using the same path as `f:dial_charlie/3`, returning the
-%% updated state or `{error, no_listener}`.
--spec dial_charlie_in_state(map(), map(), term()) -> {ok, map()} | {error, no_listener}.
+%% updated state or `{error, no_listener}` / `{error, {dial_failed, Reason}}`.
+%% `connect/4` awaits the handshake for up to 20 s and answers `{error,
+%% Reason}` for an unreachable or slow candidate — an ordinary case here,
+%% since candidates come from the NetDb. Handle it, don't crash: this
+%% gen_server owns the intro-side listener.
+-spec dial_charlie_in_state(map(), map(), term()) ->
+    {ok, map()} | {error, no_listener | {dial_failed, term()}}.
 dial_charlie_in_state(State, CharlieOpts, CharlieRI) ->
     case dial_listener(State) of
         undefined ->
@@ -388,10 +397,13 @@ dial_charlie_in_state(State, CharlieOpts, CharlieRI) ->
         Listener ->
             BobLocal = maps:get(bob_local, State),
             BobRIBlock = i2p_router_info:to_binary(maps:get(ri, BobLocal)),
-            {ok, CharlieSess, _Keys} =
-                i2p_ssu2_conn:connect(BobLocal, CharlieOpts, BobRIBlock, Listener),
-            erlang:unlink(CharlieSess),
-            {ok, State#{charlie_sess => CharlieSess, charlie_ri => CharlieRI}}
+            case i2p_ssu2_conn:connect(BobLocal, CharlieOpts, BobRIBlock, Listener) of
+                {ok, CharlieSess, _Keys} ->
+                    erlang:unlink(CharlieSess),
+                    {ok, State#{charlie_sess => CharlieSess, charlie_ri => CharlieRI}};
+                {error, Reason} ->
+                    {error, {dial_failed, Reason}}
+            end
     end.
 
 %% Pick one qualifying Charlie from the NetDb: SSU2 address with the `B`
@@ -461,6 +473,13 @@ auto_select_charlie(Pid, Code, Flags, Ver, Nonce, Ts, Port, Ip, Sig, AliceHash, 
                         {error, no_listener} ->
                             _ = i2p_counters:add(charlie_selections_rejected, 1),
                             i2p_log:debug({coord_msg1, auto_select, no_listener}, []),
+                            reply_reject(AlicePid, Nonce, Ts, Port, Ip),
+                            State#{pending_msg1 => undefined};
+                        {error, {dial_failed, Reason}} ->
+                            _ = i2p_counters:add(charlie_selections_rejected, 1),
+                            i2p_log:debug(
+                                {coord_msg1, auto_select, {dial_failed, Reason}}, []
+                            ),
                             reply_reject(AlicePid, Nonce, Ts, Port, Ip),
                             State#{pending_msg1 => undefined};
                         {ok, State1} ->
