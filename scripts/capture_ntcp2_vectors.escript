@@ -325,7 +325,12 @@ read_peer_keys(DataDir, PeerRI) ->
     ],
     case Published of
         [#{<<"s">> := S} | _] ->
-            _ = i2p_keys:decode_b64(S);
+            case i2p_keys:decode_b64(S) of
+                Pub ->
+                    ok;
+                Other ->
+                    erlang:error({peer_static_key_mismatch, Pub, Other})
+            end;
         [] ->
             erlang:error(peer_router_info_has_no_ntcp2_static_key)
     end,
