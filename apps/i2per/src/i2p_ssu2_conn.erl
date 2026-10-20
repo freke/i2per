@@ -99,7 +99,34 @@ clearing `remote_ri` in isolation once made every Charlie reply sign over
     rtt/1,
     rtt_ms/1,
     srtt/1,
-    cwnd/1
+    cwnd/1,
+    %% The congestion-control arithmetic, exported for the same reason:
+    %% `apply_rtt_sample/2`, `apply_cc_ack/2`, `on_cc_loss/1` and
+    %% `on_cc_timeout/1` are pure functions of the session state map, and
+    %% "what does the window do when a packet is acknowledged, lost, or never
+    %% acknowledged" is arithmetic whose coefficients are otherwise asserted
+    %% nowhere. A transposed weight here produces plausible numbers and a
+    %% throughput regression with no oracle to attribute it to, so the window's
+    %% shape is a claim a test can only make by asking. `update_rtt_at/4`
+    %% rather than `update_rtt/3` because the RTT path is only testable at all
+    %% once the clock is a parameter -- see `f:update_rtt_at/4`. `send_packet/3`
+    %% because whether a packet is queued or sent is not a function of the
+    %% window alone but of the window *and* whether the packet is
+    %% ack-eliciting, so neither half can be tested into the other's corner:
+    %% a gate that throttled ACKs would still pass every window-only case.
+    update_rtt_at/4,
+    apply_rtt_sample/2,
+    apply_cc_ack/2,
+    on_cc_loss/1,
+    on_cc_timeout/1,
+    inflight_bytes/1,
+    drain_send_queue/1,
+    send_packet/3,
+    %% The data-phase MTU, which is the unit every window above is counted in.
+    %% Exported so the tests derive their expected values from the define
+    %% rather than restating it: a hardcoded 1472 in a test is a second copy
+    %% of a constant that gates the send path.
+    mtu/0
 ]).
 -export([
     start_link/1,
@@ -2258,7 +2285,18 @@ drain_send_queue(State = #{send_queue := Q}) ->
     end.
 
 update_rtt(State, Acked, Out) ->
-    NowMs = erlang:monotonic_time(millisecond),
+    update_rtt_at(State, Acked, Out, erlang:monotonic_time(millisecond)).
+
+%% The same fold with the clock passed in. `NowMs` is a parameter rather than
+%% a read so that "a replayed ACK sequence drives srtt toward the inter-arrival
+%% interval" is a claim a test can make with the captured i2pd vectors: with
+%% the clock read inside, the only thing observable about a sample is that one
+%% happened, and the whole Jacobson/Karels estimator is unreachable.
+%%
+%% Only packets recorded with `Retransmitted =:= false` contribute -- Karn's
+%% algorithm, since a retransmitted packet's sample would fold the peer's
+%% retransmit delay into the estimate.
+update_rtt_at(State, Acked, Out, NowMs) ->
     State1 = lists:foldl(
         fun(Num, St) ->
             case maps:get(Num, Out, undefined) of
@@ -2396,6 +2434,19 @@ handshake_max_resends() ->
         {ok, N} when is_integer(N), N > 0 -> N;
         _ -> ?MAX_RESENDS
     end.
+
+-doc """
+The data-phase MTU in bytes: the unit the congestion window, the in-flight
+total and the send queue are all counted in.
+
+Exported so callers and tests derive window arithmetic from the define rather
+than restating it. A window is `N * ?MTU` bytes wide, so a test that hardcodes
+1472 is asserting against a second copy of a constant that gates the send path.
+
+No `-spec`: dialyzer infers `1472` here, and a written one would only ever be
+a second copy of the define. `rtt/1` and its siblings below are the same shape.
+""".
+mtu() -> ?MTU.
 
 data_resend_ms() ->
     case application:get_env(i2per, data_resend_ms) of
