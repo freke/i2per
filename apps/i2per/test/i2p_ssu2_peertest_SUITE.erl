@@ -23,7 +23,8 @@
     coordinator_relay_loopback/1,
     full_seven_message_peertest_loopback/1,
     charlie_dial_failure_returns_error/1,
-    auto_select_dial_failure_rejects_alice/1
+    auto_select_dial_failure_rejects_alice/1,
+    auto_select_sends_alice_ri_before_msg2/1
 ]).
 
 -define(APP, i2per).
@@ -44,7 +45,8 @@ all() ->
         coordinator_relay_loopback,
         full_seven_message_peertest_loopback,
         charlie_dial_failure_returns_error,
-        auto_select_dial_failure_rejects_alice
+        auto_select_dial_failure_rejects_alice,
+        auto_select_sends_alice_ri_before_msg2
     ].
 
 %% ---------------------------------------------------------------------------
@@ -570,6 +572,103 @@ wait_no_charlie_reject(AlicePid, Ip) ->
         end,
         ?DATA_WINDOW
     ).
+
+%% The auto-selected Charlie must receive Alice's RouterInfo before message 2
+%% (docs/protocol.md:2058): Charlie verifies Alice against it and caches her
+%% SSU2 address for the out-of-session message 5. The relay doubles answer a
+%% message 2 regardless of what arrived before it — which is how a missing
+%% RouterInfo passed the green gates — so this case enforces the order at
+%% Charlie's session owner: a message 2 ahead of Alice's RouterInfo fails,
+%% and the relay still has to complete with an accepted message 4.
+auto_select_sends_alice_ri_before_msg2(_Config) ->
+    {BobLocal, _BobRIBlock} = bob_local(),
+    {ok, Coord} = i2p_peertest_coord:start_link(BobLocal),
+    try
+        %% The one qualifying NetDb candidate is a live Charlie listener.
+        {_CharlieListener, _CPort, CharlieLocal} = listen_full_local(<<"127.0.0.1">>),
+        CharlieRI = maps:get(ri, CharlieLocal),
+        {ok, _} = i2p_netdb_srv:store_binary(
+            i2p_router_info:to_binary(CharlieRI),
+            erlang:system_time(millisecond)
+        ),
+        BobPort = i2p_peertest_coord:port(Coord),
+
+        {AliceListener, _APort, AliceLocal} = listen_full_local(<<"127.0.0.1">>),
+        AliceRIBlock = maps:get(ri_binary, AliceLocal),
+        AlicePort = i2p_ssu2_listener:port(AliceListener),
+        RemoteOpts =
+            #{
+                host => <<"127.0.0.1">>,
+                port => BobPort,
+                static_key => maps:get(static_pub, BobLocal),
+                intro_key => maps:get(intro_key, BobLocal)
+            },
+        {ok, AlicePid, _} =
+            i2p_ssu2_conn:connect(AliceLocal, RemoteOpts, AliceRIBlock, AliceListener, alice),
+        unlink(AlicePid),
+
+        BobHash = maps:get(hash, BobLocal),
+        Ip = <<127, 0, 0, 1>>,
+        ok = i2p_ssu2_conn:send_router_info(AlicePid, 0, AliceRIBlock),
+        ok = i2p_ssu2_conn:initiate_peertest(AlicePid, BobHash, AlicePort, Ip),
+
+        ok = wait_alice_ri_before_msg2(AliceRIBlock),
+        Counters = i2p_counters:snapshot(),
+        1 = maps:get(charlie_selections_succeeded, Counters, 0),
+        CharlieIntroKey = maps:get(intro_key, CharlieLocal),
+        ok = wait_relay_result(AlicePid, CharlieRI, Ip, CharlieIntroKey, false, false)
+    after
+        catch i2p_peertest_coord:stop(Coord)
+    end.
+
+%% Drain the shared mailbox watching for Alice's RouterInfo reaching the
+%% auto-dialed Charlie and his message 2 following it. Each block travels in
+%% its own data message (the send side emits one block per packet), but the
+%% same-list case is walked in list order anyway. A message 2 seen before
+%% Alice's RouterInfo is the failure; with neither signal the waits time out
+%% naming the missing one.
+wait_alice_ri_before_msg2(AliceRIBlock) ->
+    Deadline = erlang:monotonic_time(millisecond) + ?DATA_WINDOW,
+    wait_alice_ri_before_msg2(AliceRIBlock, false, Deadline).
+
+wait_alice_ri_before_msg2(AliceRIBlock, SeenRI, Deadline) ->
+    receive
+        {ssu2_data, _Pid, Blocks} ->
+            case consume_signals(block_signals(Blocks, AliceRIBlock), SeenRI, Blocks) of
+                done ->
+                    ok;
+                {continue, SeenRI1} ->
+                    wait_alice_ri_before_msg2(AliceRIBlock, SeenRI1, Deadline)
+            end;
+        _ ->
+            wait_alice_ri_before_msg2(AliceRIBlock, SeenRI, Deadline)
+    after erlang:max(0, Deadline - erlang:monotonic_time(millisecond)) ->
+        case SeenRI of
+            false -> erlang:error(alice_router_info_never_forwarded_to_charlie);
+            true -> erlang:error(charlie_msg2_never_relayed)
+        end
+    end.
+
+%% Walk the in-order signals of one block list against the seen flag: an RI
+%% sets it, a message 2 either completes the pair or fails the case.
+consume_signals([], SeenRI, _Blocks) ->
+    {continue, SeenRI};
+consume_signals([ri | Rest], _SeenRI, Blocks) ->
+    consume_signals(Rest, true, Blocks);
+consume_signals([msg2 | _], false, Blocks) ->
+    erlang:error({msg2_before_alice_router_info, Blocks});
+consume_signals([msg2 | _], true, _Blocks) ->
+    done.
+
+block_signals(Blocks, AliceRIBlock) ->
+    [Sig || B <- Blocks, Sig <- [block_signal(B, AliceRIBlock)], Sig =/= none].
+
+block_signal({router_info, _, RIData}, AliceRIBlock) when RIData =:= AliceRIBlock ->
+    ri;
+block_signal({peertest, 2, _Code, _Flags, _Hash, _Ver, _Nonce, _Ts, _Port, _Ip, _Sig}, _) ->
+    msg2;
+block_signal(_, _) ->
+    none.
 
 %% ---------------------------------------------------------------------------
 %% PeerTest relay helpers

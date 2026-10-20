@@ -17,7 +17,9 @@ routes them:
 Charlie selection is now NetDb-driven: when a message 1 arrives and no Charlie
 session is dialed yet, the coordinator selects a qualifying RouterInfo from the
 NetDb (SSU2 address with the `B` peer-test capability and a public host/port),
-dials it, and relays. A manual path remains via `f:dial_charlie/3` for tests
+dials it, and relays. Alice's RouterInfo, held from the moment it was learned,
+goes to the freshly dialed session ahead of message 2 as the spec requires.
+A manual path remains via `f:dial_charlie/3` for tests
 and operators. The coordinator binds the intro-side listener as both its owner
 and `peer_test_coordinator`, so an inbound Alice message 1 is forwarded here
 instead of auto-rejected.
@@ -143,6 +145,7 @@ routing_state(BobLocal) ->
         alice_sess => undefined,
         charlie_sess => undefined,
         alice_hash => undefined,
+        alice_ri => undefined,
         charlie_ri => undefined,
         alice_rate_limits => #{}
     }.
@@ -242,17 +245,21 @@ route_blocks(Pid, Blocks, State = #{charlie_sess := Charlie}) ->
             end
     end.
 
-%% Alice -> Charlie. Learn Alice's hash from her RouterInfo block, then relay a
-%% message 1 as message 2 to the Charlie session. Alice's RouterInfo, when
-%% present, is forwarded ahead of message 2 per the spec.
-relay_alice_to_charlie(Pid, Blocks, State = #{charlie_sess := Charlie}) ->
+%% Alice -> Charlie. Learn Alice's hash (and hold her RouterInfo binary) from
+%% her RouterInfo block, forward any RouterInfo blocks to the current Charlie
+%% session, flush a message 1 buffered before her hash was known, then relay a
+%% message 1 as message 2 to the Charlie session. The order matters: a freshly
+%% dialed Charlie must receive her RouterInfo ahead of message 2 per the spec,
+%% so the flush that may perform the dial runs after the forward.
+relay_alice_to_charlie(Pid, Blocks, State) ->
     State1 = learn_alice_hash(Blocks, State),
-    State2 = forward_router_infos(Blocks, Charlie, State1),
+    State2 = forward_router_infos(Blocks, State1),
+    State3 = flush_pending_msg1(State2),
     case lists:keyfind(peertest, 1, Blocks) of
         {peertest, 1, Code, Flags, _Hash, Ver, Nonce, Ts, Port, Ip, Sig} ->
-            relay_msg1_or_buffer(Pid, Code, Flags, Ver, Nonce, Ts, Port, Ip, Sig, State2);
+            relay_msg1_or_buffer(Pid, Code, Flags, Ver, Nonce, Ts, Port, Ip, Sig, State3);
         _ ->
-            State2
+            State3
     end.
 
 relay_msg1_or_buffer(Pid, Code, Flags, Ver, Nonce, Ts, Port, Ip, Sig, State) ->
@@ -286,10 +293,17 @@ learn_alice_hash(Blocks, State) ->
     case maps:get(alice_hash, State, undefined) of
         undefined ->
             case lists:keyfind(router_info, 1, Blocks) of
-                {router_info, _Flag, RIData} ->
+                {router_info, Flag, RIData} ->
                     case i2p_router_info:decode(RIData) of
                         {ok, RI} ->
-                            flush_pending_msg1(State#{alice_hash => i2p_router_info:hash(RI)});
+                            %% Hold the binary, not only the hash: the Charlie
+                            %% session may not exist yet, and when one is
+                            %% dialed it must receive Alice's RouterInfo ahead
+                            %% of message 2 (docs/protocol.md:2058).
+                            State#{
+                                alice_hash => i2p_router_info:hash(RI),
+                                alice_ri => {Flag, RIData}
+                            };
                         _ ->
                             State
                     end;
@@ -324,12 +338,13 @@ flush_pending_msg1(State) ->
             State
     end.
 
-forward_router_infos(_Blocks, undefined, State) ->
+forward_router_infos(_Blocks, State = #{charlie_sess := undefined}) ->
     %% No Charlie session yet: there is nobody to forward a RouterInfo to, and
-    %% sending to no session at all would raise this process. The RouterInfo
-    %% blocks are still the ones that learn Alice's hash, handled above.
+    %% sending to no session at all would raise this process. The block is
+    %% held in `alice_ri` and goes out when a Charlie is dialed, ahead of
+    %% message 2; the same block is also the one that learns Alice's hash.
     State;
-forward_router_infos(Blocks, Charlie, State) ->
+forward_router_infos(Blocks, State = #{charlie_sess := Charlie}) ->
     lists:foreach(
         fun
             ({router_info, Flag, RIData}) -> i2p_ssu2_conn:send_router_info(Charlie, Flag, RIData);
@@ -400,10 +415,23 @@ dial_charlie_in_state(State, CharlieOpts, CharlieRI) ->
             case i2p_ssu2_conn:connect(BobLocal, CharlieOpts, BobRIBlock, Listener) of
                 {ok, CharlieSess, _Keys} ->
                     erlang:unlink(CharlieSess),
-                    {ok, State#{charlie_sess => CharlieSess, charlie_ri => CharlieRI}};
+                    State1 = State#{charlie_sess => CharlieSess, charlie_ri => CharlieRI},
+                    ok = send_held_alice_ri(CharlieSess, State1),
+                    {ok, State1};
                 {error, Reason} ->
                     {error, {dial_failed, Reason}}
             end
+    end.
+
+%% Alice's RouterInfo, held from the moment it was learned. Charlie must
+%% receive it before message 2, so a freshly dialed session gets it right
+%% away: the block may have arrived while no Charlie session existed to
+%% forward it to.
+-spec send_held_alice_ri(pid(), #{alice_ri := {non_neg_integer(), binary()}, _ => _}) -> ok.
+send_held_alice_ri(CharlieSess, State) ->
+    case maps:get(alice_ri, State, undefined) of
+        {Flag, RIData} -> i2p_ssu2_conn:send_router_info(CharlieSess, Flag, RIData);
+        undefined -> ok
     end.
 
 %% Pick one qualifying Charlie from the NetDb: SSU2 address with the `B`
