@@ -33,7 +33,7 @@ Rows are one verdict, not prose: **done** (implemented and exercised),
 | ElGamal / AES legacy crypto | absent | excluded by maintainer decision |
 | Static-key (NTCP1) crypto | absent | legacy, excluded |
 | Tunnel creation v0.1 (ECIES) | done | 3-hop outbound and inbound |
-| Tunnel build v2 (variable tunnels) | absent | 1.0.0 material |
+| Tunnel build v2 (variable tunnels) | done | hop cap raised to 7 (i2pd parity); default build stays 3 hops |
 | Transit tunnel participation | partial | available, bounded, off by default |
 | Inbound gateway role | done | |
 | Outbound gateway role | done | client send runs in caller process (ADR 0003) |
@@ -49,7 +49,7 @@ Rows are one verdict, not prose: **done** (implemented and exercised),
 | Addressbook (subscribe) | done | |
 | Addressbook (publish) | absent | deferred |
 | Charlie / introducer role | done | in-session RelayResponse and out-of-session HolePunch (type 11), rate-limited and endpoint-checked (`A740VAB`) |
-| Automatic NetDb-driven Charlie selection | absent | 1.0.0 material |
+| Automatic NetDb-driven Charlie selection | done | SSU2 + peer_test + public address candidates; uniform random; one Charlie per cycle; per-Alice 60s rate limit; code-2 reject on failure |
 | Peer testing | done | measured reachability ladder |
 | Measured reachability | done | see `CD7ZBVH` |
 | TUN interface | absent | excluded by maintainer decision |
@@ -59,7 +59,6 @@ Rows are one verdict, not prose: **done** (implemented and exercised),
 
 ## 1.0.0 material explicitly listed
 
-- Tunnel build v2 with NetDb-driven Charlie selection.
 - LeaseSet v1, EncryptedLeaseSet, MetaLeaseSet.
 - SOCKS / HTTP proxy / BOB / I2PControl console.
 - TUN interface.
@@ -74,15 +73,18 @@ follow-up ticket at that point so the refresh is scheduled rather than hoped for
 
 `apps/i2per/test/fixtures/i2pd_ssu2_data_phase.term` holds SSU2 data-phase
 datagrams captured from i2pd 2.61.0 — the version pinned above — and
-`i2p_ssu2_vectors_SUITE` replays them in the hermetic gate. The capture is
-tied to this snapshot, so it is refreshed on the same cadence as this file:
+`apps/i2per/test/fixtures/i2pd_ntcp2_handshake.term` holds an NTCP2 XK handshake
+and the data phase that followed it. `i2p_ssu2_vectors_SUITE` and
+`i2p_ntcp2_vectors_SUITE` replay them in the hermetic gate. The captures are
+tied to this snapshot, so they are refreshed on the same cadence as this file:
 
 ```sh
 I2PD_BIN=/path/to/i2pd just capture-vectors
 ```
 
-It needs an i2pd binary and no network. Three things about it are not obvious
-and each cost a capture to find:
+It needs an i2pd binary and no network. Both captures come out of one throwaway
+router, so the driver takes SSU2 first and NTCP2 second against the same
+instance. Five things about it are not obvious and each cost a capture to find:
 
 - **`reservedrange` must be `false`.** i2pd admits an inbound SSU2 datagram only
   when `!IsInReservedRange(addr)` (`SSU2.cpp:775`), which that flag turns on,
@@ -95,6 +97,17 @@ and each cost a capture to find:
   servers, it retries for `RESEED_GIVEUP_TIMEOUT` (180 s, `Reseed.cpp:26`)
   before giving up. An empty NetDb costs the capture nothing either way: SSU2
   answers a SessionRequest without peers.
+- **`ntcp2.published` must be `true`.** The NTCP2 acceptor is created inside a
+  loop over the router's own addresses and only for an address where
+  `IsPublishedNTCP2()` holds (`NTCP2.cpp:1763`). With `ntcp2.published = false`
+  no such address is written, the loop skips every entry, and i2pd binds no
+  TCP port at all — the connect that follows fails with `econnrefused` while
+  the log looks healthy.
+- **Wait on `NTCP2: Start listening v4 TCP port`, and only that line.** i2pd
+  also logs `Transports: Accepting incoming connections at port <n>`
+  (`Transports.cpp:1608`) for SSU2, and that line appears whether or not NTCP2
+  is up. Treating it as evidence of a listener is a false positive that hides
+  the case above; the driver greps the acceptor's own line instead.
 - **One of our packets is dropped on purpose.** An ACK over a contiguous run of
   packet numbers has an empty range list, and the NACK ranges are the part that
   exercises ACK accounting. The capture swallows one packet so i2pd emits them.
@@ -103,3 +116,13 @@ Review the regenerated diff rather than taking it on trust: the ACK accounting
 the suite asserts is only meaningful if the capture still contains the loss, and
 `a_dropped_packet_stays_a_nack_range` is what fails if a re-capture stopped
 producing it.
+
+The SSU2 capture is **not deterministic in packet count**: how many datagrams
+i2pd sends before it goes quiet depends on its own timers, so `just
+capture-vectors` rewrites `i2pd_ssu2_data_phase.term` with a different number of
+packets from run to run. That is fine for a local recapture, but it means the
+committed SSU2 fixture must not be regenerated as a side effect of a run where
+only the NTCP2 side changed — restore it (`jj restore
+apps/i2per/test/fixtures/i2pd_ssu2_data_phase.term`) rather than committing a
+noise diff. The NTCP2 fixture's *handshake* bytes are deterministic given the
+pinned keys; its `ba_frames` count is subject to the same timer drift.
