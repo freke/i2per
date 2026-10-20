@@ -34,15 +34,17 @@
 # `workflow_dispatch` one either, because a suite that needs the network is a
 # suite whose failure means nothing when the network is what broke.
 #
-# %%%%% `i2p_ssu2_vectors_SUITE` is in the gate, and its name does not match %%%%%
+# %%%%% The two vectors suites are in the gate, and their names do not match %%%%%
 #
-# It replays SSU2 data-phase datagrams captured from a real i2pd and committed to
-# `apps/i2per/test/fixtures/`. It needs the committed bytes and nothing else: no
-# i2pd process, no network, no second router. That is the opposite of what the
-# guard above is for, so the guard's rule -- *name matches `i2pd` or `interop`,
-# therefore it wants a live i2pd* -- does not fire, and that is the intent rather
-# than an accident of spelling. Renaming it to include `i2pd` would be the one
-# change that made it honest-looking and wrong.
+# `i2p_ssu2_vectors_SUITE` replays SSU2 data-phase datagrams, and
+# `i2p_ntcp2_vectors_SUITE` replays an NTCP2 XK handshake and the data phase
+# after it, both captured from a real i2pd and committed to
+# `apps/i2per/test/fixtures/`. They need the committed bytes and nothing else:
+# no i2pd process, no network, no second router. That is the opposite of what
+# the guard above is for, so the guard's rule -- *name matches `i2pd` or
+# `interop`, therefore it wants a live i2pd* -- does not fire, and that is the
+# intent rather than an accident of spelling. Renaming either to include `i2pd`
+# would be the one change that made it honest-looking and wrong.
 #
 # The distinction that matters is whether the bytes come from a process that has
 # to be started. `just capture-vectors` starts i2pd to take the capture; this

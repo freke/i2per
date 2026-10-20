@@ -93,8 +93,9 @@ The project interoperates with I2P routers. It does not bundle code from
 - **SSU2 congestion control and RTT:** SSU2 estimates RTT and runs window-based
   congestion control, so a router manages its own throughput instead of relying
   on a fixed resend timer.
-- **Hermetic protocol gate:** the SSU2 data phase is captured from a real i2pd
-  and committed, then replayed on every push by `i2p_ssu2_vectors_SUITE`.
+- **Hermetic protocol gate:** the SSU2 data phase and the NTCP2 XK handshake
+  are captured from a real i2pd and committed, then replayed on every push by
+  `i2p_ssu2_vectors_SUITE` and `i2p_ntcp2_vectors_SUITE`.
 - **Observability:** `i2p_status_data:view/0` (view version 5) reports aggregate
   SSU2 RTT and congestion window, and the status page surfaces them.
 - **Scope:** 0.5.0 anchors on RC68AGE alone; NetDb-driven Charlie selection is
@@ -462,16 +463,21 @@ of what it checks is replayed from a real i2pd. `apps/i2per/test/fixtures/
 i2pd_ssu2_data_phase.term` holds SSU2 data-phase datagrams — a real peer's ACK
 blocks, its RouterInfo, its I2NP messages — together with the session keys that
 make them readable, and `i2p_ssu2_vectors_SUITE` replays them with no i2pd and
-no network. To recapture against a different i2pd:
+no network. `apps/i2per/test/fixtures/i2pd_ntcp2_handshake.term` holds an NTCP2
+XK handshake and the data phase that followed it — our msg1 and msg3 re-encode
+to the captured bytes and i2pd's msg2 and data frames open under the keys the
+replay derives — and `i2p_ntcp2_vectors_SUITE` replays that the same way. To
+recapture both against a different i2pd:
 
 ```sh
 I2PD_BIN=/path/to/i2pd just capture-vectors
 ```
 
 The capture needs an i2pd binary and nothing else: it boots a throwaway router
-with an empty NetDb, records one SSU2 session, and rewrites the fixture. It is
-run by hand, on purpose, for the same reason the interop suite below is — a
-fixture regenerated on every push would be a fixture nobody reads.
+with an empty NetDb, records one SSU2 session and one NTCP2 session against it,
+and rewrites both fixtures. It is run by hand, on purpose, for the same reason
+the interop suite below is — a fixture regenerated on every push would be a
+fixture nobody reads.
 
 To run the explicit interop suite against a real i2pd instance:
 
