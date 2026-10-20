@@ -14,7 +14,9 @@ full_snapshot() ->
         peers => #{connected => 3, other => 2},
         tunnels => #{outbound => 1, inbound => 2, transit => 4},
         netdb => #{ri => 9, ls => 0},
-        sessions => 5
+        sessions => 5,
+        ssu2 => #{sessions => 7, rtt_ms => 42, cwnd => 14720},
+        ssu2_preferred => true
     }.
 
 online_renders_report_table_test() ->
@@ -28,7 +30,11 @@ online_renders_report_table_test() ->
             <<"<tr><td>transit tunnels</td><td>4</td></tr>">>,
             <<"<tr><td>netdb router infos</td><td>9</td></tr>">>,
             <<"<tr><td>netdb leasesets</td><td>0</td></tr>">>,
-            <<"<tr><td>SAM sessions</td><td>5</td></tr>">>
+            <<"<tr><td>SAM sessions</td><td>5</td></tr>">>,
+            <<"<tr><td>SSU2 dials UDP first</td><td>yes</td></tr>">>,
+            <<"<tr><td>SSU2 sessions</td><td>7</td></tr>">>,
+            <<"<tr><td>SSU2 RTT (ms)</td><td>42</td></tr>">>,
+            <<"<tr><td>SSU2 cwnd (bytes)</td><td>14720</td></tr>">>
         ],
         Body
     ),
@@ -59,6 +65,10 @@ missing_sections_render_na_test() ->
             <<"netdb router infos">>,
             <<"netdb leasesets">>,
             <<"SAM sessions">>,
+            <<"SSU2 dials UDP first">>,
+            <<"SSU2 sessions">>,
+            <<"SSU2 RTT (ms)">>,
+            <<"SSU2 cwnd (bytes)">>,
             <<"transfer rate">>,
             <<"tunnel success">>
         ]

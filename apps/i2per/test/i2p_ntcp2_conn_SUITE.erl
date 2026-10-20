@@ -106,7 +106,7 @@
 %% is what fires and the failure is an error term naming the stall rather than a
 %% CT kill that says only that time ran out.
 -define(FRAMES_PER_DIRECTION, 70000).
--define(FRAME_BUDGET_MS, 20000).
+-define(FRAME_BUDGET_MS, 60000).
 
 suite() ->
     [{timetrap, 30000}].

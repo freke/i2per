@@ -96,10 +96,6 @@ clearing `remote_ri` in isolation once made every Charlie reply sign over
     %% Reading `remote_ri` here while establishment clears it is exactly the
     %% divergence #ER0J6KM shipped, so the answer is asserted, not assumed.
     peer_hash/1,
-    rtt/1,
-    rtt_ms/1,
-    srtt/1,
-    cwnd/1,
     %% The congestion-control arithmetic, exported for the same reason:
     %% `apply_rtt_sample/2`, `apply_cc_ack/2`, `on_cc_loss/1` and
     %% `on_cc_timeout/1` are pure functions of the session state map, and
@@ -1306,8 +1302,18 @@ send_packet(Blocks, State = #{keys := Keys, pkt_out := Num}, Track) ->
                     Queue = maps:get(send_queue, State, queue:new()),
                     case queue:len(Queue) >= ?MAX_SEND_QUEUE of
                         true ->
-                            i2p_log:debug(send_queue_full, #{role => role(State)}),
-                            State;
+                            %% Full queue: drop the oldest queued packet so the
+                            %% newest (and least stale) one can be enqueued.
+                            %% Announce and log at warning level rather than
+                            %% silently discarding.
+                            {_, Queue1} = queue:out(Queue),
+                            logger:warning(
+                                "~0p ~0p",
+                                [send_queue_full, #{role => role(State)}],
+                                #{label => send_queue_full, context => #{role => role(State)}}
+                            ),
+                            _ = i2p_events:notify({ssu2_send_queue_full, role(State)}),
+                            State#{send_queue => queue:in(Blocks, Queue1)};
                         false ->
                             State#{send_queue => queue:in(Blocks, Queue)}
                     end;
@@ -1811,26 +1817,6 @@ peer_hash(State) ->
         Hash ->
             Hash
     end.
-
-rtt(State) when is_pid(State) ->
-    rtt(sys:get_state(State));
-rtt(State) when is_map(State) ->
-    maps:get(rtt, State, maps:get(rtt_ms, State, 0)).
-
-rtt_ms(State) when is_pid(State) ->
-    rtt_ms(sys:get_state(State));
-rtt_ms(State) when is_map(State) ->
-    maps:get(rtt_ms, State, maps:get(rtt, State, 0)).
-
-srtt(State) when is_pid(State) ->
-    srtt(sys:get_state(State));
-srtt(State) when is_map(State) ->
-    maps:get(srtt, State, maps:get(srtt_ms, State, 0)).
-
-cwnd(State) when is_pid(State) ->
-    cwnd(sys:get_state(State));
-cwnd(State) when is_map(State) ->
-    maps:get(cwnd, State, 0).
 
 addr_type(Ip) when byte_size(Ip) == 16 -> ipv6;
 addr_type(_Ip) -> ipv4.
