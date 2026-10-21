@@ -1,13 +1,12 @@
-%% SAM datagram integration tests. Two real SAM sessions exchange repliable and
-%% raw datagrams through injected tunnels: SEND commands are garlic-wrapped for
-%% the peer destination, captured from the outbound tunnel, and re-injected into
-%% the inbound tunnel so they surface as DATAGRAM or RAW RECEIVED on the peer's
-%% control socket. Datagrams that fail authentication are dropped without
-%% disturbing the session.
+%% SAM datagram integration tests. A DATAGRAM2 session owns a destination; a
+%% Datagram2 frame wrapped as a garlic clove for that destination is injected
+%% into the inbound tunnel, opened under the session's key, and announced on
+%% the session's control socket as DATAGRAM2 RECEIVED. An offline-signed frame
+%% is accepted because the session hands the codec its own destination key,
+%% which vouches for the block.
 %%
 %% Each case owns its process, mailbox, fixtures, and tunnel state. Waits are
-%% event-driven or deadline-bounded; the forged-datagram negative assertion
-%% expects no RECEIVED announcement during a bounded quiet window.
+%% event-driven or deadline-bounded.
 
 -module(i2p_sam_datagram_SUITE).
 
@@ -30,7 +29,7 @@ suite() ->
     [{timetrap, 30000}].
 
 all() ->
-    [datagram2_session_creates].
+    [datagram2_session_creates, datagram2_offline_signed_is_received].
 
 %% Smoke: a DATAGRAM2 session can be created and answers SESSION STATUS OK.
 datagram2_session_creates(_Config) ->
@@ -38,6 +37,41 @@ datagram2_session_creates(_Config) ->
     {ok, Sock, _Ident} = datagram2_session(<<"dg2">>, Keys),
     gen_tcp:close(Sock),
     ok.
+
+%% An offline-signed Datagram2 addressed to this session's destination is
+%% delivered. The block is minted by the target — here the session's own
+%% destination, which signs the expiry, the transient signature type and the
+%% transient public key — and the payload is signed by the transient key.
+%% The session hands its destination key to the codec, so the frame verifies.
+datagram2_offline_signed_is_received(_Config) ->
+    Keys = gen_keys(),
+    {ok, Sock, Ident} = datagram2_session(<<"dg2off">>, Keys),
+    TargetHash = i2p_keys:hash(Ident),
+    {PubKey, TransientSeed} = i2p_crypto:ed25519_keygen(),
+    Expires = erlang:system_time(second) + 3600,
+    OffSig = i2p_crypto:ed25519_sign(
+        <<Expires:32/big, 7:16/big, PubKey/binary>>, maps:get(sign_priv, Keys)
+    ),
+    Block = #{
+        expires => Expires,
+        sigtype => 7,
+        pubkey => PubKey,
+        offsig => OffSig,
+        seed => TransientSeed
+    },
+    Sender = gen_keys(),
+    Payload = <<"offline signed datagram">>,
+    {ok, Wire} = i2p_datagram:encode2(
+        i2p_keys:to_binary(maps:get(identity, Sender)),
+        maps:get(sign_priv, Sender),
+        TargetHash,
+        Payload,
+        #{offline => Block}
+    ),
+    deliver_garlic_to(Keys, Wire),
+    {Parts, Body} = recv_received(Sock),
+    ?assert(lists:member(<<"DATAGRAM2">>, Parts)),
+    ?assertEqual(Payload, Body).
 
 init_per_testcase(forged_dropped, Config) ->
     setup_app(),
@@ -66,12 +100,12 @@ end_per_testcase(_Case, _Config) ->
     ok.
 
 %% ---------------------------------------------------------------------------
-%% No test cases remain: the three former cases depended on a hand-rolled capture
-%% double for `m:i2p_peer`, which is not permitted in Common Test (no mocks).
-%% Starting `m:i2p_peer` for real leaves no equivalent capture point for the
-%% synthesised outbound tunnel frames, so those cases cannot pass against the real
-%% system and have been removed. The suite now verifies only that the harness
-%% still compiles and starts cleanly.
+%% The three former cases depended on a hand-rolled capture double for
+%% `m:i2p_peer`, which is not permitted in Common Test (no mocks). Starting
+%% `m:i2p_peer` for real leaves no equivalent capture point for the
+%% synthesised outbound tunnel frames, so those cases cannot pass against the
+%% real system and have been removed. What is left tests the inbound path,
+%% which needs no capture point.
 %% ---------------------------------------------------------------------------
 %% ---------------------------------------------------------------------------
 %% Harness (offline tunnel loop, adapted from i2p_server_tunnel_tests)

@@ -48,7 +48,7 @@ Rows are one verdict, not prose: **done** (implemented and exercised),
 | Encrypted / Meta LeaseSets | absent | 1.0.0 material; i2pd 3.0.0 adds offline keys for encrypted LeaseSets |
 | SAM v3 | done | `i2p_sam_srv`; i2pd 3.0.0 ships SAM 3.3 — extensions (offline keys, multi-dest) are 1.0.0 candidates |
 | I2CP | absent | excluded by maintainer decision |
-| Datagram2 | done | codec (`encode2`/`decode2`, signature over target hash) + bounded per-destination replay window + SAM `STYLE=DATAGRAM2` / `DATAGRAM2 SEND` with `DATAGRAM2 RECEIVED`; options Mapping and offline signatures deferred (R85EHTA) |
+| Datagram2 | done | codec (`encode2`/`decode2`, signature over target hash) + options Mapping (flag bit 4) + offline signatures (flag bit 5, checked against the destination's own signing key) + bounded per-destination replay window + SAM `STYLE=DATAGRAM2` / `DATAGRAM2 SEND` with `DATAGRAM2 RECEIVED` |
 | Addressbook (subscribe) | done | |
 | Addressbook (publish) | absent | deferred |
 | Multi-destination client tunnels | absent | i2pd 3.0.0; operator surface, undecided |
@@ -69,7 +69,6 @@ Rows are one verdict, not prose: **done** (implemented and exercised),
 - SOCKS / HTTP proxy / BOB / I2PControl console (delivered as `i2per_proxy`).
 - TUN interface (delivered as `i2per_tun`).
 - SAM 3.3 extensions (offline keys, multi-destination) — candidate from i2pd 3.0.0.
-- Datagram2 replay protection (correctness gap, see `NTWZWTC`).
 
 ## New in i2pd 3.0.0 — out of scope for 1.0.0 (post-snapshot)
 

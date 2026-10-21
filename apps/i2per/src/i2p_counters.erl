@@ -487,9 +487,12 @@ counters() ->
         %% **Inbound Datagram2 frames.** `datagram2_received` counts frames that
         %% decoded and authenticated and were delivered to the SAM client;
         %% `datagram2_replayed` counts frames dropped as replays by the
-        %% per-destination replay window.
+        %% per-destination replay window; `datagram2_offline_signed` counts
+        %% the delivered frames that carried an offline-signature section,
+        %% signed by a transient key the target destination vouched for.
         datagram2_received,
-        datagram2_replayed
+        datagram2_replayed,
+        datagram2_offline_signed
     ].
 
 -doc """

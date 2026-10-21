@@ -1558,7 +1558,7 @@ packet
 | Field | Size | Description |
 |-------|------|-------------|
 | from | 391 | Sender Destination (X25519 ‖ padding ‖ Ed25519 ‖ KEY cert), same fixed layout as every destination in this router. Its signing key verifies the signature. |
-| signature | 64 | Ed25519 over the **payload bytes only** (non-DSA rule, release 0.9.14+). Datagram2 (Proposal 163) is implemented: `encode2`/`decode2` sign over the target destination hash + flags + payload, with a bounded per-destination FIFO replay window (capacity fixed, counters `accepted`/`replayed`/`evicted`); options Mapping and offline signatures are not implemented. |
+| signature | 64 | Ed25519 over the **payload bytes only** (non-DSA rule, release 0.9.14+). Datagram2 (Proposal 163) is implemented as well — see below. |
 | payload | 1..~11 KB practical | Application bytes. Unreliable and unordered end-to-end. |
 
 RAW datagrams carry no header at all: the Data-clove payload is the
@@ -1568,6 +1568,53 @@ message, and receivers cannot attribute or authenticate it.
 or a failed signature all return `error` from `f:i2p_datagram:decode/1`
 and are dropped silently — exactly what an unauthenticated stranger
 deserves.
+
+#### Datagram2 wire format
+
+[Proposal 163](https://i2p.net/en/proposals/163-datagram2/) replaces the
+Datagram1 header with a flags word and two optional sections. The codec is
+`m:i2p_datagram`: `f:i2p_datagram:encode2/5` builds a frame,
+`f:i2p_datagram:decode2/3` authenticates one.
+
+```mermaid
+packet
+0-390: "from — sender Destination (391 bytes)"
+391-392: "flags — version 0x02 and the section bits (2 bytes)"
++393: "options Mapping (optional), offline signature (optional), payload, signature (64 bytes)"
+```
+
+| Field | Size | Description |
+|-------|------|-------------|
+| flags | 2 bytes | Bits 3-0 carry the version (`0x02`); bit 4 announces the options Mapping, bit 5 the offline-signature section; bits 15-6 are reserved and must be zero. A frame whose version nibble is not `0x02`, that sets a reserved bit, or that announces a section it does not carry, is dropped. |
+| options | 0..65537 bytes | A [Mapping](https://i2p.net/en/docs/specs/common-structures/): a 2-byte size (the bytes that follow) then `key=value;` pairs with 1-byte length-prefixed strings. Present only when bit 4 is set. The encoder sorts the keys (byte order, the spec's rule for signed mappings) so the signed bytes are canonical; duplicate keys, strings longer than 255 bytes and mappings longer than 65535 bytes are refused. |
+| offline signature | 0..102 bytes | The offline-signature section of the [common structures spec](https://i2p.net/en/docs/specs/common-structures/): expiry (4 bytes, seconds since the epoch), transient signature type (2 bytes), the transient signing public key, and the destination's signature over those three fields. Present only when bit 5 is set. |
+| payload | 1..~11 KB practical | Application bytes, as in Datagram1. |
+| signature | 64 bytes | Ed25519 over the prelude — the 32-byte hash of the **target** destination, which is not on the wire — followed by the flags, the options and offline sections when they are present, and the payload. |
+
+**The prelude binds the frame to its addressee.** The hash of the
+destination the datagram was sent to is covered by the signature even
+though it never appears in the bytes, so a frame cannot be replayed at a
+different destination.
+
+**An offline-signed datagram is signed by a transient key.** The payload
+signature is made with the transient key the offline section carries, and
+the section's `offsig` is the *target destination's* signature over the
+expiry, the transient signature type and the transient public key. A
+receiver therefore checks the `offsig` against the destination's own
+signing key before it trusts the transient key, and drops the frame when
+the signature type is not Ed25519, when the block has expired, or when
+`f:i2p_datagram:decode2/2` is called without a destination key — there is
+nothing to check the `offsig` against, so the frame cannot be accepted.
+
+The block is minted by the target: the datagrams spec says the section
+"can, and should, be generated offline", and a sender cannot mint one
+because it does not hold the target's signing key. It travels to the
+sender out of band.
+
+The SAM receive path hands the session's own destination key to the codec
+(`f:i2p_datagram:decode2/3`), so a datagram addressed to this router can
+carry an offline section; the counter `datagram2_offline_signed` counts
+the frames that did.
 
 #### Control-socket protocol
 
