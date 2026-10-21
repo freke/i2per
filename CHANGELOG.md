@@ -43,7 +43,33 @@ changes, so a 0.4.0 `data_dir` is read unchanged.
 
 ## [Unreleased]
 
-_(nothing yet)_
+### Changed
+
+- **Automatic NetDb-driven Charlie selection.** Bob (the introducer) now
+  selects a Charlie from the NetDb on an inbound PeerTest message 1 instead of
+  requiring the operator to supply one: SSU2 address with the `B` peer-test
+  capability and a published host/port, uniform random, one Charlie per cycle,
+  per-Alice 60s rate limit, and the deterministic "no Charlie available" reject
+  (code 2) on any failure. The manual `dial_charlie/3` path remains for tests
+  and operators (#6TGF083).
+- **Tunnel build v2 (variable tunnels).** The maximum tunnel hop count is
+  raised from 3 to 7 (i2pd parity) across the tunnel stack; the default build
+  stays 3 hops (#K62PQHJ).
+- **NTCP2 vectors in the hermetic gate.** The NTCP2 XK handshake is now captured
+  from a real i2pd alongside the existing SSU2 data phase, and
+  `i2p_ntcp2_vectors_SUITE` replays it on every push with no i2pd and no
+  network: our msg1 and msg3 re-encode to the captured bytes, i2pd's msg2 opens
+  under the reconstructed handshake state, and the data-phase frames that follow
+  decrypt under keys derived from it (#7B96TT8).
+
+### Fixed
+
+- **NTCP2 keepalive frame length.** The capture sender advanced the SipHash
+  state once before handing it to `encrypt_frame/4`, which advances it again, so
+  the frame length went on the wire masked against one digest too many and a
+  peer would have dropped the frame. The sender now makes the same single call
+  the production path does; `the_keepalive_re_encodes_to_the_captured_bytes` is
+  the replay case that would catch a regression (#7B96TT8).
 
 ## [0.4.0] — 2026-10-18
 

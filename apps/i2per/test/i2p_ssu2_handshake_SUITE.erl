@@ -12,6 +12,11 @@
 %% result. The data-path twin, `data_survives_dropped_packet`, drops an
 %% established Data packet in each direction and verifies the sender's
 %% resend timer restores the exact body through the public owner-mailbox seam.
+%%
+%% Two classification cases pin routing without a session: `f:classify/5`'s
+%% pending step must be scoped to the listener that registered the dialer
+%% (#2SE5SNW), and a handshake reply whose masked type byte happens to read
+%% PeerTest must still reach its pending session (ZWHH3TX).
 -module(i2p_ssu2_handshake_SUITE).
 
 -include_lib("common_test/include/ct.hrl").
@@ -24,6 +29,7 @@
     dial_survives_created_loss/1,
     data_survives_dropped_packet/1,
     created_with_peertest_type_byte_is_delivered/1,
+    pending_claim_is_scoped_to_the_listener_that_registered_it/1,
     a_truncated_datagram_does_not_kill_the_socket_owner/1,
     classification_spends_one_pass_per_claimed_datagram/1
 ]).
@@ -42,6 +48,7 @@ all() ->
         dial_survives_created_loss,
         data_survives_dropped_packet,
         created_with_peertest_type_byte_is_delivered,
+        pending_claim_is_scoped_to_the_listener_that_registered_it,
         a_truncated_datagram_does_not_kill_the_socket_owner,
         classification_spends_one_pass_per_claimed_datagram
     ].
@@ -318,6 +325,58 @@ search_collision(IntroKey, N, Last) ->
 
 opened(Payload, IntroKey) ->
     i2p_ssu2:open_long(Payload, IntroKey, IntroKey).
+
+%% A pending dialer is claimed by the listener it dialled through, not by any
+%% listener that sees a datagram from the endpoint it is waiting on.
+%%
+%% The pending table is node-global and the listeners are not. Keyed by endpoint
+%% alone, one listener's pending row was visible to every other listener, so a
+%% datagram arriving anywhere from that endpoint was handed to that dialer -- even
+%% when the dialer's own SessionRequest had left through a different socket.
+%%
+%% This is what JNW6QQG's auto-selected Charlie hit: Alice registered a pending
+%% row for Bob's listener endpoint through her own listener, and the coordinator's
+%% outbound Charlie dial, which sends through the router's listener, produced
+%% SessionRequests arriving at Charlie's listener from exactly that endpoint.
+%% Charlie's listener claimed them for Alice, never spawned a Bob session for
+%% them, and the dial exhausted its handshake budget with
+%% `{handshake_timeout, session_request}`. See #2SE5SNW.
+%%
+%% The case reproduces the shape with two real listeners and no sessions: a
+%% dialer waiting on listener A for endpoint E, and a datagram sent to listener B
+%% from E. B must not claim it.
+pending_claim_is_scoped_to_the_listener_that_registered_it(_Config) ->
+    Local = peer_local(),
+    IntroKey = maps:get(intro_key, Local),
+    {ok, ListenerA} = i2p_ssu2_listener:listen(<<"127.0.0.1">>, 0, Local, self()),
+    {ok, ListenerB} = i2p_ssu2_listener:listen(<<"127.0.0.1">>, 0, Local, self()),
+    {ok, Sock} = gen_udp:open(0, [binary, {active, false}]),
+    try
+        {ok, SrcPort} = inet:port(Sock),
+        Source = {{127, 0, 0, 1}, SrcPort},
+        Payload = sealed_datagram(IntroKey, 16#5A5A5A5A5A5A5A5A, 7, 96),
+        %% The dialer is registered on A, waiting for a SessionCreated from Source.
+        gen_server:cast(ListenerA, {register_pending, self(), Source}),
+        %% A datagram from that same endpoint reaches B instead -- the misroute.
+        ok = gen_udp:send(Sock, {127, 0, 0, 1}, i2p_ssu2_listener:port(ListenerB), Payload),
+        receive
+            {ssu2_packet, _} -> error(claimed_by_a_listener_that_did_not_register_it)
+        after 500 -> ok
+        end,
+        %% And the row is still live for the listener that did register it: the
+        %% same payload sent to A is delivered, so the case cannot pass by the
+        %% registration having silently gone nowhere.
+        ok = gen_udp:send(Sock, {127, 0, 0, 1}, i2p_ssu2_listener:port(ListenerA), Payload),
+        receive
+            {ssu2_packet, Payload} -> ok
+        after 5000 ->
+            error(pending_row_was_not_reachable_on_its_own_listener)
+        end
+    after
+        gen_udp:close(Sock),
+        i2p_ssu2_listener:stop(ListenerA),
+        i2p_ssu2_listener:stop(ListenerB)
+    end.
 
 %% Data-phase recovery: after a full pair is established, a Data packet is
 %% dropped on the wire in each direction in turn. The sender's data-resend

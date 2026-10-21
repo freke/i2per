@@ -465,7 +465,22 @@ counters() ->
         tunnels_failed_outbound_invalid,
         tunnels_failed_outbound_rejected,
         tunnels_expired_inbound,
-        tunnels_expired_outbound
+        tunnels_expired_outbound,
+
+        %% %%%%% Peer test / Charlie selection %%%%%
+        %%
+        %% NetDb-driven Charlie selection (0.6.0): attempted on every inbound
+        %% PeerTest message 1 that finds no Charlie dialed; succeeded when a
+        %% qualifying candidate was dialed; rejected when rate-limited, no
+        %% candidate, or the dial failed (replied with code 2). The
+        %% no-candidate count is broken out because it is the one outcome that
+        %% says the NetDb had nobody to offer -- as opposed to a candidate that
+        %% was offered and did not answer -- and it is what a router with too
+        %% few peers sees.
+        charlie_selections_attempted,
+        charlie_selections_succeeded,
+        charlie_selections_no_candidate,
+        charlie_selections_rejected
     ].
 
 -doc """

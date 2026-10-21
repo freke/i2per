@@ -210,25 +210,25 @@ parse_tunnel_lengths(Tokens) ->
 %% when present and integral, `{error, bad_length}` otherwise.
 -dialyzer({no_underspecs, length_opt/2}).
 -spec length_opt(binary(), [binary()]) ->
-    none | {ok, 1..3} | {error, bad_length}.
+    none | {ok, 1..7} | {error, bad_length}.
 length_opt(Key, Tokens) ->
     case parse_kv(Key, Tokens, undefined) of
         undefined -> none;
         Bin -> parse_hops(Bin)
     end.
 
-%% parse_hops/1 — digit-only integer clamped to 1..3; anything else
+%% parse_hops/1 — digit-only integer clamped to 1..7; anything else
 %% (empty, signed, non-digit) is bad_length.
--spec parse_hops(binary()) -> {ok, 1..3} | {error, bad_length}.
+-spec parse_hops(binary()) -> {ok, 1..7} | {error, bad_length}.
 parse_hops(Bin) when byte_size(Bin) > 0 ->
     case all_digits(Bin) of
-        true -> {ok, min(max(binary_to_integer(Bin), 1), 3)};
+        true -> {ok, min(max(binary_to_integer(Bin), 1), 7)};
         false -> {error, bad_length}
     end;
 parse_hops(_Bin) ->
     {error, bad_length}.
 
--spec maybe_put_len(in_len | out_len, none | {ok, 1..3}, i2p_sam_session:tunnel_lengths()) ->
+-spec maybe_put_len(in_len | out_len, none | {ok, 1..7}, i2p_sam_session:tunnel_lengths()) ->
     i2p_sam_session:tunnel_lengths().
 maybe_put_len(_Key, none, Acc) ->
     Acc;

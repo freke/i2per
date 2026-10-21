@@ -14,9 +14,14 @@ routes them:
 * Charlie's message 3 (+ his RouterInfo) → relayed back to the Alice session
   as message 4, carrying Charlie's router hash.
 
-Charlie selection is supplied by the caller. Automatic NetDb-driven selection
-is not implemented in this release: the coordinator receives the Charlie RouterInfo to
-relay, not a hash to resolve. It binds the intro-side listener as both its owner
+Charlie selection is now NetDb-driven: when a message 1 arrives and no Charlie
+session is dialed yet, the coordinator selects a qualifying RouterInfo from the
+NetDb (SSU2 address with the `B` peer-test capability and a published
+host/port — "published" means the address carries a host and port, not that it
+is publicly reachable), dials it, and relays. Alice's RouterInfo, held from the moment it was learned,
+goes to the freshly dialed session ahead of message 2 as the spec requires.
+A manual path remains via `f:dial_charlie/3` for tests
+and operators. The coordinator binds the intro-side listener as both its owner
 and `peer_test_coordinator`, so an inbound Alice message 1 is forwarded here
 instead of auto-rejected.
 
@@ -32,9 +37,9 @@ and `peer_test_coordinator` — the standalone Bob shape the tests own.
 enabled (defaulting off): the sessions it routes between are the ones the
 router's own SSU2 listener spawned, owned by `m:i2p_peer`, and their
 peer-test and RouterInfo blocks reach this process forwarded by the peer
-manager. Until a Charlie session is dialed (`f:dial_charlie/3`) an in-session
-message 1 is held, not answered: routing it is the Charlie-selection work,
-which is not this release's.
+manager. When no Charlie session is dialed yet, an in-session message 1 triggers
+NetDb-driven Charlie selection and a dial; if selection fails the request is
+answered with the deterministic "no Charlie available" reject (code 2).
 """.
 
 -behaviour(gen_server).
@@ -105,9 +110,11 @@ relay to Alice before message 4 (its `ri` must be a `m:i2p_router_info` map).
 The SessionConfirmed routes Bob's own RouterInfo. Returns once the session is
 established. In attach mode the dial sends through the running router's SSU2
 listener, resolved by name; with no listener up the answer is
-`{error, no_listener}`.
+`{error, no_listener}`, and an unreachable or slow Charlie answers
+`{error, {dial_failed, Reason}}` — the coordinator survives either way.
 """.
--spec dial_charlie(pid(), map(), term()) -> ok | {error, no_listener}.
+-spec dial_charlie(pid(), map(), term()) ->
+    ok | {error, no_listener | {dial_failed, term()}}.
 dial_charlie(Coord, CharlieOpts, CharlieRI) ->
     gen_server:call(Coord, {dial_charlie, CharlieOpts, CharlieRI}).
 
@@ -131,13 +138,17 @@ init(BobLocal) ->
         i2p_ssu2_listener:listen(<<"127.0.0.1">>, 0, BobLocal, self(), self()),
     {ok, (routing_state(BobLocal))#{listener => Listener}}.
 
+-define(ALICE_RATE_LIMIT_MS, 60000).
+
 routing_state(BobLocal) ->
     #{
         bob_local => BobLocal,
         alice_sess => undefined,
         charlie_sess => undefined,
         alice_hash => undefined,
-        charlie_ri => undefined
+        alice_ri => undefined,
+        charlie_ri => undefined,
+        alice_rate_limits => #{}
     }.
 
 handle_call(port, _From, State = #{listener := Listener}) ->
@@ -147,17 +158,15 @@ handle_call(port, _From, State) ->
 handle_call(
     {dial_charlie, CharlieOpts, CharlieRI},
     _From,
-    State = #{bob_local := BobLocal}
+    State = #{bob_local := _BobLocal}
 ) ->
-    case dial_listener(State) of
-        undefined ->
+    case dial_charlie_in_state(State, CharlieOpts, CharlieRI) of
+        {error, no_listener} ->
             {reply, {error, no_listener}, State};
-        Listener ->
-            BobRIBlock = i2p_router_info:to_binary(maps:get(ri, BobLocal)),
-            {ok, CharlieSess, _Keys} =
-                i2p_ssu2_conn:connect(BobLocal, CharlieOpts, BobRIBlock, Listener),
-            erlang:unlink(CharlieSess),
-            {reply, ok, State#{charlie_sess => CharlieSess, charlie_ri => CharlieRI}}
+        {error, {dial_failed, Reason}} ->
+            {reply, {error, {dial_failed, Reason}}, State};
+        {ok, State1} ->
+            {reply, ok, State1}
     end;
 handle_call(charlie_sess, _From, State) ->
     {reply, maps:get(charlie_sess, State), State};
@@ -230,27 +239,31 @@ route_blocks(Pid, Blocks, State = #{charlie_sess := Charlie}) ->
             relay_charlie_to_alice(Blocks, State);
         false ->
             i2p_log:debug({coord_route, alice_to_charlie}, []),
-            State1 = relay_alice_to_charlie(Blocks, State),
+            State1 = relay_alice_to_charlie(Pid, Blocks, State),
             case maps:get(alice_sess, State1, undefined) of
                 undefined -> State1#{alice_sess => Pid};
                 _ -> State1
             end
     end.
 
-%% Alice -> Charlie. Learn Alice's hash from her RouterInfo block, then relay a
-%% message 1 as message 2 to the Charlie session. Alice's RouterInfo, when
-%% present, is forwarded ahead of message 2 per the spec.
-relay_alice_to_charlie(Blocks, State = #{charlie_sess := Charlie}) ->
+%% Alice -> Charlie. Learn Alice's hash (and hold her RouterInfo binary) from
+%% her RouterInfo block, forward any RouterInfo blocks to the current Charlie
+%% session, flush a message 1 buffered before her hash was known, then relay a
+%% message 1 as message 2 to the Charlie session. The order matters: a freshly
+%% dialed Charlie must receive her RouterInfo ahead of message 2 per the spec,
+%% so the flush that may perform the dial runs after the forward.
+relay_alice_to_charlie(Pid, Blocks, State) ->
     State1 = learn_alice_hash(Blocks, State),
-    State2 = forward_router_infos(Blocks, Charlie, State1),
+    State2 = forward_router_infos(Blocks, State1),
+    State3 = flush_pending_msg1(State2),
     case lists:keyfind(peertest, 1, Blocks) of
         {peertest, 1, Code, Flags, _Hash, Ver, Nonce, Ts, Port, Ip, Sig} ->
-            relay_msg1_or_buffer(Code, Flags, Ver, Nonce, Ts, Port, Ip, Sig, State2);
+            relay_msg1_or_buffer(Pid, Code, Flags, Ver, Nonce, Ts, Port, Ip, Sig, State3);
         _ ->
-            State2
+            State3
     end.
 
-relay_msg1_or_buffer(Code, Flags, Ver, Nonce, Ts, Port, Ip, Sig, State) ->
+relay_msg1_or_buffer(Pid, Code, Flags, Ver, Nonce, Ts, Port, Ip, Sig, State) ->
     case alice_hash(State) of
         undefined ->
             i2p_log:debug({coord_msg1, buffered}, []),
@@ -263,16 +276,12 @@ relay_msg1_or_buffer(Code, Flags, Ver, Nonce, Ts, Port, Ip, Sig, State) ->
         AliceHash ->
             case maps:get(charlie_sess, State) of
                 undefined ->
-                    %% No Charlie session yet (`f:dial_charlie/3` not called):
-                    %% hold the request until one is dialed, the same hold as
-                    %% above. In attach mode this is the ordinary state — the
-                    %% Charlie selection is the caller's work — and sending to
-                    %% no session at all would raise this process.
-                    i2p_log:debug({coord_msg1, buffered, no_charlie}, []),
-                    State#{
-                        pending_msg1 =>
-                            {peertest, 1, Code, Flags, <<0:256>>, Ver, Nonce, Ts, Port, Ip, Sig}
-                    };
+                    %% No Charlie session yet: select one from the NetDb and dial it.
+                    %% On any failure (rate-limited, no candidate, dial error) reply
+                    %% with the deterministic "no Charlie available" reject (code 2).
+                    auto_select_charlie(
+                        Pid, Code, Flags, Ver, Nonce, Ts, Port, Ip, Sig, AliceHash, State
+                    );
                 CharlieSess ->
                     i2p_log:debug({coord_msg1, sent}, []),
                     Msg2 = {peertest, 2, Code, Flags, AliceHash, Ver, Nonce, Ts, Port, Ip, Sig},
@@ -285,10 +294,17 @@ learn_alice_hash(Blocks, State) ->
     case maps:get(alice_hash, State, undefined) of
         undefined ->
             case lists:keyfind(router_info, 1, Blocks) of
-                {router_info, _Flag, RIData} ->
+                {router_info, Flag, RIData} ->
                     case i2p_router_info:decode(RIData) of
                         {ok, RI} ->
-                            flush_pending_msg1(State#{alice_hash => i2p_router_info:hash(RI)});
+                            %% Hold the binary, not only the hash: the Charlie
+                            %% session may not exist yet, and when one is
+                            %% dialed it must receive Alice's RouterInfo ahead
+                            %% of message 2 (docs/protocol.md:2058).
+                            State#{
+                                alice_hash => i2p_router_info:hash(RI),
+                                alice_ri => {Flag, RIData}
+                            };
                         _ ->
                             State
                     end;
@@ -306,20 +322,30 @@ flush_pending_msg1(State) ->
         {{peertest, 1, Code, Flags, _Hash, Ver, Nonce, Ts, Port, Ip, Sig}, AliceHash} when
             is_binary(AliceHash)
         ->
-            i2p_log:debug({coord_msg1, flushed_from_buffer}, []),
-            Msg2 = {peertest, 2, Code, Flags, AliceHash, Ver, Nonce, Ts, Port, Ip, Sig},
-            i2p_ssu2_conn:send_peertest(maps:get(charlie_sess, State), Msg2),
-            State#{pending_msg1 => undefined};
+            case maps:get(charlie_sess, State) of
+                undefined ->
+                    %% Alice's hash just learned; still no Charlie dialed — try
+                    %% NetDb-driven selection now that we can build message 2.
+                    auto_select_charlie(
+                        undefined, Code, Flags, Ver, Nonce, Ts, Port, Ip, Sig, AliceHash, State
+                    );
+                CharlieSess ->
+                    i2p_log:debug({coord_msg1, flushed_from_buffer}, []),
+                    Msg2 = {peertest, 2, Code, Flags, AliceHash, Ver, Nonce, Ts, Port, Ip, Sig},
+                    i2p_ssu2_conn:send_peertest(CharlieSess, Msg2),
+                    State#{pending_msg1 => undefined}
+            end;
         _ ->
             State
     end.
 
-forward_router_infos(_Blocks, undefined, State) ->
+forward_router_infos(_Blocks, State = #{charlie_sess := undefined}) ->
     %% No Charlie session yet: there is nobody to forward a RouterInfo to, and
-    %% sending to no session at all would raise this process. The RouterInfo
-    %% blocks are still the ones that learn Alice's hash, handled above.
+    %% sending to no session at all would raise this process. The block is
+    %% held in `alice_ri` and goes out when a Charlie is dialed, ahead of
+    %% message 2; the same block is also the one that learns Alice's hash.
     State;
-forward_router_infos(Blocks, Charlie, State) ->
+forward_router_infos(Blocks, State = #{charlie_sess := Charlie}) ->
     lists:foreach(
         fun
             ({router_info, Flag, RIData}) -> i2p_ssu2_conn:send_router_info(Charlie, Flag, RIData);
@@ -361,3 +387,156 @@ peek_pt(Blocks) ->
 
 alice_hash(State) ->
     maps:get(alice_hash, State, undefined).
+
+%% ----------------------------------------------------------------------
+%% NetDb-driven Charlie selection (0.6.0)
+
+%% Resolve the Alice session pid to reply to: prefer the supplied Pid, fall
+%% back to the lazily-learned slot.
+alice_session_pid(Pid, _State) when is_pid(Pid) ->
+    Pid;
+alice_session_pid(_Pid, State) ->
+    maps:get(alice_sess, State, undefined).
+
+%% Dial Charlie using the same path as `f:dial_charlie/3`, returning the
+%% updated state or `{error, no_listener}` / `{error, {dial_failed, Reason}}`.
+%% `connect/4` awaits the handshake for up to 20 s and answers `{error,
+%% Reason}` for an unreachable or slow candidate — an ordinary case here,
+%% since candidates come from the NetDb. Handle it, don't crash: this
+%% gen_server owns the intro-side listener.
+-spec dial_charlie_in_state(map(), map(), term()) ->
+    {ok, map()} | {error, no_listener | {dial_failed, term()}}.
+dial_charlie_in_state(State, CharlieOpts, CharlieRI) ->
+    case dial_listener(State) of
+        undefined ->
+            {error, no_listener};
+        Listener ->
+            BobLocal = maps:get(bob_local, State),
+            BobRIBlock = i2p_router_info:to_binary(maps:get(ri, BobLocal)),
+            case i2p_ssu2_conn:connect(BobLocal, CharlieOpts, BobRIBlock, Listener) of
+                {ok, CharlieSess, _Keys} ->
+                    erlang:unlink(CharlieSess),
+                    State1 = State#{charlie_sess => CharlieSess, charlie_ri => CharlieRI},
+                    ok = send_held_alice_ri(CharlieSess, State1),
+                    {ok, State1};
+                {error, Reason} ->
+                    {error, {dial_failed, Reason}}
+            end
+    end.
+
+%% Alice's RouterInfo, held from the moment it was learned. Charlie must
+%% receive it before message 2, so a freshly dialed session gets it right
+%% away: the block may have arrived while no Charlie session existed to
+%% forward it to.
+-spec send_held_alice_ri(pid(), #{alice_ri := {non_neg_integer(), binary()}, _ => _}) -> ok.
+send_held_alice_ri(CharlieSess, State) ->
+    case maps:get(alice_ri, State, undefined) of
+        {Flag, RIData} -> i2p_ssu2_conn:send_router_info(CharlieSess, Flag, RIData);
+        undefined -> ok
+    end.
+
+%% Pick one qualifying Charlie from the NetDb: SSU2 address with the `B`
+%% peer-test capability and a published host/port, excluding ourselves and
+%% Alice. Uniform random among candidates.
+%%
+%% Alice is excluded because she is an ordinary router that publishes an SSU2
+%% address with `B`, so her own RouterInfo is in our NetDb and the draw can
+%% otherwise return her: she would then test herself, and messages 5-7 would run
+%% Alice-to-Alice, which says nothing about her reachability. The chance rises as
+%% the NetDb shrinks.
+%%
+%% `published` here means `f:i2p_router_info:ssu2_address_options/1` reported a
+%% host and port present -- loopback and private addresses included -- not that
+%% the address is publicly reachable. That is deliberate: the local test harness
+%% advertises `127.0.0.1` candidates, so a reachability filter would break it.
+-spec select_charlie(#{hash := i2p_crypto:hash(), _ => _}, i2p_crypto:hash() | undefined) ->
+    {ok, i2p_router_info:router_info(), map()} | {error, no_candidate}.
+select_charlie(#{hash := OurHash}, AliceHash) ->
+    Candidates = [
+        RI
+     || RI <- i2p_netdb_srv:routers(),
+        i2p_router_info:hash(RI) =/= OurHash,
+        i2p_router_info:hash(RI) =/= AliceHash,
+        {ok, Opts} <- [i2p_router_info:ssu2_address_options(RI)],
+        maps:get(peer_test, Opts, false) =:= true,
+        maps:get(published, Opts, false) =:= true
+    ],
+    case Candidates of
+        [] ->
+            {error, no_candidate};
+        _ ->
+            RI = lists:nth(rand:uniform(length(Candidates)), Candidates),
+            {ok, Opts} = i2p_router_info:ssu2_address_options(RI),
+            {ok, RI, Opts}
+    end.
+
+%% Per-Alice rate limit: true when a dial happened within the window.
+rate_limited(AliceHash, State) ->
+    Now = erlang:system_time(millisecond),
+    Last = maps:get(AliceHash, maps:get(alice_rate_limits, State, #{}), 0),
+    Now - Last < ?ALICE_RATE_LIMIT_MS.
+
+%% Reply to Alice with the deterministic "no Charlie available" reject (code 2).
+reply_reject(Pid, Nonce, Ts, Port, Ip) ->
+    AlicePid = Pid,
+    case AlicePid of
+        undefined ->
+            ok;
+        _ ->
+            Reject = {peertest, 4, 2, 0, <<0:256>>, 2, Nonce, Ts, Port, Ip, <<>>},
+            catch i2p_ssu2_conn:send_peertest(AlicePid, Reject)
+    end.
+
+%% Auto-select a Charlie and relay message 2, or reject on any failure.
+auto_select_charlie(Pid, Code, Flags, Ver, Nonce, Ts, Port, Ip, Sig, AliceHash, State) ->
+    _ = i2p_counters:add(charlie_selections_attempted, 1),
+    AlicePid = alice_session_pid(Pid, State),
+    RateLimits = maps:get(alice_rate_limits, State, #{}),
+    case rate_limited(AliceHash, State) of
+        true ->
+            _ = i2p_counters:add(charlie_selections_rejected, 1),
+            i2p_log:debug({coord_msg1, auto_select, rate_limited}, []),
+            reply_reject(AlicePid, Nonce, Ts, Port, Ip),
+            State#{
+                pending_msg1 => undefined,
+                alice_rate_limits => RateLimits
+            };
+        false ->
+            BobLocal = maps:get(bob_local, State),
+            case select_charlie(BobLocal, AliceHash) of
+                {error, no_candidate} ->
+                    _ = i2p_counters:add(charlie_selections_no_candidate, 1),
+                    _ = i2p_counters:add(charlie_selections_rejected, 1),
+                    i2p_log:debug({coord_msg1, auto_select, no_candidate}, []),
+                    reply_reject(AlicePid, Nonce, Ts, Port, Ip),
+                    State#{pending_msg1 => undefined};
+                {ok, RI, Opts} ->
+                    case dial_charlie_in_state(State, Opts, RI) of
+                        {error, no_listener} ->
+                            _ = i2p_counters:add(charlie_selections_rejected, 1),
+                            i2p_log:debug({coord_msg1, auto_select, no_listener}, []),
+                            reply_reject(AlicePid, Nonce, Ts, Port, Ip),
+                            State#{pending_msg1 => undefined};
+                        {error, {dial_failed, Reason}} ->
+                            _ = i2p_counters:add(charlie_selections_rejected, 1),
+                            i2p_log:debug(
+                                {coord_msg1, auto_select, {dial_failed, Reason}}, []
+                            ),
+                            reply_reject(AlicePid, Nonce, Ts, Port, Ip),
+                            State#{pending_msg1 => undefined};
+                        {ok, State1} ->
+                            _ = i2p_counters:add(charlie_selections_succeeded, 1),
+                            Now = erlang:system_time(millisecond),
+                            RL1 = maps:put(
+                                AliceHash, Now, maps:get(alice_rate_limits, State1, #{})
+                            ),
+                            CharlieSess = maps:get(charlie_sess, State1),
+                            i2p_log:debug({coord_msg1, auto_select, sent}, []),
+                            Msg2 =
+                                {peertest, 2, Code, Flags, AliceHash, Ver, Nonce, Ts, Port, Ip,
+                                    Sig},
+                            i2p_ssu2_conn:send_peertest(CharlieSess, Msg2),
+                            State1#{pending_msg1 => undefined, alice_rate_limits => RL1}
+                    end
+            end
+    end.

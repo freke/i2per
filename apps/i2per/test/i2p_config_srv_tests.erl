@@ -240,7 +240,7 @@ invalid_values_test() ->
         {tunnel_pool, #{outbound => 1, inbound => 0}},
         {tunnel_pool, #{outbound => 1, inbound => 1, exploratory => 0}},
         {tunnel_pool, #{outbound => 1, inbound => 1, exploratory => 1, exploratory_hops => 0}},
-        {tunnel_pool, #{outbound => 1, inbound => 1, exploratory => 1, exploratory_hops => 4}},
+        {tunnel_pool, #{outbound => 1, inbound => 1, exploratory => 1, exploratory_hops => 8}},
         {host, 123},
         {host, "list-not-binary"},
         {port, 0},

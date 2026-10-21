@@ -18,7 +18,7 @@ periodic tick:
   builds need a reply path.
 - **Exploratory pool** — the same `tunnel_pool` env map optionally declares
   `exploratory => N` (the size, default 2 when present) and
-  `exploratory_hops => H` (1..3, default 2); without the `exploratory` key
+  `exploratory_hops => H` (1..7, default 2); without the `exploratory` key
   the pool stays off. When configured, the tick keeps `N` active-or-pending
   short-hop tunnels per direction in the lookup pools, inbound-first.
   Client traffic never touches these tunnels.

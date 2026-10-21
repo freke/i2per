@@ -33,6 +33,7 @@
     session_create_transient/1,
     session_create_explicit_dest/1,
     session_create_length_options/1,
+    session_create_one_sided_length_defaults/1,
     session_create_length_clamp/1,
     session_create_bad_length/1,
     session_create_without_options/1,
@@ -125,6 +126,7 @@ all() ->
         session_create_transient,
         session_create_explicit_dest,
         session_create_length_options,
+        session_create_one_sided_length_defaults,
         session_create_length_clamp,
         session_create_bad_length,
         session_create_without_options,
@@ -734,7 +736,7 @@ session_create_explicit_dest(_Config) ->
     ?assert(binary:match(Reply, <<"SESSION STATUS RESULT=OK">>) =/= nomatch),
     gen_tcp:close(Sock).
 
-%% Length options are accepted, clamped into 1..3 hops, and registered as a
+%% Length options are accepted, clamped into 1..7 hops, and registered as a
 %% demand on the tunnel manager for the life of the session.
 session_create_length_options(_Config) ->
     Port = start_sam_listener(),
@@ -752,7 +754,24 @@ session_create_length_options(_Config) ->
     ?assertMatch(#{in_len := 2, out_len := 1}, maps:get(Pid, Demands)),
     gen_tcp:close(Sock).
 
-%% Out-of-range values clamp into the 1..3 hop budget.
+%% A session that names only one side takes the router default (3 hops) on the
+%% other, not the maximum. Naming `outbound.length=1` says nothing about the
+%% inbound side, and before K62PQHJ's split of default from maximum that side
+%% silently rode the cap up to 7.
+session_create_one_sided_length_defaults(_Config) ->
+    Port = start_sam_listener(),
+    {ok, Sock} = connect_sam(Port),
+    send_cmd(Sock, <<"HELLO VERSION MIN=3.1 MAX=3.1">>),
+    _ = recv_line(Sock),
+    send_cmd(Sock, <<"SESSION CREATE STYLE=STREAM ID=onesided outbound.length=1">>),
+    Reply = recv_line(Sock),
+    ?assert(binary:match(Reply, <<"SESSION STATUS RESULT=OK">>) =/= nomatch),
+    {ok, {Pid, _DestHash, _Style}} = i2p_sam_sup:session_lookup(<<"onesided">>),
+    Demands = i2p_tunnel_srv:demands(),
+    ?assertMatch(#{in_len := 3, out_len := 1}, maps:get(Pid, Demands)),
+    gen_tcp:close(Sock).
+
+%% Out-of-range values clamp into the 1..7 hop budget.
 session_create_length_clamp(_Config) ->
     Port = start_sam_listener(),
     {ok, Sock} = connect_sam(Port),
@@ -766,7 +785,7 @@ session_create_length_clamp(_Config) ->
     ?assert(binary:match(Reply, <<"SESSION STATUS RESULT=OK">>) =/= nomatch),
     {ok, {Pid, _DestHash, datagram}} = i2p_sam_sup:session_lookup(<<"lenclamp">>),
     Demands = i2p_tunnel_srv:demands(),
-    ?assertMatch(#{in_len := 3, out_len := 1}, maps:get(Pid, Demands)),
+    ?assertMatch(#{in_len := 7, out_len := 1}, maps:get(Pid, Demands)),
     gen_tcp:close(Sock).
 
 %% A non-integer length is a protocol violation: I2P_ERROR reply and the
