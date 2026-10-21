@@ -8,12 +8,15 @@ are not in scope and do not change 1.0.0. See `3M0RBXX` for the decision and
 
 ## Snapshot
 
-- **i2pd version:** 2.61.0
-- **Date taken:** 2026-10-07 (interop suite run, see `ENFW64W`)
+- **i2pd version:** 3.0.0
+- **Date taken:** 2026-10-21 (snapshot bumped on i2pd 3.0.0 release; interop
+  suite re-run pending, see `94S9H7K`)
 - **i2per release at snapshot:** 0.6.0
-- **Source of the capability list:** i2pd 2.61.0 release notes plus the
+- **Source of the capability list:** i2pd 3.0.0 release notes plus the
   capabilities exercised by `scripts/interop_i2pd.sh` and
   `docs/protocol.md`.
+- **Previous snapshot:** 2.61.0 (2026-10-07). Per the header, capabilities new in
+  3.0.0 do not change 1.0.0 unless explicitly absorbed (see "1.0.0 material").
 
 Rows are one verdict, not prose: **done** (implemented and exercised),
 **partial** (implemented partially / bounded / off by default), or **absent**
@@ -37,31 +40,43 @@ Rows are one verdict, not prose: **done** (implemented and exercised),
 | Transit tunnel participation | partial | available, bounded, off by default |
 | Inbound gateway role | done | |
 | Outbound gateway role | done | client send runs in caller process (ADR 0003) |
-| Streaming protocol | done | implemented; field accessors read through and written around (#C252TF7) |
-| NetDb (lookup / store) | done | RI and LeaseSet lookups |
+| Streaming protocol | done | implemented; field accessors read through and written around (#C252TF7); i2pd 3.0.0 new UDP tunnels window/ack policy |
+| NetDb (lookup / store) | done | RI and LeaseSet lookups; i2pd 3.0.0 faster lookups, rejects LS type 1 from ECIES sessions, rejects ipv4-mapped ipv6 in RI |
 | Floodfill participation | partial | available, off by default |
 | LeaseSet v2 | done | |
 | LeaseSet v1 | absent | 1.0.0 material (see `0.2.0` map) |
-| Encrypted / Meta LeaseSets | absent | 1.0.0 material |
-| SAM v3 | done | `i2p_sam_srv` |
+| Encrypted / Meta LeaseSets | absent | 1.0.0 material; i2pd 3.0.0 adds offline keys for encrypted LeaseSets |
+| SAM v3 | done | `i2p_sam_srv`; i2pd 3.0.0 ships SAM 3.3 — extensions (offline keys, multi-dest) are 1.0.0 candidates |
 | I2CP | absent | excluded by maintainer decision |
-| Datagram2 | absent | correctness gap, deferred |
+| Datagram2 | absent | correctness gap, deferred; i2pd 3.0.0 fixed Datagram2 signatures |
 | Addressbook (subscribe) | done | |
 | Addressbook (publish) | absent | deferred |
+| Multi-destination client tunnels | absent | i2pd 3.0.0; operator surface, undecided |
+| Torrents tunnels (RPC/magnets/PEX/DHT/datagram trackers) | absent | i2pd 3.0.0; out of scope for 1.0.0 |
+| Post-quantum (ML-KEM) NTCP2 | absent | i2pd 2.59+; new crypto, out of scope per header |
 | Charlie / introducer role | done | in-session RelayResponse and out-of-session HolePunch (type 11), rate-limited and endpoint-checked (`A740VAB`) |
 | Automatic NetDb-driven Charlie selection | done | SSU2 + peer_test + public address candidates; uniform random; one Charlie per cycle; per-Alice 60s rate limit; code-2 reject on failure |
 | Peer testing | done | measured reachability ladder |
 | Measured reachability | done | see `CD7ZBVH` |
-| TUN interface | absent | excluded by maintainer decision |
-| SOCKS / HTTP proxy / BOB / I2PControl | absent | operator surface, undecided |
+| TUN interface | done (separate app) | `i2per_tun` companion app (ADR 0001) |
+| SOCKS / HTTP proxy / BOB / I2PControl | done (separate app) | `i2per_proxy` companion app; i2pd 3.0.0 adds `LocalDestinationInfo` to I2PControl |
 | In-built status monitor | partial | separate presentation app (`i2per_status`) |
 | UPnP / NAT traversal service | absent | one-shot indirect dial only |
 
 ## 1.0.0 material explicitly listed
 
-- LeaseSet v1, EncryptedLeaseSet, MetaLeaseSet.
-- SOCKS / HTTP proxy / BOB / I2PControl console.
-- TUN interface.
+- LeaseSet v1, EncryptedLeaseSet, MetaLeaseSet (offline keys now in i2pd 3.0.0).
+- SOCKS / HTTP proxy / BOB / I2PControl console (delivered as `i2per_proxy`).
+- TUN interface (delivered as `i2per_tun`).
+- SAM 3.3 extensions (offline keys, multi-destination) — candidate from i2pd 3.0.0.
+- Datagram2 replay protection (correctness gap, see `NTWZWTC`).
+
+## New in i2pd 3.0.0 — out of scope for 1.0.0 (post-snapshot)
+
+- Torrents tunnels with RPC, magnets, PEX, DHT, datagram trackers.
+- Multi-destination client tunnels.
+- Post-quantum (ML-KEM) NTCP2/SSU2 crypto.
+- New UDP tunnels window and ack policy.
 
 ## Freshness
 
