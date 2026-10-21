@@ -43,6 +43,17 @@ changes, so a 0.4.0 `data_dir` is read unchanged.
 
 ## [Unreleased]
 
+_(nothing yet)_
+
+## [0.6.0] — 2026-10-21
+
+**The reachability-automation release.** 0.5.0 managed throughput; 0.6.0
+manages reachability: a router selects its own Charlies from the network
+database instead of requiring the operator to supply one, and the tunnel stack
+builds variable-length tunnels up to i2pd's 7-hop cap. The NTCP2 XK handshake
+joins the hermetic gate. No wire-format or configuration-key changes, so a
+0.5.0 `data_dir` is read unchanged.
+
 ### Changed
 
 - **Automatic NetDb-driven Charlie selection.** Bob (the introducer) now
@@ -61,6 +72,8 @@ changes, so a 0.4.0 `data_dir` is read unchanged.
   network: our msg1 and msg3 re-encode to the captured bytes, i2pd's msg2 opens
   under the reconstructed handshake state, and the data-phase frames that follow
   decrypt under keys derived from it (#7B96TT8).
+- **Test layering.** Three system tests that sat in the eunit layer now run in
+  Common Test (#ZN4GA6B).
 
 ### Fixed
 
