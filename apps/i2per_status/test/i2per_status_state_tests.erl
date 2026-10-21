@@ -7,7 +7,7 @@ not-implemented/irrelevant fallthrough clauses.
 
 The callbacks are exercised directly with crafted state maps (they are
 exported parts of the gen_server behaviour surface); the live server against a
-router is covered end-to-end in `m:i2per_status_tests`.
+router is covered end-to-end in `m:i2per_status_service_SUITE`.
 """.
 
 -include_lib("eunit/include/eunit.hrl").

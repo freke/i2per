@@ -673,9 +673,9 @@ sam_session_limit_rejects_new_child(_Config) ->
 %% read.
 %%
 %% **Scope: the refusal, not the independence.** That a stream cap says nothing
-%% about sessions is pinned in the unit tier, by
-%% `stream_conn_cap_does_not_bound_sessions_test/0` in `i2p_admission_tests`,
-%% where a session can actually be started cheaply. Here the equivalent assertion
+%% about sessions is pinned in `m:i2p_admission_SUITE`, by
+%% `stream_conn_cap_does_not_bound_sessions`, where a session can actually be
+%% started cheaply. Here the equivalent assertion
 %% would mean booting a real `i2p_sam_session`, which needs a client destination
 %% and a socket -- so it would test that module rather than the cap. What is
 %% asserted instead is the count staying at zero, which is the half that would fail
