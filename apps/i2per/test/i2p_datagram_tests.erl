@@ -49,4 +49,75 @@ malformed() ->
     %% Non-binary input
     ?assertEqual(error, i2p_datagram:decode(wrong)),
     %% Sender destination must be a full 391-byte binary
-    ?assertEqual(error, i2p_datagram:encode(<<0:16/unit:8>>, Seed, <<"x">>)).
+    ?assertEqual(error, i2p_datagram:encode(<<0:16/unit:8>>, Seed, <<"x">>)),
+    %% Target hash must be 32 bytes
+    ?assertEqual(error, i2p_datagram:encode2(FromBin, Seed, <<0:16/unit:8>>, <<"x">>)),
+    %% Payload must be a binary
+    ?assertEqual(
+        error, i2p_datagram:encode2(FromBin, Seed, crypto:hash(sha256, <<"t">>), not_a_binary)
+    ).
+
+datagram2_codec_test_() ->
+    [
+        {"round-trip keeps sender destination and payload", fun roundtrip2/0},
+        {"tampered payload fails authentication", fun tampered2/0},
+        {"signature by another key fails", fun foreign_signer2/0},
+        {"malformed frames fail closed", fun malformed2/0},
+        {"unsupported flag bits fail closed", fun flag_bits2/0}
+    ].
+
+roundtrip2() ->
+    #{identity := Id, sign_priv := Seed} = i2p_keys:generate_with_privkeys(),
+    FromBin = i2p_keys:to_binary(Id),
+    TargetHash = crypto:hash(sha256, <<"target destination">>),
+    Payload = <<"ping over datagram2">>,
+    {ok, Wire} = i2p_datagram:encode2(FromBin, Seed, TargetHash, Payload),
+    ?assertEqual(391 + 2 + byte_size(Payload) + 64, byte_size(Wire)),
+    {ok, #{from := FromBin, payload := Payload, flags := 16#0002}} =
+        i2p_datagram:decode2(Wire, TargetHash).
+
+tampered2() ->
+    #{identity := Id, sign_priv := Seed} = i2p_keys:generate_with_privkeys(),
+    TargetHash = crypto:hash(sha256, <<"target destination">>),
+    {ok, Wire} = i2p_datagram:encode2(
+        i2p_keys:to_binary(Id), Seed, TargetHash, <<"attack at dawn">>
+    ),
+    HeadSize = 391 + 2,
+    <<Head:HeadSize/binary, P, Rest/binary>> = Wire,
+    ?assertEqual(
+        error, i2p_datagram:decode2(<<Head/binary, (P bxor 16#FF), Rest/binary>>, TargetHash)
+    ).
+
+foreign_signer2() ->
+    #{sign_priv := SeedA} = i2p_keys:generate_with_privkeys(),
+    #{identity := IdB} = i2p_keys:generate_with_privkeys(),
+    TargetHash = crypto:hash(sha256, <<"target destination">>),
+    {ok, Wire} = i2p_datagram:encode2(i2p_keys:to_binary(IdB), SeedA, TargetHash, <<"spoof">>),
+    ?assertEqual(error, i2p_datagram:decode2(Wire, TargetHash)).
+
+malformed2() ->
+    #{identity := Id, sign_priv := Seed} = i2p_keys:generate_with_privkeys(),
+    FromBin = i2p_keys:to_binary(Id),
+    TargetHash = crypto:hash(sha256, <<"target destination">>),
+    {ok, Wire} = i2p_datagram:encode2(FromBin, Seed, TargetHash, <<"payload">>),
+    ?assertEqual(error, i2p_datagram:decode2(binary:part(Wire, 0, 400), TargetHash)),
+    ?assertEqual(error, i2p_datagram:decode2(<<>>, TargetHash)),
+    ?assertEqual(error, i2p_datagram:decode2(<<0, 1, 2, 3>>, TargetHash)),
+    ?assertEqual(error, i2p_datagram:decode2(Wire, wrong)),
+    ?assertEqual(error, i2p_datagram:decode2(Wire, <<0:16/unit:8>>)),
+    ?assertEqual(error, i2p_datagram:decode2(not_a_binary, TargetHash)).
+
+flag_bits2() ->
+    #{identity := Id, sign_priv := Seed} = i2p_keys:generate_with_privkeys(),
+    FromBin = i2p_keys:to_binary(Id),
+    TargetHash = crypto:hash(sha256, <<"target destination">>),
+    Payload = <<"payload">>,
+    lists:foreach(
+        fun(Flags) ->
+            ToSign = <<TargetHash:32/binary, Flags:16/big, Payload/binary>>,
+            Sig = i2p_crypto:ed25519_sign(ToSign, Seed),
+            Wire = <<FromBin:391/binary, Flags:16/big, Payload/binary, Sig:64/binary>>,
+            ?assertEqual(error, i2p_datagram:decode2(Wire, TargetHash))
+        end,
+        [16#0012, 16#0022]
+    ).
