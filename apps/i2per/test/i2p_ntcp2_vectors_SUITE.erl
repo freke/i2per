@@ -211,14 +211,19 @@ is_ntcp2(_) -> false.
 %% And the msg3 payload i2pd accepted names *us*: it is the type-2 block wrapping
 %% our signed RouterInfo, and its identity must be the one the replay built from
 %% the pinned static key. A fixture whose payload carried someone else's identity
-%% would still re-encode, so the payload is decoded rather than only compared.
+%% would still re-encode, so the payload is decoded rather than only compared --
+%% and the `s` option is compared against the pinned static key, not just its
+%% presence, because a payload carrying another router's RouterInfo on loopback
+%% would otherwise pass every assertion here.
 msg3_payload_carries_our_router_info(Config) ->
     #{msg3_payload := Payload} = replay_state(Config),
+    AlicePub = unhex(required(alice, path(static_pub), terms(Config))),
     {ok, Blocks} = i2p_framing:decode_blocks(Payload),
     [#{type := 2, data := <<0:8, Data/binary>>} | _] = Blocks,
     {ok, PayloadRI} = i2p_router_info:decode(Data),
-    [#{transport := <<"NTCP2">>, options := #{<<"host">> := <<"127.0.0.1">>}} | _] =
+    [#{transport := <<"NTCP2">>, options := #{<<"host">> := <<"127.0.0.1">>, <<"s">> := S}} | _] =
         [A || A = #{transport := <<"NTCP2">>} <- i2p_router_info:addresses(PayloadRI)],
+    AlicePub = i2p_keys:decode_b64(S),
     ok.
 
 %% ---------------------------------------------------------------------------
