@@ -273,16 +273,20 @@ the_data_phase_frames_open_under_the_derived_keys(Config) ->
 %% encoder is handed that state and the plaintext, and the state the frame
 %% advances into is the mask source the receiver also derives. Re-encoding from
 %% what the frame opened to is therefore the whole claim: same keys, same
-%% message number, same state, same bytes.
+%% message number, same state, same bytes -- and the two states are compared
+%% rather than discarded, because an encoder that advanced into a different
+%% state would still produce this frame and only fail on the next one, where the
+%% mistake would surface as an opaque AEAD error.
 the_keepalive_re_encodes_to_the_captured_bytes(Config) ->
     #{keys := Keys} = replay_state(Config),
     [AbHex] = required(ab_frames, terms(Config)),
     AbFrame = unhex(AbHex),
     Sip = maps:get(sip_ab, Keys),
-    {ok, Payload, _SipAfterFrame} = i2p_framing:decrypt_frame(
+    {ok, Payload, SipAfterFrame} = i2p_framing:decrypt_frame(
         maps:get(k_ab, Keys), 0, AbFrame, Sip
     ),
-    {Frame, _SipAfterEncode} = i2p_framing:encrypt_frame(maps:get(k_ab, Keys), 0, Payload, Sip),
+    {Frame, SipAfterEncode} = i2p_framing:encrypt_frame(maps:get(k_ab, Keys), 0, Payload, Sip),
+    SipAfterFrame = SipAfterEncode,
     AbFrame = i2p_framing:frame_bytes(Frame),
     ok.
 
