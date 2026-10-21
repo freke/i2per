@@ -480,7 +480,16 @@ counters() ->
         charlie_selections_attempted,
         charlie_selections_succeeded,
         charlie_selections_no_candidate,
-        charlie_selections_rejected
+        charlie_selections_rejected,
+
+        %% %%%%% Datagram2 %%%%%
+        %%
+        %% **Inbound Datagram2 frames.** `datagram2_received` counts frames that
+        %% decoded and authenticated and were delivered to the SAM client;
+        %% `datagram2_replayed` counts frames dropped as replays by the
+        %% per-destination replay window.
+        datagram2_received,
+        datagram2_replayed
     ].
 
 -doc """

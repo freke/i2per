@@ -30,7 +30,14 @@ suite() ->
     [{timetrap, 30000}].
 
 all() ->
-    [].
+    [datagram2_session_creates].
+
+%% Smoke: a DATAGRAM2 session can be created and answers SESSION STATUS OK.
+datagram2_session_creates(_Config) ->
+    Keys = gen_keys(),
+    {ok, Sock, _Ident} = datagram2_session(<<"dg2">>, Keys),
+    gen_tcp:close(Sock),
+    ok.
 
 init_per_testcase(forged_dropped, Config) ->
     setup_app(),
@@ -81,6 +88,10 @@ datagram_session(Id, Keys) ->
 raw_session(Id, Keys) ->
     session(Id, Keys, <<"RAW">>).
 
+%% Open a SAM socket, handshake, create a DATAGRAM2-style session.
+datagram2_session(Id, Keys) ->
+    session(Id, Keys, <<"DATAGRAM2">>).
+
 session(Id, Keys, Style) ->
     Sock = connect_sam(),
     send_cmd(Sock, <<"HELLO VERSION MIN=3.1 MAX=3.1">>),
@@ -116,7 +127,8 @@ send_datagram(Sock, TargetDestB64, Kind, Payload) ->
     Verb =
         case Kind of
             repliable -> <<"DATAGRAM SEND">>;
-            raw -> <<"RAW SEND">>
+            raw -> <<"RAW SEND">>;
+            datagram2 -> <<"DATAGRAM2 SEND">>
         end,
     Line = <<
         Verb/binary,

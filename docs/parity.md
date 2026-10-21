@@ -48,7 +48,7 @@ Rows are one verdict, not prose: **done** (implemented and exercised),
 | Encrypted / Meta LeaseSets | absent | 1.0.0 material; i2pd 3.0.0 adds offline keys for encrypted LeaseSets |
 | SAM v3 | done | `i2p_sam_srv`; i2pd 3.0.0 ships SAM 3.3 — extensions (offline keys, multi-dest) are 1.0.0 candidates |
 | I2CP | absent | excluded by maintainer decision |
-| Datagram2 | absent | correctness gap, deferred; i2pd 3.0.0 fixed Datagram2 signatures |
+| Datagram2 | done | codec (`encode2`/`decode2`, signature over target hash) + bounded per-destination replay window + SAM `STYLE=DATAGRAM2` / `DATAGRAM2 SEND` with `DATAGRAM2 RECEIVED`; options Mapping and offline signatures deferred (R85EHTA) |
 | Addressbook (subscribe) | done | |
 | Addressbook (publish) | absent | deferred |
 | Multi-destination client tunnels | absent | i2pd 3.0.0; operator surface, undecided |

@@ -1558,7 +1558,7 @@ packet
 | Field | Size | Description |
 |-------|------|-------------|
 | from | 391 | Sender Destination (X25519 ‖ padding ‖ Ed25519 ‖ KEY cert), same fixed layout as every destination in this router. Its signing key verifies the signature. |
-| signature | 64 | Ed25519 over the **payload bytes only** (non-DSA rule, release 0.9.14+). Datagram2 replay protection is not implemented in this release. |
+| signature | 64 | Ed25519 over the **payload bytes only** (non-DSA rule, release 0.9.14+). Datagram2 (Proposal 163) is implemented: `encode2`/`decode2` sign over the target destination hash + flags + payload, with a bounded per-destination FIFO replay window (capacity fixed, counters `accepted`/`replayed`/`evicted`); options Mapping and offline signatures are not implemented. |
 | payload | 1..~11 KB practical | Application bytes. Unreliable and unordered end-to-end. |
 
 RAW datagrams carry no header at all: the Data-clove payload is the

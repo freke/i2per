@@ -160,6 +160,10 @@ parse_command_tokens([<<"RAW">>, <<"SEND">> | Rest]) ->
     Dest = parse_kv(<<"DESTINATION">>, Rest, <<>>),
     Size = parse_kv(<<"SIZE">>, Rest, <<>>),
     {datagram_send, raw, Dest, Size};
+parse_command_tokens([<<"DATAGRAM2">>, <<"SEND">> | Rest]) ->
+    Dest = parse_kv(<<"DESTINATION">>, Rest, <<>>),
+    Size = parse_kv(<<"SIZE">>, Rest, <<>>),
+    {datagram_send, datagram2, Dest, Size};
 parse_command_tokens([<<"NAMING">>, <<"LOOKUP">> | Rest]) ->
     Name = parse_kv(<<"NAME">>, Rest, <<>>),
     {naming_lookup, Name};
@@ -182,6 +186,7 @@ parse_kv(Key, [Elem | Rest], Default) ->
 -spec parse_session_style(binary()) -> i2p_sam_session:style().
 parse_session_style(<<"STREAM">>) -> stream;
 parse_session_style(<<"DATAGRAM">>) -> datagram;
+parse_session_style(<<"DATAGRAM2">>) -> datagram2;
 parse_session_style(<<"RAW">>) -> raw;
 parse_session_style(_) -> stream.
 

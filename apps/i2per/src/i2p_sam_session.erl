@@ -61,10 +61,10 @@ Sessions are spawned by `m:i2p_sam_listener` and are not started directly.
 -type phase() :: hello | established | raw.
 
 -doc "Session client form — the STYLE= of SESSION CREATE.".
--type style() :: stream | datagram | raw.
+-type style() :: stream | datagram | datagram2 | raw.
 
 -doc "Datagram kind carried by a DATAGRAM/RAW SEND command.".
--type send_kind() :: repliable | raw.
+-type send_kind() :: repliable | raw | datagram2.
 
 -doc """
 Tunnel-length options parsed from SESSION CREATE (`inbound.length` /
@@ -115,7 +115,8 @@ dialled once the handshake completed (`sock` is `undefined` while dialling).
     connecting => boolean(),
     pending_connect_b64 => binary() | undefined,
     forward => forward_target() | undefined,
-    fwd_relays => #{pid() => fwd_relay()}
+    fwd_relays => #{pid() => fwd_relay()},
+    replay_window => term()
 }.
 
 -doc "Start a SAM session process.".
@@ -133,7 +134,8 @@ init(#{sock := Sock, local := Local}) ->
         phase => hello,
         local => Local,
         buf => <<>>,
-        read => undefined
+        read => undefined,
+        replay_window => i2p_datagram_replay:new(1024)
     }}.
 
 handle_call(_Request, _From, State) ->
@@ -232,6 +234,9 @@ handle_control_info({stream_data, Wire}, #{style := datagram} = State) when is_b
     %% Garlic opened under this DATAGRAM session's key: one repliable
     %% datagram.
     {noreply, deliver_datagram(Wire, State)};
+handle_control_info({stream_data, Wire}, #{style := datagram2} = State) when is_binary(Wire) ->
+    %% Garlic opened under this DATAGRAM2 session's key: one Datagram2.
+    {noreply, deliver_datagram2(Wire, State)};
 handle_control_info({stream_data, Wire}, #{style := raw} = State) when is_binary(Wire) ->
     %% Garlic opened under this RAW session's key: one anonymous datagram.
     {noreply, deliver_raw(Wire, State)};
@@ -654,7 +659,7 @@ handle_stream_forward(_Id, _HostBin, _PortBin, State) ->
 -spec handle_datagram_send(send_kind(), binary(), binary(), state()) -> state().
 handle_datagram_send(Kind, DestB64, SizeBin, State) ->
     case maps:get(style, State, undefined) of
-        Style when Style =:= datagram orelse Style =:= raw ->
+        Style when Style =:= datagram orelse Style =:= datagram2 orelse Style =:= raw ->
             Size = binary_to_integer(SizeBin),
             case Size >= 1 andalso Size =< ?MAX_DATAGRAM of
                 true ->
@@ -740,7 +745,18 @@ payload_step(#{read := Read} = State, Data) ->
 finish_send(Kind, DestB64, Payload, State) ->
     case resolve_send_target(DestB64) of
         {ok, Route} ->
-            i2p_client:send_wire(Route, datagram_wire(Kind, Payload, State)),
+            Wire =
+                case {Kind, maps:get(style, State, undefined)} of
+                    {raw, _} ->
+                        Payload;
+                    {datagram2, _} ->
+                        datagram2_wire(Payload, State, Route);
+                    {repliable, datagram2} ->
+                        datagram2_wire(Payload, State, Route);
+                    {repliable, _} ->
+                        datagram_wire(repliable, Payload, State)
+                end,
+            i2p_client:send_wire(Route, Wire),
             State;
         error ->
             State
@@ -755,9 +771,20 @@ datagram_wire(repliable, Payload, State) ->
             maps:get(sign_priv, State),
             Payload
         ),
-    Wire;
-datagram_wire(raw, Payload, _State) ->
-    Payload.
+    Wire.
+
+%% datagram2_wire/3 — build a Datagram2 garlic Data-clove payload for one send.
+-spec datagram2_wire(binary(), state(), i2p_client:route()) -> binary().
+datagram2_wire(Payload, State, Route) ->
+    TargetHash = maps:get(dest_hash, Route),
+    {ok, Wire} =
+        i2p_datagram:encode2(
+            i2p_keys:to_binary(maps:get(dest, State)),
+            maps:get(sign_priv, State),
+            TargetHash,
+            Payload
+        ),
+    Wire.
 
 %% resolve_send_target/1 — a base64 destination (or address-book name)
 %% resolved to a lease route like STREAM CONNECT.
@@ -801,6 +828,35 @@ deliver_datagram(Wire, State) ->
             ]),
             ok = gen_tcp:send(maps:get(sock, State), Payload),
             State;
+        error ->
+            State
+    end.
+
+%% deliver_datagram2/2 — announce an authenticated inbound Datagram2 on the
+%% control socket, with replay protection. Replayed or malformed frames are
+%% dropped silently.
+-spec deliver_datagram2(binary(), state()) -> state().
+deliver_datagram2(Wire, State) ->
+    TargetHash = maps:get(dest_hash, State),
+    case i2p_datagram:decode2(Wire, TargetHash) of
+        {ok, #{from := FromBin, payload := Payload}} ->
+            Key = crypto:hash(sha256, Wire),
+            W0 = maps:get(replay_window, State, i2p_datagram_replay:new(1024)),
+            case i2p_datagram_replay:check(W0, Key) of
+                {replay, W1} ->
+                    i2p_counters:add(datagram2_replayed, 1),
+                    State#{replay_window => W1};
+                {accepted, W1} ->
+                    i2p_counters:add(datagram2_received, 1),
+                    send_line(State, [
+                        <<"DATAGRAM2 RECEIVED DESTINATION=">>,
+                        i2p_keys:encode_b64(FromBin),
+                        <<" SIZE=">>,
+                        integer_to_binary(byte_size(Payload))
+                    ]),
+                    ok = gen_tcp:send(maps:get(sock, State), Payload),
+                    State#{replay_window => W1}
+            end;
         error ->
             State
     end.
