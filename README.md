@@ -1,7 +1,7 @@
 # i2per
 
 `i2per` is an Erlang/OTP implementation of an I2P router with a SAM v3 client
-bridge. This repository contains the 0.5.0 release. It implements the modern
+bridge. This repository contains the 0.6.0 release. It implements the modern
 X25519 and Ed25519 protocol surface, including NTCP2, SSU2, ECIES tunnel
 creation, LeaseSet2, the I2P streaming protocol, and bounded tunnel relay
 participation.
@@ -9,20 +9,20 @@ participation.
 The project interoperates with I2P routers. It does not bundle code from
 `i2pd` or `i2p-java`; the repository's `NOTICE` file records the attribution.
 
-> **Status: 0.5.0 is cut and published.** The release page
+> **Status: 0.6.0 is in preparation.** The release page
 > (<https://github.com/freke/i2per/releases>) will carry the relx tarball and its
 > provenance MANIFEST, built by CI from the tag rather than by a person
 > remembering to run `just release`. The documentation site is published from the
 > same tag at <https://freke.github.io/i2per/>. `CHANGELOG.md` records what
 > changed, including the known issues an operator should know about.
 >
-> 0.5.0 is the performance release: SSU2 gains RTT estimation and window-based
-> congestion control, so a router manages its own throughput instead of relying
-> on a fixed resend timer. It also captures the SSU2 data-phase vectors from a
-> real i2pd and surfaces RTT and congestion state in `i2p_status_data:view/0`.
-> No wire-format or configuration-key changes, so a 0.4.0 `data_dir` is read
-> unchanged. The external i2pd interoperability suite remains a local
-> diagnostic; it is not a required CI gate.
+> 0.6.0 is the reachability-automation release: a router selects its own
+> Charlies from the NetDb on an inbound peer test instead of requiring the
+> operator to supply one, and the tunnel stack builds variable-length tunnels
+> up to a 7-hop maximum. The NTCP2 XK handshake joins the SSU2 data phase in
+> the hermetic gate. No wire-format or configuration-key changes, so a 0.5.0
+> `data_dir` is read unchanged. The external i2pd interoperability suite
+> remains a local diagnostic; it is not a required CI gate.
 > See [ADR 0001](https://github.com/freke/i2per/blob/main/docs/adr/0001-data-only-core-with-presentation-apps.md),
 > [ADR 0002](https://github.com/freke/i2per/blob/main/docs/adr/0002-the-logging-floor-the-bus-is-the-instrument.md)
 > and the [changelog](CHANGELOG.md) for the reasoning.
@@ -101,6 +101,24 @@ The project interoperates with I2P routers. It does not bundle code from
 - **Scope:** 0.5.0 anchors on RC68AGE alone; NetDb-driven Charlie selection is
   deferred to 0.6.0.
 
+## Included in 0.6.0
+
+- **Automatic NetDb-driven Charlie selection:** Bob selects a Charlie from the
+  NetDb on an inbound PeerTest message 1 — SSU2 address with the `B` peer-test
+  capability and a published host/port, uniform random, one Charlie per cycle,
+  per-Alice rate limit — and replies the deterministic code-2 reject when no
+  candidate is available. The manual `dial_charlie/3` path remains for tests
+  and operators.
+- **Tunnel build v2:** the maximum tunnel hop count rises from 3 to 7, matching
+  i2pd; the default build stays 3 hops.
+- **NTCP2 vectors in the hermetic gate:** the NTCP2 XK handshake is captured
+  from a real i2pd alongside the SSU2 data phase and replayed on every push by
+  `i2p_ntcp2_vectors_SUITE`, with no i2pd and no network.
+- **Test layering:** three system tests that sat in the eunit layer now run in
+  Common Test.
+- **Scope:** 0.6.0 anchors on the reachability cluster; Datagram2 with replay
+  protection is deferred to 0.7.0.
+
 The default profile is a local client. It does not contact the live network,
 publish a floodfill RouterInfo, or accept public transit unless an operator
 explicitly enables those choices.
@@ -168,7 +186,7 @@ Wait for `===> Booted i2per`, then run these checks at the Erlang prompt:
 application:ensure_all_started(i2per).
 true = is_pid(whereis(i2per_sup)).
 %% The version string moves with each release; it is the app's own {vsn, ...}.
-{ok, "0.5.0"} = application:get_key(i2per, vsn).
+{ok, "0.6.0"} = application:get_key(i2per, vsn).
 ```
 
 The successful results are `{ok,[i2per]}`, `true`, and `ok`. Leave the shell
@@ -361,7 +379,7 @@ application:set_env(i2per, addressbook, #{
 Values already present in `sys.config` or the application environment take
 precedence over values in `i2per.conf`. In particular, edit the release's
 `releases/<vsn>/sys.config` to change the shipped `./data` directory (the
-directory is named after the release, so it carries the version — `0.5.0` for
+directory is named after the release, so it carries the version — `0.6.0` for
 this release). A
 persistent boot requires `data_dir` and `seeds` in the application environment.
 The release profile sets `live_network = false` and `ntcp2_published = false`;
@@ -492,18 +510,18 @@ part of the normal gate. `just live-smoke` is an offline self-check. Use
 
 ## Release limitations
 
-The 0.5.0 release does not implement NTCP1, SSU1, I2CP, the legacy ElGamal/AES
-crypto formats, Datagram2, or a TUN interface. SSU2 path migration and automatic
-NetDb-driven Charlie selection are outside this release. Floodfill and transit
-participation are available as bounded features, but they are not enabled by
-the shipped default profile. Automatic NetDb-driven Charlie selection is not
-implemented: the Charlie role itself is (a tagged session answers a RelayIntro,
-verifies the requester's signature and punches), so a peer that already holds a
-tag from i2per can select it. In-place relup upgrades are not supported;
-upgrading means installing a new tarball. 0.5.0 keeps the 0.4.0 dial and hot
-path surface and adds SSU2 RTT estimation and window-based congestion control,
-hermetic SSU2 vectors, and status-page visibility; a `data_dir` written by
-0.4.0 is read unchanged.
+The 0.6.0 release does not implement NTCP1, SSU1, I2CP, the legacy ElGamal/AES
+crypto formats, Datagram2, or a TUN interface. SSU2 path migration is outside
+this release. Floodfill and transit participation are available as bounded
+features, but they are not enabled by the shipped default profile. Automatic
+NetDb-driven Charlie selection is implemented: on an inbound peer test Bob
+picks a qualifying Charlie from the NetDb (SSU2 address with the `B` peer-test
+capability and a published host/port), and the manual `dial_charlie/3` path
+remains for tests and operators. In-place relup upgrades are not supported;
+upgrading means installing a new tarball. 0.6.0 keeps the 0.5.0 dial and hot
+path surface and adds NetDb-driven Charlie selection, the 7-hop tunnel cap,
+and NTCP2 vectors in the hermetic gate; a `data_dir` written by 0.5.0 is read
+unchanged.
 
 `CHANGELOG.md` lists the known issues for this release: the event bus's far
 side is unbounded if a subscriber node stops draining (OTP 28 offers no cap

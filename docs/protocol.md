@@ -1,6 +1,6 @@
 # Protocol Reference
 
-This document describes the I2P wire formats implemented by i2per 0.5.0.
+This document describes the I2P wire formats implemented by i2per 0.6.0.
 Unsupported formats and release limitations are listed explicitly.
 
 All multi-byte integers in I2P are big-endian unless otherwise noted. Ed25519
@@ -12,17 +12,18 @@ in the [I2P documentation](https://i2p.net/en/docs/).
 
 ## Release boundaries
 
-The 0.5.0 release does not implement NTCP1, SSU1, I2CP, the legacy
+The 0.6.0 release does not implement NTCP1, SSU1, I2CP, the legacy
 ElGamal/AES garlic formats, Datagram2, or a TUN interface. SSU2 path migration
-and automatic Charlie selection for PeerTest are
-also outside this release. The Charlie role is implemented: a tagged session
+is also outside this release. The Charlie role is implemented: a tagged session
 answers a RelayIntro as Charlie, verifies the requester's signature, checks the
 asserted endpoint, and punches, and the relay accept now grants a session token
-that Bob validates on the redirect (see #BFKFGY0, #98GAVQK).
-The sections below describe only behavior that is present in 0.5.0. 0.5.0 makes
-no wire-format changes over 0.4.0: SSU2 gains RTT estimation and window-based
-congestion control, which are transport-layer behaviour rather than wire format;
-the Charlie RelayResponse and HolePunch
+that Bob validates on the redirect (see #BFKFGY0, #98GAVQK). Automatic
+NetDb-driven Charlie selection is implemented (#6TGF083), and the tunnel build
+accepts up to 7 hops (#K62PQHJ).
+The sections below describe only behavior that is present in 0.6.0. 0.6.0 makes
+no wire-format changes over 0.5.0: automatic Charlie selection and the raised
+hop cap are control-plane behaviour rather than wire format; the Charlie
+RelayResponse and HolePunch
 blocks and the measured-reachability caps remain as shipped in 0.3.0.
 ## Implemented
 
@@ -1124,7 +1125,7 @@ start it on demand. See the full
 | `HELLO VERSION [MIN=…] [MAX=…]` | `HELLO REPLY RESULT=OK VERSION=3.1` | Required first command. The parser checks the `HELLO VERSION` shape; MIN/MAX are not negotiated and the reply version is fixed. | Implemented |
 | `DEST GENERATE SIGNATURE_TYPE=7` | one base64 line | Generate an Ed25519 destination private blob | Implemented |
 | `SESSION CREATE STYLE=STREAM ID=… DESTINATION=…` | `SESSION STATUS RESULT=OK DESTINATION=…` | Create a STREAM session; tunnel and LeaseSet work is asynchronous | Implemented |
-| `… SESSION CREATE` with `inbound.length=N outbound.length=N` | — (options on the same command) | Per-session tunnel lengths, clamped to 1–3 hops; drive the router's tunnel-pool targets and which inbound tunnel the published lease names | Implemented |
+| `… SESSION CREATE` with `inbound.length=N outbound.length=N` | — (options on the same command) | Per-session tunnel lengths, clamped to 1–7 hops; drive the router's tunnel-pool targets and which inbound tunnel the published lease names | Implemented |
 | `STREAM CONNECT ID=… DESTINATION=…` | `STREAM STATUS RESULT=OK` | Outbound connection | Implemented |
 | `STREAM ACCEPT ID=…` | base64 identity line, then raw mode | Register an inbound stream destination; the socket becomes raw immediately | Implemented |
 | `STREAM FORWARD ID=… PORT=… [HOST=…]` | `STREAM STATUS RESULT=OK` | Bind a local service; every inbound stream relays to a fresh local TCP connection (control socket stays in line mode) | Implemented |
@@ -1940,7 +1941,7 @@ covers it. Retransmission is idempotent to the receiver: fragments overwrite
 the same message-id/fragment-number slots, and whole blocks are re-forwarded
 at most idempotently by message identity. Pure ACK and keepalive
 (`path_challenge`/`path_response`) packets are never recorded, so they cannot
-feedback-loop. This release uses a fixed resend period. RTT estimation and window-based congestion control shipped in 0.5.0; path migration is not implemented.
+feedback-loop. RTT estimation and window-based congestion control shipped in 0.5.0 and govern the send path; the fixed `data_resend_ms` period above remains as the loss-recovery fallback. Path migration is not implemented.
 
 **Send queue under congestion.** When the congestion window is closed,
 `send_packet/3` queues the block list instead of sending it, up to
