@@ -44,8 +44,8 @@ Rows are one verdict, not prose: **done** (implemented and exercised),
 | NetDb (lookup / store) | done | RI and LeaseSet lookups; i2pd 3.0.0 faster lookups, rejects LS type 1 from ECIES sessions, rejects ipv4-mapped ipv6 in RI |
 | Floodfill participation | partial | available, off by default |
 | LeaseSet v2 | done | |
-| LeaseSet v1 | absent | 1.0.0 material (see `0.2.0` map) |
-| Encrypted / Meta LeaseSets | absent | 1.0.0 material; i2pd 3.0.0 adds offline keys for encrypted LeaseSets |
+| LeaseSet v1 | partial | receive, store and serve (store type 1); publishing not supported (X25519 + Ed25519 forces LeaseSet2) |
+| Encrypted / Meta LeaseSets | partial | type 5 (EncryptedLeaseSet) stored, expired and served; type 7 (MetaLeaseSet) stored but not re-broadcast; publishing not supported |
 | SAM v3 | done | `i2p_sam_srv`; i2pd 3.0.0 ships SAM 3.3 — extensions (offline keys, multi-dest) are 1.0.0 candidates |
 | I2CP | absent | excluded by maintainer decision |
 | Datagram2 | done | codec (`encode2`/`decode2`, signature over target hash) + options Mapping (flag bit 4) + offline signatures (flag bit 5, checked against the destination's own signing key) + bounded per-destination replay window + SAM `STYLE=DATAGRAM2` / `DATAGRAM2 SEND` with `DATAGRAM2 RECEIVED` |

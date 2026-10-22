@@ -394,12 +394,11 @@ An unsolicited store, or the reply to a successful DatabaseLookup. The
 one-byte store type is part of the DatabaseStore body, not part of a
 LeaseSet's own content. The values used by the I2NP codec are `0` (RouterInfo),
 `1` (LeaseSet), `3` (LeaseSet2), `5` (EncryptedLeaseSet), and `7`
-(MetaLeaseSet). i2per's NetDb path stores types `0`, `1`, and `3`. Types `5`
-and `7` **are decoded** — the codec reports every byte on the wire rather than
-only the types it understands — and are then dropped as unimplemented, with a
-warning naming the type. The distinction matters: a type i2per cannot parse and
-a type it has no parser for are different facts, and only the latter arrives
-here. Encrypted LeaseSet is live in both reference routers (off by default);
+(MetaLeaseSet). i2per's NetDb path stores types `0`, `1` (LeaseSet v1), `3`,
+`5` (EncryptedLeaseSet), and `7` (MetaLeaseSet). Type `5` is stored, expired
+and served verbatim; type `7` is stored but not re-broadcast. The codec
+reports every byte on the wire rather than only the types it understands.
+Encrypted LeaseSet is live in both reference routers (off by default);
 MetaLeaseSet remains draft.
 
 ```mermaid
@@ -1255,6 +1254,17 @@ byte; `i2p_i2np:db_store/5` places store type `3` immediately before the
 content in a DatabaseStore body. The LeaseSet2 content is not an encrypted
 blob: its properties, keys, and leases are carried in the signed clear form
 above.
+
+### LeaseSet (v1)
+
+The original, deprecated LeaseSet (DatabaseStore `store_type` `1`). i2per
+receives, stores, and serves v1 LeaseSets but never publishes one: its
+identities are X25519 + Ed25519, and a v1 encryption key is ElGamal, so
+publishing would require a legacy identity i2per does not have. Wire format:
+`destination ‖ encryption_key(256) ‖ signing_key ‖ num ‖ leases ‖ signature`.
+Leases are 44 bytes each (`gateway(32) ‖ tunnelID(4) ‖ endDate(8 ms)`); up
+to 16. Expiry is when all leases have ended (v1 carries no published
+timestamp). Implemented in `m:i2p_leaset_v1`.
 
 ### Streaming protocol
 

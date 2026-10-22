@@ -79,8 +79,15 @@ Floodfills = i2p_netdb_srv:closest_floodfills(Target, 3, []).
     store_binary/2,
     store_ls/2,
     store_ls_binary/2,
+    store_ls_v1/2,
+    store_ls_v1_binary/2,
+    store_ls_5_binary/3,
+    store_ls_7_binary/3,
     find/1,
     find_ls/1,
+    find_ls_v1/1,
+    find_ls_5/1,
+    find_ls_7/1,
     remove/1,
     routers/0,
     keys/0,
@@ -239,6 +246,61 @@ store_ls_binary(Bin, NowSec) ->
         {error, Reason} -> {error, Reason}
     end.
 
+-doc """
+Store a v1 LeaseSet from its raw signed content bytes.
+""".
+-spec store_ls_v1_binary(binary(), non_neg_integer()) ->
+    {ok, added | updated | older | expired} | {error, term()}.
+store_ls_v1_binary(Bin, NowSec) ->
+    case i2p_leaset_v1:decode(Bin) of
+        {ok, LS} -> {ok, store_ls_v1(LS, NowSec)};
+        {error, Reason} -> {error, Reason}
+    end.
+
+-doc """
+Store a verified v1 LeaseSet.
+""".
+-spec store_ls_v1(i2p_leaset_v1:lease_set(), non_neg_integer()) ->
+    added | updated | older | expired.
+store_ls_v1(LS, NowSec) ->
+    gen_server:call(?MODULE, {store_ls_v1, LS, NowSec}).
+
+-doc """
+Look up a v1 LeaseSet by destination hash.
+""".
+-spec find_ls_v1(i2p_netdb:ls_key()) -> {ok, i2p_leaset_v1:lease_set()} | not_found.
+find_ls_v1(Key) ->
+    gen_server:call(?MODULE, {find_ls_v1, Key}).
+
+-doc """
+Store an EncryptedLeaseSet (type 5) from its raw bytes.
+""".
+-spec store_ls_5_binary(i2p_netdb:ls_key(), binary(), non_neg_integer()) ->
+    {ok, added | updated} | {error, term()}.
+store_ls_5_binary(Key, Bin, NowSec) ->
+    gen_server:call(?MODULE, {store_ls_5, Key, Bin, NowSec}).
+
+-doc """
+Store a MetaLeaseSet (type 7) from its raw bytes.
+""".
+-spec store_ls_7_binary(i2p_netdb:ls_key(), binary(), non_neg_integer()) ->
+    {ok, added | updated} | {error, term()}.
+store_ls_7_binary(Key, Bin, NowSec) ->
+    gen_server:call(?MODULE, {store_ls_7, Key, Bin, NowSec}).
+
+-doc """
+Look up an EncryptedLeaseSet by destination hash.
+""".
+-spec find_ls_5(i2p_netdb:ls_key()) -> {ok, binary()} | not_found.
+find_ls_5(Key) ->
+    gen_server:call(?MODULE, {find_ls_5, Key}).
+
+-doc """
+Look up a MetaLeaseSet by destination hash.
+""".
+-spec find_ls_7(i2p_netdb:ls_key()) -> {ok, binary()} | not_found.
+find_ls_7(Key) ->
+    gen_server:call(?MODULE, {find_ls_7, Key}).
 -doc """
 Look up a LeaseSet2 by destination hash.
 
@@ -634,6 +696,9 @@ handle_call({store, RI, NowMs}, _From, {Store, Counters}) ->
 handle_call({store_ls, LS, NowSec}, _From, {Store, Counters}) ->
     {Store2, Outcome} = i2p_netdb:store_ls(Store, LS, NowSec),
     {reply, Outcome, {Store2, Counters}};
+handle_call({store_ls_v1, LS, NowSec}, _From, {Store, Counters}) ->
+    {Store2, Outcome} = i2p_netdb:store_ls_v1(Store, LS, NowSec),
+    {reply, Outcome, {Store2, Counters}};
 handle_call({find, Key}, _From, {Store, _} = State) ->
     case i2p_netdb:find(Store, Key) of
         {ok, RI} -> {reply, {ok, RI}, State};
@@ -642,6 +707,27 @@ handle_call({find, Key}, _From, {Store, _} = State) ->
 handle_call({find_ls, Key}, _From, {Store, _} = State) ->
     case i2p_netdb:find_ls(Store, Key) of
         {ok, LS} -> {reply, {ok, LS}, State};
+        error -> {reply, not_found, State}
+    end;
+handle_call({find_ls_v1, Key}, _From, {Store, _} = State) ->
+    case i2p_netdb:find_ls_v1(Store, Key) of
+        {ok, LS} -> {reply, {ok, LS}, State};
+        error -> {reply, not_found, State}
+    end;
+handle_call({store_ls_5, Key, Bin, NowSec}, _From, {Store, Counters}) ->
+    {ok, Store2, Outcome} = i2p_netdb:store_ls_5_binary_at(Store, Key, Bin, NowSec),
+    {reply, {ok, Outcome}, {Store2, Counters}};
+handle_call({store_ls_7, Key, Bin, NowSec}, _From, {Store, Counters}) ->
+    {ok, Store2, Outcome} = i2p_netdb:store_ls_7_binary_at(Store, Key, Bin, NowSec),
+    {reply, {ok, Outcome}, {Store2, Counters}};
+handle_call({find_ls_5, Key}, _From, {Store, _} = State) ->
+    case i2p_netdb:find_ls_5(Store, Key) of
+        {ok, Bin} -> {reply, {ok, Bin}, State};
+        error -> {reply, not_found, State}
+    end;
+handle_call({find_ls_7, Key}, _From, {Store, _} = State) ->
+    case i2p_netdb:find_ls_7(Store, Key) of
+        {ok, Bin} -> {reply, {ok, Bin}, State};
         error -> {reply, not_found, State}
     end;
 handle_call({remove, Key}, _From, {Store, Counters}) ->

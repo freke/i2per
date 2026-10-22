@@ -27,6 +27,8 @@ ok = i2p_tunnel_srv:inject(Injection, {tunnel, Gateway, TunnelID}, StdMsg).
 -export([
     pick_lease/1,
     pick_lease/2,
+    pick_lease_v1/1,
+    pick_lease_v1/2,
     wrap_payload/2,
     unwrap_payload/2,
     route_to_dest/1,
@@ -97,6 +99,40 @@ pick_lease(LS, NowMs) ->
             error;
         _ ->
             %% Freshest lease last after ascending end-date sort
+            Sorted = lists:sort([{maps:get(end_date, L), L} || L <- Fresh]),
+            {_MaxEnd, Best} = lists:last(Sorted),
+            {ok, {maps:get(gateway, Best), maps:get(tunnel_id, Best)}}
+    end.
+
+-doc """
+Pick the freshest unexpired lease of a v1 LeaseSet, at the current wall clock.
+
+Output: `{ok, SelectedLease}` or `error` when every lease has expired.
+""".
+-spec pick_lease_v1(i2p_leaset_v1:lease_set()) -> {ok, selected_lease()} | error.
+pick_lease_v1(LS) ->
+    pick_lease_v1(LS, erlang:system_time(millisecond)).
+
+-doc """
+Pick the freshest unexpired lease of a v1 LeaseSet against a fixed clock.
+
+Input: `LS` — the decoded v1 LeaseSet; `NowMs` — the reference time in ms.
+Output: `{ok, SelectedLease}` or `error` when every lease has expired.
+""".
+-spec pick_lease_v1(i2p_leaset_v1:lease_set(), non_neg_integer()) ->
+    {ok, selected_lease()} | error.
+pick_lease_v1(LS, NowMs) ->
+    Fresh =
+        [
+            L
+         || L <- i2p_leaset_v1:leases(LS),
+            delta_ms(maps:get(end_date, L), NowMs) > 0,
+            delta_ms(maps:get(end_date, L), NowMs) < ?DATE_HALF_WINDOW
+        ],
+    case Fresh of
+        [] ->
+            error;
+        _ ->
             Sorted = lists:sort([{maps:get(end_date, L), L} || L <- Fresh]),
             {_MaxEnd, Best} = lists:last(Sorted),
             {ok, {maps:get(gateway, Best), maps:get(tunnel_id, Best)}}
@@ -224,33 +260,53 @@ lease_route(Identity, DestBin) ->
     LS =
         case i2p_netdb_srv:find_ls(DestHash) of
             {ok, Found} ->
-                {ok, Found};
+                {ok, {v2, Found}};
             not_found ->
-                case i2p_lookup_srv:find_ls(DestHash) of
-                    Result = {ok, _} -> Result;
-                    {error, _} -> error
+                case i2p_netdb_srv:find_ls_v1(DestHash) of
+                    {ok, Found1} ->
+                        {ok, {v1, Found1}};
+                    not_found ->
+                        case i2p_lookup_srv:find_ls(DestHash) of
+                            {ok, Found2} ->
+                                {ok, {v2, Found2}};
+                            {error, _} ->
+                                case i2p_lookup_srv:find_ls_v1(DestHash) of
+                                    {ok, Found3} -> {ok, {v1, Found3}};
+                                    {error, _} -> error
+                                end
+                        end
                 end
         end,
     case LS of
-        {ok, LeaseSet} ->
+        {ok, {v2, LeaseSet}} ->
             case pick_lease(LeaseSet) of
                 {ok, {Gw, Tid}} ->
-                    case i2p_tunnel_srv:pick_outbound() of
-                        {ok, OutTid, _Entry} ->
-                            {ok, #{
-                                out_tid => OutTid,
-                                gw => Gw,
-                                tid => Tid,
-                                dest_pub => i2p_keys:public_key(Identity),
-                                dest_bin => DestBin,
-                                dest_hash => DestHash
-                            }};
-                        error ->
-                            error
-                    end;
+                    finish_lease_route(Gw, Tid, Identity, DestBin, DestHash);
                 error ->
                     error
             end;
+        {ok, {v1, LeaseSet}} ->
+            case pick_lease_v1(LeaseSet) of
+                {ok, {Gw, Tid}} ->
+                    finish_lease_route(Gw, Tid, Identity, DestBin, DestHash);
+                error ->
+                    error
+            end;
+        error ->
+            error
+    end.
+
+finish_lease_route(Gw, Tid, Identity, DestBin, DestHash) ->
+    case i2p_tunnel_srv:pick_outbound() of
+        {ok, OutTid, _Entry} ->
+            {ok, #{
+                out_tid => OutTid,
+                gw => Gw,
+                tid => Tid,
+                dest_pub => i2p_keys:public_key(Identity),
+                dest_bin => DestBin,
+                dest_hash => DestHash
+            }};
         error ->
             error
     end.
