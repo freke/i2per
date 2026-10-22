@@ -50,7 +50,7 @@ Rows are one verdict, not prose: **done** (implemented and exercised),
 | I2CP | absent | excluded by maintainer decision |
 | Datagram2 | done | codec (`encode2`/`decode2`, signature over target hash) + options Mapping (flag bit 4) + offline signatures (flag bit 5, checked against the destination's own signing key) + bounded per-destination replay window + SAM `STYLE=DATAGRAM2` / `DATAGRAM2 SEND` with `DATAGRAM2 RECEIVED` |
 | Addressbook (subscribe) | done | |
-| Addressbook (publish) | absent | deferred |
+| Addressbook (publish) | done | dump merged book to configured hosts_file (i2pd addressbook.hostsfile parity), atomic rewrite, counters/events; serve via operator eepsite/server tunnel |
 | Multi-destination client tunnels | absent | i2pd 3.0.0; operator surface, undecided |
 | Torrents tunnels (RPC/magnets/PEX/DHT/datagram trackers) | absent | i2pd 3.0.0; out of scope for 1.0.0 |
 | Post-quantum (ML-KEM) NTCP2 | absent | i2pd 2.59+; new crypto, out of scope per header |

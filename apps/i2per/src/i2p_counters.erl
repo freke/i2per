@@ -492,7 +492,16 @@ counters() ->
         %% signed by a transient key the target destination vouched for.
         datagram2_received,
         datagram2_replayed,
-        datagram2_offline_signed
+        datagram2_offline_signed,
+
+        %% %%%%% Addressbook publication %%%%%
+        %%
+        %% The merged addressbook was dumped to the publication path. Each
+        %% successful write counts one publish; failures count separately.
+        addressbook_published,
+
+        %% The addressbook publication dump failed (I/O or write error).
+        addressbook_publish_failed
     ].
 
 -doc """

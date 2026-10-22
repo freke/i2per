@@ -1514,6 +1514,18 @@ site's destination hash, buffered HTTP GET flushed on establishment — and
 merges every fetched entry into the store. The first fetch fires on boot;
 refreshes default to hourly.
 
+**Publication.** Configured via app env
+`addressbook => #{hosts_file => Path}` (the file to dump the merged
+addressbook in hosts.txt format, mirroring i2pd's `addressbook.hostsfile`).
+The publisher (`m:i2p_addressbook_pub`) dumps the full merged book
+atomically (write temp + rename) on a timer and on boot, emitting
+`addressbook_published` / `addressbook_publish_failed` counters and events.
+The dump is a snapshot of the live merged book (subscriptions plus local
+entries). Serving the dumped file over I2P to remote subscribers is done by
+the operator (e.g. via a local HTTP server and a server tunnel), matching
+i2pd's publication model. Pushing the router's own entry is an
+identity/privacy decision not taken here.
+
 ### Server tunnels
 
 A local TCP service is published as an I2P destination by `m:i2p_server_tunnel`.

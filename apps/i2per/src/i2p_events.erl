@@ -183,7 +183,11 @@ lookup service not being running, where there is no key and nothing was asked fo
     %% opposite problems and used to be the same result.
     | {lookup_failed, i2p_crypto:hash() | undefined, lookup_kind(),
         i2p_lookup_srv:lookup_failed_reason()}
-    | {config_changed, atom(), term()}.
+    | {config_changed, atom(), term()}
+    %% The merged addressbook was dumped to its publication path.
+    | {addressbook_published, non_neg_integer()}
+    %% The addressbook publication dump failed.
+    | {addressbook_publish_failed, term()}.
 
 %% %%%%% Why there is no heap bound on the manager %%%%% %%%
 %%
