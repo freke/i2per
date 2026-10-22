@@ -395,9 +395,9 @@ start_bob(Sock, LocalKeys, Owner) ->
             %%
             %% No frame and no bus event for it, and that is a decision rather than
             %% an omission. A frame here would be a fifth module emitting frames,
-            %% which `i2p_log_tests` exists to object to; an event has nowhere to
-            %% key: the handshake has not run, so there is no RouterInfo and no
-            %% peer hash to count against. What the peer sees — a completed TCP
-            %% connection closed at once — is what it saw before this loop moved.
+            %% which `i2p_log_checklist_tests` exists to object to; an event has
+            %% nowhere to key: the handshake has not run, so there is no RouterInfo
+            %% and no peer hash to count against. What the peer sees — a completed
+            %% TCP connection closed at once — is what it saw before this loop moved.
             ok = gen_tcp:close(Sock)
     end.

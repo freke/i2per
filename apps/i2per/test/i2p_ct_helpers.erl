@@ -94,10 +94,9 @@
 %% The repository root, found by walking up from this module's beam until the
 %% source tree is in sight.
 %%
-%% Lives here because three test modules now need it and each had its own copy:
-%% `i2p_events_vocabulary_tests`, `i2p_log_checklist_tests`, and the release-profile
-%% cases in `i2p_log_tests`. A per-module copy is harmless until one of them is
-%% wrong, and then two of the three are wrong in different ways -- and the copies
+%% Lives here because test modules need it and each had its own copy:
+%% `i2p_log_checklist_tests` (restored) and the release-profile cases. A
+%% per-module copy is harmless until one of them is wrong, and then the copies
 %% are only ever exercised by the case that needs them, so the drift is invisible.
 %%
 %% Walking up from the beam rather than reading the CWD, because rebar3 does not
