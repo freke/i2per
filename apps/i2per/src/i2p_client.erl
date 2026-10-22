@@ -87,22 +87,14 @@ Output: `{ok, SelectedLease}` or `error` when every lease has expired.
 -spec pick_lease(i2p_leaset:lease_set(), non_neg_integer()) ->
     {ok, selected_lease()} | error.
 pick_lease(LS, NowMs) ->
-    Fresh =
-        [
-            L
-         || L <- i2p_leaset:leases(LS),
-            delta_ms(maps:get(end_date, L), NowMs) > 0,
-            delta_ms(maps:get(end_date, L), NowMs) < ?DATE_HALF_WINDOW
-        ],
-    case Fresh of
-        [] ->
-            error;
-        _ ->
-            %% Freshest lease last after ascending end-date sort
-            Sorted = lists:sort([{maps:get(end_date, L), L} || L <- Fresh]),
-            {_MaxEnd, Best} = lists:last(Sorted),
-            {ok, {maps:get(gateway, Best), maps:get(tunnel_id, Best)}}
-    end.
+    pick_lease_generic(
+        i2p_leaset:leases(LS),
+        NowMs,
+        fun(EndDate, Now) ->
+            Delta = (EndDate - Now) band ?DATE_MASK,
+            Delta > 0 andalso Delta < ?DATE_HALF_WINDOW
+        end
+    ).
 
 -doc """
 Pick the freshest unexpired lease of a v1 LeaseSet, at the current wall clock.
@@ -122,13 +114,18 @@ Output: `{ok, SelectedLease}` or `error` when every lease has expired.
 -spec pick_lease_v1(i2p_leaset_v1:lease_set(), non_neg_integer()) ->
     {ok, selected_lease()} | error.
 pick_lease_v1(LS, NowMs) ->
-    Fresh =
-        [
-            L
-         || L <- i2p_leaset_v1:leases(LS),
-            delta_ms(maps:get(end_date, L), NowMs) > 0,
-            delta_ms(maps:get(end_date, L), NowMs) < ?DATE_HALF_WINDOW
-        ],
+    pick_lease_generic(
+        i2p_leaset_v1:leases(LS),
+        NowMs,
+        fun(EndDate, Now) -> EndDate > Now end
+    ).
+
+%% Shared lease-selection core used by both LeaseSet versions. `FreshPred`
+%% decides whether a lease is still usable against `NowMs`; the v2 version
+%% wraps the 4-byte end_date, the v1 version compares its 8-byte end_date
+%% directly.
+pick_lease_generic(Leases, NowMs, FreshPred) ->
+    Fresh = [L || L <- Leases, FreshPred(maps:get(end_date, L), NowMs)],
     case Fresh of
         [] ->
             error;
@@ -137,9 +134,6 @@ pick_lease_v1(LS, NowMs) ->
             {_MaxEnd, Best} = lists:last(Sorted),
             {ok, {maps:get(gateway, Best), maps:get(tunnel_id, Best)}}
     end.
-
-delta_ms(EndDate, NowMs) ->
-    (EndDate - NowMs) band ?DATE_MASK.
 
 -doc """
 Wrap raw stream payload for a remote destination.

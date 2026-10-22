@@ -1,6 +1,6 @@
 # Protocol Reference
 
-This document describes the I2P wire formats implemented by i2per 0.6.0.
+This document describes the I2P wire formats implemented by i2per 0.7.0.
 Unsupported formats and release limitations are listed explicitly.
 
 All multi-byte integers in I2P are big-endian unless otherwise noted. Ed25519
@@ -12,17 +12,21 @@ in the [I2P documentation](https://i2p.net/en/docs/).
 
 ## Release boundaries
 
-The 0.6.0 release does not implement NTCP1, SSU1, I2CP, the legacy
-ElGamal/AES garlic formats, Datagram2, or a TUN interface. SSU2 path migration
-is also outside this release. The Charlie role is implemented: a tagged session
+The 0.7.0 release does not implement NTCP1, SSU1, I2CP, the legacy
+ElGamal/AES garlic formats, or a TUN interface. SSU2 path migration
+is also outside this release. LeaseSet v1 (store type 1), EncryptedLeaseSet
+(store type 5) and MetaLeaseSet (store type 7) are implemented (#VANCF02,
+#3G0Z06C), and Datagram2 (Proposal 163) is implemented with replay protection
+(#NTWZWTC). Addressbook publication is implemented (#GDEGVQH). The Charlie role is implemented: a tagged session
 answers a RelayIntro as Charlie, verifies the requester's signature, checks the
 asserted endpoint, and punches, and the relay accept now grants a session token
 that Bob validates on the redirect (see #BFKFGY0, #98GAVQK). Automatic
 NetDb-driven Charlie selection is implemented (#6TGF083), and the tunnel build
 accepts up to 7 hops (#K62PQHJ).
-The sections below describe only behavior that is present in 0.6.0. 0.6.0 makes
-no wire-format changes over 0.5.0: automatic Charlie selection and the raised
-hop cap are control-plane behaviour rather than wire format; the Charlie
+The sections below describe only behavior that is present in 0.7.0. 0.7.0 makes
+wire-format additions over 0.6.0: LeaseSet v1, EncryptedLeaseSet and
+MetaLeaseSet, and the Datagram2 codec; automatic Charlie selection and the
+raised hop cap are control-plane behaviour rather than wire format; the Charlie
 RelayResponse and HolePunch
 blocks and the measured-reachability caps remain as shipped in 0.3.0.
 ## Implemented
@@ -395,8 +399,9 @@ one-byte store type is part of the DatabaseStore body, not part of a
 LeaseSet's own content. The values used by the I2NP codec are `0` (RouterInfo),
 `1` (LeaseSet), `3` (LeaseSet2), `5` (EncryptedLeaseSet), and `7`
 (MetaLeaseSet). i2per's NetDb path stores types `0`, `1` (LeaseSet v1), `3`,
-`5` (EncryptedLeaseSet), and `7` (MetaLeaseSet). Type `5` is stored, expired
-and served verbatim; type `7` is stored but not re-broadcast. The codec
+`5` (EncryptedLeaseSet), and `7` (MetaLeaseSet). Type `5` is stored and served
+verbatim (capacity-bounded; no time-based expiry is applied to the raw bytes);
+type `7` is stored but not re-broadcast. The codec
 reports every byte on the wire rather than only the types it understands.
 Encrypted LeaseSet is live in both reference routers (off by default);
 MetaLeaseSet remains draft.

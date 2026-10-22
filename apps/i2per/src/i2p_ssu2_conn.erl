@@ -1174,12 +1174,12 @@ on_data(Num, Blocks, ImmediateAck, RecvDir, State = #{seen_in := SeenIn}) ->
 %% what the datagram carried, not what happened to it, and a label carrying them
 %% made the label a payload rather than a name -- which is also why the level
 %% could not be checked before constructing it.
--spec frame(map(), [tuple()]) -> fun(() -> {atom(), [tuple()] | atom()}).
+-spec frame(map(), [tuple() | atom()]) -> fun(() -> {atom(), [tuple() | atom()]}).
 frame(State, Blocks) ->
     fun() -> {role(State), block_kinds(Blocks)} end.
 
 %% One entry per block, for a frame that will be read by somebody at `debug`.
--spec block_kinds([tuple()]) -> [tuple() | atom].
+-spec block_kinds([tuple() | atom()]) -> [tuple() | atom()].
 block_kinds(Blocks) ->
     [block_kind(B) || B <- Blocks].
 

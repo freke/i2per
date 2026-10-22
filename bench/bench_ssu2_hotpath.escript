@@ -128,6 +128,7 @@ socket_owner(Opts) ->
         %% Warm-up on the soak's discipline: every cache on this path fills once,
         %% and a measurement taken cold reports the fill as cost.
         blast(Sender, maps:get(warm, Opts)),
+        timer:sleep(?SETTLE_MS),
         _ = count(Sink),
         {Delivered, Elapsed, PerDatagram} = steady_window(
             Listener, Sender, Sink, maps:get(count, Opts)
@@ -140,7 +141,12 @@ socket_owner(Opts) ->
         io:format("    reductions/datagram ~s   <- the figure that compares trees~n", [
             PerDatagram
         ]),
-        io:format("    sender us/datagram ~.2f~n", [Elapsed / Delivered])
+        UsPerDatagram =
+            case Delivered < 1 of
+                true -> "unknown";
+                false -> io_lib:format("~.2f", [Elapsed / Delivered])
+            end,
+        io:format("    sender us/datagram ~s~n", [UsPerDatagram])
     after
         i2p_ssu2_listener:stop(Listener)
     end.

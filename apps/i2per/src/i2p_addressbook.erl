@@ -104,11 +104,14 @@ Output: `ok` on success, or `{error, term()}` on failure.
 """.
 -spec dump(file:filename_all()) -> ok | {error, term()}.
 dump(Path) ->
-    case snapshot() of
-        {ok, Entries} ->
-            write_snapshot(Path, Entries);
-        {error, not_running} ->
-            {error, not_running}
+    case whereis(?MODULE) of
+        undefined ->
+            case snapshot() of
+                {ok, Entries} -> write_snapshot(Path, Entries);
+                {error, not_running} -> {error, not_running}
+            end;
+        _Pid ->
+            gen_server:call(?MODULE, {dump, Path})
     end.
 
 -spec init([file:filename_all() | undefined]) -> {ok, map()}.
@@ -138,6 +141,8 @@ handle_call({add, Name, DestB64}, _From, State) ->
     {reply, ok, State#{entries := Entries}};
 handle_call(snapshot, _From, State) ->
     {reply, {ok, maps:get(entries, State)}, State};
+handle_call({dump, Path}, _From, State) ->
+    {reply, write_snapshot(Path, maps:get(entries, State)), State};
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 
@@ -211,7 +216,8 @@ write_snapshot(Path, Entries) ->
         ),
     Dir = filename:dirname(Path),
     _ = filelib:ensure_dir(filename:join(Dir, "hosts.txt")),
-    Tmp = Path ++ ".tmp",
+    PathBin = unicode:characters_to_binary(Path),
+    Tmp = <<PathBin/binary, ".tmp">>,
     case file:write_file(Tmp, Bin) of
         ok ->
             case file:rename(Tmp, Path) of

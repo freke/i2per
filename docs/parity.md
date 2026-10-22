@@ -11,7 +11,7 @@ are not in scope and do not change 1.0.0. See `3M0RBXX` for the decision and
 - **i2pd version:** 3.0.0
 - **Date taken:** 2026-10-21 (snapshot bumped on i2pd 3.0.0 release; interop
   suite re-run pending, see `94S9H7K`)
-- **i2per release at snapshot:** 0.6.0
+- **i2per release at snapshot:** 0.7.0
 - **Source of the capability list:** i2pd 3.0.0 release notes plus the
   capabilities exercised by `scripts/interop_i2pd.sh` and
   `docs/protocol.md`.
@@ -58,7 +58,7 @@ Rows are one verdict, not prose: **done** (implemented and exercised),
 | Automatic NetDb-driven Charlie selection | done | SSU2 + peer_test + public address candidates; uniform random; one Charlie per cycle; per-Alice 60s rate limit; code-2 reject on failure |
 | Peer testing | done | measured reachability ladder |
 | Measured reachability | done | see `CD7ZBVH` |
-| TUN interface | done (separate app) | `i2per_tun` companion app (ADR 0001) |
+| TUN interface | done (separate app) | `i2per_tun` companion app (ADR 0001); not part of the 0.7.0 release, which defers TUN to 0.8.0 |
 | SOCKS / HTTP proxy / BOB / I2PControl | done (separate app) | `i2per_proxy` companion app; i2pd 3.0.0 adds `LocalDestinationInfo` to I2PControl |
 | In-built status monitor | partial | separate presentation app (`i2per_status`) |
 | UPnP / NAT traversal service | absent | one-shot indirect dial only |
@@ -86,7 +86,8 @@ follow-up ticket at that point so the refresh is scheduled rather than hoped for
 ## Recapturing the committed vectors
 
 `apps/i2per/test/fixtures/i2pd_ssu2_data_phase.term` holds SSU2 data-phase
-datagrams captured from i2pd 2.61.0 — the version pinned above — and
+datagrams captured from i2pd 2.61.0 — the version this capture still covers
+until it is refreshed for the 3.0.0 snapshot above (interop rerun pending) — and
 `apps/i2per/test/fixtures/i2pd_ntcp2_handshake.term` holds an NTCP2 XK handshake
 and the data phase that followed it. `i2p_ssu2_vectors_SUITE` and
 `i2p_ntcp2_vectors_SUITE` replay them in the hermetic gate. The captures are

@@ -521,6 +521,8 @@ dispatch_local_message(StdMsg, State) ->
             %% or DatabaseSearchReply into our inbound tunnel as a bare message.
             DbMsg = #{type => maps:get(type, Msg), body => maps:get(body, Msg)},
             case i2p_garlic:dispatch_db_message(DbMsg, 0) of
+                {store, lease_v1, Key, LsBin, _Ts} ->
+                    notify_lookup(Key, lease_v1, store_lease_v1(LsBin));
                 {store, lease, Key, LsBin, _Ts} ->
                     notify_lookup(Key, lease, store_lease(LsBin));
                 {store, router, Key, RiBin, _Ts} ->
@@ -566,7 +568,7 @@ dispatch_inbound_garlic(GarlicBody, State) ->
 %% that never arrived. Both sites used to write `_ = i2p_netdb_srv:store_ls_binary(...)`
 %% and then send the same `{db_stored, Key, Kind}` either way, so a lookup could not
 %% tell them apart and both read as a timeout.
--spec notify_lookup(i2p_crypto:hash(), router | lease, store_result()) -> ok.
+-spec notify_lookup(i2p_crypto:hash(), router | lease | lease_v1, store_result()) -> ok.
 notify_lookup(Key, Kind, Outcome) ->
     maybe_notify({db_stored, Key, Kind, Outcome}).
 
@@ -581,6 +583,10 @@ store_router(RiBin) ->
 -spec store_lease(binary()) -> store_result().
 store_lease(LsBin) ->
     outcome(i2p_netdb_srv:store_ls_binary(LsBin, erlang:system_time(second))).
+
+-spec store_lease_v1(binary()) -> store_result().
+store_lease_v1(LsBin) ->
+    outcome(i2p_netdb_srv:store_ls_v1_binary(LsBin, erlang:system_time(second))).
 
 %% Two accepted shapes and two refused ones, across two NetDb entry points that do not
 %% spell the vocabulary identically: `store_binary/2` says `too_old` where
@@ -606,7 +612,7 @@ notify_search_reply(Key, Peers) ->
     maybe_notify({search_reply, Key, Peers}).
 
 -spec maybe_notify(
-    {db_stored, i2p_crypto:hash(), router | lease, store_result()}
+    {db_stored, i2p_crypto:hash(), router | lease | lease_v1, store_result()}
     | {search_reply, i2p_crypto:hash(), [i2p_crypto:hash()]}
 ) -> ok.
 maybe_notify(Msg) ->
@@ -822,6 +828,11 @@ dispatch_one_clove(_ConnPid, PeerHash, #{type := T, data := Data}, State) when
             Outcome = store_router(RiBin),
             replicate_clove_store(0, Key, RiBin, PeerHash, State),
             notify_lookup(Key, router, Outcome),
+            State;
+        {store, lease_v1, Key, LsBin, _Ts} ->
+            Outcome = store_lease_v1(LsBin),
+            replicate_clove_store(1, Key, LsBin, PeerHash, State),
+            notify_lookup(Key, lease_v1, Outcome),
             State;
         {store, lease, Key, LsBin, _Ts} ->
             Outcome = store_lease(LsBin),

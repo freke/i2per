@@ -2094,7 +2094,8 @@ lookup_reply(leaseset, Key, Excluded) ->
             {store_ls, {ls2, LS}};
         not_found ->
             case i2p_netdb_srv:find_ls_v1(Key) of
-                {ok, LS} -> {store_ls, {ls1, LS}};
+                {ok, LS} ->
+                    {store_ls, {ls1, LS}};
                 not_found ->
                     case i2p_netdb_srv:find_ls_5(Key) of
                         {ok, Bin} -> {store_ls, {ls5, Bin}};

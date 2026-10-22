@@ -91,7 +91,7 @@ mailbox bound the thing `{active, once}` was buying:
 The bound is in datagrams and not in bytes, because that is what a socket budget
 is: a datagram here is at most one UDP datagram, so the worst case is
 `?ACTIVE_BUDGET` times 64 KB and the realistic case at MTU is
-`?ACTIVE_BUDGET` times ~1.5 KB -- 48 KB and 2 MB respectively. Both are against a
+`?ACTIVE_BUDGET` times ~1.5 KB -- 2 MB and 48 KB respectively. Both are against a
 kernel receive buffer that the datagrams past the budget wait in, and which bounds
 them either way. Raising the budget makes the mailbox bound worse and the syscall
 cheaper, lowering it the reverse, and 32 is where the re-arm has already fallen

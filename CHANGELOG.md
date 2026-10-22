@@ -8,6 +8,37 @@ CI refuses a tag that disagrees.
 
 _(nothing yet)_
 
+## [0.7.0] — 2026-10-22
+
+**The LeaseSet-and-Datagram release.** 0.6.0 automated reachability; 0.7.0
+fills in the data plane: the router parses, stores and serves the LeaseSet
+family (v1, EncryptedLeaseSet, MetaLeaseSet), publishes its own addressbook,
+and implements the Datagram2 codec end to end through SAM with replay
+protection. No wire-format changes beyond the LeaseSet family and Datagram2, so
+a 0.6.0 `data_dir` is read unchanged.
+
+### Changed
+
+- **LeaseSet family.** The NetDb parses, stores and answers lookups for
+  LeaseSet v1 (store type 1), and decodes EncryptedLeaseSet (store type 5) and
+  MetaLeaseSet (store type 7) (#VANCF02, #3G0Z06C).
+- **Addressbook publication.** i2per publishes its own `hosts.txt` to a
+  configured hosts file instead of only subscribing to remote addressbooks
+  (#GDEGVQH).
+- **Datagram2.** Full codec (flags, options, signature over the target hash)
+  with a bounded per-destination replay window, wired through SAM with send kind
+  and inbound delivery; optional options mapping and offline signatures
+  (#NTWZWTC, #E2QX0HF, #F0KZAJ6, #EF88ASV, #R85EHTA).
+- **Logging floor.** Checklist enforcement restored (#NT2GZ7V); the XZTYAVX
+  level-gated debug path forward-ported (#7STWF7T); ssu2 cc tests moved to
+  Common Test (#XJ62X6Y).
+- **CHANGELOG.** Sections reordered newest-first (#H435BMC).
+
+### Fixed
+
+- **CHANGELOG ordering.** 0.5.0 no longer appears above 0.6.0 with
+  `Unreleased` wedged between them (#H435BMC).
+
 ## [0.6.0] — 2026-10-21
 
 **The reachability-automation release.** 0.5.0 managed throughput; 0.6.0

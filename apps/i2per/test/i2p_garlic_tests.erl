@@ -350,10 +350,21 @@ dispatch_db_store_router_test() ->
         i2p_garlic:dispatch_db_message(Msg, NowMs)
     ).
 
-dispatch_db_store_lease_test() ->
+dispatch_db_store_lease_v1_test() ->
     Key = crypto:strong_rand_bytes(32),
     LsData = crypto:strong_rand_bytes(128),
     Body = <<Key/binary, 1:8, 0:32/big, LsData/binary>>,
+    Msg = #{type => 1, msg_id => <<1, 2, 3, 4>>, expiration => 1800000000, body => Body},
+    NowMs = 1700000000000,
+    ?assertEqual(
+        {store, lease_v1, Key, LsData, NowMs},
+        i2p_garlic:dispatch_db_message(Msg, NowMs)
+    ).
+
+dispatch_db_store_lease_test() ->
+    Key = crypto:strong_rand_bytes(32),
+    LsData = crypto:strong_rand_bytes(128),
+    Body = <<Key/binary, 3:8, 0:32/big, LsData/binary>>,
     Msg = #{type => 1, msg_id => <<1, 2, 3, 4>>, expiration => 1800000000, body => Body},
     NowMs = 1700000000000,
     ?assertEqual(

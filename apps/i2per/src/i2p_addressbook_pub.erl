@@ -32,13 +32,13 @@ stop() ->
         Pid -> gen_server:stop(Pid)
     end.
 
--spec init([map(), ...]) -> {ok, #{path := term(), interval := non_neg_integer(), timer := reference()}}.
+-spec init([map(), ...]) ->
+    {ok, #{path := term(), interval := non_neg_integer(), timer := reference() | undefined}}.
 init([Opts]) ->
     Path = maps:get(hosts_file, Opts),
     Interval = maps:get(interval_ms, Opts, ?DEFAULT_INTERVAL_MS),
-    Timer = erlang:send_after(Interval, self(), dump),
     self() ! dump,
-    {ok, #{path => Path, interval => Interval, timer => Timer}}.
+    {ok, #{path => Path, interval => Interval, timer => undefined}}.
 
 -spec handle_call(term(), gen_server:from(), map()) -> {reply, term(), map()}.
 handle_call(_Request, _From, State) ->

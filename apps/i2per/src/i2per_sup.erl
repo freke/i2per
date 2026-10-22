@@ -821,7 +821,19 @@ addressbook_pub_children() ->
         {ok, Opts} when is_map(Opts) ->
             case maps:find(hosts_file, Opts) of
                 {ok, Path} when is_binary(Path); is_list(Path) ->
-                    [addressbook_pub_child_spec(#{hosts_file => iolist_to_binary(Path)})];
+                    BaseOpts = #{
+                        hosts_file =>
+                            case is_binary(Path) of
+                                true -> Path;
+                                false -> unicode:characters_to_binary(Path)
+                            end
+                    },
+                    Opts1 =
+                        case maps:find(interval_ms, Opts) of
+                            {ok, Interval} -> BaseOpts#{interval_ms => Interval};
+                            error -> BaseOpts
+                        end,
+                    [addressbook_pub_child_spec(Opts1)];
                 _ ->
                     []
             end;

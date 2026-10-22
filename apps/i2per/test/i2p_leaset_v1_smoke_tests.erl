@@ -23,6 +23,14 @@ smoke_test() ->
     ?assertEqual(1, length(i2p_leaset_v1:leases(LS))),
     ?assertEqual(Bin, i2p_leaset_v1:to_binary(LS)),
     ?assertEqual(1, i2p_leaset_v1:store_type()),
+    %% Tampering a signed byte without re-signing must fail verification.
+    Tampered =
+        <<
+            (binary:part(Bin, 0, byte_size(Bin) - 65))/binary,
+            (binary:at(Bin, byte_size(Bin) - 65) bxor 1):8,
+            (binary:part(Bin, byte_size(Bin) - 64, 64))/binary
+        >>,
+    ?assertEqual({error, bad_signature}, i2p_leaset_v1:decode(Tampered)),
     ok.
 
 new_seed_key() ->

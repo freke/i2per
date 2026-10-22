@@ -834,14 +834,12 @@ deliver_datagram(Wire, State) ->
 
 %% deliver_datagram2/2 — announce an authenticated inbound Datagram2 on the
 %% control socket, with replay protection. Replayed or malformed frames are
-%% dropped silently. The session's own destination key is handed to the
-%% codec: an offline-signed datagram carries the target's signature over
-%% the transient key, and this destination is the target.
+%% dropped silently. An offline-signed datagram carries the sender's
+%% signature over the transient key, verified against the sender's From key.
 -spec deliver_datagram2(binary(), state()) -> state().
 deliver_datagram2(Wire, State) ->
     TargetHash = maps:get(dest_hash, State),
-    DestKey = i2p_keys:signing_key(maps:get(dest, State)),
-    case i2p_datagram:decode2(Wire, TargetHash, DestKey) of
+    case i2p_datagram:decode2(Wire, TargetHash) of
         {ok, #{from := FromBin, payload := Payload} = Datagram} ->
             Key = crypto:hash(sha256, Wire),
             W0 = maps:get(replay_window, State, i2p_datagram_replay:new(1024)),

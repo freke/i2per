@@ -2,8 +2,7 @@
 %% Datagram2 frame wrapped as a garlic clove for that destination is injected
 %% into the inbound tunnel, opened under the session's key, and announced on
 %% the session's control socket as DATAGRAM2 RECEIVED. An offline-signed frame
-%% is accepted because the session hands the codec its own destination key,
-%% which vouches for the block.
+%% is accepted because the sender's From key vouches for the block.
 %%
 %% Each case owns its process, mailbox, fixtures, and tunnel state. Waits are
 %% event-driven or deadline-bounded.
@@ -47,10 +46,11 @@ datagram2_offline_signed_is_received(_Config) ->
     Keys = gen_keys(),
     {ok, Sock, Ident} = datagram2_session(<<"dg2off">>, Keys),
     TargetHash = i2p_keys:hash(Ident),
+    Sender = gen_keys(),
     {PubKey, TransientSeed} = i2p_crypto:ed25519_keygen(),
     Expires = erlang:system_time(second) + 3600,
     OffSig = i2p_crypto:ed25519_sign(
-        <<Expires:32/big, 7:16/big, PubKey/binary>>, maps:get(sign_priv, Keys)
+        <<Expires:32/big, 7:16/big, PubKey/binary>>, maps:get(sign_priv, Sender)
     ),
     Block = #{
         expires => Expires,
@@ -59,7 +59,6 @@ datagram2_offline_signed_is_received(_Config) ->
         offsig => OffSig,
         seed => TransientSeed
     },
-    Sender = gen_keys(),
     Payload = <<"offline signed datagram">>,
     {ok, Wire} = i2p_datagram:encode2(
         i2p_keys:to_binary(maps:get(identity, Sender)),

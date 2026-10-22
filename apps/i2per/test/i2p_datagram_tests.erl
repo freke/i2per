@@ -6,7 +6,7 @@
 %% Datagram2 (Proposal 163) adds the options Mapping (flag bit 4) and the
 %% offline-signature section (flag bit 5) to the same framing. The options
 %% and the offline section are covered by the signature, and an offline
-%% section is only accepted when the target destination's own key vouches
+%% section is only accepted when the sender's own key vouches
 %% for it.
 
 -module(i2p_datagram_tests).
@@ -75,9 +75,8 @@ datagram2_codec_test_() ->
         {"options are covered by the signature", fun options_signed/0},
         {"malformed options fail closed", fun options_malformed/0},
         {"duplicate option keys are refused", fun options_duplicate/0},
-        {"offline-signed datagrams verify against the target key", fun offline_roundtrip/0},
-        {"offline-signed datagrams need the target key", fun offline_needs_key/0},
-        {"offline signature by another key fails", fun offline_foreign_key/0},
+        {"offline-signed datagrams verify against the sender key", fun offline_roundtrip/0},
+        {"offline signature by a key other than from fails", fun offline_wrong_signer/0},
         {"tampered offline signature fails", fun offline_tampered/0},
         {"expired offline blocks fail closed", fun offline_expired/0},
         {"unsupported offline signature types fail closed", fun offline_sigtype/0},
@@ -232,13 +231,13 @@ offline_roundtrip() ->
     FromBin = i2p_keys:to_binary(Id),
     TargetHash = crypto:hash(sha256, <<"target destination">>),
     Payload = <<"offline signed">>,
-    {DestKey, Block} = offline_block(),
+    Block = offline_block(Seed),
     {ok, Wire} = i2p_datagram:encode2(
         FromBin, Seed, TargetHash, Payload, #{offline => Block}
     ),
     %% from + flags + expires + sigtype + pubkey + offsig + payload + sig
     ?assertEqual(391 + 2 + 4 + 2 + 32 + 64 + byte_size(Payload) + 64, byte_size(Wire)),
-    {ok, Decoded} = i2p_datagram:decode2(Wire, TargetHash, DestKey),
+    {ok, Decoded} = i2p_datagram:decode2(Wire, TargetHash),
     ?assertEqual(16#0022, maps:get(flags, Decoded)),
     ?assertEqual(Payload, maps:get(payload, Decoded)),
     #{expires := Expires, sigtype := 7, pubkey := PubKey, offsig := OffSig} =
@@ -247,37 +246,23 @@ offline_roundtrip() ->
     ?assertEqual(maps:get(pubkey, Block), PubKey),
     ?assertEqual(maps:get(offsig, Block), OffSig).
 
-offline_needs_key() ->
+offline_wrong_signer() ->
     #{identity := Id, sign_priv := Seed} = i2p_keys:generate_with_privkeys(),
     FromBin = i2p_keys:to_binary(Id),
     TargetHash = crypto:hash(sha256, <<"target destination">>),
-    {_DestKey, Block} = offline_block(),
+    #{identity := _OtherId, sign_priv := OtherSeed} = i2p_keys:generate_with_privkeys(),
+    Block = offline_block(OtherSeed),
     {ok, Wire} = i2p_datagram:encode2(
         FromBin, Seed, TargetHash, <<"offline signed">>, #{offline => Block}
     ),
-    %% Without the target destination's key there is nothing to check the
-    %% offline signature against, so the frame is dropped.
+    %% The offline block is signed by a key other than `from`, so it is rejected.
     ?assertEqual(error, i2p_datagram:decode2(Wire, TargetHash)).
-
-offline_foreign_key() ->
-    #{identity := Id, sign_priv := Seed} = i2p_keys:generate_with_privkeys(),
-    FromBin = i2p_keys:to_binary(Id),
-    TargetHash = crypto:hash(sha256, <<"target destination">>),
-    {_DestKey, Block} = offline_block(),
-    {ok, Wire} = i2p_datagram:encode2(
-        FromBin, Seed, TargetHash, <<"offline signed">>, #{offline => Block}
-    ),
-    %% A different destination's key does not verify the offline signature.
-    #{identity := Other} = i2p_keys:generate_with_privkeys(),
-    ?assertEqual(
-        error, i2p_datagram:decode2(Wire, TargetHash, i2p_keys:signing_key(Other))
-    ).
 
 offline_tampered() ->
     #{identity := Id, sign_priv := Seed} = i2p_keys:generate_with_privkeys(),
     FromBin = i2p_keys:to_binary(Id),
     TargetHash = crypto:hash(sha256, <<"target destination">>),
-    {DestKey, Block} = offline_block(),
+    Block = offline_block(Seed),
     {ok, Wire} = i2p_datagram:encode2(
         FromBin, Seed, TargetHash, <<"offline signed">>, #{offline => Block}
     ),
@@ -287,24 +272,24 @@ offline_tampered() ->
     Broken =
         <<Head/binary, Flags:16/big, Expires:32/big, SigType:16/big, PubKey/binary,
             (binary:at(OffSig, 0) bxor 16#FF), (binary:part(OffSig, 1, 63))/binary, Rest/binary>>,
-    ?assertEqual(error, i2p_datagram:decode2(Broken, TargetHash, DestKey)).
+    ?assertEqual(error, i2p_datagram:decode2(Broken, TargetHash)).
 
 offline_expired() ->
     #{identity := Id, sign_priv := Seed} = i2p_keys:generate_with_privkeys(),
     FromBin = i2p_keys:to_binary(Id),
     TargetHash = crypto:hash(sha256, <<"target destination">>),
-    {DestKey, Block} = offline_block(erlang:system_time(second) - 60),
+    Block = offline_block(Seed, erlang:system_time(second) - 60),
     {ok, Wire} = i2p_datagram:encode2(
         FromBin, Seed, TargetHash, <<"offline signed">>, #{offline => Block}
     ),
-    ?assertEqual(error, i2p_datagram:decode2(Wire, TargetHash, DestKey)).
+    ?assertEqual(error, i2p_datagram:decode2(Wire, TargetHash)).
 
 offline_sigtype() ->
     #{identity := Id, sign_priv := Seed} = i2p_keys:generate_with_privkeys(),
     FromBin = i2p_keys:to_binary(Id),
     TargetHash = crypto:hash(sha256, <<"target destination">>),
     Payload = <<"x">>,
-    {DestKey, Block} = offline_block(),
+    Block = offline_block(Seed),
     %% A signature type this codec does not sign with is refused on the
     %% way out and on the way in.
     ?assertEqual(
@@ -314,29 +299,29 @@ offline_sigtype() ->
         )
     ),
     Wire = offline_wire(FromBin, Seed, TargetHash, Payload, Block#{sigtype => 3}),
-    ?assertEqual(error, i2p_datagram:decode2(Wire, TargetHash, DestKey)).
+    ?assertEqual(error, i2p_datagram:decode2(Wire, TargetHash)).
 
 offline_transient_signs() ->
     #{identity := Id, sign_priv := Seed} = i2p_keys:generate_with_privkeys(),
     FromBin = i2p_keys:to_binary(Id),
     TargetHash = crypto:hash(sha256, <<"target destination">>),
     Payload = <<"offline signed">>,
-    {DestKey, Block} = offline_block(),
+    Block = offline_block(Seed),
     %% The same frame, but the payload signed by the sender's own key
     %% instead of the transient one: the transient key is the only one the
     %% receiver accepts.
     Wire = offline_wire(FromBin, Seed, TargetHash, Payload, Block),
-    ?assertEqual(error, i2p_datagram:decode2(Wire, TargetHash, DestKey)),
+    ?assertEqual(error, i2p_datagram:decode2(Wire, TargetHash)),
     %% Signed by the transient key, it verifies.
     Wire2 = offline_wire(FromBin, maps:get(seed, Block), TargetHash, Payload, Block),
-    ?assertMatch({ok, _}, i2p_datagram:decode2(Wire2, TargetHash, DestKey)).
+    ?assertMatch({ok, _}, i2p_datagram:decode2(Wire2, TargetHash)).
 
 options_and_offline() ->
     #{identity := Id, sign_priv := Seed} = i2p_keys:generate_with_privkeys(),
     FromBin = i2p_keys:to_binary(Id),
     TargetHash = crypto:hash(sha256, <<"target destination">>),
     Payload = <<"both">>,
-    {DestKey, Block} = offline_block(),
+    Block = offline_block(Seed),
     {ok, Wire} = i2p_datagram:encode2(
         FromBin,
         Seed,
@@ -344,7 +329,7 @@ options_and_offline() ->
         Payload,
         #{options => [{<<"k">>, <<"v">>}], offline => Block}
     ),
-    {ok, Decoded} = i2p_datagram:decode2(Wire, TargetHash, DestKey),
+    {ok, Decoded} = i2p_datagram:decode2(Wire, TargetHash),
     ?assertEqual(16#0032, maps:get(flags, Decoded)),
     ?assertEqual([{<<"k">>, <<"v">>}], maps:get(options, Decoded)),
     ?assertEqual(Payload, maps:get(payload, Decoded)),
@@ -352,26 +337,23 @@ options_and_offline() ->
 
 %%%%%%% %%% Internal %%%%%%%
 
-%% offline_block/0 — the block the *target* destination mints: a transient
-%% keypair, plus its own signature over the expiry, the transient signature
-%% type and the transient public key. Returns the target's signing key (the
-%% receiver needs it) and the block.
-offline_block() ->
-    offline_block(erlang:system_time(second) + 3600).
+%% offline_block/1 — the block the *sender* mints: a transient keypair, plus
+%% the sender's own signature over the expiry, the transient signature type
+%% and the transient public key. `SignerSeed` is the sender's signing seed.
+offline_block(SignerSeed) ->
+    offline_block(SignerSeed, erlang:system_time(second) + 3600).
 
-offline_block(Expires) ->
-    #{identity := Id, sign_priv := SignSeed} = i2p_keys:generate_with_privkeys(),
+offline_block(SignerSeed, Expires) ->
     {PubKey, Seed} = i2p_crypto:ed25519_keygen(),
     Signed = <<Expires:32/big, 7:16/big, PubKey/binary>>,
-    OffSig = i2p_crypto:ed25519_sign(Signed, SignSeed),
-    Block = #{
+    OffSig = i2p_crypto:ed25519_sign(Signed, SignerSeed),
+    #{
         expires => Expires,
         sigtype => 7,
         pubkey => PubKey,
         offsig => OffSig,
         seed => Seed
-    },
-    {i2p_keys:signing_key(Id), Block}.
+    }.
 
 %% offline_wire/5 — the frame a sender builds by hand: the offline section
 %% followed by the payload, signed by `SignSeed`.

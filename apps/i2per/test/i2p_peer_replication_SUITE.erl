@@ -172,7 +172,7 @@ unimplemented_store_type_does_not_replicate(Config) ->
             ),
             ?assertEqual([], forwards(?SETTLE_MS))
         end,
-        [5, 7]
+        [2, 4]
     ).
 
 %% A RouterInfo the NetDb's clock window refuses is not in our store either, so
@@ -206,8 +206,8 @@ unstored_outcomes_are_reported(Config) ->
     Peer = ?config(peer, Config),
     Now = ?config(now, Config),
     %% A type we do not implement, named as such rather than as a refusal.
-    send(Peer, i2p_ct_helpers:db_store_block(5, crypto:strong_rand_bytes(32), <<"x">>)),
-    ?assertEqual({unsupported_type, 5}, await_not_stored(5000)),
+    send(Peer, i2p_ct_helpers:db_store_block(2, crypto:strong_rand_bytes(32), <<"x">>)),
+    ?assertEqual({unsupported_type, 2}, await_not_stored(5000)),
     %% A RouterInfo the clock window refuses, with the NetDb's own reason. The
     %% two are different answers and must not collapse into one.
     send(

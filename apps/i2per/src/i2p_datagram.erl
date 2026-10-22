@@ -34,7 +34,7 @@ flags     2 bytes: version 0x02 in bits 3-0, bit 4 announces the options
 options   Mapping (2-byte size, then `key=value;` pairs with 1-byte
           length-prefixed strings) — only when bit 4 is set
 offline   expires (4 bytes, seconds since epoch), sigtype (2 bytes), the
-          transient signing public key, and the target destination's
+          transient signing public key, and the sender's
           signature over those three fields — only when bit 5 is set
 payload   application bytes
 signature 64 bytes, over the prelude (the target destination's hash), the
@@ -46,10 +46,9 @@ wire but is covered by the signature, which is what binds a datagram to the
 destination it was addressed to.
 
 An offline-signed datagram is signed by a transient key rather than by the
-sender's own. The target's signature over that transient key (the `offsig`)
-is what makes the key trustworthy, so a receiver can only accept such a
-datagram when it holds the target destination's signing key; without it the
-frame is dropped (`f:decode2/2`).
+sender's own long-term key. The sender's own signature over that transient
+key (the `offsig`) is what makes the key trustworthy, so the frame carries
+everything a receiver needs to verify it (`f:decode2/2`).
 
 ## Usage
 
@@ -61,7 +60,7 @@ frame is dropped (`f:decode2/2`).
 ```
 """.
 
--export([encode/3, decode/1, encode2/4, encode2/5, decode2/2, decode2/3]).
+-export([encode/3, decode/1, encode2/4, encode2/5, decode2/2]).
 
 -export_type([
     datagram/0,
@@ -120,7 +119,7 @@ the offline-signature section.
 -doc """
 The offline-signature section of a Datagram2 as it appears on the wire: the
 expiry, the transient signature type, the transient signing public key, and
-the target destination's signature over those three fields.
+the sender's signature over those three fields.
 """.
 -type offline_sig() :: #{
     expires := non_neg_integer(),
@@ -144,11 +143,9 @@ absent key means the section is absent.
 The offline-signature section as a *sender* needs it: the four wire fields
 plus the transient private seed that signs the payload.
 
-The section is minted by the target destination — its `offsig` is the
-target's own signature over `expires`, `sigtype` and `pubkey` — and handed
-to the sender out of band; the datagrams spec says the section "can, and
-should, be generated offline". A sender cannot mint one: it does not hold
-the target's signing key.
+The section is minted by the sender itself — its `offsig` is the sender's
+own signature over `expires`, `sigtype` and `pubkey` — and the datagrams
+spec says the section "can, and should, be generated offline".
 """.
 -type offline_block() :: #{
     expires := non_neg_integer(),
@@ -232,8 +229,8 @@ section.
   longer than 255 bytes and mappings longer than 65535 bytes are refused.
 - `offline` — an `t:offline_block/0`, announced by flag bit 5. The payload is
   then signed by the transient key the block carries instead of by the
-  sender's own key, and the block's `offsig` (the target destination's
-  signature over `expires`, `sigtype` and `pubkey`) travels in the frame.
+  sender's own key, and the block's `offsig` (the sender's signature
+  over `expires`, `sigtype` and `pubkey`) travels in the frame.
 
 A key that is not `options` or `offline` is refused, as is a section that
 does not fit the wire.
@@ -276,45 +273,22 @@ is well-formed, carries version 0x02, has no reserved flag bits, and the
 embedded signature verifies against the sender's signing key; `error`
 otherwise.
 
-An offline-signed frame is always refused here: its `offsig` is the target
-destination's signature, and without that destination's signing key there is
-nothing to check it against. Use `f:decode2/3` to accept those.
+An offline-signed frame is accepted when its `offsig` verifies against the
+signing key of the sender destination (`from`): the signature covers the
+block's expiry, transient signature type and transient public key. The
+payload is then checked against the transient public key the block carries.
 """.
 -spec decode2(binary(), binary()) -> {ok, datagram2()} | error.
-decode2(Wire, TargetDestHash) ->
-    decode2(Wire, TargetDestHash, undefined).
-
--doc """
-Decode and authenticate a Datagram2, with the target destination's signing
-key.
-
-`DestSignPubKey` is the 32-byte Ed25519 signing public key of the
-destination the datagram was addressed to (`i2p_keys:signing_key/1` of the
-session's own identity), or `undefined` when the caller holds no such key.
-
-An offline-signed frame is accepted only when its `offsig` verifies against
-`DestSignPubKey` — the signature covers the block's expiry, transient
-signature type and transient public key — and the block has not expired; the
-payload signature is then checked against the transient public key the block
-carries. An ordinary frame is verified against the sender destination's
-signing key, exactly as in `f:decode2/2`.
-
-Output: `{ok, Datagram}` when the frame is well-formed and authentic;
-`error` otherwise. Malformed frames, unsupported flag combinations,
-unparsable sender destinations, failed authentication and expired offline
-blocks all collapse to `error`.
-""".
--spec decode2(binary(), binary(), binary() | undefined) -> {ok, datagram2()} | error.
-decode2(Wire, TargetDestHash, DestSignPubKey) when
+decode2(Wire, TargetDestHash) when
     is_binary(Wire), is_binary(TargetDestHash)
 ->
     case TargetDestHash of
         <<_:32/binary>> ->
-            decode2_body(Wire, TargetDestHash, DestSignPubKey);
+            decode2_body(Wire, TargetDestHash);
         _ ->
             error
     end;
-decode2(_, _, _) ->
+decode2(_, _) ->
     error.
 
 %%%%%%% %%% Internal %%%%%%%
@@ -473,16 +447,16 @@ sigtype_lengths(?SIGTYPE_ED25519) ->
 sigtype_lengths(SigType) when is_integer(SigType), SigType >= 0 ->
     error.
 
--spec decode2_body(binary(), <<_:256>>, binary() | undefined) ->
+-spec decode2_body(binary(), <<_:256>>) ->
     {ok, datagram2()} | error.
-decode2_body(Wire, TargetDestHash, DestSignPubKey) ->
+decode2_body(Wire, TargetDestHash) ->
     case Wire of
         <<From:?DEST_SIZE/binary, Flags:16/big, Rest/binary>> when
             byte_size(Rest) >= ?SIG_LEN
         ->
             case flags2_ok(Flags) of
                 true ->
-                    decode2_sections(From, Flags, Rest, TargetDestHash, DestSignPubKey);
+                    decode2_sections(From, Flags, Rest, TargetDestHash);
                 false ->
                     error
             end;
@@ -497,15 +471,15 @@ flags2_ok(Flags) when Flags >= 0, Flags =< 16#FFFF ->
     (Flags band 16#000F) =:= ?DG2_VERSION andalso (Flags band ?DG2_RESERVED) =:= 0.
 
 -spec decode2_sections(
-    <<_:3128>>, 0..16#FFFF, binary(), <<_:256>>, binary() | undefined
+    <<_:3128>>, 0..16#FFFF, binary(), <<_:256>>
 ) ->
     {ok, datagram2()} | error.
-decode2_sections(From, Flags, Rest, TargetDestHash, DestSignPubKey) ->
+decode2_sections(From, Flags, Rest, TargetDestHash) ->
     HasOptions = (Flags band ?DG2_FLAG_OPTIONS) =/= 0,
     HasOffline = (Flags band ?DG2_FLAG_OFFLINE) =/= 0,
     case options2_section(Rest, HasOptions) of
         {ok, Options, OptionsBin, Rest1} ->
-            case offline2_section(Rest1, HasOffline, DestSignPubKey) of
+            case offline2_section(Rest1, HasOffline, From) of
                 {ok, Offline, OfflineBin, Rest2} ->
                     case payload2(Rest2) of
                         {ok, Payload, Signature} ->
@@ -547,60 +521,70 @@ options2_section(Rest, true) ->
     end.
 
 %% offline2_section/3 — the offline-signature section when bit 5 announces
-%% it. The section is only accepted when the target destination's key
-%% vouches for it and the block has not expired.
--spec offline2_section(binary(), boolean(), binary() | undefined) ->
+%% it. The section is only accepted when the sender's key vouches for it
+%% and the block has not expired.
+-spec offline2_section(binary(), boolean(), <<_:3128>>) ->
     {ok, offline_sig() | undefined, binary(), binary()} | error.
-offline2_section(Rest, false, _DestSignPubKey) ->
+offline2_section(Rest, false, _From) ->
     {ok, undefined, <<>>, Rest};
-offline2_section(Rest, true, DestSignPubKey) ->
-    case Rest of
-        <<Expires:32/big, SigType:16/big, Rest1/binary>> ->
-            case sigtype_lengths(SigType) of
-                {ok, PubLen, SigLen} ->
-                    case Rest1 of
-                        <<PubKey:PubLen/binary, OffSig:SigLen/binary, Rest2/binary>> ->
-                            Section =
-                                <<Expires:32/big, SigType:16/big, PubKey/binary, OffSig/binary>>,
-                            case offline2_valid(Expires, SigType, PubKey, OffSig, DestSignPubKey) of
-                                true ->
-                                    {ok,
-                                        #{
-                                            expires => Expires,
-                                            sigtype => SigType,
-                                            pubkey => PubKey,
-                                            offsig => OffSig
-                                        },
-                                        Section, Rest2};
-                                false ->
+offline2_section(Rest, true, From) ->
+    case i2p_keys:parse(From) of
+        {ok, Identity} ->
+            FromSignKey = i2p_keys:signing_key(Identity),
+            case Rest of
+                <<Expires:32/big, SigType:16/big, Rest1/binary>> ->
+                    case sigtype_lengths(SigType) of
+                        {ok, PubLen, SigLen} ->
+                            case Rest1 of
+                                <<PubKey:PubLen/binary, OffSig:SigLen/binary, Rest2/binary>> ->
+                                    Section =
+                                        <<Expires:32/big, SigType:16/big, PubKey/binary,
+                                            OffSig/binary>>,
+                                    case
+                                        offline2_valid(
+                                            Expires, SigType, PubKey, OffSig, FromSignKey
+                                        )
+                                    of
+                                        true ->
+                                            {ok,
+                                                #{
+                                                    expires => Expires,
+                                                    sigtype => SigType,
+                                                    pubkey => PubKey,
+                                                    offsig => OffSig
+                                                },
+                                                Section, Rest2};
+                                        false ->
+                                            error
+                                    end;
+                                _ ->
                                     error
                             end;
-                        _ ->
+                        error ->
                             error
                     end;
-                error ->
+                _ ->
                     error
             end;
-        _ ->
+        {error, _} ->
             error
     end.
 
-%% offline2_valid/5 — the target destination's signature over the expiry,
+%% offline2_valid/5 — the sender's signature over the expiry,
 %% the transient signature type and the transient public key, plus the
 %% expiry itself: a block whose time has passed is refused.
 -spec offline2_valid(
-    non_neg_integer(), non_neg_integer(), binary(), binary(), binary() | undefined
+    non_neg_integer(), 7, <<_:256>>, <<_:512>>, <<_:256>>
 ) ->
     boolean().
-offline2_valid(Expires, SigType, PubKey, OffSig, DestSignPubKey) ->
-    case DestSignPubKey of
-        <<_:?ED25519_PUBKEY_LEN/binary>> ->
-            Signed = <<Expires:32/big, SigType:16/big, PubKey/binary>>,
-            i2p_crypto:ed25519_verify(Signed, OffSig, DestSignPubKey) andalso
-                Expires >= erlang:system_time(second);
-        _ ->
-            false
-    end.
+offline2_valid(Expires, SigType, PubKey, OffSig, FromSignKey) when
+    is_binary(FromSignKey), byte_size(FromSignKey) =:= ?ED25519_PUBKEY_LEN
+->
+    Signed = <<Expires:32/big, SigType:16/big, PubKey/binary>>,
+    i2p_crypto:ed25519_verify(Signed, OffSig, FromSignKey) andalso
+        Expires >= erlang:system_time(second);
+offline2_valid(_, _, _, _, _) ->
+    false.
 
 %% payload2/1 — the payload and the signature that closes the frame.
 -spec payload2(binary()) -> {ok, binary(), <<_:512>>} | error.

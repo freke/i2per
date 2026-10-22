@@ -265,11 +265,18 @@ listener_survives_beyond_active_budget(_Config) ->
         %% re-arm at 32 cannot mask an arithmetic error in the second arm.
         Count = 73,
         Payloads = [sealed_one(IntroKey, ConnId, N) || N <- lists:seq(1, Count)],
-        lists:foreach(
-            fun(D) -> ok = gen_udp:send(Sock, {127, 0, 0, 1}, LPort, D) end,
-            Payloads
-        ),
-        Received = collect_n(self(), Count, []),
+        Received =
+            lists:foldl(
+                fun(Chunk, Acc0) ->
+                    lists:foreach(
+                        fun(D) -> ok = gen_udp:send(Sock, {127, 0, 0, 1}, LPort, D) end,
+                        Chunk
+                    ),
+                    Acc0 ++ collect_n(self(), length(Chunk), [])
+                end,
+                [],
+                chunks(Payloads, 8)
+            ),
         case Received of
             _ when length(Received) =:= Count -> ok;
             _ -> ct:fail({received, length(Received), Count})
@@ -723,3 +730,8 @@ peer_local() ->
         hash => i2p_router_info:hash(RI),
         ri => RI
     }.
+
+%% Split a list into chunks of at most `N` elements.
+chunks([], _) -> [];
+chunks(L, N) when length(L) =< N -> [L];
+chunks(L, N) -> [lists:sublist(L, N) | chunks(lists:nthtail(N, L), N)].
