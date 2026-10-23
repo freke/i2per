@@ -1,0 +1,10 @@
+{application, i2per_tun, [
+    {description, "TUN interface companion app for the i2per router (fd spike)"},
+    {vsn, "0.8.0"},
+    {registered, []},
+    {mod, {i2per_tun_app, []}},
+    {applications, [kernel, stdlib]},
+    {env, []},
+    {modules, []},
+    {licenses, ["BSD-3-Clause"]}
+]}.

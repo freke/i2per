@@ -6,6 +6,9 @@ erl_crash.dump
 rebar3.crashdump
 priv/native/
 *.so
+
+# Rust NIF build artifacts (scripts/build-i2per-tun-nif.sh)
+apps/*/native/*/target/
 doc/
 apps/*/doc/
 

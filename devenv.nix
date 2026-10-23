@@ -4,6 +4,11 @@
   cachix.enable = false;
 
   languages.erlang.enable = true;
+  # The i2per_tun NIF is Rust (D3750BZ): the toolchain must be pinned here
+  # rather than taken from the host, because the gate runs everything through
+  # devenv, and a NIF built against a different OTP's headers than the one
+  # that loads it is exactly the mismatch this file exists to prevent.
+  languages.rust.enable = true;
   packages = [ pkgs.just pkgs.jujutsu pkgs.git pkgs.erlfmt pkgs.erlang-language-platform pkgs.gh ];
 
   # No `enterShell` hook. The `gh` OSC 11 workaround used to live here, as a
