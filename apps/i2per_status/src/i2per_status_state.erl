@@ -207,7 +207,9 @@ A snapshot is the union of the two sets, and the union is what a reader of
     peers => #{
         connected := non_neg_integer(),
         connecting := non_neg_integer(),
-        other := non_neg_integer()
+        other := non_neg_integer(),
+        dialed => non_neg_integer(),
+        detail => #{binary() => map()}
     },
     tunnels => #{
         outbound => non_neg_integer(),
@@ -215,10 +217,14 @@ A snapshot is the union of the two sets, and the union is what a reader of
         transit => non_neg_integer(),
         pending => non_neg_integer(),
         exploratory_outbound => non_neg_integer(),
-        exploratory_inbound => non_neg_integer()
+        exploratory_inbound => non_neg_integer(),
+        detail => map(),
+        demands => map()
     },
-    netdb => #{ri => non_neg_integer(), ls => non_neg_integer()},
+    netdb => map(),
     sessions => non_neg_integer(),
+    config => map(),
+    sam_sessions => [binary()],
     %% The measured reachability per family, as the router's read API carries
     %% it: the latest concluded test's ladder rung and, when the chain broke,
     %% the typed reason. Optional for the same reason `peers` is — a snapshot
@@ -477,12 +483,14 @@ empty_counters() ->
 known_view_keys() ->
     [
         boot_time,
+        config,
         counters,
         gauges,
         identity,
         netdb,
         peers,
         reachability_detail,
+        sam_sessions,
         sessions,
         ssu2,
         ssu2_preferred,

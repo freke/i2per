@@ -64,6 +64,7 @@ writes configuration files.
     %% capability change the router had not made.
     relay_coord,
     peertest_coord,
+    upnp,
     %% Applied immediately rather than merely stored. `m:i2p_log:set_level/1` is the
     %% only thing in the tree that can change the level, so this key routes through
     %% it: going through `application:set_env/3` alone would record the new level
@@ -97,7 +98,8 @@ writes configuration files.
             max_ssu2_sessions,
             max_stream_connections,
             ntcp2_keepalive_interval_ms,
-            ssu2_preferred
+            ssu2_preferred,
+            upnp_name
         ]
 ).
 
@@ -165,6 +167,8 @@ set(Key, Value) ->
     | log_level
     | relay_coord
     | peertest_coord
+    | upnp
+    | upnp_name
     | host
     | port
     | sam_port
@@ -248,6 +252,8 @@ store_runtime(relay_coord, Value) ->
     apply_coordinator(relay_coord, Value);
 store_runtime(peertest_coord, Value) ->
     apply_coordinator(peertest_coord, Value);
+store_runtime(upnp, Value) ->
+    i2per_sup:apply_upnp(Value);
 store_runtime(Key, Value) ->
     application:set_env(i2per, Key, Value),
     ok.
@@ -295,6 +301,9 @@ validate_value(Key, Value) ->
         {ntcp2_published, V} when is_boolean(V) -> ok;
         {live_network, V} when is_boolean(V) -> ok;
         {peertest_coord, V} when is_boolean(V) -> ok;
+        {upnp, V} when is_boolean(V) -> ok;
+        {upnp_name, V} when is_binary(V), byte_size(V) > 0 -> ok;
+        {upnp_name, V} when is_list(V), V =/= [] -> ok;
         %% The Charlie/introducer switch additionally requires `live_network`, per
         %% the resolved decision: the capability begins issuing relay tags and
         %% emitting unsolicited datagrams to third-party addresses, so it is gated

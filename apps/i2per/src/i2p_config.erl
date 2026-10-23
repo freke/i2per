@@ -411,6 +411,10 @@ coerce_scalar(<<"ntcp2_published">>, V) ->
     coerce_bool(ntcp2_published, V);
 coerce_scalar(<<"live_network">>, V) ->
     coerce_bool(live_network, V);
+coerce_scalar(<<"upnp">>, V) ->
+    coerce_bool(upnp, V);
+coerce_scalar(<<"upnp_name">>, V) ->
+    {ok, {upnp_name, unicode:characters_to_binary(V)}};
 %% The level vocabulary is `m:i2p_log`'s. The whitelist is fail-closed, so this
 %% clause has to exist for the key to be usable from a file at all -- and it consults
 %% the owner rather than listing levels, so a level cannot be accepted here and

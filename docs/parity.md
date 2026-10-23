@@ -60,8 +60,8 @@ Rows are one verdict, not prose: **done** (implemented and exercised),
 | Measured reachability | done | see `CD7ZBVH` |
 | TUN interface | done (separate app) | `i2per_tun` companion app (ADR 0001); not part of the 0.7.0 release, which defers TUN to 0.8.0 |
 | SOCKS / HTTP proxy / BOB / I2PControl | done (separate app) | `i2per_proxy` companion app; i2pd 3.0.0 adds `LocalDestinationInfo` to I2PControl |
-| In-built status monitor | partial | separate presentation app (`i2per_status`) |
-| UPnP / NAT traversal service | absent | one-shot indirect dial only |
+| In-built status monitor | done (separate app) | `i2per_status` presentation app; held fields rendered (peers/tunnels/netdb/config/SAM), derived rates and reachability ladder; absent: graceful shutdown, non-SAM service rows, peer-test error reasons |
+| UPnP / NAT traversal service | done (separate app) | `i2p_upnp_srv` (off by default, hot-switchable); SSDP discovery, SOAP port mapping with renewal |
 
 ## 1.0.0 material explicitly listed
 

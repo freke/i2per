@@ -1036,5 +1036,8 @@ rename_private(TmpPath, Path) ->
 data_dir() ->
     case application:get_env(i2per, data_dir) of
         {ok, Dir} when is_list(Dir) -> {ok, Dir};
-        _ -> undefined
+        {ok, Dir} when is_binary(Dir) ->
+            {ok, unicode:characters_to_list(Dir)};
+        _ ->
+            undefined
     end.

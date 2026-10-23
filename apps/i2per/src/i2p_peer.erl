@@ -2098,8 +2098,13 @@ lookup_reply(leaseset, Key, Excluded) ->
                     {store_ls, {ls1, LS}};
                 not_found ->
                     case i2p_netdb_srv:find_ls_5(Key) of
-                        {ok, Bin} -> {store_ls, {ls5, Bin}};
-                        not_found -> {search, i2p_netdb_srv:closest(Key, 4) -- Excluded}
+                        {ok, Bin} ->
+                            {store_ls, {ls5, Bin}};
+                        not_found ->
+                            case i2p_netdb_srv:find_ls_7(Key) of
+                                {ok, Bin7} -> {store_ls, {ls7, Bin7}};
+                                not_found -> {search, i2p_netdb_srv:closest(Key, 4) -- Excluded}
+                            end
                     end
             end
     end;
@@ -2145,6 +2150,10 @@ tunnel_lookup_reply(
             {store_ls, {ls5, Bin}} ->
                 i2p_i2np:db_store(
                     Key, 5, 0, undefined, Bin
+                );
+            {store_ls, {ls7, Bin}} ->
+                i2p_i2np:db_store(
+                    Key, 7, 0, undefined, Bin
                 );
             {search, PeerHashes} ->
                 i2p_i2np:db_search_reply(Key, PeerHashes, OurHash)
@@ -2307,6 +2316,10 @@ send_ls_store(ConnPid, Transport, Key, {ls1, LS}) ->
 send_ls_store(ConnPid, Transport, Key, {ls5, Bin}) ->
     send_i2np(
         ConnPid, Transport, i2p_i2np:db_store(Key, 5, 0, undefined, Bin)
+    );
+send_ls_store(ConnPid, Transport, Key, {ls7, Bin}) ->
+    send_i2np(
+        ConnPid, Transport, i2p_i2np:db_store(Key, 7, 0, undefined, Bin)
     ).
 
 send_search_reply(ConnPid, Transport, Key, PeerHashes, State) ->

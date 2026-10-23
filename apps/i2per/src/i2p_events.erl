@@ -187,7 +187,12 @@ lookup service not being running, where there is no key and nothing was asked fo
     %% The merged addressbook was dumped to its publication path.
     | {addressbook_published, non_neg_integer()}
     %% The addressbook publication dump failed.
-    | {addressbook_publish_failed, term()}.
+    | {addressbook_publish_failed, term()}
+    %% UPnP port mapping discovery/mapping events.
+    | {upnp_mapping_lost, no_gateway | term()}
+    | {upnp_mapping_discovered, binary()}
+    | {upnp_mapping_renewed, pos_integer(), string()}
+    | {upnp_mapping_refused, pos_integer(), string(), term()}.
 
 %% %%%%% Why there is no heap bound on the manager %%%%% %%%
 %%

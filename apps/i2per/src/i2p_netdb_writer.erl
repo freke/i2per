@@ -314,5 +314,11 @@ chmod_and_rename(TmpPath, Path) ->
 data_dir() ->
     case application:get_env(i2per, data_dir) of
         {ok, Dir} when is_list(Dir) -> Dir;
-        _ -> undefined
+        {ok, Dir} when is_binary(Dir) ->
+            %% Normalise to a list of code points so the `++`-based temp-path
+            %% construction below (and `filename:join/2`) keep working for
+            %% Unicode paths; a binary would make `++` raise `badarg`.
+            unicode:characters_to_list(Dir);
+        _ ->
+            undefined
     end.

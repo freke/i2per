@@ -43,7 +43,7 @@ The `Local` identity map is computed once and shared between all managers.
 
 -behaviour(supervisor).
 
--export([start_link/0, init/1, apply_coordinator/2]).
+-export([start_link/0, init/1, apply_coordinator/2, apply_upnp/1]).
 
 -spec start_link() -> {ok, pid()} | {error, term()}.
 start_link() ->
@@ -71,7 +71,8 @@ init([]) ->
             %% fails as a `start_spec` badmatch from every test that boots the app.
             netdb_children() ++
             ntcp2_sup_children(LocalSeeds) ++ ssu2_sup_children(LocalSeeds) ++
-            manager_children(LocalSeeds) ++ coordinator_children(LocalSeeds),
+            manager_children(LocalSeeds) ++ coordinator_children(LocalSeeds) ++
+            upnp_children(),
     {ok, {#{strategy => one_for_one, intensity => 10, period => 10}, Children}}.
 
 %% ADR 0002's "it started and I don't know with what".
@@ -691,6 +692,44 @@ stop_coord(Key) ->
             {error, Reason}
     end.
 
+%% Apply a UPnP enable change at runtime. Same shape as `apply_coordinator/2`,
+%% but the service needs no identity and no coordinator seed, so the start path
+%% is just the child spec. An env write happens only on success, so a failed
+%% start leaves the setting and the running state in agreement.
+-spec apply_upnp(boolean()) -> ok | {error, term()}.
+apply_upnp(true) ->
+    case supervisor:start_child(?MODULE, upnp_child()) of
+        {ok, _Pid} ->
+            application:set_env(i2per, upnp, true),
+            ok;
+        {error, {already_started, _Pid}} ->
+            application:set_env(i2per, upnp, true),
+            ok;
+        {error, already_present} ->
+            _ = supervisor:delete_child(?MODULE, i2p_upnp_srv),
+            case supervisor:start_child(?MODULE, upnp_child()) of
+                {ok, _Pid} ->
+                    application:set_env(i2per, upnp, true),
+                    ok;
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end;
+apply_upnp(false) ->
+    case supervisor:terminate_child(?MODULE, i2p_upnp_srv) of
+        ok ->
+            _ = supervisor:delete_child(?MODULE, i2p_upnp_srv),
+            application:set_env(i2per, upnp, false),
+            ok;
+        {error, not_found} ->
+            application:set_env(i2per, upnp, false),
+            ok;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
 %% The supervisor child id each enable key drives. The key and the id are
 %% different atoms — `relay_coord` names the setting, `i2p_relay_coord` names
 %% the child — and a stop that looked up the child by the setting's name would
@@ -811,6 +850,26 @@ sam_sup_child_spec(_Local, no_listen) ->
         shutdown => infinity,
         type => supervisor,
         modules => [i2p_sam_sup]
+    }.
+
+%% upnp_children/0 - the UPnP port-mapping service, off unless the operator
+%% turned it on. The service is bounded and hot-switchable like a coordinator,
+%% but it needs no identity, so its child spec is a plain worker.
+-spec upnp_children() -> [supervisor:child_spec()].
+upnp_children() ->
+    case i2p_upnp_srv:enabled() of
+        true -> [upnp_child()];
+        false -> []
+    end.
+
+upnp_child() ->
+    #{
+        id => i2p_upnp_srv,
+        start => {i2p_upnp_srv, start_link, []},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker,
+        modules => [i2p_upnp_srv]
     }.
 
 %% addressbook_pub_children/0 - publish merged book when configured via
