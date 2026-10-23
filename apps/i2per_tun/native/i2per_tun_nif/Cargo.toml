@@ -1,0 +1,22 @@
+[package]
+name = "i2per_tun_nif"
+version = "0.1.0"
+edition = "2021"
+description = "Rust NIF owning the Linux TUN device for i2per_tun (epiq D3750BZ spike)"
+license = "BSD-3-Clause"
+publish = false
+
+[lib]
+name = "i2per_tun_nif"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Raw Erlang NIF bindings. The build.rs of this crate parses the local OTP
+# headers (it needs `erl` on PATH), so the signatures always match the Erlang
+# installation the NIF is built against.
+rustler_sys = "2.4"
+libc = "0.2"
+
+# Deliberately no [profile.release] panic = "abort": unwind is what lets every
+# entry point's catch_unwind contain a panic at the NIF boundary instead of
+# taking the VM down.
