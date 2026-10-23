@@ -31,7 +31,8 @@
     created_with_peertest_type_byte_is_delivered/1,
     pending_claim_is_scoped_to_the_listener_that_registered_it/1,
     a_truncated_datagram_does_not_kill_the_socket_owner/1,
-    classification_spends_one_pass_per_claimed_datagram/1
+    classification_spends_one_pass_per_claimed_datagram/1,
+    listener_survives_beyond_active_budget/1
 ]).
 
 -define(APP, i2per).
@@ -50,7 +51,8 @@ all() ->
         created_with_peertest_type_byte_is_delivered,
         pending_claim_is_scoped_to_the_listener_that_registered_it,
         a_truncated_datagram_does_not_kill_the_socket_owner,
-        classification_spends_one_pass_per_claimed_datagram
+        classification_spends_one_pass_per_claimed_datagram,
+        listener_survives_beyond_active_budget
     ].
 
 init_per_testcase(_Case, Config) ->
@@ -241,6 +243,67 @@ sealed_datagram(IntroKey, ConnId, Type, Size) ->
     %% and the datagram would not present as `Type` at all.
     Body = binary:copy(crypto:strong_rand_bytes(Size - byte_size(Header)), 1),
     i2p_ssu2:seal_long(<<Header/binary, Body/binary>>, IntroKey, IntroKey).
+
+%% The re-arm is a counter and not a one-shot, so the listener must keep
+%% receiving once the first arm is exhausted. This is the case the off-by-one
+%% in `f:rearm/2` would fail -- and silently, with nothing in the log -- so a
+%% bare existence check is the only direct guard on it.
+%%
+%% The datagrams carry a registered connection id, so each is routed back to
+%% this process exactly as `classification_spends_one_pass_per_claimed_datagram`
+%% relies on the first one being.
+listener_survives_beyond_active_budget(_Config) ->
+    Local = peer_local(),
+    IntroKey = maps:get(intro_key, Local),
+    {ok, Listener} = i2p_ssu2_listener:listen(<<"127.0.0.1">>, 0, Local, self()),
+    {ok, Sock} = gen_udp:open(0, [binary, {active, false}]),
+    try
+        LPort = i2p_ssu2_listener:port(Listener),
+        ConnId = 16#FEEDFACEDEADC0DE,
+        true = ets:insert(i2p_ssu2_sessions, {ConnId, self()}),
+        %% Past the arm, with room to re-arm a second time, so a single stiff
+        %% re-arm at 32 cannot mask an arithmetic error in the second arm.
+        Count = 73,
+        Payloads = [sealed_one(IntroKey, ConnId, N) || N <- lists:seq(1, Count)],
+        Received =
+            lists:foldl(
+                fun(Chunk, Acc0) ->
+                    lists:foreach(
+                        fun(D) -> ok = gen_udp:send(Sock, {127, 0, 0, 1}, LPort, D) end,
+                        Chunk
+                    ),
+                    Acc0 ++ collect_n(self(), length(Chunk), [])
+                end,
+                [],
+                chunks(Payloads, 8)
+            ),
+        case Received of
+            _ when length(Received) =:= Count -> ok;
+            _ -> ct:fail({received, length(Received), Count})
+        end
+    after
+        gen_udp:close(Sock),
+        i2p_ssu2_listener:stop(Listener)
+    end.
+
+%% Build one claimed datagram with a unique packet number, so 73 of them are 73
+%% distinct datagrams rather than duplicates the listener would drop.
+sealed_one(IntroKey, ConnId, Num) ->
+    Header = <<ConnId:64, Num:32, 0:8, 2:8, 2:8, 0:8, 0:64, 0:64>>,
+    Body = binary:copy(<<0>>, 1472 - byte_size(Header)),
+    i2p_ssu2:seal_long(<<Header/binary, Body/binary>>, IntroKey, IntroKey).
+
+%% Drain exactly `Target` packets from the mailbox and return them; keeps
+%% reading across the re-arm windows and times out once no more are coming.
+collect_n(_Pid, 0, Acc) ->
+    lists:reverse(Acc);
+collect_n(Pid, Left, Acc) ->
+    receive
+        {ssu2_packet, D} ->
+            collect_n(Pid, Left - 1, [D | Acc])
+    after 1000 ->
+        lists:reverse(Acc)
+    end.
 
 %% ---------------------------------------------------------------------------
 %% Fault-injected bare dials
@@ -667,3 +730,8 @@ peer_local() ->
         hash => i2p_router_info:hash(RI),
         ri => RI
     }.
+
+%% Split a list into chunks of at most `N` elements.
+chunks([], _) -> [];
+chunks(L, N) when length(L) =< N -> [L];
+chunks(L, N) -> [lists:sublist(L, N) | chunks(lists:nthtail(N, L), N)].

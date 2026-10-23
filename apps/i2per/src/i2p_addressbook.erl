@@ -31,6 +31,8 @@ i2p_addressbook:add(<<"stats.i2p">>, DestB64),
     resolve/1,
     add/2,
     hosts_file_for/1,
+    snapshot/0,
+    dump/1,
     stop/0
 ]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
@@ -82,6 +84,36 @@ add(Name, DestB64) ->
 stop() ->
     gen_server:stop(?MODULE).
 
+-doc """
+Snapshot the current merged book.
+Output: `{ok, map()}` from the server, or `{error, not_running}` if the
+address book is not running.
+""".
+-spec snapshot() -> {ok, map()} | {error, not_running}.
+snapshot() ->
+    case whereis(?MODULE) of
+        undefined ->
+            {error, not_running};
+        _Pid ->
+            gen_server:call(?MODULE, snapshot)
+    end.
+
+-doc """
+Dump the merged book to `Path` in hosts.txt format.
+Output: `ok` on success, or `{error, term()}` on failure.
+""".
+-spec dump(file:filename_all()) -> ok | {error, term()}.
+dump(Path) ->
+    case whereis(?MODULE) of
+        undefined ->
+            case snapshot() of
+                {ok, Entries} -> write_snapshot(Path, Entries);
+                {error, not_running} -> {error, not_running}
+            end;
+        _Pid ->
+            gen_server:call(?MODULE, {dump, Path})
+    end.
+
 -spec init([file:filename_all() | undefined]) -> {ok, map()}.
 init([FilePath]) ->
     Entries =
@@ -107,6 +139,10 @@ handle_call({add, Name, DestB64}, _From, State) ->
     Entries = maps:put(Name, DestB64, maps:get(entries, State)),
     append_line(maps:get(file, State), Name, DestB64),
     {reply, ok, State#{entries := Entries}};
+handle_call(snapshot, _From, State) ->
+    {reply, {ok, maps:get(entries, State)}, State};
+handle_call({dump, Path}, _From, State) ->
+    {reply, write_snapshot(Path, maps:get(entries, State)), State};
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 
@@ -165,6 +201,34 @@ append_line(Path, Name, DestB64) ->
             ok;
         {error, Reason} ->
             exit({addressbook_write_failed, Path, Reason})
+    end.
+
+write_snapshot(Path, Entries) ->
+    Keys = lists:sort(maps:keys(Entries)),
+    Bin =
+        lists:foldl(
+            fun(Key, Acc) ->
+                Dest = maps:get(Key, Entries),
+                <<Acc/binary, Key/binary, "=", Dest/binary, "\n">>
+            end,
+            <<>>,
+            Keys
+        ),
+    Dir = filename:dirname(Path),
+    _ = filelib:ensure_dir(filename:join(Dir, "hosts.txt")),
+    PathBin = unicode:characters_to_binary(Path),
+    Tmp = <<PathBin/binary, ".tmp">>,
+    case file:write_file(Tmp, Bin) of
+        ok ->
+            case file:rename(Tmp, Path) of
+                ok ->
+                    ok;
+                {error, _} = Err ->
+                    _ = file:delete(Tmp),
+                    Err
+            end;
+        {error, _} = Err ->
+            Err
     end.
 
 -doc "The hosts.txt path for `DataDir`, or `undefined` without persistence.".

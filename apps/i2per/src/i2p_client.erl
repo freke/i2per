@@ -27,6 +27,8 @@ ok = i2p_tunnel_srv:inject(Injection, {tunnel, Gateway, TunnelID}, StdMsg).
 -export([
     pick_lease/1,
     pick_lease/2,
+    pick_lease_v1/1,
+    pick_lease_v1/2,
     wrap_payload/2,
     unwrap_payload/2,
     route_to_dest/1,
@@ -85,25 +87,53 @@ Output: `{ok, SelectedLease}` or `error` when every lease has expired.
 -spec pick_lease(i2p_leaset:lease_set(), non_neg_integer()) ->
     {ok, selected_lease()} | error.
 pick_lease(LS, NowMs) ->
-    Fresh =
-        [
-            L
-         || L <- i2p_leaset:leases(LS),
-            delta_ms(maps:get(end_date, L), NowMs) > 0,
-            delta_ms(maps:get(end_date, L), NowMs) < ?DATE_HALF_WINDOW
-        ],
+    pick_lease_generic(
+        i2p_leaset:leases(LS),
+        NowMs,
+        fun(EndDate, Now) ->
+            Delta = (EndDate - Now) band ?DATE_MASK,
+            Delta > 0 andalso Delta < ?DATE_HALF_WINDOW
+        end
+    ).
+
+-doc """
+Pick the freshest unexpired lease of a v1 LeaseSet, at the current wall clock.
+
+Output: `{ok, SelectedLease}` or `error` when every lease has expired.
+""".
+-spec pick_lease_v1(i2p_leaset_v1:lease_set()) -> {ok, selected_lease()} | error.
+pick_lease_v1(LS) ->
+    pick_lease_v1(LS, erlang:system_time(millisecond)).
+
+-doc """
+Pick the freshest unexpired lease of a v1 LeaseSet against a fixed clock.
+
+Input: `LS` — the decoded v1 LeaseSet; `NowMs` — the reference time in ms.
+Output: `{ok, SelectedLease}` or `error` when every lease has expired.
+""".
+-spec pick_lease_v1(i2p_leaset_v1:lease_set(), non_neg_integer()) ->
+    {ok, selected_lease()} | error.
+pick_lease_v1(LS, NowMs) ->
+    pick_lease_generic(
+        i2p_leaset_v1:leases(LS),
+        NowMs,
+        fun(EndDate, Now) -> EndDate > Now end
+    ).
+
+%% Shared lease-selection core used by both LeaseSet versions. `FreshPred`
+%% decides whether a lease is still usable against `NowMs`; the v2 version
+%% wraps the 4-byte end_date, the v1 version compares its 8-byte end_date
+%% directly.
+pick_lease_generic(Leases, NowMs, FreshPred) ->
+    Fresh = [L || L <- Leases, FreshPred(maps:get(end_date, L), NowMs)],
     case Fresh of
         [] ->
             error;
         _ ->
-            %% Freshest lease last after ascending end-date sort
             Sorted = lists:sort([{maps:get(end_date, L), L} || L <- Fresh]),
             {_MaxEnd, Best} = lists:last(Sorted),
             {ok, {maps:get(gateway, Best), maps:get(tunnel_id, Best)}}
     end.
-
-delta_ms(EndDate, NowMs) ->
-    (EndDate - NowMs) band ?DATE_MASK.
 
 -doc """
 Wrap raw stream payload for a remote destination.
@@ -224,33 +254,53 @@ lease_route(Identity, DestBin) ->
     LS =
         case i2p_netdb_srv:find_ls(DestHash) of
             {ok, Found} ->
-                {ok, Found};
+                {ok, {v2, Found}};
             not_found ->
-                case i2p_lookup_srv:find_ls(DestHash) of
-                    Result = {ok, _} -> Result;
-                    {error, _} -> error
+                case i2p_netdb_srv:find_ls_v1(DestHash) of
+                    {ok, Found1} ->
+                        {ok, {v1, Found1}};
+                    not_found ->
+                        case i2p_lookup_srv:find_ls(DestHash) of
+                            {ok, Found2} ->
+                                {ok, {v2, Found2}};
+                            {error, _} ->
+                                case i2p_lookup_srv:find_ls_v1(DestHash) of
+                                    {ok, Found3} -> {ok, {v1, Found3}};
+                                    {error, _} -> error
+                                end
+                        end
                 end
         end,
     case LS of
-        {ok, LeaseSet} ->
+        {ok, {v2, LeaseSet}} ->
             case pick_lease(LeaseSet) of
                 {ok, {Gw, Tid}} ->
-                    case i2p_tunnel_srv:pick_outbound() of
-                        {ok, OutTid, _Entry} ->
-                            {ok, #{
-                                out_tid => OutTid,
-                                gw => Gw,
-                                tid => Tid,
-                                dest_pub => i2p_keys:public_key(Identity),
-                                dest_bin => DestBin,
-                                dest_hash => DestHash
-                            }};
-                        error ->
-                            error
-                    end;
+                    finish_lease_route(Gw, Tid, Identity, DestBin, DestHash);
                 error ->
                     error
             end;
+        {ok, {v1, LeaseSet}} ->
+            case pick_lease_v1(LeaseSet) of
+                {ok, {Gw, Tid}} ->
+                    finish_lease_route(Gw, Tid, Identity, DestBin, DestHash);
+                error ->
+                    error
+            end;
+        error ->
+            error
+    end.
+
+finish_lease_route(Gw, Tid, Identity, DestBin, DestHash) ->
+    case i2p_tunnel_srv:pick_outbound() of
+        {ok, OutTid, _Entry} ->
+            {ok, #{
+                out_tid => OutTid,
+                gw => Gw,
+                tid => Tid,
+                dest_pub => i2p_keys:public_key(Identity),
+                dest_bin => DestBin,
+                dest_hash => DestHash
+            }};
         error ->
             error
     end.

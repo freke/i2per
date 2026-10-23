@@ -454,6 +454,7 @@ manager_children({ok, Local, Seeds, Listen}) ->
             addressbook_child_spec()
         ] ++
         subs_children() ++
+        addressbook_pub_children() ++
         server_tunnels_children() ++ reseed_children();
 manager_children(error) ->
     [].
@@ -810,4 +811,42 @@ sam_sup_child_spec(_Local, no_listen) ->
         shutdown => infinity,
         type => supervisor,
         modules => [i2p_sam_sup]
+    }.
+
+%% addressbook_pub_children/0 - publish merged book when configured via
+%% app env `i2per` -> `addressbook` => #{hosts_file => Path}.
+-spec addressbook_pub_children() -> [supervisor:child_spec()].
+addressbook_pub_children() ->
+    case application:get_env(i2per, addressbook) of
+        {ok, Opts} when is_map(Opts) ->
+            case maps:find(hosts_file, Opts) of
+                {ok, Path} when is_binary(Path); is_list(Path) ->
+                    BaseOpts = #{
+                        hosts_file =>
+                            case is_binary(Path) of
+                                true -> Path;
+                                false -> unicode:characters_to_binary(Path)
+                            end
+                    },
+                    Opts1 =
+                        case maps:find(interval_ms, Opts) of
+                            {ok, Interval} -> BaseOpts#{interval_ms => Interval};
+                            error -> BaseOpts
+                        end,
+                    [addressbook_pub_child_spec(Opts1)];
+                _ ->
+                    []
+            end;
+        _ ->
+            []
+    end.
+
+addressbook_pub_child_spec(Opts) ->
+    #{
+        id => i2p_addressbook_pub,
+        start => {i2p_addressbook_pub, start_link, [Opts]},
+        restart => transient,
+        shutdown => 5000,
+        type => worker,
+        modules => [i2p_addressbook_pub]
     }.

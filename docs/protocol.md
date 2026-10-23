@@ -1,6 +1,6 @@
 # Protocol Reference
 
-This document describes the I2P wire formats implemented by i2per 0.6.0.
+This document describes the I2P wire formats implemented by i2per 0.7.0.
 Unsupported formats and release limitations are listed explicitly.
 
 All multi-byte integers in I2P are big-endian unless otherwise noted. Ed25519
@@ -12,17 +12,21 @@ in the [I2P documentation](https://i2p.net/en/docs/).
 
 ## Release boundaries
 
-The 0.6.0 release does not implement NTCP1, SSU1, I2CP, the legacy
-ElGamal/AES garlic formats, Datagram2, or a TUN interface. SSU2 path migration
-is also outside this release. The Charlie role is implemented: a tagged session
+The 0.7.0 release does not implement NTCP1, SSU1, I2CP, the legacy
+ElGamal/AES garlic formats, or a TUN interface. SSU2 path migration
+is also outside this release. LeaseSet v1 (store type 1), EncryptedLeaseSet
+(store type 5) and MetaLeaseSet (store type 7) are implemented (#VANCF02,
+#3G0Z06C), and Datagram2 (Proposal 163) is implemented with replay protection
+(#NTWZWTC). Addressbook publication is implemented (#GDEGVQH). The Charlie role is implemented: a tagged session
 answers a RelayIntro as Charlie, verifies the requester's signature, checks the
 asserted endpoint, and punches, and the relay accept now grants a session token
 that Bob validates on the redirect (see #BFKFGY0, #98GAVQK). Automatic
 NetDb-driven Charlie selection is implemented (#6TGF083), and the tunnel build
 accepts up to 7 hops (#K62PQHJ).
-The sections below describe only behavior that is present in 0.6.0. 0.6.0 makes
-no wire-format changes over 0.5.0: automatic Charlie selection and the raised
-hop cap are control-plane behaviour rather than wire format; the Charlie
+The sections below describe only behavior that is present in 0.7.0. 0.7.0 makes
+wire-format additions over 0.6.0: LeaseSet v1, EncryptedLeaseSet and
+MetaLeaseSet, and the Datagram2 codec; automatic Charlie selection and the
+raised hop cap are control-plane behaviour rather than wire format; the Charlie
 RelayResponse and HolePunch
 blocks and the measured-reachability caps remain as shipped in 0.3.0.
 ## Implemented
@@ -394,12 +398,12 @@ An unsolicited store, or the reply to a successful DatabaseLookup. The
 one-byte store type is part of the DatabaseStore body, not part of a
 LeaseSet's own content. The values used by the I2NP codec are `0` (RouterInfo),
 `1` (LeaseSet), `3` (LeaseSet2), `5` (EncryptedLeaseSet), and `7`
-(MetaLeaseSet). i2per's NetDb path stores types `0`, `1`, and `3`. Types `5`
-and `7` **are decoded** — the codec reports every byte on the wire rather than
-only the types it understands — and are then dropped as unimplemented, with a
-warning naming the type. The distinction matters: a type i2per cannot parse and
-a type it has no parser for are different facts, and only the latter arrives
-here. Encrypted LeaseSet is live in both reference routers (off by default);
+(MetaLeaseSet). i2per's NetDb path stores types `0`, `1` (LeaseSet v1), `3`,
+`5` (EncryptedLeaseSet), and `7` (MetaLeaseSet). Type `5` is stored and served
+verbatim (capacity-bounded; no time-based expiry is applied to the raw bytes);
+type `7` is stored but not re-broadcast. The codec
+reports every byte on the wire rather than only the types it understands.
+Encrypted LeaseSet is live in both reference routers (off by default);
 MetaLeaseSet remains draft.
 
 ```mermaid
@@ -1256,6 +1260,17 @@ content in a DatabaseStore body. The LeaseSet2 content is not an encrypted
 blob: its properties, keys, and leases are carried in the signed clear form
 above.
 
+### LeaseSet (v1)
+
+The original, deprecated LeaseSet (DatabaseStore `store_type` `1`). i2per
+receives, stores, and serves v1 LeaseSets but never publishes one: its
+identities are X25519 + Ed25519, and a v1 encryption key is ElGamal, so
+publishing would require a legacy identity i2per does not have. Wire format:
+`destination ‖ encryption_key(256) ‖ signing_key ‖ num ‖ leases ‖ signature`.
+Leases are 44 bytes each (`gateway(32) ‖ tunnelID(4) ‖ endDate(8 ms)`); up
+to 16. Expiry is when all leases have ended (v1 carries no published
+timestamp). Implemented in `m:i2p_leaset_v1`.
+
 ### Streaming protocol
 
 TCP-like reliable ordered transport carried as the payload of end-to-end
@@ -1504,6 +1519,18 @@ site's destination hash, buffered HTTP GET flushed on establishment — and
 merges every fetched entry into the store. The first fetch fires on boot;
 refreshes default to hourly.
 
+**Publication.** Configured via app env
+`addressbook => #{hosts_file => Path}` (the file to dump the merged
+addressbook in hosts.txt format, mirroring i2pd's `addressbook.hostsfile`).
+The publisher (`m:i2p_addressbook_pub`) dumps the full merged book
+atomically (write temp + rename) on a timer and on boot, emitting
+`addressbook_published` / `addressbook_publish_failed` counters and events.
+The dump is a snapshot of the live merged book (subscriptions plus local
+entries). Serving the dumped file over I2P to remote subscribers is done by
+the operator (e.g. via a local HTTP server and a server tunnel), matching
+i2pd's publication model. Pushing the router's own entry is an
+identity/privacy decision not taken here.
+
 ### Server tunnels
 
 A local TCP service is published as an I2P destination by `m:i2p_server_tunnel`.
@@ -1558,7 +1585,7 @@ packet
 | Field | Size | Description |
 |-------|------|-------------|
 | from | 391 | Sender Destination (X25519 ‖ padding ‖ Ed25519 ‖ KEY cert), same fixed layout as every destination in this router. Its signing key verifies the signature. |
-| signature | 64 | Ed25519 over the **payload bytes only** (non-DSA rule, release 0.9.14+). Datagram2 replay protection is not implemented in this release. |
+| signature | 64 | Ed25519 over the **payload bytes only** (non-DSA rule, release 0.9.14+). Datagram2 (Proposal 163) is implemented as well — see below. |
 | payload | 1..~11 KB practical | Application bytes. Unreliable and unordered end-to-end. |
 
 RAW datagrams carry no header at all: the Data-clove payload is the
@@ -1568,6 +1595,53 @@ message, and receivers cannot attribute or authenticate it.
 or a failed signature all return `error` from `f:i2p_datagram:decode/1`
 and are dropped silently — exactly what an unauthenticated stranger
 deserves.
+
+#### Datagram2 wire format
+
+[Proposal 163](https://i2p.net/en/proposals/163-datagram2/) replaces the
+Datagram1 header with a flags word and two optional sections. The codec is
+`m:i2p_datagram`: `f:i2p_datagram:encode2/5` builds a frame,
+`f:i2p_datagram:decode2/3` authenticates one.
+
+```mermaid
+packet
+0-390: "from — sender Destination (391 bytes)"
+391-392: "flags — version 0x02 and the section bits (2 bytes)"
++393: "options Mapping (optional), offline signature (optional), payload, signature (64 bytes)"
+```
+
+| Field | Size | Description |
+|-------|------|-------------|
+| flags | 2 bytes | Bits 3-0 carry the version (`0x02`); bit 4 announces the options Mapping, bit 5 the offline-signature section; bits 15-6 are reserved and must be zero. A frame whose version nibble is not `0x02`, that sets a reserved bit, or that announces a section it does not carry, is dropped. |
+| options | 0..65537 bytes | A [Mapping](https://i2p.net/en/docs/specs/common-structures/): a 2-byte size (the bytes that follow) then `key=value;` pairs with 1-byte length-prefixed strings. Present only when bit 4 is set. The encoder sorts the keys (byte order, the spec's rule for signed mappings) so the signed bytes are canonical; duplicate keys, strings longer than 255 bytes and mappings longer than 65535 bytes are refused. |
+| offline signature | 0..102 bytes | The offline-signature section of the [common structures spec](https://i2p.net/en/docs/specs/common-structures/): expiry (4 bytes, seconds since the epoch), transient signature type (2 bytes), the transient signing public key, and the destination's signature over those three fields. Present only when bit 5 is set. |
+| payload | 1..~11 KB practical | Application bytes, as in Datagram1. |
+| signature | 64 bytes | Ed25519 over the prelude — the 32-byte hash of the **target** destination, which is not on the wire — followed by the flags, the options and offline sections when they are present, and the payload. |
+
+**The prelude binds the frame to its addressee.** The hash of the
+destination the datagram was sent to is covered by the signature even
+though it never appears in the bytes, so a frame cannot be replayed at a
+different destination.
+
+**An offline-signed datagram is signed by a transient key.** The payload
+signature is made with the transient key the offline section carries, and
+the section's `offsig` is the *target destination's* signature over the
+expiry, the transient signature type and the transient public key. A
+receiver therefore checks the `offsig` against the destination's own
+signing key before it trusts the transient key, and drops the frame when
+the signature type is not Ed25519, when the block has expired, or when
+`f:i2p_datagram:decode2/2` is called without a destination key — there is
+nothing to check the `offsig` against, so the frame cannot be accepted.
+
+The block is minted by the target: the datagrams spec says the section
+"can, and should, be generated offline", and a sender cannot mint one
+because it does not hold the target's signing key. It travels to the
+sender out of band.
+
+The SAM receive path hands the session's own destination key to the codec
+(`f:i2p_datagram:decode2/3`), so a datagram addressed to this router can
+carry an offline section; the counter `datagram2_offline_signed` counts
+the frames that did.
 
 #### Control-socket protocol
 

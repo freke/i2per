@@ -32,6 +32,8 @@ SAM STREAM CONNECT uses this to resolve uncached destinations.
     start_link/1,
     find_ls/1,
     find_ls/2,
+    find_ls_v1/1,
+    find_ls_v1/2,
     find_ri/1,
     find_ri/2,
     send_lookup/4,
@@ -45,7 +47,7 @@ SAM STREAM CONNECT uses this to resolve uncached destinations.
 -define(MAX_ATTEMPTS, 5).
 -define(CANDIDATES_PER_ROUND, 3).
 
--type kind() :: lease | router.
+-type kind() :: lease | lease_v1 | router.
 
 -doc """
 Why a lookup did not produce the record it was asked for.
@@ -156,6 +158,21 @@ bus regardless of who asked.
 find_ls(Key, Opts) ->
     find(Key, lease, Opts).
 
+-doc """
+Fetch a v1 LeaseSet from the network, blocking until it resolves.
+
+Input: `Key` — the destination hash.
+Output: `{ok, LeaseSet}` once a responder's store lands, or `{error, not_found}`.
+""".
+-spec find_ls_v1(i2p_crypto:hash()) -> {ok, i2p_leaset_v1:lease_set()} | {error, not_found}.
+find_ls_v1(Key) ->
+    find_ls_v1(Key, #{}).
+
+-spec find_ls_v1(i2p_crypto:hash(), lookup_options()) ->
+    {ok, i2p_leaset_v1:lease_set()} | {error, not_found | {lookup_failed, lookup_failed_reason()}}.
+find_ls_v1(Key, Opts) ->
+    find(Key, lease_v1, Opts).
+
 -doc "As `f:find_ls/2` but for a RouterInfo.".
 -spec find_ri(i2p_crypto:hash(), lookup_options()) ->
     {ok, i2p_router_info:router_info()}
@@ -264,6 +281,11 @@ handle_info(_Info, State) ->
 
 cached(lease, Key) ->
     case i2p_netdb_srv:find_ls(Key) of
+        {ok, LS} -> {ok, LS};
+        not_found -> error
+    end;
+cached(lease_v1, Key) ->
+    case i2p_netdb_srv:find_ls_v1(Key) of
         {ok, LS} -> {ok, LS};
         not_found -> error
     end;
@@ -396,6 +418,7 @@ std_binary(#{type := Type, msg_id := MsgID, body := Body}) ->
     }).
 
 flag_for(lease) -> i2p_i2np:lookup_type_leaseset();
+flag_for(lease_v1) -> i2p_i2np:lookup_type_leaseset();
 flag_for(router) -> i2p_i2np:lookup_type_routerinfo().
 
 arm_timer(Key) ->

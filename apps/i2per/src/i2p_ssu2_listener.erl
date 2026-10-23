@@ -73,9 +73,39 @@ Only routing happens on the socket owner. The Charlie responder
 a probe is 6.80 µs -- nine times routing -- and this process is the only one that
 can send, so its time is also every other session's send latency.
 
-The socket is driven `{active, once}` so a flood can only starve itself;
-each datagram re-arms the socket. Sessions send through this process
-(`f:send/2`) because it alone owns the socket.
+Sessions send through this process (`f:send/2`) because it alone owns the socket.
+
+## The re-arm budget, and what it bounds
+
+The socket is driven `{active, ?ACTIVE_BUDGET}` rather than `{active, once}`, and
+`f:handle_info/2` re-arms it once every `?ACTIVE_BUDGET` datagrams. The runtime
+stops reading from the socket when the budget runs out, which is what makes the
+mailbox bound the thing `{active, once}` was buying:
+
+| | syscalls per datagram | queued here |
+| --- | --- | --- |
+| `{active, true}` | 0 | **unbounded** -- a flood fills this process |
+| `{active, once}`, what it was | 1 | at most 1 datagram |
+| `{active, ?ACTIVE_BUDGET}`, what it is | **1 / ?ACTIVE_BUDGET** | at most **?ACTIVE_BUDGET** datagrams |
+
+The bound is in datagrams and not in bytes, because that is what a socket budget
+is: a datagram here is at most one UDP datagram, so the worst case is
+`?ACTIVE_BUDGET` times 64 KB and the realistic case at MTU is
+`?ACTIVE_BUDGET` times ~1.5 KB -- 2 MB and 48 KB respectively. Both are against a
+kernel receive buffer that the datagrams past the budget wait in, and which bounds
+them either way. Raising the budget makes the mailbox bound worse and the syscall
+cheaper, lowering it the reverse, and 32 is where the re-arm has already fallen
+below a hundredth of the cost of routing a datagram. See #XZTYAVX.
+
+**The invariant that makes it safe: the socket is never left passive.** The budget
+is re-armed on the datagram that spends it, at the top of `f:handle_info/2` and
+before classification, so by the time a probe starts the Charlie responder -- a
+supervisor call from inside this process -- the socket is already listening again,
+and a datagram arriving in that window waits in the driver's buffer rather than
+being missed. A count that drifted out of step with the budget would leave the
+socket passive for good and take every SSU2 session down with it, which is why
+`i2p_ssu2_listener_tests` drives more than a full budget through a live socket and
+asserts the last datagram arrives.
 """.
 
 -behaviour(gen_server).
@@ -100,6 +130,17 @@ each datagram re-arms the socket. Sessions send through this process
 ]).
 
 -define(HANDSHAKE_TYPES, [?TYPE_SESSION_REQUEST, ?TYPE_TOKEN_REQUEST]).
+
+%% How many datagrams the socket is armed for at a time. See the module doc for
+%% what it buys and what it costs; the short form is that it divides the re-arm
+%% syscall by 32 and widens the mailbox bound from 1 datagram to 32.
+%%
+%% It is a **budget and not a delay**: the runtime stops reading from the socket
+%% when it runs out, and `f:handle_info/2` tops it back up. Nothing here is
+%% expressed in milliseconds, and nothing can be: a budget the runtime enforces is
+%% the only shape of this bound that survives a datagram arriving at the instant
+%% the counter is read.
+-define(ACTIVE_BUDGET, 32).
 
 %% ------------------------------------------------------------------
 %% API
@@ -194,7 +235,7 @@ init({Host, Port, LocalKeys, Owner, Coordinator}) ->
 open_socket(IPAddress, Port, LocalKeys, Owner, Coordinator) ->
     case
         gen_udp:open(Port, [
-            binary, {active, once}, {reuseaddr, true}, {ip, IPAddress}
+            binary, {active, ?ACTIVE_BUDGET}, {reuseaddr, true}, {ip, IPAddress}
         ])
     of
         {ok, Sock} ->
@@ -204,6 +245,7 @@ open_socket(IPAddress, Port, LocalKeys, Owner, Coordinator) ->
             {ok, #{
                 sock => Sock,
                 port => BoundPort,
+                armed => ?ACTIVE_BUDGET,
                 local => LocalKeys,
                 owner => Owner,
                 %% `undefined` until the first probe needs answering. A listener
@@ -276,13 +318,8 @@ handle_info({udp, Sock, IP, PortNum, Datagram}, State = #{sock := Sock}) ->
     %% boundaries, so this is the exact datagram size with no framing guesswork
     %% in it.
     ok = i2p_counters:add(ssu2_bytes_in, byte_size(Datagram)),
-    %% Re-armed before classification, not after. It matters only while the
-    %% responder is being started on a probe, which is a supervisor call from
-    %% inside this process -- but re-arming first means the socket is already
-    %% listening again by the time we go looking for it, so a datagram arriving in
-    %% that window waits in the driver's buffer rather than being missed.
-    _ = inet:setopts(Sock, [{active, once}]),
-    {noreply, classify(self(), Datagram, IP, PortNum, State)};
+    State1 = rearm(Sock, State),
+    {noreply, classify(self(), Datagram, IP, PortNum, State1)};
 handle_info({'DOWN', _MRef, process, Pid, _Info}, State = #{charlie := Pid}) ->
     %% The responder died on unauthenticated input, which is what it is for. The
     %% socket owner does not die with it, and does not lose its send path: replace
@@ -300,6 +337,38 @@ handle_info({'DOWN', _MRef, process, Pid, _Info}, State) ->
     {noreply, State};
 handle_info(_Other, State) ->
     {noreply, State}.
+
+%% Top the socket's arm back up, but only on the datagram that spends it.
+%%
+%% This is the one place the socket is re-armed, and the whole shape of the change
+%% is here: `{active, ?ACTIVE_BUDGET}` makes the runtime stop reading from the
+%% socket when the arm runs out, so this counter is what keeps it listening -- and
+%% it is a counter rather than an `inet:getopts/2` read precisely because a read is
+%% the syscall this removed. One comparison per datagram, and one `inet:setopts/2`
+%% per `?ACTIVE_BUDGET`.
+%%
+%% **`armed` counts the datagram in hand, so it re-arms on `1` rather than on `0`.**
+%% `{active, N}` counts datagrams *delivered to this process*, and delivery is what
+%% put the message in this mailbox -- so by the time `f:handle_info/2` reads the
+%% Nth, the arm is already spent and the socket is already passive. A counter that
+%% re-armed on `0` would then be waiting for an N+1th datagram that the socket is
+%% no longer listening for, and the listener would go permanently deaf: every SSU2
+%% session with it, with no crash and nothing in the log to say so. This is not a
+%% hypothetical -- it is what the first version of this change did, and what
+%% `i2p_ssu2_listener_tests` was written to catch.
+%%
+%% **It runs before classification, not after**, which is the one property the
+%% `{active, once}` version had and this keeps. It matters while the Charlie
+%% responder is being started on a probe: that is a supervisor call from inside
+%% this process, and re-arming first means the socket is already listening again
+%% by the time we go looking for the responder, so a datagram arriving in that
+%% window waits in the driver's buffer rather than being missed.
+-spec rearm(port(), map()) -> map().
+rearm(Sock, State = #{armed := 1}) ->
+    _ = inet:setopts(Sock, [{active, ?ACTIVE_BUDGET}]),
+    State#{armed := ?ACTIVE_BUDGET};
+rearm(_Sock, State = #{armed := Left}) ->
+    State#{armed := Left - 1}.
 
 terminate(_Reason, #{sock := Sock}) ->
     catch gen_udp:close(Sock),

@@ -242,7 +242,7 @@ unparseable_store_is_reported_as_unreadable_not_as_a_timeout_test() ->
     Owner = ensure_netdb(),
     try
         Key = crypto:strong_rand_bytes(32),
-        Reason = {unsupported_type, 5},
+        Reason = {unsupported_type, 2},
         From = caller(),
         Tag = element(2, From),
         Events = i2p_ct_helpers:events_from(

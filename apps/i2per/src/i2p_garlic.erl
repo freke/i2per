@@ -387,7 +387,8 @@ side effects — this function remains a pure library call.
 ## Message types handled
 
 - **type 1 (DatabaseStore):** body is decoded via `m:i2p_i2np:decode_db_store/1`.
-  `store_type` 0 → `{store, router, Data, NowMs}`; 1 → `{store, lease, Data, NowMs}`.
+  `store_type` 0 → `{store, router, Data, NowMs}`; 1 → `{store, lease_v1, Data, NowMs}`;
+  3 → `{store, lease, Data, NowMs}`.
 - **type 2 (DatabaseLookup):** `{lookup, ParsedBody}`.
 - **type 3 (DatabaseSearchReply):** `{search_reply, ParsedBody}`.
 
@@ -415,7 +416,7 @@ Output: `{store, router | lease, Key :: binary(), Data :: binary(), non_neg_inte
 %% outcome, so a router could not tell "the network is not helping me" from "the
 %% network is helping me with something I cannot read".
 -spec dispatch_db_message(dispatch_msg(), integer()) ->
-    {store, router | lease, i2p_crypto:hash(), binary(), non_neg_integer()}
+    {store, router | lease | lease_v1, i2p_crypto:hash(), binary(), non_neg_integer()}
     | {lookup, i2p_i2np:db_lookup()}
     | {search_reply, i2p_i2np:db_search_reply()}
     | {ignored, ignore_reason()}.
@@ -423,8 +424,10 @@ dispatch_db_message(#{type := 1, body := Body}, NowMs) ->
     case i2p_i2np:decode_db_store(Body) of
         {ok, #{store_type := 0, key := Key, data := Data}} ->
             {store, router, Key, Data, NowMs};
-        %% Store types 1 (LeaseSet) and 3 (LeaseSet2) both advertise leases.
-        {ok, #{store_type := T, key := Key, data := Data}} when T =:= 1; T =:= 3 ->
+        %% Store type 1 is a v1 LeaseSet; store type 3 is a LeaseSet2.
+        {ok, #{store_type := 1, key := Key, data := Data}} ->
+            {store, lease_v1, Key, Data, NowMs};
+        {ok, #{store_type := 3, key := Key, data := Data}} ->
             {store, lease, Key, Data, NowMs};
         %% A store type this router has no parser for. Types 5 and 7 decode
         %% successfully, so without this clause they fall off the `case` and

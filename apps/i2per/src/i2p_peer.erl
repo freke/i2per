@@ -1899,7 +1899,7 @@ reason a `not_stored` carries.
 %% `store_entry/4` returns `{Outcome, State}` where a `not_stored` outcome
 %% carries its reason in a three-tuple, so the reason travels with the decision
 %% rather than needing a second return value that only one branch populates.
--spec store_entry(byte(), binary(), pid() | undefined, term()) ->
+-spec store_entry(byte(), i2p_crypto:hash(), binary(), pid() | undefined, term()) ->
     {stored, term()} | {not_stored, store_not_stored_reason(), term()}.
 
 %% `f:handle_db_store/4` decided what became of an entry and then ignored its
@@ -1929,7 +1929,7 @@ handle_db_store(ConnPid, MsgID, Body, State) ->
     case i2p_i2np:decode_db_store(Body) of
         {ok, #{key := Key, store_type := StoreType, data := Data, reply_token := Token} = Store} ->
             reply_to_store(Store, MsgID, State),
-            Result = store_entry(StoreType, Data, ConnPid, State),
+            Result = store_entry(StoreType, Key, Data, ConnPid, State),
             replicate_stored(StoreType, Key, Data, Token, Result, ConnPid);
         error ->
             %% A DatabaseStore we cannot even parse came from a peer that is
@@ -1944,11 +1944,13 @@ handle_db_store(ConnPid, MsgID, Body, State) ->
 %% 0 is a RouterInfo, 1 a LeaseSet, 3 a local LeaseSet; 5 (ELS2) and 7
 %% (MetaLeaseSet) decode but are not implemented, and neither is anything a
 %% future type brings.
-store_entry(0, Data, ConnPid, State) ->
+store_entry(0, _Key, Data, ConnPid, State) ->
     store_ri_entry(Data, ConnPid, State);
-store_entry(StoreType, Data, _ConnPid, State) when StoreType =:= 1; StoreType =:= 3 ->
-    store_ls_entry(Data, State);
-store_entry(StoreType, _Data, _ConnPid, State) ->
+store_entry(StoreType, _Key, Data, _ConnPid, State) when StoreType =:= 1; StoreType =:= 3 ->
+    store_ls_entry(StoreType, Data, State);
+store_entry(StoreType, Key, Data, ConnPid, State) when StoreType =:= 5; StoreType =:= 7 ->
+    store_raw_ls_entry(StoreType, Key, Data, ConnPid, State);
+store_entry(StoreType, _Key, _Data, _ConnPid, State) ->
     {not_stored, {unsupported_type, StoreType}, State}.
 
 store_ri_entry(Data, _ConnPid, State) ->
@@ -1965,8 +1967,27 @@ store_ri_entry(Data, _ConnPid, State) ->
             {not_stored, unparseable_router_info_data, State}
     end.
 
-store_ls_entry(Data, State) ->
-    case i2p_netdb_srv:store_ls_binary(Data, erlang:system_time(second)) of
+store_ls_entry(StoreType, Data, State) ->
+    Result =
+        case StoreType of
+            1 -> i2p_netdb_srv:store_ls_v1_binary(Data, erlang:system_time(second));
+            3 -> i2p_netdb_srv:store_ls_binary(Data, erlang:system_time(second))
+        end,
+    case Result of
+        {ok, Outcome} ->
+            netdb_outcome(Outcome, State);
+        {error, Reason} ->
+            {not_stored, {Reason}, State}
+    end.
+
+store_raw_ls_entry(StoreType, Key, Data, _ConnPid, State) ->
+    NowSec = erlang:system_time(second),
+    Result =
+        case StoreType of
+            5 -> i2p_netdb_srv:store_ls_5_binary(Key, Data, NowSec);
+            7 -> i2p_netdb_srv:store_ls_7_binary(Key, Data, NowSec)
+        end,
+    case Result of
         {ok, Outcome} ->
             netdb_outcome(Outcome, State);
         {error, Reason} ->
@@ -1985,6 +2006,9 @@ netdb_outcome(Outcome, State) -> {not_stored, {refused_with_reason, Outcome}, St
 %% else is reported, because an entry that arrived and was not kept is the fact
 %% an operator needs: silently dropping it is indistinguishable from a peer that
 %% never sent anything.
+replicate_stored(StoreType, _Key, _Data, _Token, {stored, State}, _ConnPid) when StoreType =:= 7 ->
+    %% MetaLeaseSet: store but do not re-broadcast (bytes we cannot parse).
+    State;
 replicate_stored(StoreType, Key, Data, Token, {stored, State}, ConnPid) ->
     _ = maybe_replicate(StoreType, Key, Data, Token, ConnPid, State),
     State;
@@ -2066,8 +2090,18 @@ lookup_reply(routerinfo, Key, Excluded) ->
     end;
 lookup_reply(leaseset, Key, Excluded) ->
     case i2p_netdb_srv:find_ls(Key) of
-        {ok, LS} -> {store_ls, LS};
-        not_found -> {search, i2p_netdb_srv:closest(Key, 4) -- Excluded}
+        {ok, LS} ->
+            {store_ls, {ls2, LS}};
+        not_found ->
+            case i2p_netdb_srv:find_ls_v1(Key) of
+                {ok, LS} ->
+                    {store_ls, {ls1, LS}};
+                not_found ->
+                    case i2p_netdb_srv:find_ls_5(Key) of
+                        {ok, Bin} -> {store_ls, {ls5, Bin}};
+                        not_found -> {search, i2p_netdb_srv:closest(Key, 4) -- Excluded}
+                    end
+            end
     end;
 lookup_reply(_AnyOrExploratory, Key, Excluded) ->
     {search, i2p_netdb_srv:closest(Key, 4) -- Excluded}.
@@ -2100,9 +2134,17 @@ tunnel_lookup_reply(
             {store_ri, RI} ->
                 Data = i2p_i2np:router_info_data(i2p_router_info:to_binary(RI)),
                 i2p_i2np:db_store(Key, 0, 0, undefined, Data);
-            {store_ls, LS} ->
+            {store_ls, {ls2, LS}} ->
                 i2p_i2np:db_store(
                     Key, i2p_leaset:store_type(), 0, undefined, i2p_leaset:to_binary(LS)
+                );
+            {store_ls, {ls1, LS}} ->
+                i2p_i2np:db_store(
+                    Key, i2p_leaset_v1:store_type(), 0, undefined, i2p_leaset_v1:to_binary(LS)
+                );
+            {store_ls, {ls5, Bin}} ->
+                i2p_i2np:db_store(
+                    Key, 5, 0, undefined, Bin
                 );
             {search, PeerHashes} ->
                 i2p_i2np:db_search_reply(Key, PeerHashes, OurHash)
@@ -2252,10 +2294,19 @@ sender_hash(ConnPid, State) ->
         not_found -> maps:get(our_hash, State)
     end.
 
-send_ls_store(ConnPid, Transport, Key, LS) ->
+send_ls_store(ConnPid, Transport, Key, {ls2, LS}) ->
     Data = i2p_leaset:to_binary(LS),
     send_i2np(
         ConnPid, Transport, i2p_i2np:db_store(Key, i2p_leaset:store_type(), 0, undefined, Data)
+    );
+send_ls_store(ConnPid, Transport, Key, {ls1, LS}) ->
+    Data = i2p_leaset_v1:to_binary(LS),
+    send_i2np(
+        ConnPid, Transport, i2p_i2np:db_store(Key, i2p_leaset_v1:store_type(), 0, undefined, Data)
+    );
+send_ls_store(ConnPid, Transport, Key, {ls5, Bin}) ->
+    send_i2np(
+        ConnPid, Transport, i2p_i2np:db_store(Key, 5, 0, undefined, Bin)
     ).
 
 send_search_reply(ConnPid, Transport, Key, PeerHashes, State) ->

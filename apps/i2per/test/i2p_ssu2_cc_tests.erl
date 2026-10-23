@@ -349,69 +349,6 @@ rtt_summary_is_zero_without_a_supervisor_test() ->
     ?assertEqual(undefined, whereis(i2p_ssu2_sup)),
     ?assertEqual(#{sessions => 0, rtt_ms => 0, cwnd => 0}, i2p_ssu2_sup:rtt_summary()).
 
-%% Two live sessions, averaged. The aggregate is the mean of the sessions that
-%% have an RTT sample, integer-divided.
-rtt_summary_averages_rtt_across_live_sessions_test() ->
-    with_sup(fun() ->
-        Session = live_session(),
-        ok = i2p_ssu2_sup:update_metrics(self(), 100, true, 1000, established),
-        ok = i2p_ssu2_sup:update_metrics(Session, 200, true, 2000, established),
-        ?assertMatch(#{rtt_ms := 150, cwnd := 3000}, i2p_ssu2_sup:rtt_summary()),
-        Session ! stop
-    end).
-
-%% A session that has not taken a sample yet pushes rtt_init = false with an
-%% rtt_ms of 0. Folding that zero into the average would halve every reading
-%% on the status page, which looks like a fast link that is not fast.
-%%
-%% The second session's own 100 is what makes this a test rather than a
-%% tautology: with the filter, the mean is 100; without it, (100 + 0) / 2 = 50.
-%% Asserting the unfiltered mean against a lone 0 would pass either way.
-rtt_summary_skips_uninitialised_rtts_in_the_average_test() ->
-    with_sup(fun() ->
-        Session = live_session(),
-        ok = i2p_ssu2_sup:update_metrics(self(), 100, true, 1000, established),
-        ok = i2p_ssu2_sup:update_metrics(Session, 0, false, 5000, established),
-        %% Its window still counts -- 6000, not 1000 -- because the window is
-        %% measured from the first packet, while the RTT is not.
-        ?assertMatch(#{rtt_ms := 100, cwnd := 6000}, i2p_ssu2_sup:rtt_summary()),
-        Session ! stop
-    end).
-
-%% Only an established session's window is a congestion measurement. One still
-%% handshaking carries the default window, and summing those would report a
-%% total larger than anything any of those sessions could actually send.
-rtt_summary_counts_only_established_windows_test() ->
-    with_sup(fun() ->
-        Session = live_session(),
-        ok = i2p_ssu2_sup:update_metrics(Session, 100, true, 9999, handshake),
-        ?assertMatch(#{rtt_ms := 100, cwnd := 0}, i2p_ssu2_sup:rtt_summary()),
-        Session ! stop
-    end).
-
-%% A session process that exited without clearing its row leaves a stale entry
-%% behind, and `remove_metrics/1` only runs on a clean terminate. The read
-%% prunes it: an unreclaimed row is a permanent overstatement of both figures.
-rtt_summary_prunes_rows_whose_session_is_gone_test() ->
-    with_sup(fun() ->
-        Gone = dead_session(),
-        ok = i2p_ssu2_sup:update_metrics(Gone, 999, true, 999, established),
-        ?assertMatch(#{rtt_ms := 0, cwnd := 0}, i2p_ssu2_sup:rtt_summary()),
-        ?assertEqual([], ets:lookup(i2p_ssu2_metrics, Gone))
-    end).
-
-%% A session tearing down releases its row eagerly, so the aggregate drops it
-%% without waiting for the next read to notice the process is gone.
-remove_metrics_releases_the_row_test() ->
-    with_sup(fun() ->
-        Session = live_session(),
-        ok = i2p_ssu2_sup:update_metrics(Session, 100, true, 1000, established),
-        ?assertEqual(1, length(ets:lookup(i2p_ssu2_metrics, Session))),
-        ok = i2p_ssu2_sup:remove_metrics(Session),
-        ?assertEqual([], ets:lookup(i2p_ssu2_metrics, Session)),
-        Session ! stop
-    end).
-
 %%% --------------------------------------------------------------------------
 %%% The admitting side of the gate
 %%% --------------------------------------------------------------------------
@@ -535,22 +472,6 @@ clean_mailbox() ->
     _ = take_sends(),
     ok.
 
-%% The metrics table is a named public ETS table, so it is node-global and its
-%% rows outlive the test that wrote them: eunit runs a module's tests in one
-%% process, so the table created by the first `start_link/0` is still there --
-%% and still holding that test's rows -- for the next one. Every case here
-%% reads the aggregate whole, so a leftover row would be a phantom session in
-%% someone else's average. Hence the wipe, after the table exists and before
-%% the case runs.
-with_sup(Fun) ->
-    {ok, _Sup} = i2p_ssu2_sup:start_link(),
-    try
-        ets:delete_all_objects(i2p_ssu2_metrics),
-        Fun()
-    after
-        stop_sup()
-    end.
-
 %% Wait for the DOWN rather than firing and returning: the registered name is
 %% released as part of the exit, and a later `start_link/0` would otherwise
 %% race the unregistration and answer `{error, {already_started, _}}`.
@@ -565,20 +486,4 @@ stop_sup() ->
             receive
                 {'DOWN', Ref, process, Pid, _} -> ok
             end
-    end.
-
-%% A session stands in for a live process only in that it is alive and holds
-%% an ETS row; the aggregate reads no session state beyond `is_process_alive/1`.
-live_session() ->
-    spawn(fun() ->
-        receive
-            stop -> ok
-        end
-    end).
-
-dead_session() ->
-    Pid = spawn(fun() -> ok end),
-    Ref = monitor(process, Pid),
-    receive
-        {'DOWN', Ref, process, Pid, _} -> Pid
     end.

@@ -4,46 +4,40 @@ All notable changes to i2per are recorded here. Versions follow the OTP
 applications' own `{vsn, ...}`; the release tag is `v` + that version, and
 CI refuses a tag that disagrees.
 
-## [0.5.0] — 2026-10-19
-
-**The performance release.** 0.4.0 hardened the dial and hot path; 0.5.0 adds
-throughput management: SSU2 estimates RTT and runs window-based congestion
-control instead of a fixed resend timer. No wire-format or configuration-key
-changes, so a 0.4.0 `data_dir` is read unchanged.
-
-### Changed
-
-- **SSU2 congestion control and RTT.** SSU2 now estimates RTT and runs
-  window-based congestion control, so a router manages its own throughput
-  instead of relying on a fixed resend timer (#RC68AGE).
-- **Hermetic protocol gate.** The SSU2 data phase is captured from a real i2pd
-  and committed, then replayed on every push (#3TC871W).
-- **Observability.** `i2p_status_data:view/0` now reports aggregate SSU2 RTT
-  and congestion window (view version 5), and the status page surfaces them
-  (#3HWTDQV).
-- **Scope.** 0.5.0 anchors on RC68AGE alone; NetDb-driven Charlie selection
-  is deferred to 0.6.0 unless it lands small (#01T1WWE). The i2pd interop
-  suite stays a local diagnostic, not a required CI gate (#HD80K76).
-
-### Fixed
-
-- **Send queue fairness.** A full SSU2 send queue now drops its oldest queued
-  packet (rather than the newest) and announces/logs the drop instead of
-  discarding silently (#7NRF872).
-- **Status page coverage.** The four SSU2 rows are tested and the `n/a`
-  metric list updated with them (#DQ40YW8).
-- **Documentation truth.** `config/sys.config` no longer claims the hot
-  transport flip is an unbuilt ticket, and `docs/parity.md` marks the
-  streaming protocol done (#EAZB4CS).
-- **Cleanup.** Dead `rtt`/`rtt_ms`/`srtt`/`cwnd` accessors, an unused
-  listener registration path, and two orphaned test helpers are removed
-  (#WDJ7NV1).
-- **Test reliability.** The NTCP2 70k-frame flood hang guard is widened
-  (#SM1MJN0).
-
 ## [Unreleased]
 
 _(nothing yet)_
+
+## [0.7.0] — 2026-10-22
+
+**The LeaseSet-and-Datagram release.** 0.6.0 automated reachability; 0.7.0
+fills in the data plane: the router parses, stores and serves the LeaseSet
+family (v1, EncryptedLeaseSet, MetaLeaseSet), publishes its own addressbook,
+and implements the Datagram2 codec end to end through SAM with replay
+protection. No wire-format changes beyond the LeaseSet family and Datagram2, so
+a 0.6.0 `data_dir` is read unchanged.
+
+### Changed
+
+- **LeaseSet family.** The NetDb parses, stores and answers lookups for
+  LeaseSet v1 (store type 1), and decodes EncryptedLeaseSet (store type 5) and
+  MetaLeaseSet (store type 7) (#VANCF02, #3G0Z06C).
+- **Addressbook publication.** i2per publishes its own `hosts.txt` to a
+  configured hosts file instead of only subscribing to remote addressbooks
+  (#GDEGVQH).
+- **Datagram2.** Full codec (flags, options, signature over the target hash)
+  with a bounded per-destination replay window, wired through SAM with send kind
+  and inbound delivery; optional options mapping and offline signatures
+  (#NTWZWTC, #E2QX0HF, #F0KZAJ6, #EF88ASV, #R85EHTA).
+- **Logging floor.** Checklist enforcement restored (#NT2GZ7V); the XZTYAVX
+  level-gated debug path forward-ported (#7STWF7T); ssu2 cc tests moved to
+  Common Test (#XJ62X6Y).
+- **CHANGELOG.** Sections reordered newest-first (#H435BMC).
+
+### Fixed
+
+- **CHANGELOG ordering.** 0.5.0 no longer appears above 0.6.0 with
+  `Unreleased` wedged between them (#H435BMC).
 
 ## [0.6.0] — 2026-10-21
 
@@ -83,6 +77,43 @@ joins the hermetic gate. No wire-format or configuration-key changes, so a
   peer would have dropped the frame. The sender now makes the same single call
   the production path does; `the_keepalive_re_encodes_to_the_captured_bytes` is
   the replay case that would catch a regression (#7B96TT8).
+
+## [0.5.0] — 2026-10-19
+
+**The performance release.** 0.4.0 hardened the dial and hot path; 0.5.0 adds
+throughput management: SSU2 estimates RTT and runs window-based congestion
+control instead of a fixed resend timer. No wire-format or configuration-key
+changes, so a 0.4.0 `data_dir` is read unchanged.
+
+### Changed
+
+- **SSU2 congestion control and RTT.** SSU2 now estimates RTT and runs
+  window-based congestion control, so a router manages its own throughput
+  instead of relying on a fixed resend timer (#RC68AGE).
+- **Hermetic protocol gate.** The SSU2 data phase is captured from a real i2pd
+  and committed, then replayed on every push (#3TC871W).
+- **Observability.** `i2p_status_data:view/0` now reports aggregate SSU2 RTT
+  and congestion window (view version 5), and the status page surfaces them
+  (#3HWTDQV).
+- **Scope.** 0.5.0 anchors on RC68AGE alone; NetDb-driven Charlie selection
+  is deferred to 0.6.0 unless it lands small (#01T1WWE). The i2pd interop
+  suite stays a local diagnostic, not a required CI gate (#HD80K76).
+
+### Fixed
+
+- **Send queue fairness.** A full SSU2 send queue now drops its oldest queued
+  packet (rather than the newest) and announces/logs the drop instead of
+  discarding silently (#7NRF872).
+- **Status page coverage.** The four SSU2 rows are tested and the `n/a`
+  metric list updated with them (#DQ40YW8).
+- **Documentation truth.** `config/sys.config` no longer claims the hot
+  transport flip is an unbuilt ticket, and `docs/parity.md` marks the
+  streaming protocol done (#EAZB4CS).
+- **Cleanup.** Dead `rtt`/`rtt_ms`/`srtt`/`cwnd` accessors, an unused
+  listener registration path, and two orphaned test helpers are removed
+  (#WDJ7NV1).
+- **Test reliability.** The NTCP2 70k-frame flood hang guard is widened
+  (#SM1MJN0).
 
 ## [0.4.0] — 2026-10-18
 

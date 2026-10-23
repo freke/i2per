@@ -231,8 +231,15 @@ true = i2p_netdb:has_router(Store, Key).
     store_binary/3,
     store_ls/3,
     store_ls_binary/3,
+    store_ls_v1/3,
+    store_ls_v1_binary/3,
+    store_ls_5_binary_at/4,
+    store_ls_7_binary_at/4,
     find/2,
     find_ls/2,
+    find_ls_v1/2,
+    find_ls_5/2,
+    find_ls_7/2,
     remove/2,
     routers/1,
     keys/1,
@@ -375,7 +382,13 @@ value loses nothing that is not already lost.
     routing := {binary(), #{router_key() => router_key()}},
     floodfill_index := #{router_key() => true},
     lease_sets := #{ls_key() => i2p_leaset:lease_set()},
-    ls_order := [ls_key()]
+    ls_order := [ls_key()],
+    lease_sets_v1 := #{ls_key() => i2p_leaset_v1:lease_set()},
+    lease_sets_v1_order := [ls_key()],
+    lease_sets_5 := #{ls_key() => binary()},
+    lease_sets_5_order := [ls_key()],
+    lease_sets_7 := #{ls_key() => binary()},
+    lease_sets_7_order := [ls_key()]
 }.
 
 -doc """
@@ -453,7 +466,13 @@ new(Capacity, MaxMs, MinMs) when
         routing => {<<>>, #{}},
         floodfill_index => #{},
         lease_sets => #{},
-        ls_order => []
+        ls_order => [],
+        lease_sets_v1 => #{},
+        lease_sets_v1_order => [],
+        lease_sets_5 => #{},
+        lease_sets_5_order => [],
+        lease_sets_7 => #{},
+        lease_sets_7_order => []
     };
 new(_, _, _) ->
     error(badarg).
@@ -565,6 +584,134 @@ store_ls_binary(Store, Bin, NowSec) ->
         {error, Reason} ->
             {error, Reason}
     end.
+
+-doc """
+Store a verified v1 LeaseSet.
+
+Input: `Store`; `LS` — a parsed v1 LeaseSet; `NowSec` — wall-clock seconds.
+Output: `{Store2, Outcome}` like `f:store_ls/3`.
+""".
+-spec store_ls_v1(store(), i2p_leaset_v1:lease_set(), non_neg_integer()) ->
+    {store(), added | updated | older | expired}.
+store_ls_v1(Store, LS, NowSec) when is_integer(NowSec) ->
+    Key = i2p_leaset_v1:hash(LS),
+    V1Maps = maps:get(lease_sets_v1, Store),
+    case maps:find(Key, V1Maps) of
+        {ok, Existing} ->
+            %% v1 has no published timestamp; version by max lease end_date.
+            ExistingVer = v1_version(Existing),
+            NewVer = v1_version(LS),
+            case ExistingVer >= NewVer of
+                true -> {Store, older};
+                false -> insert_ls_v1(Store, Key, LS, NowSec, updated)
+            end;
+        error ->
+            insert_ls_v1(Store, Key, LS, NowSec, added)
+    end;
+store_ls_v1(_Store, _LS, _NowSec) ->
+    error(badarg).
+
+v1_version(LS) ->
+    Leases = i2p_leaset_v1:leases(LS),
+    case Leases of
+        [] -> 0;
+        _ -> lists:max([maps:get(end_date, L) || L <- Leases])
+    end.
+
+insert_ls_v1(Store, Key, LS, NowSec, Outcome) ->
+    case i2p_leaset_v1:valid(LS, NowSec) of
+        ok ->
+            V1Maps0 = maps:get(lease_sets_v1, Store),
+            V1Order0 = maps:get(lease_sets_v1_order, Store),
+            V1Maps = V1Maps0#{Key => LS},
+            V1Order1 = [Key | lists:delete(Key, V1Order0)],
+            Store1 = Store#{lease_sets_v1 => V1Maps, lease_sets_v1_order => V1Order1},
+            {trim_ls_v1(Store1), Outcome};
+        {error, expired} ->
+            {Store, expired}
+    end.
+
+-doc """
+Store a v1 LeaseSet from its raw signed content bytes.
+""".
+-spec store_ls_v1_binary(store(), binary(), non_neg_integer()) ->
+    {ok, store(), added | updated | older | expired} | {error, term()}.
+store_ls_v1_binary(Store, Bin, NowSec) ->
+    case i2p_leaset_v1:decode(Bin) of
+        {ok, LS} ->
+            {Store2, Outcome} = store_ls_v1(Store, LS, NowSec),
+            {ok, Store2, Outcome};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+-doc """
+Look up a v1 LeaseSet by destination hash.
+""".
+-spec find_ls_v1(store(), ls_key()) -> {ok, i2p_leaset_v1:lease_set()} | error.
+find_ls_v1(Store, Key) ->
+    maps:find(Key, maps:get(lease_sets_v1, Store)).
+
+-doc """
+Store an EncryptedLeaseSet (store type 5) from its raw bytes.
+
+The raw bytes do not contain their own key, so the caller supplies the
+DatabaseStore key. The bytes are stored verbatim.
+""".
+-spec store_ls_5_binary_at(store(), ls_key(), binary(), non_neg_integer()) ->
+    {ok, store(), added | updated}.
+store_ls_5_binary_at(Store, Key, Bin, _NowSec) when
+    is_binary(Key), byte_size(Key) =:= 32, is_binary(Bin), byte_size(Bin) > 0
+->
+    Maps = maps:get(lease_sets_5, Store),
+    Order0 = maps:get(lease_sets_5_order, Store),
+    Outcome =
+        case maps:is_key(Key, Maps) of
+            true -> updated;
+            false -> added
+        end,
+    Maps2 = Maps#{Key => Bin},
+    Order1 = [Key | lists:delete(Key, Order0)],
+    Store1 = Store#{lease_sets_5 => Maps2, lease_sets_5_order => Order1},
+    {ok, trim_ls_5(Store1), Outcome};
+store_ls_5_binary_at(_Store, _Key, _Bin, _NowSec) ->
+    error(badarg).
+
+-doc """
+Store a MetaLeaseSet (store type 7) from its raw bytes.
+""".
+-spec store_ls_7_binary_at(store(), ls_key(), binary(), non_neg_integer()) ->
+    {ok, store(), added | updated}.
+store_ls_7_binary_at(Store, Key, Bin, _NowSec) when
+    is_binary(Key), byte_size(Key) =:= 32, is_binary(Bin), byte_size(Bin) > 0
+->
+    Maps = maps:get(lease_sets_7, Store),
+    Order0 = maps:get(lease_sets_7_order, Store),
+    Outcome =
+        case maps:is_key(Key, Maps) of
+            true -> updated;
+            false -> added
+        end,
+    Maps2 = Maps#{Key => Bin},
+    Order1 = [Key | lists:delete(Key, Order0)],
+    Store1 = Store#{lease_sets_7 => Maps2, lease_sets_7_order => Order1},
+    {ok, trim_ls_7(Store1), Outcome};
+store_ls_7_binary_at(_Store, _Key, _Bin, _NowSec) ->
+    error(badarg).
+
+-doc """
+Look up an EncryptedLeaseSet by destination hash.
+""".
+-spec find_ls_5(store(), ls_key()) -> {ok, binary()} | error.
+find_ls_5(Store, Key) ->
+    maps:find(Key, maps:get(lease_sets_5, Store)).
+
+-doc """
+Look up a MetaLeaseSet by destination hash.
+""".
+-spec find_ls_7(store(), ls_key()) -> {ok, binary()} | error.
+find_ls_7(Store, Key) ->
+    maps:find(Key, maps:get(lease_sets_7, Store)).
 
 -doc """
 Look up a router by hash.
@@ -1435,9 +1582,15 @@ remove_expired(Store, NowMs, NowSec) when is_integer(NowMs), is_integer(NowSec) 
     {KeptLS, KeptLSOrder, RemovedLS} = partition_ls(
         LeaseSets0, LSOrder0, NowSec, 0, []
     ),
+    V1Maps0 = maps:get(lease_sets_v1, Store2),
+    KeptV1 = partition_ls_v1(V1Maps0, NowSec),
+    V1Order0 = maps:get(lease_sets_v1_order, Store2),
+    KeptV1Order = [K || K <- V1Order0, maps:is_key(K, KeptV1)],
     Store3 = Store2#{
         lease_sets => KeptLS,
-        ls_order => lists:reverse(KeptLSOrder)
+        ls_order => lists:reverse(KeptLSOrder),
+        lease_sets_v1 => KeptV1,
+        lease_sets_v1_order => KeptV1Order
     },
     {Store3, {length(Expired), RemovedLS}};
 remove_expired(_Store, _NowMs, _NowSec) ->
@@ -1626,10 +1779,51 @@ trim_ls(Store) ->
             Store
     end.
 
+%% Evict the least recently stored v1 LeaseSet when the capacity is exceeded.
+trim_ls_v1(Store) ->
+    Order = maps:get(lease_sets_v1_order, Store),
+    case length(Order) > maps:get(capacity, Store) of
+        true ->
+            [Evicted | Rest] = lists:reverse(Order),
+            Store#{
+                lease_sets_v1 := maps:remove(Evicted, maps:get(lease_sets_v1, Store)),
+                lease_sets_v1_order := lists:reverse(Rest)
+            };
+        false ->
+            Store
+    end.
+
+%% Evict the least recently stored type-5 LeaseSet when the capacity is exceeded.
+trim_ls_5(Store) ->
+    Order = maps:get(lease_sets_5_order, Store),
+    case length(Order) > maps:get(capacity, Store) of
+        true ->
+            [Evicted | Rest] = lists:reverse(Order),
+            Store#{
+                lease_sets_5 := maps:remove(Evicted, maps:get(lease_sets_5, Store)),
+                lease_sets_5_order := lists:reverse(Rest)
+            };
+        false ->
+            Store
+    end.
+
+%% Evict the least recently stored type-7 LeaseSet when the capacity is exceeded.
+trim_ls_7(Store) ->
+    Order = maps:get(lease_sets_7_order, Store),
+    case length(Order) > maps:get(capacity, Store) of
+        true ->
+            [Evicted | Rest] = lists:reverse(Order),
+            Store#{
+                lease_sets_7 := maps:remove(Evicted, maps:get(lease_sets_7, Store)),
+                lease_sets_7_order := lists:reverse(Rest)
+            };
+        false ->
+            Store
+    end.
+
 %% Rank `Keys` by XOR distance to `Target` and return the first `N`, closest first.
 %%
 %% **Decorate, sort, undecorate. The distance is computed once per key, not once
-%% per comparison.**
 %%
 %% This used to be a bare `lists:sort` with a comparator that called `routing_key/1`
 %% on both operands. `routing_key/1` is a SHA-256 that also calls `current_day/0`,
@@ -2163,3 +2357,11 @@ partition_ls(LSMaps, [Key | Rest], NowSec, Removed, Kept) ->
         _ ->
             partition_ls(LSMaps, Rest, NowSec, Removed, [{Key, LS} | Kept])
     end.
+
+partition_ls_v1(V1Maps, NowSec) ->
+    maps:filter(
+        fun(_Key, LS) ->
+            i2p_leaset_v1:valid(LS, NowSec) =/= {error, expired}
+        end,
+        V1Maps
+    ).
