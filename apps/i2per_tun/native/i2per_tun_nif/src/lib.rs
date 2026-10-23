@@ -13,16 +13,18 @@
 //! panic strategy (see `Cargo.toml`).
 //!
 //! Spike grade, said plainly: this is the fd-mechanics probe, not the
-//! production device layer. The destructor closes the fd without a guaranteed
-//! stop-before-close, which leaves a small fd-reuse window if a resource is
-//! GC'd while still selected; the production pass must close only from the
-//! stop callback (`ERL_NIF_SELECT_STOP`) and deselect explicitly on every
-//! other path.
+//! production device layer. Every close path (destructor, stop callback) and
+//! every fd user (read, write, arm) serialize on the device's `io_lock`, so a
+//! syscall never lands on a closed — and possibly reused — descriptor. The
+//! gap that remains is the destructor closing an fd a select may still be
+//! armed on; the production pass must close only from the stop callback
+//! (`ERL_NIF_SELECT_STOP`) and deselect explicitly on every other path.
 
 #![allow(non_snake_case)]
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
+use std::sync::Mutex;
 
 use libc::{c_char, c_int, c_uint, c_ulong, c_void};
 // `enif_make_tuple!` is a #[macro_export] macro at the crate root, so it does
@@ -66,11 +68,15 @@ const RET_NOTSUP: ErlNifSelectFlags = 128;
 
 // ---- resource ----
 
-/// The TUN device behind one resource object. The fd is atomic because the
-/// stop callback may run on a dirty scheduler while the owning process is in
-/// `read`/`write`.
+/// The TUN device behind one resource object. `io_lock` serializes the close
+/// callbacks (which may run on a dirty scheduler) against every fd user: a
+/// `read`/`write`/`arm` must never touch a descriptor that a close has
+/// already handed back to the VM, where the next `open` can reuse the number.
+/// `nif_stop` must not take the lock — `enif_select(SEL_STOP)` can invoke the
+/// stop callback directly on its own thread, which would self-deadlock.
 struct TunDev {
     fd: AtomicI32,
+    io_lock: Mutex<()>,
 }
 
 static RES_TYPE: AtomicPtr<ErlNifResourceType> = AtomicPtr::new(std::ptr::null_mut());
@@ -198,10 +204,11 @@ unsafe extern "C" fn nif_load(
 
 // ---- lifecycle callbacks ----
 
-/// Spike-grade close (see the crate doc): the fd-reuse window is known and
-/// deferred to the production pass.
+/// GC close. The `io_lock` keeps this from racing an in-flight read/write;
+/// what stays spike-grade is closing without deselecting first (crate doc).
 unsafe extern "C" fn res_dtor(_env: *mut ErlNifEnv, obj: *mut c_void) {
     let dev = &*(obj as *mut TunDev);
+    let _io = dev.io_lock.lock().unwrap();
     let fd = dev.fd.swap(-1, Ordering::AcqRel);
     if fd >= 0 {
         libc::close(fd);
@@ -218,6 +225,7 @@ unsafe extern "C" fn res_stop(
     _is_direct_call: c_int,
 ) {
     let dev = &*(obj as *mut TunDev);
+    let _io = dev.io_lock.lock().unwrap();
     let fd = dev.fd.swap(-1, Ordering::AcqRel);
     if fd >= 0 {
         libc::close(fd);
@@ -379,6 +387,7 @@ unsafe extern "C" fn nif_open(
             obj,
             TunDev {
                 fd: AtomicI32::new(fd),
+                io_lock: Mutex::new(()),
             },
         );
         let term = enif_make_resource(env, obj as *const c_void);
@@ -402,6 +411,9 @@ unsafe extern "C" fn nif_read(
             return enif_make_badarg(env);
         };
         let dev = &*dev_ptr;
+        // Held across the fd load and the syscall: a concurrent stop or GC
+        // close must not close — and let the VM reuse — the number mid-read.
+        let _io = dev.io_lock.lock().unwrap();
         let Some(fd) = live_fd(dev) else {
             return make_error(env, make_atom(env, "eclosed"));
         };
@@ -439,6 +451,8 @@ unsafe extern "C" fn nif_write(
         if enif_inspect_binary(env, *argv.add(1), &mut pkt) == 0 {
             return enif_make_badarg(env);
         }
+        // Same exclusion as read: the fd must still be ours when write runs.
+        let _io = dev.io_lock.lock().unwrap();
         let Some(fd) = live_fd(dev) else {
             return make_error(env, make_atom(env, "eclosed"));
         };
@@ -471,7 +485,13 @@ unsafe extern "C" fn nif_arm(
         if enif_get_local_pid(env, *argv.add(1), &mut pid) == 0 {
             return enif_make_badarg(env);
         }
-        let Some(fd) = live_fd(&*dev_ptr) else {
+        // Same exclusion as read/write: the fd must still be ours when
+        // enif_select registers it. Holding the lock across the call is safe
+        // here — in READ mode enif_select never invokes this resource's stop
+        // callback directly (that is SEL_STOP's path, which arm never passes).
+        let dev = &*dev_ptr;
+        let _io = dev.io_lock.lock().unwrap();
+        let Some(fd) = live_fd(dev) else {
             return make_error(env, make_atom(env, "eclosed"));
         };
 
@@ -503,7 +523,8 @@ unsafe extern "C" fn nif_arm(
 /// `stop(Dev) -> ok | {error, Reason}`.
 ///
 /// Requests the select stop; the actual close happens in the stop callback,
-/// possibly deferred to a dirty scheduler.
+/// possibly deferred to a dirty scheduler. Lock-free by design: the stop
+/// request may invoke the stop callback (a lock holder) on this very thread.
 unsafe extern "C" fn nif_stop(
     env: *mut ErlNifEnv,
     _argc: c_int,

@@ -39,6 +39,12 @@ start_link() ->
 %% gen_server callbacks
 
 init([]) ->
+    %% Without trapping exits, the parent's `shutdown` signal kills this
+    %% gen_server before terminate/2 runs — and terminate/2 is the only path
+    %% that stops the armed enif_select. Skipping it keeps the fd selected and
+    %% the interface claimed (the select pins the resource), so a restart
+    %% fails in TUNSETIFF with ebusy until the VM exits.
+    process_flag(trap_exit, true),
     Name = dev_name(),
     case i2per_tun_tun:open(Name) of
         {ok, Dev} ->
