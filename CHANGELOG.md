@@ -6,7 +6,16 @@ CI refuses a tag that disagrees.
 
 ## [Unreleased]
 
-_(nothing yet)_
+### Added
+
+- **i2per_tun.** TUN companion app progressed from fd spike to a working
+  flow translator: SAM v3 client (STREAM plus RAW/DATAGRAM helpers), static
+  IP -> destination config, per-flow SAM STREAM relay, host-facing TCP
+  listener, supervision, packet/byte and per-flow counters, IPv4/TCP/UDP
+  parsing, and a hermetic Common Test suite against a mock SAM server
+  (#D3750BZ). Shape (a) (flow translator) won over shape (b)
+  (point-to-point); UDP datapath via SAM RAW/DATAGRAM lands on the same
+  helpers.
 
 ## [0.7.0] — 2026-10-22
 

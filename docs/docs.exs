@@ -30,7 +30,8 @@
 
   groups_for_modules: [
     "i2per core": ~w(i2per i2per_app i2per_sup),
-    "Status web service": ~w(i2per_status_app i2per_status_json i2per_status_page i2per_status_state i2per_status_sup)
+    "Status web service": ~w(i2per_status_app i2per_status_json i2per_status_page i2per_status_state i2per_status_sup),
+    "TUN companion app": ~w(i2per_tun_app i2per_tun_dev i2per_tun_listener i2per_tun_sup i2per_tun_tun i2per_tun_sam i2per_tun_config i2per_tun_flow i2per_tun_ip)
   ],
 
   # Mermaid diagrams: `docs/protocol.md` (and any extra) may use

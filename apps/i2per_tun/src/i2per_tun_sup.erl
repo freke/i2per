@@ -29,5 +29,13 @@ init([]) ->
                 shutdown => 5000,
                 type => worker,
                 modules => [i2per_tun_dev]
+            },
+            #{
+                id => i2per_tun_listener,
+                start => {i2per_tun_listener, start_link, []},
+                restart => permanent,
+                shutdown => 5000,
+                type => worker,
+                modules => [i2per_tun_listener]
             }
         ]}}.
