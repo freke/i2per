@@ -32,6 +32,29 @@ operator `listen_host` decision.
 Linux `/dev/net/tun` only for 0.8.0; macOS utun and Windows Wintun out of
 scope.
 
+## Testing
+
+Two tiers:
+
+- **Hermetic (default, unprivileged).** `rebar3 eunit` runs the pure parser,
+  config and mock-SAM tests, plus `i2per_tun_dev_session_tests`, which drives
+  the device owner through the fake TUN facade (`i2per_tun_tun_fake`) and a
+  mock SAM server. No privileges or real device required; session spawning,
+  flow-key dedupe, monitor/teardown, `stats/0`, `sessions/0` and UDP RAW
+  wiring are all covered here.
+- **Privileged (opt-in).** `i2per_tun_datapath_SUITE` opens a real
+  `/dev/net/tun`. Skipped unless `I2PER_TUN_PRIVILEGED=1` is set in the
+  environment, and it is outside the smoke tier. Run with
+  `I2PER_TUN_PRIVILEGED=1 rebar3 ct --suite i2per_tun_datapath_SUITE`.
+
+### Concurrency ceiling and listen host
+
+`max_sam_sessions` (default 32) is this app's concurrency ceiling: one SAM
+session per concurrent TCP flow, so a busy host needs a TUN profile with a
+higher value. The SAM listener is loopback-only by default; remote-node
+operation is an operator `listen_host` decision (see `listen_host` app env /
+`i2per_tun_listener`).
+
 ## Running it for real (privileged, by hand)
 
 The automated tests are hermetic and run unprivileged. The real-device case

@@ -11,10 +11,73 @@ host TCP socket attached yet — used by the TUN packet path to establish a
 session up front; the relay is attached later.
 """.
 
--export([run/4, run_session/3, run_session/4, stop_session/1]).
+-export([
+    run/4,
+    run_session/3, run_session/4,
+    run_raw_session/3, run_raw_session/4,
+    send_raw/2,
+    stop_session/1
+]).
 
 -spec run(gen_tcp:socket(), binary(), binary(), inet:port_number()) -> ok | {error, term()}.
 run(TcpSock, DestHost, SamHost, SamPort) ->
+    %% Prefer the Erlang-network path (E1CHFWF); fall back to SAM TCP.
+    case try_core_run(TcpSock, DestHost) of
+        ok ->
+            ok;
+        {fallback, _} ->
+            run_sam(TcpSock, DestHost, SamHost, SamPort)
+    end.
+
+try_core_run(TcpSock, DestHost) ->
+    Node = i2per_tun_config:router_node(),
+    case catch erpc:call(Node, i2p_sam_api, create_session, [#{}], 5000) of
+        {ok, SessionPid, _DestB64} ->
+            case
+                catch erpc:call(
+                    Node, i2p_sam_api, stream_connect, [SessionPid, DestHost, self()], 15000
+                )
+            of
+                {ok, ConnPid} ->
+                    relay_core(TcpSock, ConnPid),
+                    i2p_sam_api:stream_close(ConnPid),
+                    ok;
+                Other ->
+                    {fallback, Other}
+            end;
+        Other ->
+            {fallback, Other}
+    end.
+
+relay_core(TcpSock, ConnPid) ->
+    _ = inet:setopts(TcpSock, [{active, once}]),
+    relay_core_loop(TcpSock, ConnPid).
+
+relay_core_loop(TcpSock, ConnPid) ->
+    receive
+        {tcp, TcpSock, Data} ->
+            _ = i2p_sam_api:stream_send(ConnPid, Data),
+            _ = inet:setopts(TcpSock, [{active, once}]),
+            relay_core_loop(TcpSock, ConnPid);
+        {tcp_closed, TcpSock} ->
+            i2p_sam_api:stream_close(ConnPid),
+            ok;
+        {tcp_error, TcpSock, _} ->
+            i2p_sam_api:stream_close(ConnPid),
+            ok;
+        {stream_data, ConnPid, Bytes} ->
+            _ = gen_tcp:send(TcpSock, Bytes),
+            relay_core_loop(TcpSock, ConnPid);
+        {stream_closed, ConnPid} ->
+            ok;
+        {stream_reset, ConnPid} ->
+            ok
+    after 300000 ->
+        i2p_sam_api:stream_close(ConnPid),
+        ok
+    end.
+
+run_sam(TcpSock, DestHost, SamHost, SamPort) ->
     case
         gen_tcp:connect(
             binary_to_list(SamHost), SamPort, [binary, {packet, raw}, {active, false}], 5000
@@ -89,6 +152,46 @@ run_session(DestHost, SamHost, SamPort) ->
     run_session(DestHost, SamHost, SamPort, 5000).
 
 run_session(DestHost, SamHost, SamPort, Timeout) ->
+    _ = Timeout,
+    case try_core_run_session(DestHost) of
+        {ok, SessionId, HoldPid} ->
+            {ok, SessionId, HoldPid};
+        {fallback, _} ->
+            run_session_sam(DestHost, SamHost, SamPort, Timeout)
+    end.
+
+try_core_run_session(DestHost) ->
+    Node = i2per_tun_config:router_node(),
+    case catch erpc:call(Node, i2p_sam_api, create_session, [#{}], 5000) of
+        {ok, SessionPid, _DestB64} ->
+            case
+                catch erpc:call(
+                    Node, i2p_sam_api, stream_connect, [SessionPid, DestHost, self()], 15000
+                )
+            of
+                {ok, ConnPid} ->
+                    HoldPid = spawn(fun() -> hold_core_session(ConnPid) end),
+                    SessionId = erlang:unique_integer([positive, monotonic]),
+                    {ok, SessionId, HoldPid};
+                Other ->
+                    {fallback, Other}
+            end;
+        Other ->
+            {fallback, Other}
+    end.
+
+hold_core_session(ConnPid) ->
+    receive
+        stop ->
+            i2p_sam_api:stream_close(ConnPid),
+            ok;
+        {stop, From, Ref} ->
+            i2p_sam_api:stream_close(ConnPid),
+            From ! {stopped, Ref},
+            ok
+    end.
+
+run_session_sam(DestHost, SamHost, SamPort, Timeout) ->
     case
         gen_tcp:connect(
             binary_to_list(SamHost), SamPort, [binary, {packet, raw}, {active, false}], Timeout
@@ -125,6 +228,44 @@ run_session(DestHost, SamHost, SamPort, Timeout) ->
             end;
         {error, _} = Err ->
             Err
+    end.
+
+-doc "Open and hold a SAM RAW session for a UDP flow, without a host socket.".
+run_raw_session(DestHost, SamHost, SamPort) ->
+    run_raw_session(DestHost, SamHost, SamPort, 5000).
+
+run_raw_session(DestHost, SamHost, SamPort, Timeout) ->
+    _ = {SamHost, SamPort, Timeout},
+    %% Prefer the Erlang-network path: raw sends go through i2p_sam_api.
+    %% No SAM fallback is needed because the holder forwards send_raw to
+    %% the core and surfaces failures there.
+    HoldPid = spawn(fun() -> hold_core_raw_session(DestHost) end),
+    SessionId = erlang:unique_integer([positive, monotonic]),
+    {ok, SessionId, HoldPid}.
+
+hold_core_raw_session(DestHost) ->
+    receive
+        {send, Payload, From, Ref} ->
+            Result = i2p_sam_api:raw_send(DestHost, Payload),
+            From ! {sent, Ref, Result},
+            hold_core_raw_session(DestHost);
+        stop ->
+            ok;
+        {stop, From, Ref} ->
+            From ! {stopped, Ref},
+            ok
+    end.
+
+-spec send_raw(pid(), binary()) -> ok | {error, term()}.
+send_raw(Pid, Payload) when is_pid(Pid), is_binary(Payload) ->
+    Ref = make_ref(),
+    Pid ! {send, Payload, self(), Ref},
+    receive
+        {sent, Ref} -> ok;
+        {sent, Ref, ok} -> ok;
+        {sent, Ref, {error, _} = Err} -> Err;
+        {sent, Ref, Other} -> {error, Other}
+    after 5000 -> {error, timeout}
     end.
 
 hold_session(SamSock) ->

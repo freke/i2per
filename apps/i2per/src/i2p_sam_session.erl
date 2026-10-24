@@ -94,7 +94,8 @@ dialled once the handshake completed (`sock` is `undefined` while dialling).
 
 -doc "Internal session state.".
 -type state() :: #{
-    sock := gen_tcp:socket(),
+    sock => gen_tcp:socket(),
+    send_fn => fun((iodata()) -> ok | {error, term()}),
     phase := phase(),
     local := i2p_peer:local_keys(),
     session_id => session_id(),
@@ -121,22 +122,40 @@ dialled once the handshake completed (`sock` is `undefined` while dialling).
 
 -doc "Start a SAM session process.".
 -spec start_link(map()) -> {ok, pid()} | {error, term()}.
-start_link(#{sock := Sock, local := Local}) ->
-    gen_server:start_link(?MODULE, #{sock => Sock, local => Local}, []).
+start_link(#{sock := Sock, local := Local} = Args) ->
+    gen_server:start_link(?MODULE, Args#{sock => Sock, local => Local}, []);
+start_link(#{local := Local} = Args) ->
+    gen_server:start_link(?MODULE, Args#{local => Local}, []).
 
 %%%%%%% %%% gen_server callbacks %%%%%%%
 
-init(#{sock := Sock, local := Local}) ->
+init(#{local := Local} = Args) ->
+    Sock = maps:get(sock, Args, undefined),
+    SendFn =
+        case maps:get(send_fn, Args, undefined) of
+            undefined when Sock =/= undefined ->
+                fun(Data) -> gen_tcp:send(Sock, Data) end;
+            undefined ->
+                fun(_Data) -> ok end;
+            Fn when is_function(Fn, 1) ->
+                Fn
+        end,
     %% Set active-once to receive data; we buffer in handle_info
     %% but don't start reading until the socket_ready message
-    {ok, #{
-        sock => Sock,
+    State0 = #{
         phase => hello,
         local => Local,
         buf => <<>>,
         read => undefined,
-        replay_window => i2p_datagram_replay:new(1024)
-    }}.
+        replay_window => i2p_datagram_replay:new(1024),
+        send_fn => SendFn
+    },
+    State1 =
+        case Sock of
+            undefined -> State0;
+            _ -> State0#{sock => Sock}
+        end,
+    {ok, State1}.
 
 handle_call(_Request, _From, State) ->
     {reply, {error, not_implemented}, State}.
@@ -197,8 +216,12 @@ handle_control_info({tcp, Sock, _Data}, #{sock := Sock, phase := raw} = State) -
 handle_control_info({tcp, Sock, Data}, #{sock := Sock} = State0) ->
     ok = inet:setopts(Sock, [{active, once}]),
     {noreply, consume(State0, Data)};
-handle_control_info({data, Data}, #{sock := Sock} = State) ->
-    ok = gen_tcp:send(Sock, Data),
+%% Socket-less (translator) path: inbound bytes pushed by the owner of the
+%% socket, which is the thin-translator form of the listener (E1CHFWF).
+handle_control_info({inbound, Data}, State0) ->
+    {noreply, consume(State0, Data)};
+handle_control_info({data, Data}, #{send_fn := SendFn} = State) ->
+    _ = SendFn(Data),
     {noreply, State};
 handle_control_info({tcp_closed, _Sock}, State) ->
     {stop, normal, State};
@@ -224,11 +247,11 @@ handle_control_info({stream_established, Conn, _PeerHash}, #{conn := Conn} = Sta
     %% Inbound (ACCEPT-side) connection: the socket has been raw
     %% since STREAM ACCEPT; nothing further to signal.
     {noreply, State};
-handle_control_info({stream_data, Conn, Bytes}, #{sock := Sock, conn := Conn} = State) when
+handle_control_info({stream_data, Conn, Bytes}, #{send_fn := SendFn, conn := Conn} = State) when
     is_pid(Conn)
 ->
     %% Ordered payload bytes from our streaming connection.
-    ok = gen_tcp:send(Sock, Bytes),
+    _ = SendFn(Bytes),
     {noreply, State};
 handle_control_info({stream_data, Wire}, #{style := datagram} = State) when is_binary(Wire) ->
     %% Garlic opened under this DATAGRAM session's key: one repliable
@@ -884,8 +907,9 @@ stream_send(Route, Data) ->
     i2p_client:send_wire(Route, Data).
 
 -spec send_line(state(), iodata()) -> ok.
-send_line(#{sock := Sock}, Line) ->
-    gen_tcp:send(Sock, [Line, <<"\n">>]).
+send_line(#{send_fn := SendFn}, Line) ->
+    _ = SendFn([Line, <<"\n">>]),
+    ok.
 
 -spec resolve_destination(binary() | undefined, state()) ->
     {ok, #{identity := i2p_keys:identity(), crypto_priv := binary(), sign_priv := binary()}}

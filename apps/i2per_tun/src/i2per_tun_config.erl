@@ -9,7 +9,7 @@ the protocol has no automatic IP<->I2P mapping. Configured via the
 (e.g. <<"10.0.0.2">>) to a destination hostname (e.g. <<"peer.i2p">>).
 """.
 
--export([destinations/0, lookup/1, sam_host/0, sam_port/0, listen_port/0]).
+-export([destinations/0, lookup/1, sam_host/0, sam_port/0, listen_port/0, router_node/0]).
 
 -spec destinations() -> #{binary() => binary()}.
 destinations() ->
@@ -37,6 +37,13 @@ sam_port() ->
     case application:get_env(i2per_tun, sam_port) of
         {ok, P} when is_integer(P), P > 0 -> P;
         _ -> 7656
+    end.
+
+-spec router_node() -> node().
+router_node() ->
+    case application:get_env(i2per_tun, router_node) of
+        {ok, N} when is_atom(N) -> N;
+        _ -> node()
     end.
 
 -spec listen_port() -> inet:port_number().
