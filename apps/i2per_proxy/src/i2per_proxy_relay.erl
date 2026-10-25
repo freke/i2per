@@ -42,6 +42,10 @@ forward(Src, Dst, Parent) ->
                 ok -> forward(Src, Dst, Parent);
                 {error, _} -> Parent ! {done, self()}
             end;
+        {error, timeout} ->
+            %% An idle direction is normal: keep the relay alive and let the
+            %% session Timeout, not the per-read timeout, bound it.
+            forward(Src, Dst, Parent);
         {error, _} ->
             Parent ! {done, self()}
     end.

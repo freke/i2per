@@ -69,3 +69,15 @@ parse_raw_received_test() ->
         {ok, 4, <<"srcdest">>},
         i2per_tun_sam:parse_raw_received(<<"RAW RECEIVED SIZE=4 DESTINATION=srcdest">>)
     ).
+
+sam_recv_line_preserves_bytes_after_newline_test() ->
+    {ok, LSock} = gen_tcp:listen(0, [binary, {packet, raw}, {active, false}, {reuseaddr, true}]),
+    {ok, {_, Port}} = inet:sockname(LSock),
+    {ok, Client} = gen_tcp:connect("127.0.0.1", Port, [binary, {active, false}], 5000),
+    {ok, Server} = gen_tcp:accept(LSock, 5000),
+    ok = gen_tcp:send(Client, <<"hello\nworld">>),
+    ?assertEqual({ok, <<"hello">>}, i2per_tun_sam:sam_recv_line(Server)),
+    ?assertEqual({ok, <<"world">>}, gen_tcp:recv(Server, 0, 5000)),
+    gen_tcp:close(Client),
+    gen_tcp:close(Server),
+    gen_tcp:close(LSock).

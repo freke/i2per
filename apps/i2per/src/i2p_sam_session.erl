@@ -218,11 +218,23 @@ handle_control_info({tcp, Sock, Data}, #{sock := Sock} = State0) ->
     {noreply, consume(State0, Data)};
 %% Socket-less (translator) path: inbound bytes pushed by the owner of the
 %% socket, which is the thin-translator form of the listener (E1CHFWF).
+handle_control_info({inbound, Data}, #{phase := raw, paired_pid := Peer} = State) when
+    is_pid(Peer)
+->
+    Peer ! {data, Data},
+    {noreply, State};
+handle_control_info({inbound, Data}, #{phase := raw, conn := Conn} = State) when
+    is_pid(Conn)
+->
+    i2p_stream_conn:send(Conn, Data),
+    {noreply, State};
 handle_control_info({inbound, Data}, State0) ->
     {noreply, consume(State0, Data)};
 handle_control_info({data, Data}, #{send_fn := SendFn} = State) ->
-    _ = SendFn(Data),
-    {noreply, State};
+    case SendFn(Data) of
+        ok -> {noreply, State};
+        {error, _} = Err -> {stop, normal, State#{last_error => Err}}
+    end;
 handle_control_info({tcp_closed, _Sock}, State) ->
     {stop, normal, State};
 handle_control_info({tcp_error, _Sock, _Reason}, State) ->
@@ -251,8 +263,10 @@ handle_control_info({stream_data, Conn, Bytes}, #{send_fn := SendFn, conn := Con
     is_pid(Conn)
 ->
     %% Ordered payload bytes from our streaming connection.
-    _ = SendFn(Bytes),
-    {noreply, State};
+    case SendFn(Bytes) of
+        ok -> {noreply, State};
+        {error, _} -> {stop, normal, State}
+    end;
 handle_control_info({stream_data, Wire}, #{style := datagram} = State) when is_binary(Wire) ->
     %% Garlic opened under this DATAGRAM session's key: one repliable
     %% datagram.
@@ -908,8 +922,10 @@ stream_send(Route, Data) ->
 
 -spec send_line(state(), iodata()) -> ok.
 send_line(#{send_fn := SendFn}, Line) ->
-    _ = SendFn([Line, <<"\n">>]),
-    ok.
+    case SendFn([Line, <<"\n">>]) of
+        ok -> ok;
+        {error, Reason} -> erlang:error({send_failed, Reason})
+    end.
 
 -spec resolve_destination(binary() | undefined, state()) ->
     {ok, #{identity := i2p_keys:identity(), crypto_priv := binary(), sign_priv := binary()}}
@@ -917,6 +933,8 @@ send_line(#{send_fn := SendFn}, Line) ->
 resolve_destination(undefined, _State) ->
     %% No DESTINATION provided — generate a transient identity
     {ok, i2p_keys:generate_with_privkeys()};
+resolve_destination(<<"TRANSIENT">>, State) ->
+    resolve_destination(undefined, State);
 resolve_destination(DestB64, _State) ->
     i2p_keys:parse_dest_blob(i2p_keys:decode_b64(DestB64)).
 

@@ -235,9 +235,7 @@ maybe_spawn_raw_session(Key, Parsed, State, Sessions) ->
                         {ok, _SessionId, HoldPid} ->
                             monitor(process, HoldPid),
                             _ = i2per_tun_flow:send_raw(HoldPid, UdpPayload),
-                            maps:put(Key, HoldPid, Sessions);
-                        _ ->
-                            Sessions
+                            maps:put(Key, HoldPid, Sessions)
                     end;
                 error ->
                     Sessions

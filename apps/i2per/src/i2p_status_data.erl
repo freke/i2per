@@ -182,7 +182,7 @@ view() ->
                 map_size(maps:get(exploratory, Tunnels, #{})),
             exploratory_inbound =>
                 map_size(maps:get(exploratory_in, Tunnels, #{})),
-            detail => Tunnels,
+            detail => redact_tunnel_detail(Tunnels),
             demands => i2p_tunnel_srv:demands()
         },
         netdb => maps:merge(
@@ -222,6 +222,32 @@ lease_set_detail() ->
             end
         end
      || K <- Keys
+    ].
+
+%% Tunnel internals carry data-layer keys and fragment payloads. The status
+%% view is an operator surface, so strip key material before it leaves the
+%% core rather than relying on every consumer to ignore it.
+redact_tunnel_detail(Tunnels) ->
+    maps:map(fun(_Kind, Entries) -> redact(Entries) end, Tunnels).
+
+redact(Value) when is_map(Value) ->
+    maps:map(fun(_K, V) -> redact(V) end, maps:without(sensitive_tunnel_keys(), Value));
+redact(Value) when is_list(Value) ->
+    [redact(V) || V <- Value];
+redact(Value) ->
+    Value.
+
+sensitive_tunnel_keys() ->
+    [
+        layers,
+        frag_map,
+        hop_keys,
+        layer_key,
+        iv_key,
+        reply_key,
+        rgarlic_key,
+        rgarlic_tag,
+        gw_state
     ].
 
 -doc """

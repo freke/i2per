@@ -164,24 +164,40 @@ try_core_run_session(DestHost) ->
     Node = i2per_tun_config:router_node(),
     case catch erpc:call(Node, i2p_sam_api, create_session, [#{}], 5000) of
         {ok, SessionPid, _DestB64} ->
+            Holder = spawn(fun hold_core_session_wait/0),
             case
                 catch erpc:call(
-                    Node, i2p_sam_api, stream_connect, [SessionPid, DestHost, self()], 15000
+                    Node, i2p_sam_api, stream_connect, [SessionPid, DestHost, Holder], 15000
                 )
             of
                 {ok, ConnPid} ->
-                    HoldPid = spawn(fun() -> hold_core_session(ConnPid) end),
+                    Holder ! {conn, ConnPid},
                     SessionId = erlang:unique_integer([positive, monotonic]),
-                    {ok, SessionId, HoldPid};
+                    {ok, SessionId, Holder};
                 Other ->
+                    exit(Holder, kill),
+                    _ = catch erpc:call(Node, i2p_sam_api, close_session, [SessionPid]),
                     {fallback, Other}
             end;
         Other ->
             {fallback, Other}
     end.
 
+hold_core_session_wait() ->
+    receive
+        {conn, ConnPid} -> hold_core_session(ConnPid)
+    end.
+
 hold_core_session(ConnPid) ->
     receive
+        {stream_data, ConnPid, _Bytes} ->
+            hold_core_session(ConnPid);
+        {stream_closed, ConnPid} ->
+            catch i2p_sam_api:stream_close(ConnPid),
+            ok;
+        {stream_reset, ConnPid} ->
+            catch i2p_sam_api:stream_close(ConnPid),
+            ok;
         stop ->
             i2p_sam_api:stream_close(ConnPid),
             ok;

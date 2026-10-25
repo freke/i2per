@@ -669,7 +669,7 @@ The raw bytes do not contain their own key, so the caller supplies the
 DatabaseStore key. The bytes are stored verbatim.
 """.
 -spec store_ls_5_binary_at(store(), ls_key(), binary(), non_neg_integer()) ->
-    {ok, store(), added | updated}.
+    {ok, store(), added | updated} | {error, too_large | badarg}.
 store_ls_5_binary_at(Store, Key, Bin, NowSec) when
     is_binary(Key),
     byte_size(Key) =:= 32,
@@ -696,14 +696,18 @@ store_ls_5_binary_at(Store, Key, Bin, NowSec) when
         lease_sets_5_time => Time1
     },
     {ok, trim_ls_5(Store1), Outcome};
+store_ls_5_binary_at(_Store, _Key, Bin, _NowSec) when
+    is_binary(Bin), byte_size(Bin) > ?MAX_RAW_LS_BYTES
+->
+    {error, too_large};
 store_ls_5_binary_at(_Store, _Key, _Bin, _NowSec) ->
-    error(badarg).
+    {error, badarg}.
 
 -doc """
 Store a MetaLeaseSet (store type 7) from its raw bytes.
 """.
 -spec store_ls_7_binary_at(store(), ls_key(), binary(), non_neg_integer()) ->
-    {ok, store(), added | updated}.
+    {ok, store(), added | updated} | {error, too_large | badarg}.
 store_ls_7_binary_at(Store, Key, Bin, NowSec) when
     is_binary(Key),
     byte_size(Key) =:= 32,
@@ -730,8 +734,12 @@ store_ls_7_binary_at(Store, Key, Bin, NowSec) when
         lease_sets_7_time => Time1
     },
     {ok, trim_ls_7(Store1), Outcome};
+store_ls_7_binary_at(_Store, _Key, Bin, _NowSec) when
+    is_binary(Bin), byte_size(Bin) > ?MAX_RAW_LS_BYTES
+->
+    {error, too_large};
 store_ls_7_binary_at(_Store, _Key, _Bin, _NowSec) ->
-    error(badarg).
+    {error, badarg}.
 
 -doc """
 Look up an EncryptedLeaseSet by destination hash.

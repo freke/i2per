@@ -14,31 +14,31 @@ handle(ClientSock) ->
     Result =
         case recv_request(ClientSock) of
             {ok, Method, Url} when
-                Method =:= <<"GET">>; Method =:= <<"POST">>; Method =:= <<"HEAD">>
+                Method =:= <<"GET">>; Method =:= <<"HEAD">>
             ->
                 handle_request(ClientSock, Method, Url);
             {ok, _Method, _Url} ->
-                send_http(ClientSock, 405, <<"Method Not Allowed">>),
+                _ = send_http(ClientSock, 405, <<"Method Not Allowed">>),
                 ok;
             error ->
-                send_http(ClientSock, 400, <<"Bad Request">>),
+                _ = send_http(ClientSock, 400, <<"Bad Request">>),
                 ok
         end,
     gen_tcp:close(ClientSock),
     Result.
 
-handle_request(ClientSock, _Method, Url) ->
+handle_request(ClientSock, Method, Url) ->
     {Host, Path} = parse_url(Url),
-    case try_core_fetch(Host, Path) of
+    case try_core_fetch(Host, Path, Method) of
         {ok, Response} ->
-            gen_tcp:send(ClientSock, Response),
+            _ = gen_tcp:send(ClientSock, Response),
             ok;
         {fallback, Reason} ->
             _ = Reason,
-            handle_request_sam(ClientSock, Host, Path)
+            handle_request_sam(ClientSock, Host, Path, Method)
     end.
 
-try_core_fetch(Host, Path) ->
+try_core_fetch(Host, Path, Method) ->
     Node = i2per_proxy_config:router_node(),
     case catch erpc:call(Node, i2p_sam_api, create_session, [#{}], 5000) of
         {ok, SessionPid, _DestB64} ->
@@ -50,7 +50,8 @@ try_core_fetch(Host, Path) ->
             of
                 {ok, ConnPid} ->
                     Request = [
-                        <<"GET ">>,
+                        Method,
+                        <<" ">>,
                         Path,
                         <<" HTTP/1.1\r\n">>,
                         <<"Host: ">>,
@@ -59,12 +60,14 @@ try_core_fetch(Host, Path) ->
                         <<"Connection: close\r\n">>,
                         <<"\r\n">>
                     ],
-                    _ = i2p_sam_api:stream_send(ConnPid, Request),
+                    _ = catch erpc:call(Node, i2p_sam_api, stream_send, [ConnPid, Request]),
                     %% Collect the response until the stream closes.
                     Response = core_recv_all(ConnPid, <<>>),
-                    i2p_sam_api:stream_close(ConnPid),
+                    _ = catch erpc:call(Node, i2p_sam_api, stream_close, [ConnPid]),
+                    _ = catch erpc:call(Node, i2p_sam_api, close_session, [SessionPid]),
                     {ok, Response};
                 Other ->
+                    _ = catch erpc:call(Node, i2p_sam_api, close_session, [SessionPid]),
                     {fallback, Other}
             end;
         Other ->
@@ -83,7 +86,7 @@ core_recv_all(ConnPid, Acc) ->
         Acc
     end.
 
-handle_request_sam(ClientSock, Host, Path) ->
+handle_request_sam(ClientSock, Host, Path, Method) ->
     SamHost = i2per_proxy_config:sam_host(),
     SamPort = i2per_proxy_config:sam_port(),
     case
@@ -92,26 +95,26 @@ handle_request_sam(ClientSock, Host, Path) ->
         )
     of
         {ok, SamSock} ->
-            case fetch_via_sam(SamSock, Host, Path, ClientSock) of
+            case fetch_via_sam(SamSock, Host, Path, ClientSock, Method) of
                 {ok, Response} ->
-                    gen_tcp:send(ClientSock, Response),
+                    _ = gen_tcp:send(ClientSock, Response),
                     gen_tcp:close(SamSock),
                     ok;
                 {error, Reason} ->
                     gen_tcp:close(SamSock),
-                    send_http(ClientSock, 502, iolist_to_binary(io_lib:format("~p", [Reason]))),
+                    _ = send_http(ClientSock, 502, iolist_to_binary(io_lib:format("~p", [Reason]))),
                     ok
             end;
         {error, _} ->
-            send_http(ClientSock, 503, <<"SAM bridge unavailable">>),
+            _ = send_http(ClientSock, 503, <<"SAM bridge unavailable">>),
             ok
     end.
 
-fetch_via_sam(SamSock, Host, Path, _ClientSock) ->
+fetch_via_sam(SamSock, Host, Path, _ClientSock, Method) ->
     Runner = self(),
     {Worker, Mon} =
         spawn_monitor(fun() ->
-            Runner ! {proxy_fetch, self(), fetch_over_sam(SamSock, Host, Path)}
+            Runner ! {proxy_fetch, self(), fetch_over_sam(SamSock, Host, Path, Method)}
         end),
     receive
         {proxy_fetch, Worker, Response} ->
@@ -125,13 +128,14 @@ fetch_via_sam(SamSock, Host, Path, _ClientSock) ->
         {error, fetch_timeout}
     end.
 
-fetch_over_sam(SamSock, Host, Path) ->
+fetch_over_sam(SamSock, Host, Path, Method) ->
     ok = i2per_proxy_sam:hello(SamSock),
     {ok, SessionId, _DestB64} = i2per_proxy_sam:session_create(SamSock),
     {ok, TargetB64} = i2per_proxy_sam:naming_lookup(SamSock, Host),
     ok = i2per_proxy_sam:stream_connect(SamSock, SessionId, TargetB64),
     Request = [
-        <<"GET ">>,
+        Method,
+        <<" ">>,
         Path,
         <<" HTTP/1.1\r\n">>,
         <<"Host: ">>,
@@ -141,8 +145,10 @@ fetch_over_sam(SamSock, Host, Path) ->
         <<"\r\n">>
     ],
     ok = gen_tcp:send(SamSock, Request),
-    {ok, Response} = recv_all(SamSock),
-    Response.
+    case recv_all(SamSock) of
+        {ok, Response} -> Response;
+        {error, Reason} -> throw({recv_failed, Reason})
+    end.
 
 recv_request(Sock) ->
     recv_request(Sock, <<>>).
@@ -154,7 +160,7 @@ recv_request(Sock, Acc) ->
             case binary:match(Combined, <<"\r\n">>) of
                 {Pos, _} ->
                     Line = binary:part(Combined, 0, Pos),
-                    case binary:split(Line, <<" ">>) of
+                    case binary:split(Line, <<" ">>, [global]) of
                         [Method, Url | _] -> {ok, Method, Url};
                         _ -> error
                     end;
@@ -204,5 +210,6 @@ recv_all(Sock, Acc) ->
     case gen_tcp:recv(Sock, 0, 2000) of
         {ok, Data} -> recv_all(Sock, <<Acc/binary, Data/binary>>);
         {error, closed} -> {ok, Acc};
-        {error, timeout} -> {ok, Acc}
+        {error, timeout} -> recv_all(Sock, Acc);
+        {error, Reason} -> {error, Reason}
     end.

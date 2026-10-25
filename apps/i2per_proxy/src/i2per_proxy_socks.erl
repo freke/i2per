@@ -33,7 +33,7 @@ socks5(ClientSock) ->
         {ok, <<NMethods>>} ->
             case gen_tcp:recv(ClientSock, NMethods, 5000) of
                 {ok, _Methods} ->
-                    gen_tcp:send(ClientSock, <<5, 0>>),
+                    _ = gen_tcp:send(ClientSock, <<5, 0>>),
                     socks5_request(ClientSock);
                 _ ->
                     ok
@@ -66,7 +66,7 @@ socks5_request(ClientSock) ->
             end;
         _ ->
             %% unsupported request
-            gen_tcp:send(ClientSock, <<5, 7, 0, 1, 0, 0, 0, 0, 0, 0>>),
+            _ = gen_tcp:send(ClientSock, <<5, 7, 0, 1, 0, 0, 0, 0, 0, 0>>),
             ok
     end.
 
@@ -93,42 +93,44 @@ try_core_connect(ClientSock, Host) ->
                 )
             of
                 {ok, ConnPid} ->
-                    gen_tcp:send(ClientSock, <<5, 0, 0, 1, 0, 0, 0, 0, 0, 0>>),
-                    relay_core(ClientSock, ConnPid),
-                    i2p_sam_api:stream_close(ConnPid),
+                    _ = gen_tcp:send(ClientSock, <<5, 0, 0, 1, 0, 0, 0, 0, 0, 0>>),
+                    relay_core(ClientSock, ConnPid, Node),
+                    _ = catch erpc:call(Node, i2p_sam_api, stream_close, [ConnPid]),
+                    _ = catch erpc:call(Node, i2p_sam_api, close_session, [SessionPid]),
                     ok;
                 Other ->
+                    _ = catch erpc:call(Node, i2p_sam_api, close_session, [SessionPid]),
                     {fallback, Other}
             end;
         Other ->
             {fallback, Other}
     end.
 
-relay_core(ClientSock, ConnPid) ->
+relay_core(ClientSock, ConnPid, Node) ->
     _ = inet:setopts(ClientSock, [{active, once}]),
-    relay_core_loop(ClientSock, ConnPid).
+    relay_core_loop(ClientSock, ConnPid, Node).
 
-relay_core_loop(ClientSock, ConnPid) ->
+relay_core_loop(ClientSock, ConnPid, Node) ->
     receive
         {tcp, ClientSock, Data} ->
-            _ = i2p_sam_api:stream_send(ConnPid, Data),
+            _ = catch erpc:call(Node, i2p_sam_api, stream_send, [ConnPid, Data]),
             _ = inet:setopts(ClientSock, [{active, once}]),
-            relay_core_loop(ClientSock, ConnPid);
+            relay_core_loop(ClientSock, ConnPid, Node);
         {tcp_closed, ClientSock} ->
-            i2p_sam_api:stream_close(ConnPid),
+            _ = catch erpc:call(Node, i2p_sam_api, stream_close, [ConnPid]),
             ok;
         {tcp_error, ClientSock, _} ->
-            i2p_sam_api:stream_close(ConnPid),
+            _ = catch erpc:call(Node, i2p_sam_api, stream_close, [ConnPid]),
             ok;
         {stream_data, ConnPid, Bytes} ->
             _ = gen_tcp:send(ClientSock, Bytes),
-            relay_core_loop(ClientSock, ConnPid);
+            relay_core_loop(ClientSock, ConnPid, Node);
         {stream_closed, ConnPid} ->
             ok;
         {stream_reset, ConnPid} ->
             ok
     after 300000 ->
-        i2p_sam_api:stream_close(ConnPid),
+        _ = catch erpc:call(Node, i2p_sam_api, stream_close, [ConnPid]),
         ok
     end.
 
@@ -143,17 +145,17 @@ socks5_connect_sam(ClientSock, Host) ->
         {ok, SamSock} ->
             case open_sam(SamSock, Host) of
                 ok ->
-                    gen_tcp:send(ClientSock, <<5, 0, 0, 1, 0, 0, 0, 0, 0, 0>>),
+                    _ = gen_tcp:send(ClientSock, <<5, 0, 0, 1, 0, 0, 0, 0, 0, 0>>),
                     i2per_proxy_relay:relay(ClientSock, SamSock),
                     gen_tcp:close(SamSock),
                     ok;
                 {error, _} ->
                     gen_tcp:close(SamSock),
-                    gen_tcp:send(ClientSock, <<5, 4, 0, 1, 0, 0, 0, 0, 0, 0>>),
+                    _ = gen_tcp:send(ClientSock, <<5, 4, 0, 1, 0, 0, 0, 0, 0, 0>>),
                     ok
             end;
         {error, _} ->
-            gen_tcp:send(ClientSock, <<5, 4, 0, 1, 0, 0, 0, 0, 0, 0>>),
+            _ = gen_tcp:send(ClientSock, <<5, 4, 0, 1, 0, 0, 0, 0, 0, 0>>),
             ok
     end.
 
@@ -186,11 +188,11 @@ socks4a(ClientSock) ->
                         {ok, Host} when byte_size(Host) > 0 ->
                             socks4a_connect(ClientSock, Host, Port);
                         _ ->
-                            gen_tcp:send(ClientSock, <<0, 91, 0, 0, 0, 0, 0, 0>>),
+                            _ = gen_tcp:send(ClientSock, <<0, 91, 0, 0, 0, 0, 0, 0>>),
                             ok
                     end;
                 _ ->
-                    gen_tcp:send(ClientSock, <<0, 91, 0, 0, 0, 0, 0, 0>>),
+                    _ = gen_tcp:send(ClientSock, <<0, 91, 0, 0, 0, 0, 0, 0>>),
                     ok
             end;
         _ ->
@@ -208,17 +210,17 @@ socks4a_connect(ClientSock, Host, Port) ->
         {ok, SamSock} ->
             case open_sam(SamSock, Host) of
                 ok ->
-                    gen_tcp:send(ClientSock, <<0, 90, Port:16, 0, 0, 0, 1>>),
+                    _ = gen_tcp:send(ClientSock, <<0, 90, Port:16, 0, 0, 0, 1>>),
                     i2per_proxy_relay:relay(ClientSock, SamSock),
                     gen_tcp:close(SamSock),
                     ok;
                 {error, _} ->
                     gen_tcp:close(SamSock),
-                    gen_tcp:send(ClientSock, <<0, 91, 0, 0, 0, 0, 0, 0>>),
+                    _ = gen_tcp:send(ClientSock, <<0, 91, 0, 0, 0, 0, 0, 0>>),
                     ok
             end;
         {error, _} ->
-            gen_tcp:send(ClientSock, <<0, 91, 0, 0, 0, 0, 0, 0>>),
+            _ = gen_tcp:send(ClientSock, <<0, 91, 0, 0, 0, 0, 0, 0>>),
             ok
     end.
 

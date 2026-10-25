@@ -99,14 +99,23 @@ handle_cast(_Msg, State) ->
 handle_info(accept, #state{lsock = LSock, sam_host = SH, sam_port = SP} = State) ->
     case gen_tcp:accept(LSock, 100) of
         {ok, ClientSock} ->
-            spawn_link(fun() -> handle_client(ClientSock, SH, SP) end),
+            Worker = spawn(fun() ->
+                receive
+                    start -> handle_client(ClientSock, SH, SP)
+                end
+            end),
+            ok = gen_tcp:controlling_process(ClientSock, Worker),
+            Worker ! start,
             erlang:send_after(0, self(), accept),
             {noreply, State};
         {error, timeout} ->
             erlang:send_after(0, self(), accept),
             {noreply, State};
         {error, closed} ->
-            {stop, normal, State}
+            {stop, normal, State};
+        {error, _} ->
+            erlang:send_after(100, self(), accept),
+            {noreply, State}
     end;
 handle_info(_Info, State) ->
     {noreply, State}.

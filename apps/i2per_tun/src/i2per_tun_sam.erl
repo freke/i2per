@@ -36,7 +36,7 @@ session_create(Sock) ->
     Id = iolist_to_binary([
         <<"tun-">>, integer_to_binary(erlang:unique_integer([positive, monotonic]))
     ]),
-    Cmd = [<<"SESSION CREATE STYLE=STREAM ID=">>, Id, <<"\n">>],
+    Cmd = [<<"SESSION CREATE STYLE=STREAM ID=">>, Id, <<" DESTINATION=TRANSIENT\n">>],
     case gen_tcp:send(Sock, Cmd) of
         ok ->
             case sam_recv_line(Sock) of
@@ -80,7 +80,7 @@ session_create_raw(Sock) ->
     Id = iolist_to_binary([
         <<"tun-">>, integer_to_binary(erlang:unique_integer([positive, monotonic]))
     ]),
-    Cmd = [<<"SESSION CREATE STYLE=RAW ID=">>, Id, <<"\n">>],
+    Cmd = [<<"SESSION CREATE STYLE=RAW ID=">>, Id, <<" DESTINATION=TRANSIENT\n">>],
     case gen_tcp:send(Sock, Cmd) of
         ok ->
             case sam_recv_line(Sock) of
@@ -186,14 +186,16 @@ trim(Bin) -> string:trim(Bin, both, "\r\n\t ").
 
 sam_recv_line(Sock) -> sam_recv_line(Sock, <<>>).
 
+%% Read exactly one byte at a time so bytes after the newline stay in the
+%% socket buffer for the raw stream that follows the handshake.
 sam_recv_line(Sock, Acc) ->
-    case gen_tcp:recv(Sock, 0, 5000) of
-        {ok, Data} ->
-            Combined = <<Acc/binary, Data/binary>>,
-            case binary:match(Combined, <<"\n">>) of
-                {Pos, _} -> {ok, binary:part(Combined, 0, Pos)};
-                nomatch -> sam_recv_line(Sock, Combined)
-            end;
+    case gen_tcp:recv(Sock, 1, 5000) of
+        {ok, <<"\n">>} ->
+            {ok, Acc};
+        {ok, Byte} when byte_size(Acc) < 8192 ->
+            sam_recv_line(Sock, <<Acc/binary, Byte/binary>>);
+        {ok, _} ->
+            {error, line_too_long};
         {error, Reason} ->
             {error, Reason}
     end.

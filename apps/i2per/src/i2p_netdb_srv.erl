@@ -715,11 +715,15 @@ handle_call({find_ls_v1, Key}, _From, {Store, _} = State) ->
         error -> {reply, not_found, State}
     end;
 handle_call({store_ls_5, Key, Bin, NowSec}, _From, {Store, Counters}) ->
-    {ok, Store2, Outcome} = i2p_netdb:store_ls_5_binary_at(Store, Key, Bin, NowSec),
-    {reply, {ok, Outcome}, {Store2, Counters}};
+    case i2p_netdb:store_ls_5_binary_at(Store, Key, Bin, NowSec) of
+        {ok, Store2, Outcome} -> {reply, {ok, Outcome}, {Store2, Counters}};
+        {error, Reason} -> {reply, {error, Reason}, {Store, Counters}}
+    end;
 handle_call({store_ls_7, Key, Bin, NowSec}, _From, {Store, Counters}) ->
-    {ok, Store2, Outcome} = i2p_netdb:store_ls_7_binary_at(Store, Key, Bin, NowSec),
-    {reply, {ok, Outcome}, {Store2, Counters}};
+    case i2p_netdb:store_ls_7_binary_at(Store, Key, Bin, NowSec) of
+        {ok, Store2, Outcome} -> {reply, {ok, Outcome}, {Store2, Counters}};
+        {error, Reason} -> {reply, {error, Reason}, {Store, Counters}}
+    end;
 handle_call({find_ls_5, Key}, _From, {Store, _} = State) ->
     case i2p_netdb:find_ls_5(Store, Key) of
         {ok, Bin} -> {reply, {ok, Bin}, State};

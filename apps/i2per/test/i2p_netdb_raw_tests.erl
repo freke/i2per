@@ -22,3 +22,17 @@ now_sec() ->
 
 rand_hash() ->
     crypto:strong_rand_bytes(32).
+
+netdb_type5_rejects_oversized_test() ->
+    Store = i2p_netdb:new(),
+    Key = rand_hash(),
+    Bin = crypto:strong_rand_bytes(65537),
+    ?assertEqual({error, too_large}, i2p_netdb:store_ls_5_binary_at(Store, Key, Bin, now_sec())),
+    ?assertEqual(error, i2p_netdb:find_ls_5(Store, Key)).
+
+netdb_type7_rejects_oversized_test() ->
+    Store = i2p_netdb:new(),
+    Key = rand_hash(),
+    Bin = crypto:strong_rand_bytes(65537),
+    ?assertEqual({error, too_large}, i2p_netdb:store_ls_7_binary_at(Store, Key, Bin, now_sec())),
+    ?assertEqual(error, i2p_netdb:find_ls_7(Store, Key)).

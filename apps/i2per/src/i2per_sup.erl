@@ -698,24 +698,33 @@ stop_coord(Key) ->
 %% start leaves the setting and the running state in agreement.
 -spec apply_upnp(boolean()) -> ok | {error, term()}.
 apply_upnp(true) ->
-    case supervisor:start_child(?MODULE, upnp_child()) of
-        {ok, _Pid} ->
-            application:set_env(i2per, upnp, true),
+    Prev = application:get_env(i2per, upnp),
+    %% `i2p_upnp_srv:init/1` reads this key, so it must be true before the start.
+    application:set_env(i2per, upnp, true),
+    Result =
+        case supervisor:start_child(?MODULE, upnp_child()) of
+            {ok, _Pid} ->
+                ok;
+            {error, {already_started, _Pid}} ->
+                ok;
+            {error, already_present} ->
+                _ = supervisor:delete_child(?MODULE, i2p_upnp_srv),
+                case supervisor:start_child(?MODULE, upnp_child()) of
+                    {ok, _Pid} -> ok;
+                    {error, Reason} -> {error, Reason}
+                end;
+            {error, Reason} ->
+                {error, Reason}
+        end,
+    case Result of
+        ok ->
             ok;
-        {error, {already_started, _Pid}} ->
-            application:set_env(i2per, upnp, true),
-            ok;
-        {error, already_present} ->
-            _ = supervisor:delete_child(?MODULE, i2p_upnp_srv),
-            case supervisor:start_child(?MODULE, upnp_child()) of
-                {ok, _Pid} ->
-                    application:set_env(i2per, upnp, true),
-                    ok;
-                {error, Reason} ->
-                    {error, Reason}
-            end;
-        {error, Reason} ->
-            {error, Reason}
+        {error, _} = Err ->
+            case Prev of
+                {ok, V} -> application:set_env(i2per, upnp, V);
+                undefined -> application:unset_env(i2per, upnp)
+            end,
+            Err
     end;
 apply_upnp(false) ->
     case supervisor:terminate_child(?MODULE, i2p_upnp_srv) of

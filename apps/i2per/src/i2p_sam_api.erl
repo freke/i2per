@@ -34,6 +34,8 @@ Vsn = i2p_sam_api:version(),
     stream_connect/3,
     stream_send/2,
     stream_close/1,
+    close_session/1,
+    stop_session/1,
     session_dest_b64/1,
     raw_send/2
 ]).
@@ -159,9 +161,31 @@ resolvable by the address book. `Owner` receives `{stream_data, Conn, Bytes}`,
     {ok, pid()} | {error, term()}.
 stream_connect(Session, Target, Owner) when is_pid(Session) ->
     gen_server:call(Session, {stream_connect, Target, Owner}, 15000);
-stream_connect(_SessionMap, Target, Owner) ->
+stream_connect(SessionMap, Target, Owner) when is_map(SessionMap) ->
     %% Allow callers that kept the create_destination map to connect without
-    %% a running session process: spawn an ephemeral session.
+    %% a running session process: spawn an ephemeral session using the
+    %% supplied identity and private keys rather than generating a new one.
+    case maps:get(identity, SessionMap, undefined) of
+        undefined ->
+            case create_session(#{}) of
+                {ok, Pid, _} -> stream_connect(Pid, Target, Owner);
+                {error, R} -> {error, R}
+            end;
+        Identity ->
+            Args = #{
+                identity => Identity,
+                crypto_priv => maps:get(crypto_priv, SessionMap),
+                sign_priv => maps:get(sign_priv, SessionMap),
+                tunnel_lengths => maps:get(tunnel_lengths, SessionMap, #{})
+            },
+            case i2p_client_session:start_link(Args) of
+                {ok, Pid} ->
+                    stream_connect(Pid, Target, Owner);
+                {error, R} ->
+                    {error, R}
+            end
+    end;
+stream_connect(_SessionMap, Target, Owner) ->
     case create_session(#{}) of
         {ok, Pid, _} -> stream_connect(Pid, Target, Owner);
         {error, R} -> {error, R}
@@ -176,6 +200,17 @@ stream_send(Conn, Data) ->
 -spec stream_close(pid()) -> ok.
 stream_close(Conn) ->
     i2p_stream_conn:close(Conn).
+
+-doc "Stop a headless session created by `f:create_session/0-1`.".
+-spec close_session(pid()) -> ok.
+close_session(Pid) when is_pid(Pid) ->
+    catch gen_server:call(Pid, stop, 5000),
+    ok.
+
+-doc "Alias for `f:close_session/1`.".
+-spec stop_session(pid()) -> ok.
+stop_session(Pid) ->
+    close_session(Pid).
 
 -doc """
 Send an anonymous (raw) datagram to `Target`.
@@ -202,13 +237,13 @@ raw_send(Target, Payload) ->
 resolve_raw_target(Target) ->
     case i2p_keys:from_b64(Target) of
         {ok, Identity} ->
-            i2p_client:route_to_dest(i2p_keys:to_binary(Identity));
+            normalize_route(i2p_client:route_to_dest(i2p_keys:to_binary(Identity)));
         {error, _} ->
             case i2p_addressbook:resolve(Target) of
                 {ok, DestB64} ->
                     case i2p_keys:from_b64(DestB64) of
                         {ok, Identity} ->
-                            i2p_client:route_to_dest(i2p_keys:to_binary(Identity));
+                            normalize_route(i2p_client:route_to_dest(i2p_keys:to_binary(Identity)));
                         {error, _} ->
                             {error, bad_destination}
                     end;
@@ -216,3 +251,8 @@ resolve_raw_target(Target) ->
                     {error, not_found}
             end
     end.
+
+normalize_route({ok, _} = R) ->
+    R;
+normalize_route(error) ->
+    {error, no_route}.
