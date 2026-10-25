@@ -97,7 +97,15 @@ handle_info(accept, #state{lsock = LSock, protocol = Proto} = State) ->
             erlang:send_after(0, self(), accept),
             {noreply, State};
         {error, closed} ->
-            {stop, normal, State}
+            {stop, normal, State};
+        {error, _} ->
+            %% `emfile`, `enfile`, `econnaborted` and friends are transient:
+            %% retrying is right, crashing is not. A crash here restarts the
+            %% listener against the same conditions and can take the proxy app
+            %% down with it (YBTMCNP). Back off a little so a full fd table is
+            %% not spun on.
+            erlang:send_after(100, self(), accept),
+            {noreply, State}
     end;
 handle_info(_Info, State) ->
     {noreply, State}.

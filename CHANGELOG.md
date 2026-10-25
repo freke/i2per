@@ -6,14 +6,16 @@ CI refuses a tag that disagrees.
 
 ## [Unreleased]
 
-_(nothing yet)_
-
 ### Fixed
 
 - **UPnP telemetry.** The four port-mapping counters are declared, so
   discovered/renewed/lost/refused record instead of raising into a swallowed
   `catch`, and the discovery event carries the gateway URL as a binary
   (#R7XQFMP).
+- **Proxy listener survives accept errors.** `emfile`, `enfile` and
+  `econnaborted` no longer crash `i2per_proxy_listener`, which the supervisor
+  could not keep alive on a busy proxy; the listener retries after 100ms and
+  keeps accepting (#YBTMCNP).
 
 ## [0.8.0] — 2026-10-25
 
