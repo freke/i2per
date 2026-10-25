@@ -244,11 +244,19 @@ run_raw_session(DestHost, SamHost, SamPort, Timeout) ->
     {ok, SessionId, HoldPid}.
 
 hold_core_raw_session(DestHost) ->
+    hold_core_raw_session(DestHost, i2per_tun_config:router_node()).
+
+hold_core_raw_session(DestHost, Node) ->
     receive
         {send, Payload, From, Ref} ->
-            Result = i2p_sam_api:raw_send(DestHost, Payload),
+            Result =
+                try
+                    erpc:call(Node, i2p_sam_api, raw_send, [DestHost, Payload], 5000)
+                catch
+                    Class:Reason -> {error, {Class, Reason}}
+                end,
             From ! {sent, Ref, Result},
-            hold_core_raw_session(DestHost);
+            hold_core_raw_session(DestHost, Node);
         stop ->
             ok;
         {stop, From, Ref} ->

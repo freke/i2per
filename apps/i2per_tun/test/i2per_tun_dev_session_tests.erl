@@ -26,12 +26,12 @@ destinations() ->
     #{<<"10.0.0.2">> => <<"peer.i2p">>}.
 
 tcp_packet() ->
-    <<4:4, 5:4, 0:8, 40:16, 0:16, 0:16, 64:8, 6:8, 0:16, 10, 0, 0, 1, 10, 0, 0, 2,
-        1234:16, 80:16, 0:32, 0:32, 5:4, 0:4, 0:8, 1000:16, 0:16, 0:16, "x">>.
+    <<4:4, 5:4, 0:8, 40:16, 0:16, 0:16, 64:8, 6:8, 0:16, 10, 0, 0, 1, 10, 0, 0, 2, 1234:16, 80:16,
+        0:32, 0:32, 5:4, 0:4, 0:8, 1000:16, 0:16, 0:16, "x">>.
 
 udp_packet() ->
-    <<4:4, 5:4, 0:8, 28:16, 0:16, 0:16, 64:8, 17:8, 0:16, 10, 0, 0, 1, 10, 0, 0, 2,
-        53:16, 5353:16, 8:16, 0:16, "hi">>.
+    <<4:4, 5:4, 0:8, 28:16, 0:16, 0:16, 64:8, 17:8, 0:16, 10, 0, 0, 1, 10, 0, 0, 2, 53:16, 5353:16,
+        8:16, 0:16, "hi">>.
 
 start_dev(SamPort) ->
     {ok, Pid} = i2per_tun_dev:start_link(fake_opts(SamPort, destinations())),
@@ -72,7 +72,10 @@ mock_sam_tcp(LSock) ->
             gen_tcp:send(Sock, <<"NAMING REPLY RESULT=OK NAME=peer.i2p VALUE=targetdest\n">>),
             {ok, _} = gen_tcp:recv(Sock, 0, 5000),
             gen_tcp:send(Sock, <<"STREAM STATUS RESULT=OK\n">>),
-            receive stop -> ok after 5000 -> ok end,
+            receive
+                stop -> ok
+            after 5000 -> ok
+            end,
             gen_tcp:close(Sock),
             ok;
         {error, _} ->
@@ -94,7 +97,10 @@ mock_sam_raw(LSock) ->
             {ok, _} = gen_tcp:recv(Sock, 0, 5000),
             gen_tcp:send(Sock, <<"NAMING REPLY RESULT=OK NAME=peer.i2p VALUE=targetdest\n">>),
             _ = gen_tcp:recv(Sock, 0, 1000),
-            receive stop -> ok after 5000 -> ok end,
+            receive
+                stop -> ok
+            after 5000 -> ok
+            end,
             gen_tcp:close(Sock),
             ok;
         {error, _} ->
@@ -113,8 +119,13 @@ session_spawning_test() ->
         ?assertEqual(1, maps:size(i2per_tun_dev:flows(Pid))),
         ?assertEqual(ok, i2per_tun_dev:inject(Pid, tcp_packet())),
         ?assertEqual(1, maps:size(i2per_tun_dev:sessions(Pid))),
-        ?assertEqual(2, maps:get({tcp, {10,0,0,1}, {10,0,0,2}, 1234, 80},
-                                  i2per_tun_dev:flows(Pid)))
+        ?assertEqual(
+            2,
+            maps:get(
+                {tcp, {10, 0, 0, 1}, {10, 0, 0, 2}, 1234, 80},
+                i2per_tun_dev:flows(Pid)
+            )
+        )
     after
         stop_dev(Pid),
         stop_mock(Mock)

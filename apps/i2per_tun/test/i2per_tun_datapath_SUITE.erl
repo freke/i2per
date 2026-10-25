@@ -33,7 +33,10 @@ device_opens_and_drains(_Config) ->
             true = is_pid(Pid),
             ok = gen_server:stop(Pid);
         {error, _Reason} ->
-            receive {'EXIT', _, _} -> ok after 0 -> ok end,
+            receive
+                {'EXIT', _, _} -> ok
+            after 0 -> ok
+            end,
             ct:fail("TUN device could not be opened")
     end,
     process_flag(trap_exit, false),

@@ -297,7 +297,7 @@ validate_value(Key, Value) ->
         {max_stream_connections, V} when is_integer(V), V > 0 -> ok;
         {ntcp2_keepalive_interval_ms, V} when is_integer(V), V > 0 -> ok;
         {ssu2_preferred, V} when is_boolean(V) -> ok;
-        {floodfill, V} when is_boolean(V) -> ok;
+        {floodfill, V} when is_boolean(V); V =:= auto -> ok;
         {ntcp2_published, V} when is_boolean(V) -> ok;
         {live_network, V} when is_boolean(V) -> ok;
         {peertest_coord, V} when is_boolean(V) -> ok;

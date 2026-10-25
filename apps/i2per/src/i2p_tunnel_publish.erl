@@ -268,6 +268,11 @@ do_sweep(State) ->
             fun(_RecvID, #{created_at := CreatedAt}) -> AliveTransit(CreatedAt) end,
             Transit
         ),
+    ExpiredTransit = map_size(Transit) - map_size(Transit1),
+    case ExpiredTransit of
+        0 -> ok;
+        N -> ok = i2p_counters:add(transit_tunnels_expired, N)
+    end,
     lists:foldl(
         fun({Key, Direction}, Acc) -> sweep_pool(Acc, Key, Direction, AliveTunnel) end,
         State#{transit := Transit1},

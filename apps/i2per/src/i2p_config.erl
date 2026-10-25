@@ -406,7 +406,10 @@ coerce_scalar(K, V) when
 ->
     coerce_pos_int(env_key(K), V);
 coerce_scalar(<<"floodfill">>, V) ->
-    coerce_bool(floodfill, V);
+    case lower(V) of
+        <<"auto">> -> {ok, {floodfill, auto}};
+        _ -> coerce_bool(floodfill, V)
+    end;
 coerce_scalar(<<"ntcp2_published">>, V) ->
     coerce_bool(ntcp2_published, V);
 coerce_scalar(<<"live_network">>, V) ->

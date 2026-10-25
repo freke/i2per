@@ -279,6 +279,15 @@ counters() ->
         %% frame counted here is not recoverable and not retried.
         transit_frames_dropped_no_route,
 
+        %% %%%%% Transit tunnels that aged out %%%%%
+        %%
+        %% Transit entries expire after ?TRANSIT_LIFETIME_S. Counting the
+        %% expirations lets an operator tell a transit pool that is churning
+        %% (entries dying before being used) from one that is stable, and
+        %% correlates with `transit_bytes_in` for a "carried vs expired" view.
+        %% Charged in the periodic sweep, not on the hot path.
+        transit_tunnels_expired,
+
         %% %%%%% Our own outbound, undeliverable %%%%%
         %%
         %% One operator question with three causes, so one section: what did *we*
