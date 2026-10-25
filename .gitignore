@@ -4,7 +4,6 @@ devenv.local.*
 .direnv/
 erl_crash.dump
 rebar3.crashdump
-priv/native/
 *.so
 
 # Rust NIF build artifacts (scripts/build-i2per-tun-nif.sh)
@@ -13,12 +12,14 @@ doc/
 apps/*/doc/
 
 AGENTS.md
+CONTEXT.md
 
 # Local secrets and assistant state are never committed
 .env
 .env.*
 *.cookie
 /opencode.json
+.opencode/
 
 # Router data: a persistent boot writes the router identity and server-tunnel
 # destination private keys under the default data_dir (./data). Never committed.

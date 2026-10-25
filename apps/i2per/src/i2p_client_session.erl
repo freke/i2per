@@ -12,21 +12,37 @@ companion app can read and write streams directly.
 This is the client side only: no `STREAM ACCEPT`/`FORWARD`, no datagram
 sessions. Companion apps that need to accept inbound streams will get
 those in a later slice.
+
+## Ownership
+
+A session belongs to whoever holds the pid, and it ends when that caller
+stops it — never when the call that created it returns. `f:start/1` is
+therefore unlinked: companion apps reach it over `erpc`, and the worker
+erpc spawns for a call with a timeout exits *abnormally* as it delivers
+the reply, so a link would kill the session before the caller could use
+it. See `f:i2p_sam_api:create_session/1` for the callers' side.
 """.
 
 -behaviour(gen_server).
 
--export([start_link/1]).
+-export([start/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -export_type([session/0]).
 
 -type session() :: pid().
 
--doc "Start a headless client session.".
--spec start_link(map()) -> {ok, pid()} | {error, term()}.
-start_link(#{identity := _} = Args) ->
-    gen_server:start_link(?MODULE, Args, []).
+-doc """
+Start a headless client session, unlinked from the caller.
+
+Input: `Args` — a map with `identity`, `crypto_priv`, `sign_priv`, and an
+optional `tunnel_lengths`.
+Output: `{ok, Pid}` or `{error, Reason}`. The caller owns the session and
+must stop it with `f:i2p_sam_api:close_session/1`; nothing else will.
+""".
+-spec start(map()) -> {ok, pid()} | {error, term()}.
+start(#{identity := _} = Args) ->
+    gen_server:start(?MODULE, Args, []).
 
 init(#{identity := Identity, crypto_priv := CPriv, sign_priv := SPriv} = Args) ->
     DestHash = i2p_keys:hash(Identity),

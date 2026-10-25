@@ -9,6 +9,10 @@ directions until either side closes. Runs in the caller's process.
 `f:run_session/3` opens and holds a SAM STREAM session for a flow without a
 host TCP socket attached yet — used by the TUN packet path to establish a
 session up front; the relay is attached later.
+
+A core session is per flow, so it must not outlive the flow: both core
+helpers close the session on every exit path, including the one where the
+session was created and the connect that followed failed.
 """.
 
 -export([
@@ -41,8 +45,10 @@ try_core_run(TcpSock, DestHost) ->
                 {ok, ConnPid} ->
                     relay_core(TcpSock, ConnPid),
                     i2p_sam_api:stream_close(ConnPid),
+                    close_core_session(Node, SessionPid),
                     ok;
                 Other ->
+                    close_core_session(Node, SessionPid),
                     {fallback, Other}
             end;
         Other ->
@@ -164,7 +170,7 @@ try_core_run_session(DestHost) ->
     Node = i2per_tun_config:router_node(),
     case catch erpc:call(Node, i2p_sam_api, create_session, [#{}], 5000) of
         {ok, SessionPid, _DestB64} ->
-            Holder = spawn(fun hold_core_session_wait/0),
+            Holder = spawn(fun() -> hold_core_session_wait(Node, SessionPid) end),
             case
                 catch erpc:call(
                     Node, i2p_sam_api, stream_connect, [SessionPid, DestHost, Holder], 15000
@@ -176,36 +182,44 @@ try_core_run_session(DestHost) ->
                     {ok, SessionId, Holder};
                 Other ->
                     exit(Holder, kill),
-                    _ = catch erpc:call(Node, i2p_sam_api, close_session, [SessionPid]),
+                    close_core_session(Node, SessionPid),
                     {fallback, Other}
             end;
         Other ->
             {fallback, Other}
     end.
 
-hold_core_session_wait() ->
+%% The holder is the only reference to this session, so every way it can end
+%% has to close the session: otherwise the session, its conns and its published
+%% LeaseSet outlive the flow.
+hold_core_session_wait(Node, SessionPid) ->
     receive
-        {conn, ConnPid} -> hold_core_session(ConnPid)
+        {conn, ConnPid} -> hold_core_session(Node, SessionPid, ConnPid)
     end.
 
-hold_core_session(ConnPid) ->
+hold_core_session(Node, SessionPid, ConnPid) ->
     receive
         {stream_data, ConnPid, _Bytes} ->
-            hold_core_session(ConnPid);
+            hold_core_session(Node, SessionPid, ConnPid);
         {stream_closed, ConnPid} ->
-            catch i2p_sam_api:stream_close(ConnPid),
-            ok;
+            stop_core_flow(Node, SessionPid, ConnPid);
         {stream_reset, ConnPid} ->
-            catch i2p_sam_api:stream_close(ConnPid),
-            ok;
+            stop_core_flow(Node, SessionPid, ConnPid);
         stop ->
-            i2p_sam_api:stream_close(ConnPid),
-            ok;
+            stop_core_flow(Node, SessionPid, ConnPid);
         {stop, From, Ref} ->
-            i2p_sam_api:stream_close(ConnPid),
+            stop_core_flow(Node, SessionPid, ConnPid),
             From ! {stopped, Ref},
             ok
     end.
+
+stop_core_flow(Node, SessionPid, ConnPid) ->
+    catch i2p_sam_api:stream_close(ConnPid),
+    close_core_session(Node, SessionPid).
+
+close_core_session(Node, SessionPid) ->
+    _ = catch erpc:call(Node, i2p_sam_api, close_session, [SessionPid], 5000),
+    ok.
 
 run_session_sam(DestHost, SamHost, SamPort, Timeout) ->
     case

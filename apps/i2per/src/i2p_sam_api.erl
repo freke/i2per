@@ -118,9 +118,16 @@ create_destination(_Opts) ->
 -doc """
 Create a headless client session.
 
-`Opts` may carry `tunnel_lengths` (a `t:tunnel_lengths()` map). Returns
-`{ok, Pid, DestB64}` where `Pid` is the session process and `DestB64`
-is this session's destination, or `{error, Reason}`.
+`Opts` may carry `tunnel_lengths`, a map of `in_len`/`out_len` hop counts.
+Returns `{ok, Pid, DestB64}` where `Pid` is the session process and
+`DestB64` is this session's destination, or `{error, Reason}`.
+
+The session is **not linked to the caller**. A companion app reaches this
+function over `erpc:call/5`, and the worker erpc spawns for a call with a
+timeout exits abnormally as it delivers the reply, so a link would kill
+the session at creation. The caller owns it: it lives until
+`f:close_session/1`, and every caller has to close it on *every* path,
+including the one where the connect it was created for then fails.
 """.
 -spec create_session() -> {ok, pid(), binary()} | {error, term()}.
 create_session() ->
@@ -136,7 +143,7 @@ create_session(Opts) ->
         sign_priv => SPriv,
         tunnel_lengths => maps:get(tunnel_lengths, Opts, #{})
     },
-    case i2p_client_session:start_link(Args) of
+    case i2p_client_session:start(Args) of
         {ok, Pid} ->
             {ok, Pid, i2p_keys:to_b64(Identity)};
         {error, Reason} ->
@@ -178,7 +185,7 @@ stream_connect(SessionMap, Target, Owner) when is_map(SessionMap) ->
                 sign_priv => maps:get(sign_priv, SessionMap),
                 tunnel_lengths => maps:get(tunnel_lengths, SessionMap, #{})
             },
-            case i2p_client_session:start_link(Args) of
+            case i2p_client_session:start(Args) of
                 {ok, Pid} ->
                     stream_connect(Pid, Target, Owner);
                 {error, R} ->
