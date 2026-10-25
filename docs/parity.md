@@ -11,7 +11,7 @@ are not in scope and do not change 1.0.0. See `3M0RBXX` for the decision and
 - **i2pd version:** 3.0.0
 - **Date taken:** 2026-10-21 (snapshot bumped on i2pd 3.0.0 release; interop
   suite re-run pending, see `94S9H7K`)
-- **i2per release at snapshot:** 0.7.0
+- **i2per release at snapshot:** 0.8.0
 - **Source of the capability list:** i2pd 3.0.0 release notes plus the
   capabilities exercised by `scripts/interop_i2pd.sh` and
   `docs/protocol.md`.
@@ -58,7 +58,7 @@ Rows are one verdict, not prose: **done** (implemented and exercised),
 | Automatic NetDb-driven Charlie selection | done | SSU2 + peer_test + public address candidates; uniform random; one Charlie per cycle; per-Alice 60s rate limit; code-2 reject on failure |
 | Peer testing | done | measured reachability ladder |
 | Measured reachability | done | see `CD7ZBVH` |
-| TUN interface | done (separate app) | `i2per_tun` companion app (ADR 0001); not part of the 0.7.0 release, which defers TUN to 0.8.0 |
+| TUN interface | done (separate app) | `i2per_tun` companion app (ADR 0001), shape (a) flow translator (SAM STREAM + RAW/DATAGRAM helpers) |
 | SOCKS / HTTP proxy / BOB / I2PControl | done (separate app) | `i2per_proxy` companion app; i2pd 3.0.0 adds `LocalDestinationInfo` to I2PControl |
 | In-built status monitor | done (separate app) | `i2per_status` presentation app; held fields rendered (peers/tunnels/netdb/config/SAM), derived rates and reachability ladder; absent: graceful shutdown, non-SAM service rows, peer-test error reasons |
 | UPnP / NAT traversal service | done (separate app) | `i2p_upnp_srv` (off by default, hot-switchable); SSDP discovery, SOAP port mapping with renewal |

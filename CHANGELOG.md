@@ -6,6 +6,18 @@ CI refuses a tag that disagrees.
 
 ## [Unreleased]
 
+_(nothing yet)_
+
+## [0.8.0] — 2026-10-25
+
+**The operator-surface release.** 0.7.0 filled in the data plane; 0.8.0 lands
+the operator surface around it: TUN and the proxy/console as companion apps
+(ADR 0001), UPnP port mapping, transit and floodfill promoted with an `auto`
+capacity mode and expiry accounting, and a complete status monitor — so a
+router can be run, reached and observed like an i2pd, with the core staying
+data-only. No wire-format changes over 0.7.0, so a 0.7.0 `data_dir` is read
+unchanged.
+
 ### Added
 
 - **i2per_tun.** TUN companion app progressed from fd spike to a working
@@ -15,7 +27,24 @@ CI refuses a tag that disagrees.
   parsing, and a hermetic Common Test suite against a mock SAM server
   (#D3750BZ). Shape (a) (flow translator) won over shape (b)
   (point-to-point); UDP datapath via SAM RAW/DATAGRAM lands on the same
-  helpers.
+  helpers. Companion apps now talk to the core over Erlang instead of SAM
+  (#E1CHFWF).
+- **i2per_proxy.** Operator console and proxy as a companion app: SOCKS and
+  HTTP surfaces, SAM/relay helpers, hermetic tests for the direct-call path
+  (#MMZB5CG, #E1CHFWF).
+- **UPnP / NAT traversal.** `i2p_upnp_srv`, bounded and off by default, with
+  SSDP discovery, SOAP port mapping with renewal, hot-switchable (#JAVEQN2).
+- **Status monitor.** Held fields exposed in `i2p_status_data:view/0` and the
+  status page (peers, tunnels, NetDb, config, SAM), with derived rates and
+  the reachability ladder (#J6HW8NA, #P872VC7, #M1N7K53).
+- **Transit and floodfill.** Floodfill gains an `auto` capacity mode (bandwidth
+  class O or higher plus a published NTCP2 address) and transit tunnels gain
+  expiry accounting (#Q3WYG3B).
+
+### Changed
+
+- **Companion-app transport.** `i2per_proxy` and `i2per_tun` reach the core
+  over the Erlang network instead of SAM (#E1CHFWF).
 
 ## [0.7.0] — 2026-10-22
 

@@ -1,6 +1,6 @@
 # Protocol Reference
 
-This document describes the I2P wire formats implemented by i2per 0.7.0.
+This document describes the I2P wire formats implemented by i2per 0.8.0.
 Unsupported formats and release limitations are listed explicitly.
 
 All multi-byte integers in I2P are big-endian unless otherwise noted. Ed25519
@@ -12,22 +12,26 @@ in the [I2P documentation](https://i2p.net/en/docs/).
 
 ## Release boundaries
 
-The 0.7.0 release does not implement NTCP1, SSU1, I2CP, the legacy
-ElGamal/AES garlic formats, or a TUN interface. SSU2 path migration
-is also outside this release. LeaseSet v1 (store type 1), EncryptedLeaseSet
-(store type 5) and MetaLeaseSet (store type 7) are implemented (#VANCF02,
-#3G0Z06C), and Datagram2 (Proposal 163) is implemented with replay protection
-(#NTWZWTC). Addressbook publication is implemented (#GDEGVQH). The Charlie role is implemented: a tagged session
-answers a RelayIntro as Charlie, verifies the requester's signature, checks the
-asserted endpoint, and punches, and the relay accept now grants a session token
-that Bob validates on the redirect (see #BFKFGY0, #98GAVQK). Automatic
-NetDb-driven Charlie selection is implemented (#6TGF083), and the tunnel build
-accepts up to 7 hops (#K62PQHJ).
-The sections below describe only behavior that is present in 0.7.0. 0.7.0 makes
-wire-format additions over 0.6.0: LeaseSet v1, EncryptedLeaseSet and
-MetaLeaseSet, and the Datagram2 codec; automatic Charlie selection and the
-raised hop cap are control-plane behaviour rather than wire format; the Charlie
-RelayResponse and HolePunch
+The 0.8.0 release does not implement NTCP1, SSU1, I2CP, or the legacy
+ElGamal/AES garlic formats. SSU2 path migration is also outside this release.
+LeaseSet v1 (store type 1), EncryptedLeaseSet (store type 5) and
+MetaLeaseSet (store type 7) are implemented (#VANCF02, #3G0Z06C), and
+Datagram2 (Proposal 163) is implemented with replay protection (#NTWZWTC).
+Addressbook publication is implemented (#GDEGVQH). The TUN interface is
+delivered as the `i2per_tun` companion app (shape (a) flow translator) and
+the operator console as `i2per_proxy` (ADR 0001); UPnP/NAT traversal ships
+as `i2p_upnp_srv` (off by default, hot-switchable). The Charlie role is
+implemented: a tagged session answers a RelayIntro as Charlie, verifies the
+requester's signature, checks the asserted endpoint, and punches, and the
+relay accept now grants a session token that Bob validates on the redirect
+(see #BFKFGY0, #98GAVQK). Automatic NetDb-driven Charlie selection is
+implemented (#6TGF083), and the tunnel build accepts up to 7 hops (#K62PQHJ).
+The sections below describe only behavior that is present in 0.8.0. 0.8.0 makes
+no wire-format changes over 0.7.0: the work is operator surface (companion
+apps, UPnP, status monitor) and promotion (transit and floodfill, with an
+`auto` capacity mode and expiry accounting); automatic Charlie selection
+and the raised hop cap are control-plane behaviour rather than wire format;
+the Charlie RelayResponse and HolePunch
 blocks and the measured-reachability caps remain as shipped in 0.3.0.
 ## Implemented
 

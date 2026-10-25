@@ -1,7 +1,7 @@
 # i2per
 
 `i2per` is an Erlang/OTP implementation of an I2P router with a SAM v3 client
-bridge. This repository contains the 0.7.0 release. It implements the modern
+bridge. This repository contains the 0.8.0 release. It implements the modern
 X25519 and Ed25519 protocol surface, including NTCP2, SSU2, ECIES tunnel
 creation, LeaseSet2, the I2P streaming protocol, and bounded tunnel relay
 participation.
@@ -9,19 +9,20 @@ participation.
 The project interoperates with I2P routers. It does not bundle code from
 `i2pd` or `i2p-java`; the repository's `NOTICE` file records the attribution.
 
-> **Status: 0.7.0 is in preparation.** The release page
+> **Status: 0.8.0 is in preparation.** The release page
 > (<https://github.com/freke/i2per/releases>) will carry the relx tarball and its
 > provenance MANIFEST, built by CI from the tag rather than by a person
 > remembering to run `just release`. The documentation site is published from the
 > same tag at <https://freke.github.io/i2per/>. `CHANGELOG.md` records what
 > changed, including the known issues an operator should know about.
 >
-> 0.7.0 is the LeaseSet-and-Datagram release: the router parses, stores and
-> serves LeaseSet v1, EncryptedLeaseSet and MetaLeaseSet, publishes its own
-> addressbook (hosts.txt), and implements the Datagram2 codec with replay
-> protection end to end through SAM. The logging floor and test gate carry
-> forward. No wire-format changes beyond the LeaseSet family and Datagram2, so
-> a 0.6.0 `data_dir` is read unchanged. The external i2pd interoperability
+> 0.8.0 is the operator-surface release: TUN and the proxy/console land as
+> companion apps, UPnP port mapping ships as a bounded off-by-default service,
+> transit and floodfill gain an `auto` capacity mode and expiry accounting, and
+> the status monitor renders its held fields — so a router can be run, reached
+> and observed like an i2pd, with the core staying data-only (ADR 0001). The
+> logging floor and test gate carry forward. No wire-format changes over 0.7.0,
+> so a 0.7.0 `data_dir` is read unchanged. The external i2pd interoperability
 > suite remains a local diagnostic; it is not a required CI gate.
 > See [ADR 0001](https://github.com/freke/i2per/blob/main/docs/adr/0001-data-only-core-with-presentation-apps.md),
 > [ADR 0002](https://github.com/freke/i2per/blob/main/docs/adr/0002-the-logging-floor-the-bus-is-the-instrument.md)
@@ -137,6 +138,24 @@ The project interoperates with I2P routers. It does not bundle code from
   operator console, TUN, UPnP/NAT, transit and floodfill promotion, and
   status monitor completion are deferred to 0.8.0.
 
+## Included in 0.8.0
+
+- **Companion apps:** `i2per_proxy` (operator console and SOCKS/HTTP proxy
+  surfaces) and `i2per_tun` (TUN interface, shape (a) flow translator) talk
+  to the core over Erlang instead of SAM, per ADR 0001; hermetic CT suites
+  cover the TUN datapath.
+- **UPnP / NAT traversal:** `i2p_upnp_srv`, bounded and off by default, with
+  SSDP discovery, SOAP port mapping and renewal, hot-switchable.
+- **Transit and floodfill promotion:** `auto` capacity mode for floodfill
+  (bandwidth class O or higher plus a published NTCP2 address), transit
+  tunnel expiry accounting, and interop evidence; the default flip stays a
+  maintainer call.
+- **Status monitor completion:** held fields rendered in `i2p_status_data:view/0`
+  and the status page (peers, tunnels, NetDb, config, SAM), with derived rates
+  and reachability ladder.
+- **Scope:** 0.8.0 anchors on the operator surface; parity audit, soak and
+  live smoke are deferred to 0.9.0.
+
 The default profile is a local client. It does not contact the live network,
 publish a floodfill RouterInfo, or accept public transit unless an operator
 explicitly enables those choices.
@@ -204,7 +223,7 @@ Wait for `===> Booted i2per`, then run these checks at the Erlang prompt:
 application:ensure_all_started(i2per).
 true = is_pid(whereis(i2per_sup)).
 %% The version string moves with each release; it is the app's own {vsn, ...}.
-{ok, "0.7.0"} = application:get_key(i2per, vsn).
+{ok, "0.8.0"} = application:get_key(i2per, vsn).
 ```
 
 The successful results are `{ok,[i2per]}`, `true`, and `ok`. Leave the shell
@@ -397,7 +416,7 @@ application:set_env(i2per, addressbook, #{
 Values already present in `sys.config` or the application environment take
 precedence over values in `i2per.conf`. In particular, edit the release's
 `releases/<vsn>/sys.config` to change the shipped `./data` directory (the
-directory is named after the release, so it carries the version — `0.7.0` for
+directory is named after the release, so it carries the version — `0.8.0` for
 this release). A
 persistent boot requires `data_dir` and `seeds` in the application environment.
 The release profile sets `live_network = false` and `ntcp2_published = false`;
@@ -528,17 +547,20 @@ part of the normal gate. `just live-smoke` is an offline self-check. Use
 
 ## Release limitations
 
-The 0.7.0 release does not implement NTCP1, SSU1, I2CP, the legacy ElGamal/AES
-crypto formats, or a TUN interface. SSU2 path migration is outside this
-release. Floodfill and transit participation are available as bounded
-features, but they are not enabled by the shipped default profile. Automatic
-NetDb-driven Charlie selection is implemented, and the tunnel build accepts up
-to 7 hops. LeaseSet v1, EncryptedLeaseSet and MetaLeaseSet are implemented,
-Datagram2 (Proposal 163) is implemented with replay protection, and addressbook
-publication is implemented. In-place relup upgrades are not supported;
-upgrading means installing a new tarball. 0.7.0 keeps the 0.6.0 dial and hot
-path surface and adds the LeaseSet family, Datagram2, and addressbook
-publication; a `data_dir` written by 0.6.0 is read unchanged.
+The 0.8.0 release does not implement NTCP1, SSU1, I2CP, or the legacy
+ElGamal/AES crypto formats. SSU2 path migration is outside this release.
+Floodfill and transit participation are available as bounded features, and
+transit gains an `auto` capacity mode plus expiry accounting; neither is
+enabled by the shipped default profile. Automatic NetDb-driven Charlie
+selection is implemented, and the tunnel build accepts up to 7 hops. LeaseSet
+v1, EncryptedLeaseSet and MetaLeaseSet are implemented, Datagram2 (Proposal
+163) is implemented with replay protection, and addressbook publication is
+implemented. The TUN interface ships as the `i2per_tun` companion app and the
+operator console as `i2per_proxy` (ADR 0001); UPnP/NAT traversal ships as
+`i2p_upnp_srv`, off by default and hot-switchable. In-place relup upgrades
+are not supported; upgrading means installing a new tarball. 0.8.0 keeps the
+0.7.0 wire format and adds the operator surface and transit/floodfill
+promotion; a `data_dir` written by 0.7.0 is read unchanged.
 
 `CHANGELOG.md` lists the known issues for this release: the event bus's far
 side is unbounded if a subscriber node stops draining (OTP 28 offers no cap
