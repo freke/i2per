@@ -503,6 +503,21 @@ counters() ->
         datagram2_replayed,
         datagram2_offline_signed,
 
+        %% %%%%% UPnP port mapping %%%%%
+        %%
+        %% The four outcomes of the port-mapping service, counted where they
+        %% happen rather than inferred from the event bus. `discovered` is a
+        %% gateway whose device description resolved to a WAN connection
+        %% service, `renewed` is a mapping that installed, and `refused` is a
+        %% discovery, description fetch, or mapping request that failed. `lost`
+        %% is the narrower case of discovery finding no gateway at all, kept
+        %% apart because "nobody answered" and "a gateway said no" are
+        %% different operator problems.
+        upnp_mapping_discovered,
+        upnp_mapping_renewed,
+        upnp_mapping_lost,
+        upnp_mapping_refused,
+
         %% %%%%% Addressbook publication %%%%%
         %%
         %% The merged addressbook was dumped to the publication path. Each

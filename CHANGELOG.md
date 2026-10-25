@@ -8,6 +8,13 @@ CI refuses a tag that disagrees.
 
 _(nothing yet)_
 
+### Fixed
+
+- **UPnP telemetry.** The four port-mapping counters are declared, so
+  discovered/renewed/lost/refused record instead of raising into a swallowed
+  `catch`, and the discovery event carries the gateway URL as a binary
+  (#R7XQFMP).
+
 ## [0.8.0] — 2026-10-25
 
 **The operator-surface release.** 0.7.0 filled in the data plane; 0.8.0 lands

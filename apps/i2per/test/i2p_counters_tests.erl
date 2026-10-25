@@ -5,8 +5,8 @@ Unit tests for the counter home.
 
 The properties that matter here are not arithmetic. They are that a counter
 costs an atomic add rather than a message, that the numbers are still readable
-when the owning process cannot answer, and that nothing in the module wakes up
-on a timer.
+when the owning process cannot answer, that nothing in the module wakes up on a
+timer, and that every name a call site adds is declared in the registry.
 """.
 
 -include_lib("eunit/include/eunit.hrl").
@@ -61,6 +61,55 @@ set_gauge_is_a_no_op_while_the_owner_is_absent_test() ->
     after
         restore_counters(Owner)
     end.
+
+%% %%%%% %%% Declared names %%%%% %%%
+
+%% Every literal name passed to `i2p_counters:add/2` under `apps/*/src` is in
+%% `f:counters/0`.
+%%
+%% This is the check the UPnP counters were missing: `add/2` raises on an
+%% unregistered name by design, and the call sites wrap the call in `catch`, so a
+%% missing declaration becomes a counter that reads zero forever while the
+%% feature works. A dynamic name -- `Counter`, `counter_name({...})` -- is
+%% skipped, because the question is "is this literal declared", and those sites
+%% derive their name from a closed set their module owns.
+add_sites_name_declared_counters_test() ->
+    Declared = lists:usort(i2p_counters:counters()),
+    Sites = add_call_sites(),
+    ?assertNotEqual([], Sites),
+    Undeclared = [Site || {_, _, Name} = Site <- Sites, not lists:member(Name, Declared)],
+    ?assertEqual([], Undeclared).
+
+add_call_sites() ->
+    lists:flatmap(fun add_call_sites/1, source_files()).
+
+add_call_sites(File) ->
+    {ok, Bin} = file:read_file(File),
+    Pattern = "i2p_counters:add\\(\\s*([a-z][a-z0-9_]*)\\s*,",
+    case re:run(Bin, Pattern, [global, {capture, all_but_first, index}]) of
+        {match, Matches} ->
+            [
+                {filename:basename(File), line_at(Bin, Offset), name_at(Bin, Offset, Length)}
+             || [{Offset, Length}] <- Matches
+            ];
+        nomatch ->
+            []
+    end.
+
+line_at(Bin, Offset) ->
+    length(binary:matches(binary:part(Bin, 0, Offset), <<"\n">>)) + 1.
+
+%% Through the atom table rather than `binary_to_existing_atom/2`: the literal is
+%% a name this repository's own sources chose, and only test runs read it.
+name_at(Bin, Offset, Length) ->
+    binary_to_atom(binary:part(Bin, Offset, Length), utf8).
+
+source_files() ->
+    Root = i2p_ct_helpers:project_root(),
+    lists:flatmap(
+        fun(App) -> filelib:wildcard(filename:join([App, "src", "*.erl"])) end,
+        filelib:wildcard(filename:join([Root, "apps", "*"]))
+    ).
 
 %% %%%%% %%% Internal helpers %%%%% %%%
 

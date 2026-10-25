@@ -31,7 +31,7 @@ Config: app env `i2per` -> `upnp` (boolean, default false), `upnp_name`
     enabled = false :: boolean(),
     name = "I2Pd" :: string(),
     socket = undefined :: gen_udp:socket() | undefined,
-    locations = [] :: [string()],
+    locations = [] :: [binary()],
     control_url = undefined :: string() | undefined,
     service_type = "urn:schemas-upnp-org:service:WANIPConnection:1" :: string(),
     internal_ip = undefined :: string() | undefined,
@@ -198,9 +198,10 @@ ssdp_search() ->
     ]).
 
 parse_locations(Bin) ->
-    Text = binary_to_list(Bin),
     case
-        re:run(Text, "[Ll]ocation:[ \t]*([^ \t\r\n]+)", [global, {capture, all_but_first, list}])
+        re:run(Bin, "[Ll]ocation:[ \t]*([^ \t\r\n]+)", [
+            global, {capture, all_but_first, binary}
+        ])
     of
         {match, Ms} -> [L || [L] <- Ms];
         nomatch -> []
@@ -228,9 +229,12 @@ fetch_and_map(St) ->
     end.
 
 fetch_description(Location) ->
-    case httpc:request(get, {Location, []}, [{timeout, 5000}], []) of
+    %% `httpc` and `uri_string` both take a URL as a string here, so the binary
+    %% captured from SSDP is converted at this one boundary.
+    Url = binary_to_list(Location),
+    case httpc:request(get, {Url, []}, [{timeout, 5000}], []) of
         {ok, {{_, 200, _}, _Headers, Body}} ->
-            parse_control_url(Location, Body);
+            parse_control_url(Url, Body);
         {ok, {{_, Code, _}, _, _}} ->
             {error, {http_status, Code}};
         {error, Reason} ->
