@@ -41,9 +41,13 @@ mock_conversation_test_() ->
         Server ! stop
     end}.
 
+%% Each reply follows the request it answers. Answering HELLO before reading it
+%% lets the client send SESSION CREATE unprompted, and one coalesced segment is
+%% then enough to desync the exchange (WD5N85Y).
 mock_sam(LSock) ->
     case gen_tcp:accept(LSock, 5000) of
         {ok, Sock} ->
+            {ok, _} = gen_tcp:recv(Sock, 0, 5000),
             gen_tcp:send(Sock, <<"HELLO REPLY RESULT=OK VERSION=3.1\n">>),
             {ok, _} = gen_tcp:recv(Sock, 0, 5000),
             gen_tcp:send(Sock, <<"SESSION STATUS RESULT=OK DESTINATION=mydest\n">>),

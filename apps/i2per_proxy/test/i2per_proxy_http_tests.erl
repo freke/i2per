@@ -40,15 +40,19 @@ http_proxy_test_() ->
             end
         end}}.
 
+%% Every reply here follows the request it answers, one recv per protocol line.
+%% Sending `HELLO REPLY` before reading HELLO lets the client reach SESSION CREATE
+%% unprompted; the two requests then arrive in one buffer, every later recv is a
+%% message ahead, and both sides time out at the fifth (WD5N85Y).
 mock_sam(LSock) ->
     case gen_tcp:accept(LSock, 5000) of
         {ok, Sock} ->
+            {ok, _} = gen_tcp:recv(Sock, 0, 5000),
             gen_tcp:send(Sock, <<"HELLO REPLY RESULT=OK VERSION=3.1\n">>),
             {ok, _} = gen_tcp:recv(Sock, 0, 5000),
             gen_tcp:send(Sock, <<"SESSION STATUS RESULT=OK DESTINATION=mydest\n">>),
             {ok, _} = gen_tcp:recv(Sock, 0, 5000),
             gen_tcp:send(Sock, <<"NAMING REPLY RESULT=OK NAME=peer.i2p VALUE=targetdest\n">>),
-            {ok, _} = gen_tcp:recv(Sock, 0, 5000),
             {ok, _StreamConnect} = gen_tcp:recv(Sock, 0, 5000),
             gen_tcp:send(Sock, <<"STREAM STATUS RESULT=OK\n">>),
             {ok, Request} = gen_tcp:recv(Sock, 0, 5000),
