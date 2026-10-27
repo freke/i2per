@@ -171,7 +171,7 @@ do_stream_connect(Target, Owner, State) ->
                     case Result of
                         {ok, ConnPid} ->
                             Conns = maps:get(conns, State, #{}),
-                            {ok, ConnPid, State#{conns => Conns#{ConnPid => Owner}}};
+                            {{ok, ConnPid}, State#{conns => Conns#{ConnPid => Owner}}};
                         {error, Reason} ->
                             {{error, Reason}, State}
                     end
