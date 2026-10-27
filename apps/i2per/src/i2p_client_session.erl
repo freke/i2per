@@ -54,7 +54,6 @@ init(#{identity := Identity, crypto_priv := CPriv, sign_priv := SPriv} = Args) -
     %% (hermetic unit tests) simply leaves the publish pending.
     catch i2p_tunnel_srv:publish_lease_set(Identity, SPriv, in_len(Lengths)),
     catch register_lengths(Lengths, self()),
-    catch i2p_sam_sup:listener_register(DestHash, self()),
     {ok, #{
         identity => Identity,
         crypto_priv => CPriv,

@@ -32,6 +32,23 @@ close_session_ends_the_session_test() ->
     ok = i2p_sam_api:close_session(Pid),
     wait_until_dead(Pid, 100).
 
+no_listener_registered_for_headless_session_test() ->
+    case whereis(i2p_sam_sup) of
+        undefined ->
+            {ok, SupPid} = i2p_sam_sup:start_link(),
+            unlink(SupPid);
+        _ ->
+            ok
+    end,
+    {ok, Pid, DestB64} = i2p_sam_api:create_session(),
+    try
+        {ok, Identity} = i2p_keys:from_b64(DestB64),
+        DestHash = i2p_keys:hash(Identity),
+        ?assertEqual(not_found, i2p_sam_sup:listener_lookup(DestHash))
+    after
+        i2p_sam_api:close_session(Pid)
+    end.
+
 %% close_session/1 returns when the reply is sent, not when the process has
 %% gone, so the death is a short wait rather than an assertion on the next line.
 wait_until_dead(_Pid, 0) ->
