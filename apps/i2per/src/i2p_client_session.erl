@@ -21,6 +21,11 @@ therefore unlinked: companion apps reach it over `erpc`, and the worker
 erpc spawns for a call with a timeout exits *abnormally* as it delivers
 the reply, so a link would kill the session before the caller could use
 it. See `f:i2p_sam_api:create_session/1` for the callers' side.
+
+The one exception is a session started with `ephemeral => true`, which
+`f:i2p_sam_api:stream_connect/3` uses when it is given a destination map
+rather than a session pid: it stops itself when its last connection ends,
+so the caller has nothing to close.
 """.
 
 -behaviour(gen_server).
@@ -35,10 +40,11 @@ it. See `f:i2p_sam_api:create_session/1` for the callers' side.
 -doc """
 Start a headless client session, unlinked from the caller.
 
-Input: `Args` — a map with `identity`, `crypto_priv`, `sign_priv`, and an
-optional `tunnel_lengths`.
+Input: `Args` — a map with `identity`, `crypto_priv`, `sign_priv`, and
+optional `tunnel_lengths` and `ephemeral`.
 Output: `{ok, Pid}` or `{error, Reason}`. The caller owns the session and
-must stop it with `f:i2p_sam_api:close_session/1`; nothing else will.
+must stop it with `f:i2p_sam_api:close_session/1`; nothing else will, unless
+`ephemeral` is true and its last connection has ended.
 """.
 -spec start(map()) -> {ok, pid()} | {error, term()}.
 start(#{identity := _} = Args) ->
@@ -49,6 +55,7 @@ init(#{identity := Identity, crypto_priv := CPriv, sign_priv := SPriv} = Args) -
     DestBin = i2p_keys:to_binary(Identity),
     DestB64 = i2p_keys:to_b64(Identity),
     Lengths = maps:get(tunnel_lengths, Args, #{}),
+    Ephemeral = maps:get(ephemeral, Args, false),
     %% Publish a LeaseSet so remote peers can reach us, mirroring SAM's
     %% SESSION CREATE. Best-effort: a router that is not fully booted
     %% (hermetic unit tests) simply leaves the publish pending.
@@ -61,7 +68,10 @@ init(#{identity := Identity, crypto_priv := CPriv, sign_priv := SPriv} = Args) -
         dest_b64 => DestB64,
         dest_hash => DestHash,
         dest_bin => DestBin,
-        tunnel_lengths => Lengths
+        tunnel_lengths => Lengths,
+        ephemeral => Ephemeral,
+        conns => #{},
+        monitors => #{}
     }}.
 
 handle_call({stream_connect, Target, Owner}, _From, State) ->
@@ -90,10 +100,35 @@ handle_info({stream_established, Conn, PeerHash}, State) when is_pid(Conn) ->
     {noreply, State};
 handle_info({stream_closed, Conn}, State) when is_pid(Conn) ->
     forward_to_owner(Conn, {stream_closed, Conn}, State),
-    {noreply, forget_conn(Conn, State)};
+    State2 = forget_conn(Conn, State),
+    case ephemeral_stop(State2) of
+        stop -> {stop, normal, State2};
+        continue -> {noreply, State2}
+    end;
 handle_info({stream_reset, Conn}, State) when is_pid(Conn) ->
     forward_to_owner(Conn, {stream_reset, Conn}, State),
-    {noreply, forget_conn(Conn, State)};
+    State2 = forget_conn(Conn, State),
+    case ephemeral_stop(State2) of
+        stop -> {stop, normal, State2};
+        continue -> {noreply, State2}
+    end;
+handle_info({'DOWN', Mon, process, ConnPid, _Reason}, State) when is_pid(ConnPid) ->
+    Monitors = maps:get(monitors, State, #{}),
+    case maps:get(ConnPid, Monitors, undefined) of
+        Mon ->
+            State2 = forget_conn(ConnPid, State#{
+                monitors => maps:remove(ConnPid, Monitors)
+            }),
+            Conns2 = maps:get(conns, State2, #{}),
+            case maps:get(ephemeral, State, false) of
+                true when map_size(Conns2) =:= 0 ->
+                    {stop, normal, State2};
+                _ ->
+                    {noreply, State2}
+            end;
+        _ ->
+            {noreply, State}
+    end;
 handle_info({stream_data, Wire}, State) when is_binary(Wire) ->
     case i2p_streaming:decode(Wire) of
         {ok, Pkt} ->
@@ -130,6 +165,11 @@ forward_to_owner(Conn, Msg, State) ->
 
 forget_conn(Conn, State) ->
     State#{conns => maps:remove(Conn, maps:get(conns, State, #{}))}.
+
+ephemeral_stop(#{ephemeral := true, conns := Conns} = _State) when map_size(Conns) =:= 0 ->
+    stop;
+ephemeral_stop(_) ->
+    continue.
 
 %% ---- helpers ----
 
@@ -171,7 +211,12 @@ do_stream_connect(Target, Owner, State) ->
                     case Result of
                         {ok, ConnPid} ->
                             Conns = maps:get(conns, State, #{}),
-                            {{ok, ConnPid}, State#{conns => Conns#{ConnPid => Owner}}};
+                            Mon = erlang:monitor(process, ConnPid),
+                            Monitors = maps:get(monitors, State, #{}),
+                            {{ok, ConnPid}, State#{
+                                conns => Conns#{ConnPid => Owner},
+                                monitors => Monitors#{ConnPid => Mon}
+                            }};
                         {error, Reason} ->
                             {{error, Reason}, State}
                     end

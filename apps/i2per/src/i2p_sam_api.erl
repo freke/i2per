@@ -141,7 +141,8 @@ create_session(Opts) ->
         identity => Identity,
         crypto_priv => CPriv,
         sign_priv => SPriv,
-        tunnel_lengths => maps:get(tunnel_lengths, Opts, #{})
+        tunnel_lengths => maps:get(tunnel_lengths, Opts, #{}),
+        ephemeral => maps:get(ephemeral, Opts, false)
     },
     case i2p_client_session:start(Args) of
         {ok, Pid} ->
@@ -163,6 +164,12 @@ resolvable by the address book. `Owner` receives `{stream_data, Conn, Bytes}`,
 `{stream_established, Conn, PeerHash}`, `{stream_closed, Conn}` and
 `{stream_reset, Conn}` messages. Returns `{ok, ConnPid}` or
 `{error, Reason}`.
+
+`Session` is normally the pid from `f:create_session/0-1`; the caller owns that
+session and must close it. A destination map from `f:create_destination/0` is
+also accepted, and the session spawned for that connect is ephemeral: it stops
+when the connection ends, and on a failed connect it is stopped before this
+function returns.
 """.
 -spec stream_connect(pid() | map(), binary() | string() | map(), pid()) ->
     {ok, pid()} | {error, term()}.
@@ -174,8 +181,8 @@ stream_connect(SessionMap, Target, Owner) when is_map(SessionMap) ->
     %% supplied identity and private keys rather than generating a new one.
     case maps:get(identity, SessionMap, undefined) of
         undefined ->
-            case create_session(#{}) of
-                {ok, Pid, _} -> stream_connect(Pid, Target, Owner);
+            case create_session(#{ephemeral => true}) of
+                {ok, Pid, _} -> stream_connect_ephemeral(Pid, Target, Owner);
                 {error, R} -> {error, R}
             end;
         Identity ->
@@ -183,19 +190,33 @@ stream_connect(SessionMap, Target, Owner) when is_map(SessionMap) ->
                 identity => Identity,
                 crypto_priv => maps:get(crypto_priv, SessionMap),
                 sign_priv => maps:get(sign_priv, SessionMap),
-                tunnel_lengths => maps:get(tunnel_lengths, SessionMap, #{})
+                tunnel_lengths => maps:get(tunnel_lengths, SessionMap, #{}),
+                ephemeral => true
             },
             case i2p_client_session:start(Args) of
                 {ok, Pid} ->
-                    stream_connect(Pid, Target, Owner);
+                    stream_connect_ephemeral(Pid, Target, Owner);
                 {error, R} ->
                     {error, R}
             end
     end;
 stream_connect(_SessionMap, Target, Owner) ->
-    case create_session(#{}) of
-        {ok, Pid, _} -> stream_connect(Pid, Target, Owner);
+    case create_session(#{ephemeral => true}) of
+        {ok, Pid, _} -> stream_connect_ephemeral(Pid, Target, Owner);
         {error, R} -> {error, R}
+    end.
+
+stream_connect_ephemeral(Pid, Target, Owner) ->
+    try stream_connect(Pid, Target, Owner) of
+        {ok, _} = Ok ->
+            Ok;
+        {error, _} = Err ->
+            close_session(Pid),
+            Err
+    catch
+        Class:Reason ->
+            close_session(Pid),
+            {error, {Class, Reason}}
     end.
 
 -doc "Send bytes on a connection returned by `f:stream_connect/3`.".
