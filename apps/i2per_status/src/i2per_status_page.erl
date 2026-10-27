@@ -92,7 +92,6 @@ rows(Snap) ->
             {"netdb leasesets", count(Snap, netdb, ls)},
             {"netdb lease sets detail", list_count(Snap, netdb, lease_sets_detail)},
             {"netdb saves", count(Snap, netdb, saves)},
-            {"netdb saves", count(Snap, netdb, saves)},
             {"netdb loads", count(Snap, netdb, loads)},
             {"netdb expired sweeps", count(Snap, netdb, expired_sweeps)},
             {"netdb routers expired", count(Snap, netdb, routers_expired)},
