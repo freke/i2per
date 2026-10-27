@@ -25,6 +25,22 @@ parse_naming_reply_test() ->
 parse_stream_status_test() ->
     ?assertEqual(ok, i2per_proxy_sam:parse_stream_status(<<"STREAM STATUS RESULT=OK">>)).
 
+naming_lookup_rejects_injection_test() ->
+    ?assertEqual(
+        {error, {sam_naming_lookup_failed, invalid_name}},
+        i2per_proxy_sam:naming_lookup(undefined, <<"x\nSESSION CREATE STYLE=STREAM ID=evil DESTINATION=TRANSIENT">>)
+    ).
+
+naming_lookup_rejects_space_and_quote_test() ->
+    ?assertEqual(
+        {error, {sam_naming_lookup_failed, invalid_name}},
+        i2per_proxy_sam:naming_lookup(undefined, <<"a b">>)
+    ),
+    ?assertEqual(
+        {error, {sam_naming_lookup_failed, invalid_name}},
+        i2per_proxy_sam:naming_lookup(undefined, <<"a\"b">>)
+    ).
+
 mock_conversation_test_() ->
     {"full SAM conversation against a mock server", fun() ->
         {ok, LSock} = gen_tcp:listen(0, [binary, {packet, raw}, {active, false}, {reuseaddr, true}]),

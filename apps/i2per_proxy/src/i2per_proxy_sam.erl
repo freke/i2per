@@ -52,16 +52,33 @@ session_create(Sock) ->
             Err
     end.
 
-naming_lookup(Sock, Host) ->
-    Cmd = [<<"NAMING LOOKUP NAME=">>, Host, <<"\n">>],
-    case gen_tcp:send(Sock, Cmd) of
-        ok ->
-            case sam_recv_line(Sock) of
-                {ok, Line} -> parse_naming_reply(Line);
-                {error, _} = Err -> Err
+-doc """
+Resolve `Host` to a destination via the SAM bridge.
+
+`Host` must contain only the characters allowed in a hostname, a
+`.b32.i2p` address or a base64 destination (`[A-Za-z0-9._~=:-]`); any
+other input, including newline, space or quote, is rejected before it
+reaches the bridge so a proxy client cannot inject SAM commands.
+""".
+-spec naming_lookup(gen_tcp:socket(), binary() | string()) ->
+    {ok, binary()} | {error, {sam_naming_lookup_failed, invalid_name | term()}}.
+naming_lookup(Sock, Host) when is_list(Host) ->
+    naming_lookup(Sock, list_to_binary(Host));
+naming_lookup(Sock, Host) when is_binary(Host) ->
+    case valid_host(Host) of
+        true ->
+            Cmd = [<<"NAMING LOOKUP NAME=">>, Host, <<"\n">>],
+            case gen_tcp:send(Sock, Cmd) of
+                ok ->
+                    case sam_recv_line(Sock) of
+                        {ok, Line} -> parse_naming_reply(Line);
+                        {error, _} = Err -> Err
+                    end;
+                {error, _} = Err ->
+                    Err
             end;
-        {error, _} = Err ->
-            Err
+        false ->
+            {error, {sam_naming_lookup_failed, invalid_name}}
     end.
 
 stream_connect(Sock, SessionId, TargetB64) ->
@@ -100,6 +117,19 @@ find_value(<<_, Rest/binary>>) -> find_value(Rest);
 find_value(<<>>) -> error.
 
 trim(Bin) -> string:trim(Bin, both, "\r\n\t ").
+
+%% Internal
+
+-spec valid_host(binary()) -> boolean().
+valid_host(<<>>) -> false;
+valid_host(Bin) ->
+    lists:all(fun (C) ->
+        (C >= $A andalso C =< $Z) orelse
+        (C >= $a andalso C =< $z) orelse
+        (C >= $0 andalso C =< $9) orelse
+        C =:= $. orelse C =:= $_ orelse C =:= $~ orelse
+        C =:= $= orelse C =:= $: orelse C =:= $-
+    end, binary_to_list(Bin)).
 
 sam_recv_line(Sock) -> sam_recv_line(Sock, <<>>).
 
