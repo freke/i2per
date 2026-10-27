@@ -43,6 +43,10 @@ unchanged.
   (#MMZB5CG, #E1CHFWF).
 - **UPnP / NAT traversal.** `i2p_upnp_srv`, bounded and off by default, with
   SSDP discovery, SOAP port mapping with renewal, hot-switchable (#JAVEQN2).
+  Opens the pinhole only: it does not discover the gateway's external address,
+  change `ntcp2_published`, or rebuild/republish the RouterInfo, so a
+  reachable RouterAddress still requires `host` (and `ntcp2_published`) to be
+  set to the external address (#MFNTNEN).
 - **Status monitor.** Held fields exposed in `i2p_status_data:view/0` and the
   status page (peers, tunnels, NetDb, config, SAM), with derived rates and
   the reachability ladder (#J6HW8NA, #P872VC7, #M1N7K53).

@@ -21,6 +21,7 @@ Session spawning is synchronous within the drain and can be disabled with the
 
 -export([start_link/0, start_link/1, stats/0, stats/1, flows/0, flows/1, sessions/0, sessions/1]).
 -export([inject/1, inject/2]).
+-export([udp_payload/1]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
@@ -225,27 +226,32 @@ maybe_spawn_raw_session(Key, Parsed, State, Sessions) ->
         false ->
             Sessions;
         true ->
-            DstIp = ip_to_binary(maps:get(dst, Parsed)),
-            case maps:find(DstIp, State#state.destinations) of
-                {ok, DestHost} ->
-                    SH = State#state.sam_host,
-                    SP = State#state.sam_port,
-                    UdpPayload = udp_payload(Parsed),
-                    case i2per_tun_flow:run_raw_session(DestHost, SH, SP) of
-                        {ok, _SessionId, HoldPid} ->
-                            monitor(process, HoldPid),
-                            _ = i2per_tun_flow:send_raw(HoldPid, UdpPayload),
-                            maps:put(Key, HoldPid, Sessions)
-                    end;
-                error ->
-                    Sessions
+            case udp_payload(Parsed) of
+                {error, _} ->
+                    Sessions;
+                {ok, UdpPayload} ->
+                    DstIp = ip_to_binary(maps:get(dst, Parsed)),
+                    case maps:find(DstIp, State#state.destinations) of
+                        {ok, DestHost} ->
+                            SH = State#state.sam_host,
+                            SP = State#state.sam_port,
+                            case i2per_tun_flow:run_raw_session(DestHost, SH, SP) of
+                                {ok, _SessionId, HoldPid} ->
+                                    monitor(process, HoldPid),
+                                    _ = i2per_tun_flow:send_raw(HoldPid, UdpPayload),
+                                    maps:put(Key, HoldPid, Sessions)
+                            end;
+                        error ->
+                            Sessions
+                    end
             end
     end.
 
+-spec udp_payload(map()) -> {ok, binary()} | {error, not_udp}.
 udp_payload(Parsed) ->
     case i2per_tun_ip:udp_parse(maps:get(payload, Parsed, <<>>)) of
-        {ok, #{payload := P}} -> P;
-        _ -> <<>>
+        {ok, #{payload := P}} -> {ok, P};
+        {error, Reason} -> {error, Reason}
     end.
 
 ip_to_binary({A, B, C, D}) ->
@@ -292,16 +298,22 @@ handle_packet(Pkt, State) ->
                     true ->
                         case Proto of
                             17 ->
-                                Pid = maps:get(Key, State#state.sessions),
-                                _ = i2per_tun_flow:send_raw(Pid, udp_payload(Parsed)),
-                                State#state.sessions;
+                                case udp_payload(Parsed) of
+                                    {ok, UdpPayload} ->
+                                        Pid = maps:get(Key, State#state.sessions),
+                                        _ = i2per_tun_flow:send_raw(Pid, UdpPayload),
+                                        State#state.sessions;
+                                    {error, _} ->
+                                        State#state.sessions
+                                end;
                             _ ->
                                 State#state.sessions
                         end;
                     false ->
                         case Proto of
                             17 -> maybe_spawn_raw_session(Key, Parsed, State, State#state.sessions);
-                            _ -> maybe_spawn_session(Key, Parsed, State, State#state.sessions)
+                            6 -> maybe_spawn_session(Key, Parsed, State, State#state.sessions);
+                            _ -> State#state.sessions
                         end
                 end,
             State#state{

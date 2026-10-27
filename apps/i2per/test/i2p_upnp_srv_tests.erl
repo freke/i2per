@@ -32,6 +32,26 @@ status_when_not_running_test() ->
             ok
     end.
 
+parse_locations_case_insensitive_test() ->
+    Bin = <<
+        "HTTP/1.1 200 OK\r\nLOCATION: http://192.168.1.1:49152/gateway.xml\r\n"
+        "Location: http://192.168.1.2:49152/gateway.xml\r\n"
+        "location: http://192.168.1.3:49152/gateway.xml\r\n"
+    >>,
+    ?assertEqual(
+        [
+            <<"http://192.168.1.1:49152/gateway.xml">>,
+            <<"http://192.168.1.2:49152/gateway.xml">>,
+            <<"http://192.168.1.3:49152/gateway.xml">>
+        ],
+        i2p_upnp_srv:parse_locations(Bin)
+    ).
+
+parse_locations_empty_test() ->
+    ?assertEqual(
+        [], i2p_upnp_srv:parse_locations(<<"HTTP/1.1 200 OK\r\nST: upnp:rootdevice\r\n">>)
+    ).
+
 restore(undefined) ->
     application:unset_env(i2per, upnp);
 restore({ok, Value}) ->

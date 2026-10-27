@@ -28,7 +28,9 @@ parse_stream_status_test() ->
 naming_lookup_rejects_injection_test() ->
     ?assertEqual(
         {error, {sam_naming_lookup_failed, invalid_name}},
-        i2per_proxy_sam:naming_lookup(undefined, <<"x\nSESSION CREATE STYLE=STREAM ID=evil DESTINATION=TRANSIENT">>)
+        i2per_proxy_sam:naming_lookup(
+            undefined, <<"x\nSESSION CREATE STYLE=STREAM ID=evil DESTINATION=TRANSIENT">>
+        )
     ).
 
 naming_lookup_rejects_space_and_quote_test() ->

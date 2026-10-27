@@ -145,7 +145,8 @@ The project interoperates with I2P routers. It does not bundle code from
   to the core over Erlang instead of SAM, per ADR 0001; hermetic CT suites
   cover the TUN datapath.
 - **UPnP / NAT traversal:** `i2p_upnp_srv`, bounded and off by default, with
-  SSDP discovery, SOAP port mapping and renewal, hot-switchable.
+  SSDP discovery, SOAP port mapping and renewal, hot-switchable. Opens the
+  pinhole only; it does not publish a reachable RouterAddress by itself.
 - **Transit and floodfill promotion:** `auto` capacity mode for floodfill
   (bandwidth class O or higher plus a published NTCP2 address), transit
   tunnel expiry accounting, and interop evidence; the default flip stays a
@@ -557,7 +558,8 @@ v1, EncryptedLeaseSet and MetaLeaseSet are implemented, Datagram2 (Proposal
 163) is implemented with replay protection, and addressbook publication is
 implemented. The TUN interface ships as the `i2per_tun` companion app and the
 operator console as `i2per_proxy` (ADR 0001); UPnP/NAT traversal ships as
-`i2p_upnp_srv`, off by default and hot-switchable. In-place relup upgrades
+`i2p_upnp_srv`, off by default and hot-switchable, opening the pinhole only
+(it does not publish a reachable RouterAddress by itself). In-place relup upgrades
 are not supported; upgrading means installing a new tarball. 0.8.0 keeps the
 0.7.0 wire format and adds the operator surface and transit/floodfill
 promotion; a `data_dir` written by 0.7.0 is read unchanged.

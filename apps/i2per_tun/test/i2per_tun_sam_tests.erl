@@ -77,7 +77,7 @@ sam_recv_line_preserves_bytes_after_newline_test() ->
     {ok, Server} = gen_tcp:accept(LSock, 5000),
     ok = gen_tcp:send(Client, <<"hello\nworld">>),
     ?assertEqual({ok, <<"hello">>}, i2per_tun_sam:sam_recv_line(Server)),
-    ?assertEqual({ok, <<"world">>}, gen_tcp:recv(Server, 0, 5000)),
+    ?assertEqual({ok, <<"world">>}, gen_tcp:recv(Server, 5, 5000)),
     gen_tcp:close(Client),
     gen_tcp:close(Server),
     gen_tcp:close(LSock).

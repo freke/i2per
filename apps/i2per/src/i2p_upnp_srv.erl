@@ -5,8 +5,15 @@ UPnP port-mapping service.
 
 Discovers an Internet Gateway Device via SSDP, fetches its device description,
 and installs (and periodically renews) port mappings for the router's NTCP2
-(TCP) and SSU2 (UDP) listen ports, so an unpublished router behind NAT can
-publish a reachable RouterAddress instead of relying on introducers alone.
+(TCP) and SSU2 (UDP) listen ports, so a router behind NAT can be reached at
+the gateway's external address when its published RouterAddress names it.
+
+The service opens the pinhole only. It does not discover the gateway's
+external address, does not change `ntcp2_published`, and does not rebuild or
+republish the router's RouterInfo: a reachable RouterAddress still requires
+the operator to set `host` to the external address (and `ntcp2_published` to
+`true`). Without that, `upnp = true` opens a mapping nothing is published
+through.
 
 Bounded and off by default, like transit and floodfill: a router must be able
 to run with no UPnP traffic at all, and the switch is hot. Instrumentation
@@ -20,6 +27,7 @@ Config: app env `i2per` -> `upnp` (boolean, default false), `upnp_name`
 
 -export([start_link/0, stop/0, enabled/0, status/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
+-export([parse_locations/1]).
 
 -define(SSDP_ADDR, {239, 255, 255, 250}).
 -define(SSDP_PORT, 1900).
@@ -197,10 +205,12 @@ ssdp_search() ->
         "\r\n"
     ]).
 
+-doc "Extract Location header values from an SSDP/HTTP response. Field names are case-insensitive.".
+-spec parse_locations(binary()) -> [binary()].
 parse_locations(Bin) ->
     case
-        re:run(Bin, "[Ll]ocation:[ \t]*([^ \t\r\n]+)", [
-            global, {capture, all_but_first, binary}
+        re:run(Bin, "Location:[ \t]*([^ \t\r\n]+)", [
+            caseless, global, {capture, all_but_first, binary}
         ])
     of
         {match, Ms} -> [L || [L] <- Ms];
