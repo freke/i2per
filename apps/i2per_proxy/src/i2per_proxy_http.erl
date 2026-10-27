@@ -87,34 +87,34 @@ core_recv_all(ConnPid, Acc) ->
     end.
 
 handle_request_sam(ClientSock, Host, Path, Method) ->
-    SamHost = i2per_proxy_config:sam_host(),
-    SamPort = i2per_proxy_config:sam_port(),
-    case
-        gen_tcp:connect(
-            binary_to_list(SamHost), SamPort, [binary, {packet, raw}, {active, false}], 5000
-        )
-    of
-        {ok, SamSock} ->
-            case fetch_via_sam(SamSock, Host, Path, ClientSock, Method) of
+    case open_sam(Host) of
+        {ok, SessionSock, StreamSock} ->
+            Result = fetch_via_sam(StreamSock, Host, Path, ClientSock, Method),
+            gen_tcp:close(StreamSock),
+            gen_tcp:close(SessionSock),
+            case Result of
                 {ok, Response} ->
                     _ = gen_tcp:send(ClientSock, Response),
-                    gen_tcp:close(SamSock),
                     ok;
                 {error, Reason} ->
-                    gen_tcp:close(SamSock),
                     _ = send_http(ClientSock, 502, iolist_to_binary(io_lib:format("~p", [Reason]))),
                     ok
             end;
-        {error, _} ->
-            _ = send_http(ClientSock, 503, <<"SAM bridge unavailable">>),
+        {error, Reason} ->
+            _ = send_http(ClientSock, 503, iolist_to_binary(io_lib:format("~p", [Reason]))),
             ok
     end.
 
-fetch_via_sam(SamSock, Host, Path, _ClientSock, Method) ->
+open_sam(Host) ->
+    i2per_proxy_sam:open_stream(
+        i2per_proxy_config:sam_host(), i2per_proxy_config:sam_port(), Host
+    ).
+
+fetch_via_sam(StreamSock, Host, Path, _ClientSock, Method) ->
     Runner = self(),
     {Worker, Mon} =
         spawn_monitor(fun() ->
-            Runner ! {proxy_fetch, self(), fetch_over_sam(SamSock, Host, Path, Method)}
+            Runner ! {proxy_fetch, self(), fetch_over_sam(StreamSock, Host, Path, Method)}
         end),
     receive
         {proxy_fetch, Worker, Response} ->
@@ -128,11 +128,7 @@ fetch_via_sam(SamSock, Host, Path, _ClientSock, Method) ->
         {error, fetch_timeout}
     end.
 
-fetch_over_sam(SamSock, Host, Path, Method) ->
-    ok = i2per_proxy_sam:hello(SamSock),
-    {ok, SessionId, _DestB64} = i2per_proxy_sam:session_create(SamSock),
-    {ok, TargetB64} = i2per_proxy_sam:naming_lookup(SamSock, Host),
-    ok = i2per_proxy_sam:stream_connect(SamSock, SessionId, TargetB64),
+fetch_over_sam(StreamSock, Host, Path, Method) ->
     Request = [
         Method,
         <<" ">>,
@@ -144,8 +140,8 @@ fetch_over_sam(SamSock, Host, Path, Method) ->
         <<"Connection: close\r\n">>,
         <<"\r\n">>
     ],
-    ok = gen_tcp:send(SamSock, Request),
-    case recv_all(SamSock) of
+    ok = gen_tcp:send(StreamSock, Request),
+    case recv_all(StreamSock) of
         {ok, Response} -> Response;
         {error, Reason} -> throw({recv_failed, Reason})
     end.

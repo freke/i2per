@@ -9,14 +9,14 @@ all() ->
     [flow_relays_bytes].
 
 init_per_testcase(_TC, Config) ->
-    {ok, LSock} = gen_tcp:listen(0, [binary, {packet, raw}, {active, false}, {reuseaddr, true}]),
-    {ok, {_, SamPort}} = inet:sockname(LSock),
-    Server = spawn_link(fun() -> mock_sam(LSock) end),
-    [{sam_lsock, LSock}, {sam_port, SamPort}, {sam_server, Server} | Config].
+    Mock = i2per_tun_mock_sam:start(fun(StreamSock) ->
+        ok = wait_for_ping(StreamSock, <<>>),
+        ok = gen_tcp:send(StreamSock, <<"pong">>)
+    end),
+    [{sam_mock, Mock}, {sam_port, element(2, Mock)} | Config].
 
 end_per_testcase(_TC, Config) ->
-    catch gen_tcp:close(proplists:get_value(sam_lsock, Config)),
-    catch exit(proplists:get_value(sam_server, Config), kill),
+    i2per_tun_mock_sam:stop(proplists:get_value(sam_mock, Config)),
     ok.
 
 flow_relays_bytes(Config) ->
@@ -36,24 +36,6 @@ flow_relays_bytes(Config) ->
     _ = Pid,
     gen_tcp:close(HostLSock),
     ok.
-
-mock_sam(LSock) ->
-    case gen_tcp:accept(LSock, 5000) of
-        {ok, Sock} ->
-            gen_tcp:send(Sock, <<"HELLO REPLY RESULT=OK VERSION=3.1\n">>),
-            {ok, _} = gen_tcp:recv(Sock, 0, 5000),
-            gen_tcp:send(Sock, <<"SESSION STATUS RESULT=OK DESTINATION=mydest\n">>),
-            {ok, _} = gen_tcp:recv(Sock, 0, 5000),
-            gen_tcp:send(Sock, <<"NAMING REPLY RESULT=OK NAME=peer.i2p VALUE=targetdest\n">>),
-            {ok, _} = gen_tcp:recv(Sock, 0, 5000),
-            gen_tcp:send(Sock, <<"STREAM STATUS RESULT=OK\n">>),
-            ok = wait_for_ping(Sock, <<>>),
-            ok = gen_tcp:send(Sock, <<"pong">>),
-            gen_tcp:close(Sock),
-            ok;
-        {error, _} ->
-            ok
-    end.
 
 wait_for_ping(Sock, Acc) ->
     case gen_tcp:recv(Sock, 0, 5000) of

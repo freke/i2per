@@ -27,42 +27,62 @@ parse_naming_reply_test() ->
 parse_stream_status_test() ->
     ?assertEqual(ok, i2per_tun_sam:parse_stream_status(<<"STREAM STATUS RESULT=OK">>)).
 
-%% ---------------------------------------------------------------- mock SAM server conversation
+%% ---------------------------------------------------------------- open_stream
 
-mock_server_conversation_test_() ->
-    {"full SAM conversation against a mock server", fun() ->
-        {ok, LSock} = gen_tcp:listen(0, [binary, {packet, raw}, {active, false}, {reuseaddr, true}]),
-        {ok, {_, Port}} = inet:sockname(LSock),
-        Server = spawn(fun() -> mock_sam(LSock) end),
-        {ok, Sock} = gen_tcp:connect(
-            "127.0.0.1", Port, [binary, {packet, raw}, {active, false}], 5000
-        ),
-        ?assertEqual(ok, i2per_tun_sam:hello(Sock)),
-        {ok, _Id, _Dest} = i2per_tun_sam:session_create(Sock),
-        ?assertEqual({ok, <<"targetdest">>}, i2per_tun_sam:naming_lookup(Sock, <<"peer.i2p">>)),
-        ok = i2per_tun_sam:stream_connect(Sock, <<"tun-1">>, <<"targetdest">>),
-        gen_tcp:close(Sock),
-        Server ! stop
+%% SAM v3 puts the stream on a second socket: the session socket carries
+%% HELLO / SESSION CREATE / NAMING LOOKUP and must stay open, while HELLO and
+%% STREAM CONNECT arrive on a fresh connection.
+open_stream_uses_two_sockets_test_() ->
+    {"open_stream keeps the session socket and opens a second one for the stream", fun() ->
+        Mock = i2per_tun_mock_sam:start(fun(_StreamSock) ->
+            %% Hold the stream open so the assertions below see live sockets.
+            receive
+                release -> ok
+            end
+        end),
+        {_, Port, _} = Mock,
+        try
+            {ok, SessionSock, StreamSock} =
+                i2per_tun_sam:open_stream(<<"127.0.0.1">>, Port, <<"peer.i2p">>),
+            ?assertNotEqual(SessionSock, StreamSock),
+            %% The session socket is still open and still in line mode.
+            ?assertEqual({error, timeout}, gen_tcp:recv(SessionSock, 0, 100)),
+            gen_tcp:close(StreamSock),
+            gen_tcp:close(SessionSock)
+        after
+            i2per_tun_mock_sam:stop(Mock)
+        end
     end}.
 
-mock_sam(LSock) ->
-    case gen_tcp:accept(LSock, 5000) of
-        {ok, Sock} ->
-            gen_tcp:send(Sock, <<"HELLO REPLY RESULT=OK VERSION=3.1\n">>),
-            %% session create
+%% A failed negotiation closes every socket it opened, so a caller that gives
+%% up cannot leak the session socket.
+open_stream_closes_the_session_socket_on_failure_test_() ->
+    {"open_stream closes the session socket when the handshake fails", fun() ->
+        {ok, LSock} = gen_tcp:listen(0, [binary, {packet, raw}, {active, false}, {reuseaddr, true}]),
+        {ok, {_, Port}} = inet:sockname(LSock),
+        Self = self(),
+        Server = spawn_link(fun() ->
+            {ok, Sock} = gen_tcp:accept(LSock, 5000),
             {ok, _} = gen_tcp:recv(Sock, 0, 5000),
-            gen_tcp:send(Sock, <<"SESSION STATUS RESULT=OK DESTINATION=mydest\n">>),
-            %% naming lookup
-            {ok, _} = gen_tcp:recv(Sock, 0, 5000),
-            gen_tcp:send(Sock, <<"NAMING REPLY RESULT=OK NAME=peer.i2p VALUE=targetdest\n">>),
-            %% stream connect
-            {ok, _} = gen_tcp:recv(Sock, 0, 5000),
-            gen_tcp:send(Sock, <<"STREAM STATUS RESULT=OK\n">>),
-            gen_tcp:close(Sock),
-            ok;
-        {error, _} ->
-            ok
-    end.
+            ok = gen_tcp:send(Sock, <<"HELLO REPLY RESULT=I2P_ERROR MESSAGE=nope\n">>),
+            %% open_stream/3 must close what it opened.
+            Self ! {session_socket, gen_tcp:recv(Sock, 0, 5000)}
+        end),
+        try
+            ?assertMatch(
+                {error, _},
+                i2per_tun_sam:open_stream(<<"127.0.0.1">>, Port, <<"peer.i2p">>)
+            ),
+            receive
+                {session_socket, Result} -> ?assertEqual({error, closed}, Result)
+            after 5000 ->
+                ?assert(false)
+            end,
+            _ = Server
+        after
+            gen_tcp:close(LSock)
+        end
+    end}.
 
 parse_raw_received_test() ->
     ?assertEqual(

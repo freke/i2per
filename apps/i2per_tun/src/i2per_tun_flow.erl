@@ -3,8 +3,11 @@
 -moduledoc """
 One TCP flow -> one SAM STREAM session (shape (a) spike).
 
-Opens a SAM connection, runs the conversation, then relays bytes in both
-directions until either side closes. Runs in the caller's process.
+Opens the two sockets SAM v3 requires: a session socket that carries the
+handshake (`HELLO`, `SESSION CREATE`, `NAMING LOOKUP`) and stays open for the
+life of the session, and a stream socket that carries `HELLO` and
+`STREAM CONNECT` and then relays bytes in both directions until either side
+closes. Runs in the caller's process.
 
 `f:run_session/3` opens and holds a SAM STREAM session for a flow without a
 host TCP socket attached yet — used by the TUN packet path to establish a
@@ -84,38 +87,14 @@ relay_core_loop(TcpSock, ConnPid) ->
     end.
 
 run_sam(TcpSock, DestHost, SamHost, SamPort) ->
-    case
-        gen_tcp:connect(
-            binary_to_list(SamHost), SamPort, [binary, {packet, raw}, {active, false}], 5000
-        )
-    of
-        {ok, SamSock} ->
-            Result = do_flow(SamSock, DestHost, TcpSock),
-            gen_tcp:close(SamSock),
+    case i2per_tun_sam:open_stream(SamHost, SamPort, DestHost) of
+        {ok, SessionSock, StreamSock} ->
+            %% The stream socket carries the bytes; the session socket has to
+            %% stay open for as long as the flow does, or the session ends.
+            Result = relay(TcpSock, StreamSock),
+            gen_tcp:close(StreamSock),
+            gen_tcp:close(SessionSock),
             Result;
-        {error, _} = Err ->
-            Err
-    end.
-
-do_flow(SamSock, DestHost, TcpSock) ->
-    case i2per_tun_sam:hello(SamSock) of
-        ok ->
-            case i2per_tun_sam:session_create(SamSock) of
-                {ok, SessionId, _DestB64} ->
-                    case i2per_tun_sam:naming_lookup(SamSock, DestHost) of
-                        {ok, TargetB64} ->
-                            case i2per_tun_sam:stream_connect(SamSock, SessionId, TargetB64) of
-                                ok ->
-                                    relay(TcpSock, SamSock);
-                                {error, _} = Err ->
-                                    Err
-                            end;
-                        {error, _} = Err ->
-                            Err
-                    end;
-                {error, _} = Err ->
-                    Err
-            end;
         {error, _} = Err ->
             Err
     end.
@@ -158,7 +137,6 @@ run_session(DestHost, SamHost, SamPort) ->
     run_session(DestHost, SamHost, SamPort, 5000).
 
 run_session(DestHost, SamHost, SamPort, Timeout) ->
-    _ = Timeout,
     case try_core_run_session(DestHost) of
         {ok, SessionId, HoldPid} ->
             {ok, SessionId, HoldPid};
@@ -222,40 +200,12 @@ close_core_session(Node, SessionPid) ->
     ok.
 
 run_session_sam(DestHost, SamHost, SamPort, Timeout) ->
-    case
-        gen_tcp:connect(
-            binary_to_list(SamHost), SamPort, [binary, {packet, raw}, {active, false}], Timeout
-        )
-    of
-        {ok, SamSock} ->
-            case i2per_tun_sam:hello(SamSock) of
-                ok ->
-                    case i2per_tun_sam:session_create(SamSock) of
-                        {ok, SessionId, _DestB64} ->
-                            case i2per_tun_sam:naming_lookup(SamSock, DestHost) of
-                                {ok, TargetB64} ->
-                                    case
-                                        i2per_tun_sam:stream_connect(SamSock, SessionId, TargetB64)
-                                    of
-                                        ok ->
-                                            Pid = spawn(fun() -> hold_session(SamSock) end),
-                                            {ok, SessionId, Pid};
-                                        {error, _} = Err ->
-                                            gen_tcp:close(SamSock),
-                                            Err
-                                    end;
-                                {error, _} = Err ->
-                                    gen_tcp:close(SamSock),
-                                    Err
-                            end;
-                        {error, _} = Err ->
-                            gen_tcp:close(SamSock),
-                            Err
-                    end;
-                {error, _} = Err ->
-                    gen_tcp:close(SamSock),
-                    Err
-            end;
+    case i2per_tun_sam:open_stream(SamHost, SamPort, DestHost, Timeout) of
+        {ok, SessionSock, StreamSock} ->
+            Pid = spawn(fun() -> hold_session(SessionSock, StreamSock) end),
+            %% The session id is a client-side handle, as on the core path; the
+            %% holder pid is what keeps the session alive.
+            {ok, erlang:unique_integer([positive, monotonic]), Pid};
         {error, _} = Err ->
             Err
     end.
@@ -306,16 +256,24 @@ send_raw(Pid, Payload) when is_pid(Pid), is_binary(Payload) ->
     after 5000 -> {error, timeout}
     end.
 
-hold_session(SamSock) ->
+%% Both sockets belong to the flow: the session socket is the session, and the
+%% stream socket is the data path. Closing either one on `stop` is what ends
+%% the flow and releases the session.
+hold_session(SessionSock, StreamSock) ->
     receive
         stop ->
-            gen_tcp:close(SamSock),
+            close_sam(SessionSock, StreamSock),
             ok;
         {stop, From, Ref} ->
-            gen_tcp:close(SamSock),
+            close_sam(SessionSock, StreamSock),
             From ! {stopped, Ref},
             ok
     end.
+
+close_sam(SessionSock, StreamSock) ->
+    gen_tcp:close(StreamSock),
+    gen_tcp:close(SessionSock),
+    ok.
 
 -spec stop_session(pid()) -> ok.
 stop_session(Pid) when is_pid(Pid) ->

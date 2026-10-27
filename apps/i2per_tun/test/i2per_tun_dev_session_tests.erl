@@ -52,41 +52,29 @@ stop_dev(Pid) ->
     ok.
 
 start_tcp_mock() ->
-    {ok, LSock} = gen_tcp:listen(0, [binary, {packet, raw}, {active, false}, {reuseaddr, true}]),
-    {ok, {_, Port}} = inet:sockname(LSock),
-    Server = spawn(fun() -> mock_sam_tcp(LSock) end),
-    {LSock, Port, Server}.
+    Mock = i2per_tun_mock_sam:start(fun(StreamSock) ->
+        %% The device holds the flow for the life of the session; return when
+        %% the device closes it.
+        _ = gen_tcp:recv(StreamSock, 0, 5000),
+        ok
+    end),
+    {_, Port, _} = Mock,
+    {Mock, Port}.
 
-stop_mock({LSock, _Port, Server}) ->
-    Server ! stop,
-    catch gen_tcp:close(LSock),
+stop_tcp_mock(Mock) ->
+    i2per_tun_mock_sam:stop(Mock),
     ok.
-
-mock_sam_tcp(LSock) ->
-    case gen_tcp:accept(LSock, 5000) of
-        {ok, Sock} ->
-            gen_tcp:send(Sock, <<"HELLO REPLY RESULT=OK VERSION=3.1\n">>),
-            {ok, _} = gen_tcp:recv(Sock, 0, 5000),
-            gen_tcp:send(Sock, <<"SESSION STATUS RESULT=OK DESTINATION=mydest\n">>),
-            {ok, _} = gen_tcp:recv(Sock, 0, 5000),
-            gen_tcp:send(Sock, <<"NAMING REPLY RESULT=OK NAME=peer.i2p VALUE=targetdest\n">>),
-            {ok, _} = gen_tcp:recv(Sock, 0, 5000),
-            gen_tcp:send(Sock, <<"STREAM STATUS RESULT=OK\n">>),
-            receive
-                stop -> ok
-            after 5000 -> ok
-            end,
-            gen_tcp:close(Sock),
-            ok;
-        {error, _} ->
-            ok
-    end.
 
 start_raw_mock() ->
     {ok, LSock} = gen_tcp:listen(0, [binary, {packet, raw}, {active, false}, {reuseaddr, true}]),
     {ok, {_, Port}} = inet:sockname(LSock),
     Server = spawn(fun() -> mock_sam_raw(LSock) end),
     {LSock, Port, Server}.
+
+stop_mock({LSock, _Port, Server}) ->
+    Server ! stop,
+    catch gen_tcp:close(LSock),
+    ok.
 
 mock_sam_raw(LSock) ->
     case gen_tcp:accept(LSock, 5000) of
@@ -110,8 +98,7 @@ mock_sam_raw(LSock) ->
 %% ---------------------------------------------------------------- tests
 
 session_spawning_test() ->
-    Mock = start_tcp_mock(),
-    Port = element(2, Mock),
+    {Mock, Port} = start_tcp_mock(),
     Pid = start_dev(Port),
     try
         ?assertEqual(ok, i2per_tun_dev:inject(Pid, tcp_packet())),
@@ -128,12 +115,11 @@ session_spawning_test() ->
         )
     after
         stop_dev(Pid),
-        stop_mock(Mock)
+        stop_tcp_mock(Mock)
     end.
 
 monitor_teardown_test() ->
-    Mock = start_tcp_mock(),
-    Port = element(2, Mock),
+    {Mock, Port} = start_tcp_mock(),
     Pid = start_dev(Port),
     i2per_tun_dev:inject(Pid, tcp_packet()),
     SessPid = hd(maps:values(i2per_tun_dev:sessions(Pid))),
@@ -143,12 +129,11 @@ monitor_teardown_test() ->
         ?assertEqual(0, maps:size(i2per_tun_dev:sessions(Pid)))
     after
         stop_dev(Pid),
-        stop_mock(Mock)
+        stop_tcp_mock(Mock)
     end.
 
 stats_test() ->
-    Mock = start_tcp_mock(),
-    Port = element(2, Mock),
+    {Mock, Port} = start_tcp_mock(),
     Pid = start_dev(Port),
     try
         i2per_tun_dev:inject(Pid, tcp_packet()),
@@ -159,12 +144,11 @@ stats_test() ->
         ?assert(maps:get(bytes, S) > 0)
     after
         stop_dev(Pid),
-        stop_mock(Mock)
+        stop_tcp_mock(Mock)
     end.
 
 spawn_disabled_test() ->
-    Mock = start_tcp_mock(),
-    Port = element(2, Mock),
+    {Mock, Port} = start_tcp_mock(),
     Pid = start_dev_disabled(Port),
     try
         i2per_tun_dev:inject(Pid, tcp_packet()),
@@ -172,7 +156,7 @@ spawn_disabled_test() ->
         ?assertEqual(1, maps:size(i2per_tun_dev:flows(Pid)))
     after
         stop_dev(Pid),
-        stop_mock(Mock)
+        stop_tcp_mock(Mock)
     end.
 
 udp_wiring_test() ->

@@ -9,13 +9,11 @@
 socks5_handshake_test_() ->
     {"SOCKS5 CONNECT completes against a mock SAM server",
         {timeout, 30, fun() ->
-            {ok, LSock} =
-                gen_tcp:listen(0, [binary, {packet, raw}, {active, false}, {reuseaddr, true}]),
-            {ok, {_, SamPort}} = inet:sockname(LSock),
+            Mock = i2per_proxy_mock_sam:start(fun(_StreamSock) -> ok end),
+            {_, SamPort, _} = Mock,
             application:set_env(i2per_proxy, sam_port, SamPort),
             application:set_env(i2per_proxy, sam_host, <<"127.0.0.1">>),
             application:set_env(i2per_proxy, router_node, ?DEAD_NODE),
-            Server = spawn(fun() -> mock_sam(LSock) end),
             {ok, Pid} = i2per_proxy_listener:start_link(#{protocol => socks, port => 0}),
             try
                 BoundPort = i2per_proxy_listener:port(Pid),
@@ -34,31 +32,38 @@ socks5_handshake_test_() ->
                 ?assertEqual(<<5, 0, 0, 1, 0, 0, 0, 0, 0, 0>>, Reply),
                 gen_tcp:close(ClientSock)
             after
-                Server ! stop,
                 i2per_proxy_listener:stop(Pid),
-                gen_tcp:close(LSock),
+                i2per_proxy_mock_sam:stop(Mock),
                 application:unset_env(i2per_proxy, sam_port),
                 application:unset_env(i2per_proxy, sam_host),
                 application:unset_env(i2per_proxy, router_node)
             end
         end}}.
 
-%% Each reply follows the request it answers. Answering HELLO before reading it
-%% lets the client send SESSION CREATE unprompted, and one coalesced segment is
-%% then enough to desync the exchange (WD5N85Y).
-mock_sam(LSock) ->
-    case gen_tcp:accept(LSock, 5000) of
-        {ok, Sock} ->
-            {ok, _} = gen_tcp:recv(Sock, 0, 5000),
-            gen_tcp:send(Sock, <<"HELLO REPLY RESULT=OK VERSION=3.1\n">>),
-            {ok, _} = gen_tcp:recv(Sock, 0, 5000),
-            gen_tcp:send(Sock, <<"SESSION STATUS RESULT=OK DESTINATION=mydest\n">>),
-            {ok, _} = gen_tcp:recv(Sock, 0, 5000),
-            gen_tcp:send(Sock, <<"NAMING REPLY RESULT=OK NAME=peer.i2p VALUE=targetdest\n">>),
-            {ok, _} = gen_tcp:recv(Sock, 0, 5000),
-            gen_tcp:send(Sock, <<"STREAM STATUS RESULT=OK\n">>),
-            gen_tcp:close(Sock),
-            ok;
-        {error, _} ->
-            ok
-    end.
+socks4a_handshake_test_() ->
+    {"SOCKS4a CONNECT completes against a mock SAM server",
+        {timeout, 30, fun() ->
+            Mock = i2per_proxy_mock_sam:start(fun(_StreamSock) -> ok end),
+            {_, SamPort, _} = Mock,
+            application:set_env(i2per_proxy, sam_port, SamPort),
+            application:set_env(i2per_proxy, sam_host, <<"127.0.0.1">>),
+            application:set_env(i2per_proxy, router_node, ?DEAD_NODE),
+            {ok, Pid} = i2per_proxy_listener:start_link(#{protocol => socks, port => 0}),
+            try
+                BoundPort = i2per_proxy_listener:port(Pid),
+                {ok, ClientSock} = gen_tcp:connect(
+                    "127.0.0.1", BoundPort, [binary, {packet, raw}, {active, false}], 5000
+                ),
+                %% VER=4, CMD=1(CONNECT), port, IP=0.0.0.1 (SOCKS4a), user id, host
+                ok = gen_tcp:send(ClientSock, <<4, 1, 80:16, 0, 0, 0, 1, 0, "peer.i2p", 0>>),
+                {ok, Reply} = gen_tcp:recv(ClientSock, 8, 5000),
+                ?assertEqual(<<0, 90, 80:16, 0, 0, 0, 1>>, Reply),
+                gen_tcp:close(ClientSock)
+            after
+                i2per_proxy_listener:stop(Pid),
+                i2per_proxy_mock_sam:stop(Mock),
+                application:unset_env(i2per_proxy, sam_port),
+                application:unset_env(i2per_proxy, sam_host),
+                application:unset_env(i2per_proxy, router_node)
+            end
+        end}}.

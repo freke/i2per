@@ -2,9 +2,15 @@
 
 -moduledoc """
 SAM v3 client conversation for `i2per_proxy`.
+
+SAM v3 puts the stream on a second socket: the session socket must stay open
+for the session's life, and `STREAM CONNECT` arrives on a fresh connection.
+Use `f:open_stream/3` rather than driving the individual commands, so both
+sockets and their lifetimes stay together.
 """.
 
 -export([
+    open_stream/3,
     hello/1,
     session_create/1,
     naming_lookup/2,
@@ -16,6 +22,27 @@ SAM v3 client conversation for `i2per_proxy`.
     parse_naming_reply/1,
     parse_stream_status/1
 ]).
+
+-doc """
+Open a session and a stream to `Host` on the two sockets SAM v3 requires.
+
+The session socket carries `HELLO`, `SESSION CREATE` and `NAMING LOOKUP`, and
+must stay open for as long as the session is needed: closing it ends the
+session. The stream socket is a second connection to the same bridge carrying
+only `HELLO` and `STREAM CONNECT`; the caller relays stream bytes on it and
+closes both sockets when the stream ends.
+
+Input: the bridge host and port, and the host to resolve.
+Output: `{ok, SessionSock, StreamSock}`, or `{error, Reason}` with every socket
+this function opened closed.
+""".
+-spec open_stream(binary(), inet:port_number(), binary() | string()) ->
+    {ok, gen_tcp:socket(), gen_tcp:socket()} | {error, term()}.
+open_stream(SamHost, SamPort, Host) ->
+    case connect(SamHost, SamPort) of
+        {ok, SessionSock} -> open_stream_on(SessionSock, SamHost, SamPort, Host);
+        {error, _} = Err -> Err
+    end.
 
 hello(Sock) ->
     case gen_tcp:send(Sock, <<"HELLO VERSION MIN=3.1 MAX=3.1\n">>) of
@@ -119,6 +146,71 @@ find_value(<<>>) -> error.
 trim(Bin) -> string:trim(Bin, both, "\r\n\t ").
 
 %% Internal
+
+-spec connect(binary(), inet:port_number()) ->
+    {ok, gen_tcp:socket()} | {error, term()}.
+connect(SamHost, SamPort) ->
+    gen_tcp:connect(
+        binary_to_list(SamHost), SamPort, [binary, {packet, raw}, {active, false}], 5000
+    ).
+
+%% The session socket is opened by the caller; every failure after this point
+%% has to close it, because a session socket nobody holds open is a session
+%% nobody can use.
+open_stream_on(SessionSock, SamHost, SamPort, Host) ->
+    case session_ready(SessionSock, Host) of
+        {ok, SessionId, TargetB64} ->
+            case stream_ready(SamHost, SamPort, SessionId, TargetB64) of
+                {ok, StreamSock} ->
+                    {ok, SessionSock, StreamSock};
+                {error, _} = Err ->
+                    gen_tcp:close(SessionSock),
+                    Err
+            end;
+        {error, _} = Err ->
+            gen_tcp:close(SessionSock),
+            Err
+    end.
+
+-spec session_ready(gen_tcp:socket(), binary() | string()) ->
+    {ok, binary(), binary()} | {error, term()}.
+session_ready(SessionSock, Host) ->
+    case hello(SessionSock) of
+        ok ->
+            case session_create(SessionSock) of
+                {ok, SessionId, _DestB64} ->
+                    case naming_lookup(SessionSock, Host) of
+                        {ok, TargetB64} -> {ok, SessionId, TargetB64};
+                        {error, _} = Err -> Err
+                    end;
+                {error, _} = Err ->
+                    Err
+            end;
+        {error, _} = Err ->
+            Err
+    end.
+
+-spec stream_ready(binary(), inet:port_number(), binary(), binary()) ->
+    {ok, gen_tcp:socket()} | {error, term()}.
+stream_ready(SamHost, SamPort, SessionId, TargetB64) ->
+    case connect(SamHost, SamPort) of
+        {ok, StreamSock} ->
+            case hello(StreamSock) of
+                ok ->
+                    case stream_connect(StreamSock, SessionId, TargetB64) of
+                        ok ->
+                            {ok, StreamSock};
+                        {error, _} = Err ->
+                            gen_tcp:close(StreamSock),
+                            Err
+                    end;
+                {error, _} = Err ->
+                    gen_tcp:close(StreamSock),
+                    Err
+            end;
+        {error, _} = Err ->
+            Err
+    end.
 
 -spec valid_host(binary()) -> boolean().
 valid_host(<<>>) ->

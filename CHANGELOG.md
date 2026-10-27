@@ -16,6 +16,16 @@ CI refuses a tag that disagrees.
   `econnaborted` no longer crash `i2per_proxy_listener`, which the supervisor
   could not keep alive on a busy proxy; the listener retries after 100ms and
   keeps accepting (#YBTMCNP).
+- **SAM fallback speaks SAM v3.** `i2per_proxy` and `i2per_tun` open the stream
+  on a second socket and keep the session socket open, as SAM v3 requires.
+  STREAM CONNECT on the session socket is rejected by i2pd as `Socket already in
+  use`, and closing that socket to release it ends the session, so the SAM
+  fallback could not work against a real bridge. Both apps' mocks now reject the
+  one-socket conversation, so the defect cannot pass the gate again (#BCZS65N).
+- **No session leak from a destination-map connect.**
+  `i2p_sam_api:stream_connect/3` stops the ephemeral session it creates when the
+  connect fails, and that session ends with its last connection instead of
+  outliving it (#FZKBZ1H).
 
 ## [0.8.0] — 2026-10-25
 

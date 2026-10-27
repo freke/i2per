@@ -135,47 +135,26 @@ relay_core_loop(ClientSock, ConnPid, Node) ->
     end.
 
 socks5_connect_sam(ClientSock, Host) ->
-    SamHost = i2per_proxy_config:sam_host(),
-    SamPort = i2per_proxy_config:sam_port(),
-    case
-        gen_tcp:connect(
-            binary_to_list(SamHost), SamPort, [binary, {packet, raw}, {active, false}], 5000
-        )
-    of
-        {ok, SamSock} ->
-            case open_sam(SamSock, Host) of
-                ok ->
-                    _ = gen_tcp:send(ClientSock, <<5, 0, 0, 1, 0, 0, 0, 0, 0, 0>>),
-                    i2per_proxy_relay:relay(ClientSock, SamSock),
-                    gen_tcp:close(SamSock),
-                    ok;
-                {error, _} ->
-                    gen_tcp:close(SamSock),
-                    _ = gen_tcp:send(ClientSock, <<5, 4, 0, 1, 0, 0, 0, 0, 0, 0>>),
-                    ok
-            end;
+    case open_sam(Host) of
+        {ok, SessionSock, StreamSock} ->
+            _ = gen_tcp:send(ClientSock, <<5, 0, 0, 1, 0, 0, 0, 0, 0, 0>>),
+            i2per_proxy_relay:relay(ClientSock, StreamSock),
+            close_sam(SessionSock, StreamSock),
+            ok;
         {error, _} ->
             _ = gen_tcp:send(ClientSock, <<5, 4, 0, 1, 0, 0, 0, 0, 0, 0>>),
             ok
     end.
 
-open_sam(SamSock, Host) ->
-    case i2per_proxy_sam:hello(SamSock) of
-        ok ->
-            case i2per_proxy_sam:session_create(SamSock) of
-                {ok, SessionId, _DestB64} ->
-                    case i2per_proxy_sam:naming_lookup(SamSock, Host) of
-                        {ok, TargetB64} ->
-                            i2per_proxy_sam:stream_connect(SamSock, SessionId, TargetB64);
-                        {error, _} = Err ->
-                            Err
-                    end;
-                {error, _} = Err ->
-                    Err
-            end;
-        {error, _} = Err ->
-            Err
-    end.
+open_sam(Host) ->
+    i2per_proxy_sam:open_stream(
+        i2per_proxy_config:sam_host(), i2per_proxy_config:sam_port(), Host
+    ).
+
+close_sam(SessionSock, StreamSock) ->
+    gen_tcp:close(StreamSock),
+    gen_tcp:close(SessionSock),
+    ok.
 
 %% ---- SOCKS4a ----
 
@@ -200,25 +179,12 @@ socks4a(ClientSock) ->
     end.
 
 socks4a_connect(ClientSock, Host, Port) ->
-    SamHost = i2per_proxy_config:sam_host(),
-    SamPort = i2per_proxy_config:sam_port(),
-    case
-        gen_tcp:connect(
-            binary_to_list(SamHost), SamPort, [binary, {packet, raw}, {active, false}], 5000
-        )
-    of
-        {ok, SamSock} ->
-            case open_sam(SamSock, Host) of
-                ok ->
-                    _ = gen_tcp:send(ClientSock, <<0, 90, Port:16, 0, 0, 0, 1>>),
-                    i2per_proxy_relay:relay(ClientSock, SamSock),
-                    gen_tcp:close(SamSock),
-                    ok;
-                {error, _} ->
-                    gen_tcp:close(SamSock),
-                    _ = gen_tcp:send(ClientSock, <<0, 91, 0, 0, 0, 0, 0, 0>>),
-                    ok
-            end;
+    case open_sam(Host) of
+        {ok, SessionSock, StreamSock} ->
+            _ = gen_tcp:send(ClientSock, <<0, 90, Port:16, 0, 0, 0, 1>>),
+            i2per_proxy_relay:relay(ClientSock, StreamSock),
+            close_sam(SessionSock, StreamSock),
+            ok;
         {error, _} ->
             _ = gen_tcp:send(ClientSock, <<0, 91, 0, 0, 0, 0, 0, 0>>),
             ok
