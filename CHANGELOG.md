@@ -6,27 +6,6 @@ CI refuses a tag that disagrees.
 
 ## [Unreleased]
 
-### Fixed
-
-- **UPnP telemetry.** The four port-mapping counters are declared, so
-  discovered/renewed/lost/refused record instead of raising into a swallowed
-  `catch`, and the discovery event carries the gateway URL as a binary
-  (#R7XQFMP).
-- **Proxy listener survives accept errors.** `emfile`, `enfile` and
-  `econnaborted` no longer crash `i2per_proxy_listener`, which the supervisor
-  could not keep alive on a busy proxy; the listener retries after 100ms and
-  keeps accepting (#YBTMCNP).
-- **SAM fallback speaks SAM v3.** `i2per_proxy` and `i2per_tun` open the stream
-  on a second socket and keep the session socket open, as SAM v3 requires.
-  STREAM CONNECT on the session socket is rejected by i2pd as `Socket already in
-  use`, and closing that socket to release it ends the session, so the SAM
-  fallback could not work against a real bridge. Both apps' mocks now reject the
-  one-socket conversation, so the defect cannot pass the gate again (#BCZS65N).
-- **No session leak from a destination-map connect.**
-  `i2p_sam_api:stream_connect/3` stops the ephemeral session it creates when the
-  connect fails, and that session ends with its last connection instead of
-  outliving it (#FZKBZ1H).
-
 ## [0.8.0] — 2026-10-25
 
 **The operator-surface release.** 0.7.0 filled in the data plane; 0.8.0 lands
@@ -68,6 +47,42 @@ unchanged.
 
 - **Companion-app transport.** `i2per_proxy` and `i2per_tun` reach the core
   over the Erlang network instead of SAM (#E1CHFWF).
+
+### Fixed
+
+- **UPnP telemetry.** The four port-mapping counters are declared, so
+  discovered/renewed/lost/refused record instead of raising into a swallowed
+  `catch`, and the discovery event carries the gateway URL as a binary
+  (#R7XQFMP).
+- **Proxy listener survives accept errors.** `emfile`, `enfile` and
+  `econnaborted` no longer crash `i2per_proxy_listener`, which the supervisor
+  could not keep alive on a busy proxy; the listener retries after 100ms and
+  keeps accepting (#YBTMCNP).
+- **SAM fallback speaks SAM v3.** `i2per_proxy` and `i2per_tun` open the stream
+  on a second socket and keep the session socket open, as SAM v3 requires.
+  STREAM CONNECT on the session socket is rejected by i2pd as `Socket already in
+  use`, and closing that socket to release it ends the session, so the SAM
+  fallback could not work against a real bridge. Both apps' mocks now reject the
+  one-socket conversation, so the defect cannot pass the gate again (#BCZS65N).
+- **The SAM bridge takes a stream's own socket.** `STREAM CONNECT` now arrives
+  on a fresh client-to-SAM socket, as SAM v3 and i2pd require: the session
+  looks its id up in the registry, opens the stream on the socket's behalf and
+  hands the connection over, so the session socket stays in line mode for its
+  whole life and one session can carry several streams. A CONNECT on the
+  session's own socket is answered `SESSION STATUS RESULT=I2P_ERROR
+  MESSAGE="Socket already in use"` and closed, an id no live STREAM session
+  owns is `STREAM STATUS RESULT=INVALID_ID` and closed, and a failed connect
+  closes its socket too — all matching i2pd. A session now unregisters its id
+  on exit and closes the streams it still holds, so a dead session cannot leave
+  a stream of its own or a reusable id behind; a stream already paired with a
+  local listener is not tracked after the hand-off and can outlive it.
+  `STREAM ACCEPT` and `STREAM FORWARD`
+  still act on the session socket; both need a socket of their own to match the
+  spec and are filed separately (#7CBQQF7).
+- **No session leak from a destination-map connect.**
+  `i2p_sam_api:stream_connect/3` stops the ephemeral session it creates when the
+  connect fails, and that session ends with its last connection instead of
+  outliving it (#FZKBZ1H).
 
 ## [0.7.0] — 2026-10-22
 

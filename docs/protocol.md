@@ -1118,9 +1118,24 @@ start it on demand. See the full
 **Protocol basics:**
 
 - Line-based, newline-terminated (`\n`), UTF-8 as of SAM 3.2.
-- All commands on a single TCP control socket per session.
-- After `STREAM CONNECT` or `STREAM ACCEPT` succeeds, the socket switches to
-  raw data mode — no more SAM commands on that socket.
+- **One socket per stream.** A session keeps its control socket in line mode
+  for its whole life, and every stream gets a fresh client-to-SAM socket of
+  its own. `STREAM CONNECT` must therefore arrive on a socket that has not run
+  `SESSION CREATE`; sending it on the session's own socket is refused with
+  `SESSION STATUS RESULT=I2P_ERROR MESSAGE="Socket already in use"` and the
+  socket is closed, which is exactly what i2pd does. The stream socket then
+  becomes raw for that one stream and the session socket keeps serving
+  `NAMING LOOKUP`, `STREAM ACCEPT`, and further connects.
+- `STREAM ACCEPT` is where i2per departs from that model. SAM v3 gives ACCEPT
+  the same shape as CONNECT — a fresh socket with its own `HELLO` — but the
+  bridge only lets the socket that ran `SESSION CREATE` accept: ACCEPT on any
+  other socket is answered `STREAM STATUS RESULT=I2P_ERROR MESSAGE="session id
+  mismatch"`, and the session socket itself goes raw for the accepted stream.
+  This is a limitation of the bridge, not a reading of the spec.
+- A `STREAM CONNECT` that fails is answered on the stream socket and that
+  socket is closed — `STREAM STATUS RESULT=INVALID_ID` for an id no live
+  STREAM session owns, `STREAM STATUS RESULT=CANT_REACH DESTINATION=…` when
+  the target cannot be resolved or a route cannot be built.
 - `HELLO` must be accepted before other commands. `SESSION CREATE` reports
   `RESULT=OK` as soon as the session is registered; it does not wait for a
   tunnel or LeaseSet publication. A network `STREAM CONNECT` is the operation
@@ -1134,7 +1149,7 @@ start it on demand. See the full
 | `DEST GENERATE SIGNATURE_TYPE=7` | one base64 line | Generate an Ed25519 destination private blob | Implemented |
 | `SESSION CREATE STYLE=STREAM ID=… DESTINATION=…` | `SESSION STATUS RESULT=OK DESTINATION=…` | Create a STREAM session; tunnel and LeaseSet work is asynchronous | Implemented |
 | `… SESSION CREATE` with `inbound.length=N outbound.length=N` | — (options on the same command) | Per-session tunnel lengths, clamped to 1–7 hops; drive the router's tunnel-pool targets and which inbound tunnel the published lease names | Implemented |
-| `STREAM CONNECT ID=… DESTINATION=…` | `STREAM STATUS RESULT=OK` | Outbound connection | Implemented |
+| `STREAM CONNECT ID=… DESTINATION=…` | `STREAM STATUS RESULT=OK` | Outbound connection, **on a fresh socket**; that socket becomes raw for the stream | Implemented |
 | `STREAM ACCEPT ID=…` | base64 identity line, then raw mode | Register an inbound stream destination; the socket becomes raw immediately | Implemented |
 | `STREAM FORWARD ID=… PORT=… [HOST=…]` | `STREAM STATUS RESULT=OK` | Bind a local service; every inbound stream relays to a fresh local TCP connection (control socket stays in line mode) | Implemented |
 | `NAMING LOOKUP NAME=…` | `NAMING REPLY RESULT=OK NAME=… VALUE=…` | Resolve .i2p address | Implemented |
@@ -1153,23 +1168,33 @@ sequenceDiagram
     C->>S: SESSION CREATE STYLE=STREAM ID=mysession DESTINATION=… SIGNATURE_TYPE=7
     Note over S: Session registered, LeaseSet publication and tunnel work continue asynchronously
     S->>C: SESSION STATUS RESULT=OK DESTINATION=…
-    C->>S: STREAM CONNECT ID=mysession DESTINATION=target…
-    S->>C: STREAM STATUS RESULT=OK
-    Note over C,S: Socket carries raw I2P stream data
-    C->>S: (raw data bytes)
-    S->>C: (raw data bytes)
+    Note over C,S: Socket 1 stays in line mode for the session's lifetime
+    C->>S: STREAM CONNECT ID=mysession DESTINATION=target… (on socket 2)
+    Note over S: Session looks up its id, resolves the target and opens the stream
+    S->>C: STREAM STATUS RESULT=OK (on socket 2)
+    Note over C,S: Socket 2 carries raw I2P stream data
+    C->>S: (raw data bytes on socket 2)
+    S->>C: (raw data bytes on socket 2)
+    C->>S: NAMING LOOKUP NAME=something.i2p (still on socket 1)
+    S->>C: NAMING REPLY RESULT=OK … (on socket 1)
 ```
 
 **Session lifecycle:** A SAM session is one process tied to its TCP socket.
 Closing the socket, or a protocol violation, ends that process. A monitor
 removes the session's tunnel-length demand when it exits, but the shared tunnel
 pools and already-published LeaseSets are not torn down merely because a
-client socket closes. The current SAM ETS rows for the session, its
-`STREAM ACCEPT`/`STREAM FORWARD` binding, and stream demux keys are not removed
-by `i2p_sam_session:terminate/2`; stale rows can remain until overwritten.
-Stream connections have their own temporary-process lifecycle. Keep sessions
-for the lifetime of the client rather than rapidly creating and destroying
-them.
+client socket closes. `i2p_sam_session:terminate/2` unregisters the session id — so that id cannot be
+mistaken for a live session afterwards — and closes the stream connections the
+process still holds: the accept-role stream on the session socket, and a connect
+it started that has not settled. It does not close a stream it paired locally:
+`delegate_stream/4` hands the client socket to the accepting session and tracks
+nothing after the hand-off, so a locally paired peer can outlive the session
+that introduced it.
+`STREAM ACCEPT`/`STREAM FORWARD` bindings are still not removed by
+`terminate/2`; stale rows can remain until overwritten. Stream connections
+have their own temporary-process lifecycle; each is owned by the socket that
+requested it and dies with it. Keep sessions for the lifetime of the client
+rather than rapidly creating and destroying them.
 
 **Destination encoding:** `DEST GENERATE SIGNATURE_TYPE=7` returns a base64
 private destination blob of 455 bytes, or 608 I2P-Base64 characters:
@@ -1223,8 +1248,9 @@ sequenceDiagram
 **Streaming over tunnels:** SAM STREAM sessions use I2P's streaming library
 for reliable ordered delivery, as described in the [Streaming
 protocol](#streaming-protocol) section below. The same-node local pairing
-(`STREAM ACCEPT` + `CONNECT` on one router) remains a direct socket pipe that
-bypasses tunnels entirely.
+(`STREAM ACCEPT` on the session socket plus `CONNECT` on a stream socket on
+one router) remains a direct pipe between those two sockets that bypasses
+tunnels entirely.
 
 ### LeaseSet2
 
@@ -1364,12 +1390,14 @@ chunks; the streaming header and options are added around each chunk. This
 release has no RTT-based or window-based congestion control in the streaming
 layer; SSU2 gained both in 0.5.0.
 
-**SAM integration.** `STREAM CONNECT` first tries same-router listener
-pairing, which reports `RESULT=OK` immediately. Otherwise it resolves the
-route, starts a streaming connection, and reports `RESULT=OK` only after the
-signed SYN-ACK arrives; a failed or 15-second-timed-out handshake reports
-`CANT_REACH`. An inbound SYN for a pending `STREAM ACCEPT` spawns the
-accept-role connection, answers the handshake, and pairs the socket.
+**SAM integration.** `STREAM CONNECT` arrives on the stream's own socket and
+first tries same-router listener pairing, which reports `RESULT=OK`
+immediately. Otherwise it resolves the route, starts a streaming connection,
+and reports `RESULT=OK` only after the signed SYN-ACK arrives; a failed or
+15-second-timed-out handshake reports `CANT_REACH`. Either way the reply goes
+to the stream socket, and the session's own socket stays in line mode. An
+inbound SYN for a pending `STREAM ACCEPT` spawns the accept-role connection,
+answers the handshake, and pairs the socket.
 
 **The streaming-connection cap.** `max_stream_connections` (default 128) bounds
 live streaming connections router-wide, not per session: one client that has
