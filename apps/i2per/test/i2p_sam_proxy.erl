@@ -169,7 +169,7 @@ fetch_over_sam(SamSock, Host, Path) ->
     ok = sam_hello(SamSock),
     {ok, SessionId, _DestB64} = sam_session_create(SamSock),
     {ok, TargetB64} = sam_naming_lookup(SamSock, Host),
-    ok = sam_stream_connect(SamSock, SessionId, TargetB64),
+    {ok, StreamSock} = sam_stream_connect(SamSock, SessionId, TargetB64),
     HttpRequest = [
         <<"GET ">>,
         Path,
@@ -180,8 +180,8 @@ fetch_over_sam(SamSock, Host, Path) ->
         <<"Connection: close\r\n">>,
         <<"\r\n">>
     ],
-    ok = gen_tcp:send(SamSock, HttpRequest),
-    {ok, Response} = recv_all(SamSock),
+    ok = gen_tcp:send(StreamSock, HttpRequest),
+    {ok, Response} = recv_all(StreamSock),
     Response.
 
 send_http(ClientSock, Code, Body) ->
@@ -289,7 +289,15 @@ find_value(<<_, Rest/binary>>) ->
 find_value(<<>>) ->
     error.
 
-sam_stream_connect(Sock, SessionId, TargetB64) ->
+%% sam_stream_connect/3 — SAM v3 gives every stream its own client-to-SAM
+%% socket, so this opens a second connection to the bridge and returns it for
+%% the raw exchange. The session socket stays open in line mode, which is what
+%% keeps the session alive; sending CONNECT on it is rejected as
+%% "Socket already in use".
+sam_stream_connect(SessionSock, SessionId, TargetB64) ->
+    {ok, {Addr, Port}} = inet:peername(SessionSock),
+    {ok, Sock} = gen_tcp:connect(Addr, Port, [binary, {packet, raw}, {active, false}], 5000),
+    ok = sam_hello(Sock),
     ok = gen_tcp:send(Sock, [
         <<"STREAM CONNECT ID=">>,
         SessionId,
@@ -298,8 +306,11 @@ sam_stream_connect(Sock, SessionId, TargetB64) ->
         <<"\n">>
     ]),
     case sam_recv_line(Sock) of
-        {ok, <<"STREAM STATUS RESULT=OK">>} -> ok;
-        {ok, Other} -> error({sam_stream_connect_failed, Other})
+        {ok, <<"STREAM STATUS RESULT=OK">>} ->
+            {ok, Sock};
+        {ok, Other} ->
+            gen_tcp:close(Sock),
+            error({sam_stream_connect_failed, Other})
     end.
 
 sam_recv_line(Sock) ->

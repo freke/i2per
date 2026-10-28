@@ -1,0 +1,10 @@
+{application, i2per_proxy, [
+    {description, "SOCKS and HTTP proxy companion app for the i2per router"},
+    {vsn, "0.8.0"},
+    {registered, []},
+    {mod, {i2per_proxy_app, []}},
+    {applications, [kernel, stdlib]},
+    {env, []},
+    {modules, []},
+    {licenses, ["BSD-3-Clause"]}
+]}.

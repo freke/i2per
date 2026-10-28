@@ -327,6 +327,12 @@ true = i2p_netdb:has_router(Store, Key).
 -define(CAPS_HIDDEN, $H).
 -define(NTCP2_TRANSPORT, <<"NTCP2">>).
 -define(VERSION, 1).
+%% Max age (seconds) for raw LeaseSets (types 5 and 7), which carry no
+%% published timestamp of their own: evict once they are older than this.
+-define(RAW_LS_MAX_AGE_SEC, 24 * 60 * 60).
+%% Upper bound on a stored raw LeaseSet's size, so a peer cannot pin an
+%% unbounded blob behind a 32-byte key.
+-define(MAX_RAW_LS_BYTES, 65536).
 
 -doc "The NetDb key of a router: SHA-256 of its RouterIdentity.".
 -type router_key() :: i2p_crypto:hash().
@@ -387,8 +393,10 @@ value loses nothing that is not already lost.
     lease_sets_v1_order := [ls_key()],
     lease_sets_5 := #{ls_key() => binary()},
     lease_sets_5_order := [ls_key()],
+    lease_sets_5_time := #{ls_key() => non_neg_integer()},
     lease_sets_7 := #{ls_key() => binary()},
-    lease_sets_7_order := [ls_key()]
+    lease_sets_7_order := [ls_key()],
+    lease_sets_7_time := #{ls_key() => non_neg_integer()}
 }.
 
 -doc """
@@ -471,8 +479,10 @@ new(Capacity, MaxMs, MinMs) when
         lease_sets_v1_order => [],
         lease_sets_5 => #{},
         lease_sets_5_order => [],
+        lease_sets_5_time => #{},
         lease_sets_7 => #{},
-        lease_sets_7_order => []
+        lease_sets_7_order => [],
+        lease_sets_7_time => #{}
     };
 new(_, _, _) ->
     error(badarg).
@@ -659,12 +669,19 @@ The raw bytes do not contain their own key, so the caller supplies the
 DatabaseStore key. The bytes are stored verbatim.
 """.
 -spec store_ls_5_binary_at(store(), ls_key(), binary(), non_neg_integer()) ->
-    {ok, store(), added | updated}.
-store_ls_5_binary_at(Store, Key, Bin, _NowSec) when
-    is_binary(Key), byte_size(Key) =:= 32, is_binary(Bin), byte_size(Bin) > 0
+    {ok, store(), added | updated} | {error, too_large | badarg}.
+store_ls_5_binary_at(Store, Key, Bin, NowSec) when
+    is_binary(Key),
+    byte_size(Key) =:= 32,
+    is_binary(Bin),
+    byte_size(Bin) > 0,
+    byte_size(Bin) =< ?MAX_RAW_LS_BYTES,
+    is_integer(NowSec),
+    NowSec >= 0
 ->
     Maps = maps:get(lease_sets_5, Store),
     Order0 = maps:get(lease_sets_5_order, Store),
+    Time0 = maps:get(lease_sets_5_time, Store),
     Outcome =
         case maps:is_key(Key, Maps) of
             true -> updated;
@@ -672,21 +689,37 @@ store_ls_5_binary_at(Store, Key, Bin, _NowSec) when
         end,
     Maps2 = Maps#{Key => Bin},
     Order1 = [Key | lists:delete(Key, Order0)],
-    Store1 = Store#{lease_sets_5 => Maps2, lease_sets_5_order => Order1},
+    Time1 = Time0#{Key => NowSec},
+    Store1 = Store#{
+        lease_sets_5 => Maps2,
+        lease_sets_5_order => Order1,
+        lease_sets_5_time => Time1
+    },
     {ok, trim_ls_5(Store1), Outcome};
+store_ls_5_binary_at(_Store, _Key, Bin, _NowSec) when
+    is_binary(Bin), byte_size(Bin) > ?MAX_RAW_LS_BYTES
+->
+    {error, too_large};
 store_ls_5_binary_at(_Store, _Key, _Bin, _NowSec) ->
-    error(badarg).
+    {error, badarg}.
 
 -doc """
 Store a MetaLeaseSet (store type 7) from its raw bytes.
 """.
 -spec store_ls_7_binary_at(store(), ls_key(), binary(), non_neg_integer()) ->
-    {ok, store(), added | updated}.
-store_ls_7_binary_at(Store, Key, Bin, _NowSec) when
-    is_binary(Key), byte_size(Key) =:= 32, is_binary(Bin), byte_size(Bin) > 0
+    {ok, store(), added | updated} | {error, too_large | badarg}.
+store_ls_7_binary_at(Store, Key, Bin, NowSec) when
+    is_binary(Key),
+    byte_size(Key) =:= 32,
+    is_binary(Bin),
+    byte_size(Bin) > 0,
+    byte_size(Bin) =< ?MAX_RAW_LS_BYTES,
+    is_integer(NowSec),
+    NowSec >= 0
 ->
     Maps = maps:get(lease_sets_7, Store),
     Order0 = maps:get(lease_sets_7_order, Store),
+    Time0 = maps:get(lease_sets_7_time, Store),
     Outcome =
         case maps:is_key(Key, Maps) of
             true -> updated;
@@ -694,10 +727,19 @@ store_ls_7_binary_at(Store, Key, Bin, _NowSec) when
         end,
     Maps2 = Maps#{Key => Bin},
     Order1 = [Key | lists:delete(Key, Order0)],
-    Store1 = Store#{lease_sets_7 => Maps2, lease_sets_7_order => Order1},
+    Time1 = Time0#{Key => NowSec},
+    Store1 = Store#{
+        lease_sets_7 => Maps2,
+        lease_sets_7_order => Order1,
+        lease_sets_7_time => Time1
+    },
     {ok, trim_ls_7(Store1), Outcome};
+store_ls_7_binary_at(_Store, _Key, Bin, _NowSec) when
+    is_binary(Bin), byte_size(Bin) > ?MAX_RAW_LS_BYTES
+->
+    {error, too_large};
 store_ls_7_binary_at(_Store, _Key, _Bin, _NowSec) ->
-    error(badarg).
+    {error, badarg}.
 
 -doc """
 Look up an EncryptedLeaseSet by destination hash.
@@ -1586,11 +1628,27 @@ remove_expired(Store, NowMs, NowSec) when is_integer(NowMs), is_integer(NowSec) 
     KeptV1 = partition_ls_v1(V1Maps0, NowSec),
     V1Order0 = maps:get(lease_sets_v1_order, Store2),
     KeptV1Order = [K || K <- V1Order0, maps:is_key(K, KeptV1)],
+    %% Types 5 and 7 carry no published timestamp, so age them out against a
+    %% fixed ceiling from their insertion time instead.
+    Maps5 = maps:get(lease_sets_5, Store2),
+    Time5 = maps:get(lease_sets_5_time, Store2),
+    Order5 = maps:get(lease_sets_5_order, Store2),
+    {Kept5, Kept5Order, KeptTime5} = partition_raw_ls(Maps5, Time5, Order5, NowSec),
+    Maps7 = maps:get(lease_sets_7, Store2),
+    Time7 = maps:get(lease_sets_7_time, Store2),
+    Order7 = maps:get(lease_sets_7_order, Store2),
+    {Kept7, Kept7Order, KeptTime7} = partition_raw_ls(Maps7, Time7, Order7, NowSec),
     Store3 = Store2#{
         lease_sets => KeptLS,
         ls_order => lists:reverse(KeptLSOrder),
         lease_sets_v1 => KeptV1,
-        lease_sets_v1_order => KeptV1Order
+        lease_sets_v1_order => KeptV1Order,
+        lease_sets_5 => Kept5,
+        lease_sets_5_order => Kept5Order,
+        lease_sets_5_time => KeptTime5,
+        lease_sets_7 => Kept7,
+        lease_sets_7_order => Kept7Order,
+        lease_sets_7_time => KeptTime7
     },
     {Store3, {length(Expired), RemovedLS}};
 remove_expired(_Store, _NowMs, _NowSec) ->
@@ -1801,7 +1859,8 @@ trim_ls_5(Store) ->
             [Evicted | Rest] = lists:reverse(Order),
             Store#{
                 lease_sets_5 := maps:remove(Evicted, maps:get(lease_sets_5, Store)),
-                lease_sets_5_order := lists:reverse(Rest)
+                lease_sets_5_order := lists:reverse(Rest),
+                lease_sets_5_time := maps:remove(Evicted, maps:get(lease_sets_5_time, Store))
             };
         false ->
             Store
@@ -1815,7 +1874,8 @@ trim_ls_7(Store) ->
             [Evicted | Rest] = lists:reverse(Order),
             Store#{
                 lease_sets_7 := maps:remove(Evicted, maps:get(lease_sets_7, Store)),
-                lease_sets_7_order := lists:reverse(Rest)
+                lease_sets_7_order := lists:reverse(Rest),
+                lease_sets_7_time := maps:remove(Evicted, maps:get(lease_sets_7_time, Store))
             };
         false ->
             Store
@@ -2365,3 +2425,18 @@ partition_ls_v1(V1Maps, NowSec) ->
         end,
         V1Maps
     ).
+
+partition_raw_ls(Maps, Time, Order, NowSec) ->
+    KeptOrder = [
+        K
+     || K <- Order,
+        maps:is_key(K, Maps),
+        raw_ls_fresh(K, Time, NowSec)
+    ],
+    {maps:with(KeptOrder, Maps), KeptOrder, maps:with(KeptOrder, Time)}.
+
+raw_ls_fresh(Key, Time, NowSec) ->
+    case maps:find(Key, Time) of
+        {ok, Inserted} -> NowSec - Inserted =< ?RAW_LS_MAX_AGE_SEC;
+        error -> true
+    end.

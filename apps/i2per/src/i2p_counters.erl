@@ -279,6 +279,15 @@ counters() ->
         %% frame counted here is not recoverable and not retried.
         transit_frames_dropped_no_route,
 
+        %% %%%%% Transit tunnels that aged out %%%%%
+        %%
+        %% Transit entries expire after ?TRANSIT_LIFETIME_S. Counting the
+        %% expirations lets an operator tell a transit pool that is churning
+        %% (entries dying before being used) from one that is stable, and
+        %% correlates with `transit_bytes_in` for a "carried vs expired" view.
+        %% Charged in the periodic sweep, not on the hot path.
+        transit_tunnels_expired,
+
         %% %%%%% Our own outbound, undeliverable %%%%%
         %%
         %% One operator question with three causes, so one section: what did *we*
@@ -493,6 +502,21 @@ counters() ->
         datagram2_received,
         datagram2_replayed,
         datagram2_offline_signed,
+
+        %% %%%%% UPnP port mapping %%%%%
+        %%
+        %% The four outcomes of the port-mapping service, counted where they
+        %% happen rather than inferred from the event bus. `discovered` is a
+        %% gateway whose device description resolved to a WAN connection
+        %% service, `renewed` is a mapping that installed, and `refused` is a
+        %% discovery, description fetch, or mapping request that failed. `lost`
+        %% is the narrower case of discovery finding no gateway at all, kept
+        %% apart because "nobody answered" and "a gateway said no" are
+        %% different operator problems.
+        upnp_mapping_discovered,
+        upnp_mapping_renewed,
+        upnp_mapping_lost,
+        upnp_mapping_refused,
 
         %% %%%%% Addressbook publication %%%%%
         %%

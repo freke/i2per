@@ -15,6 +15,28 @@ terminal UI, or an external API other software consumes. A presentation app
 never becomes part of a core. It may run on the core's own node or on a
 different one, and the operator decides which.
 
+**Tier 1 app** — a presentation or service app that is location-transparent: it
+communicates with the core via registered names and `gen_server`/`erpc` calls,
+works on any node, and can be hot-started and stopped. Examples: `i2per_status`,
+`i2per_proxy`, `i2per_tun`, `i2per_sam`, `i2per_server_tunnels`.
+
+**Tier 2 app** — an app extracted from the core for isolation and independent
+lifecycle, but **node-local**: it depends on VM-local primitives
+(`persistent_term`, ETS, sockets, dirty schedulers) and must run on the core's
+node. Not location-transparent. Examples: `i2per_counters`, transport apps.
+
+**Component supervisor** — a per-domain supervisor inside the core that owns a
+group of related gen_servers. `i2per_sup` is a `one_for_one` registry of
+component supervisors. Each component is either a gen_server child (simple) or a
+supervisor child (complex). Enable/disable uses `supervisor:start_child` /
+`terminate_child` / `delete_child` — no manager process.
+
+**Transport behaviour** — the `i2p_transport` contract that makes transports
+pluggable. A transport implements `listen/2`, `dial/2`, `published_address/1`,
+`reachability/0`, and `name/0`. The transport registry starts configured
+transports from a list. Identity, peer, and reachability iterate over
+registered transports instead of naming them.
+
 **Deployment** — turning a core into a running service: which applications ship
 in the artifact, what cookie and distribution policy are set, and how the
 operator provisions the host. Deployment is not the core's concern.

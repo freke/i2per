@@ -454,7 +454,9 @@ loggable_config_keys() ->
         ssu2,
         transit_bandwidth_kbps,
         transit_max_tunnels,
-        tunnel_build_rate
+        tunnel_build_rate,
+        upnp,
+        upnp_name
     ].
 
 %%% %%%%% Diagnostic frames %%%%% %%%%

@@ -84,8 +84,20 @@ rows(Snap) ->
             {"tunnels outbound", count(Snap, tunnels, outbound)},
             {"tunnels inbound", count(Snap, tunnels, inbound)},
             {"transit tunnels", count(Snap, tunnels, transit)},
+            {"peers dialed", count(Snap, peers, dialed)},
+            {"peers detail", map_count(Snap, peers, detail)},
+            {"tunnels detail", map_count(Snap, tunnels, detail)},
+            {"tunnel demands", map_count(Snap, tunnels, demands)},
             {"netdb router infos", count(Snap, netdb, ri)},
             {"netdb leasesets", count(Snap, netdb, ls)},
+            {"netdb lease sets detail", list_count(Snap, netdb, lease_sets_detail)},
+            {"netdb saves", count(Snap, netdb, saves)},
+            {"netdb loads", count(Snap, netdb, loads)},
+            {"netdb expired sweeps", count(Snap, netdb, expired_sweeps)},
+            {"netdb routers expired", count(Snap, netdb, routers_expired)},
+            {"netdb leasesets expired", count(Snap, netdb, ls_expired)},
+            {"config keys", map_count_top(Snap, config)},
+            {"SAM session hashes", list_count_top(Snap, sam_sessions)},
             {"SAM sessions", sessions(Snap)},
             {"SSU2 dials UDP first", ssu2_preferred(Snap)},
             {"SSU2 sessions", ssu2_sessions(Snap)},
@@ -219,6 +231,40 @@ count(Snap, Section, Key) ->
     case maps:find(Section, Snap) of
         {ok, Sub} -> integer_to_binary(maps:get(Key, Sub, 0));
         error -> <<"n/a">>
+    end.
+
+map_count(Snap, Section, Key) ->
+    case maps:find(Section, Snap) of
+        {ok, Sub} ->
+            case maps:find(Key, Sub) of
+                {ok, M} when is_map(M) -> integer_to_binary(maps:size(M));
+                _ -> <<"n/a">>
+            end;
+        error ->
+            <<"n/a">>
+    end.
+
+list_count(Snap, Section, Key) ->
+    case maps:find(Section, Snap) of
+        {ok, Sub} ->
+            case maps:find(Key, Sub) of
+                {ok, L} when is_list(L) -> integer_to_binary(length(L));
+                _ -> <<"n/a">>
+            end;
+        error ->
+            <<"n/a">>
+    end.
+
+map_count_top(Snap, Key) ->
+    case maps:find(Key, Snap) of
+        {ok, M} when is_map(M) -> integer_to_binary(maps:size(M));
+        _ -> <<"n/a">>
+    end.
+
+list_count_top(Snap, Key) ->
+    case maps:find(Key, Snap) of
+        {ok, L} when is_list(L) -> integer_to_binary(length(L));
+        _ -> <<"n/a">>
     end.
 
 sessions(Snap) ->

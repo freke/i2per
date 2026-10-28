@@ -189,9 +189,13 @@ valid(#{leases := []}, _NowSec) ->
 valid(#{leases := Leases}, NowSec) when is_integer(NowSec), NowSec >= 0 ->
     NowMs = NowSec * 1000,
     MaxEnd = lists:max([maps:get(end_date, L) || L <- Leases]),
-    case NowMs > MaxEnd of
-        true -> {error, expired};
-        false -> ok
+    %% Cap how far into the future a LeaseSet's end_date may reach, so a
+    %% peer cannot store one that never expires.
+    MaxFutureMs = NowMs + 24 * 60 * 60 * 1000,
+    if
+        NowMs > MaxEnd -> {error, expired};
+        MaxEnd > MaxFutureMs -> {error, expired};
+        true -> ok
     end;
 valid(_LS, _NowSec) ->
     error(badarg).

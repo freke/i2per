@@ -56,7 +56,7 @@ job, by sampling twice and subtracting. Nothing here computes one.
 %% sessions (session count, average RTT in ms, total congestion window), so
 %% the read API surfaces the congestion control #RC68AGE added rather than
 %% leaving it process-local. Additive only.
--define(VIEW_VERSION, 5).
+-define(VIEW_VERSION, 6).
 
 %% `underspecs` is off for the read API's two functions, deliberately, and this
 %% is the one place in the tree where that is the right call.
@@ -111,7 +111,9 @@ reason the two are separate.
         peers := #{
             connected := non_neg_integer(),
             connecting := non_neg_integer(),
-            other := non_neg_integer()
+            other := non_neg_integer(),
+            dialed := non_neg_integer(),
+            detail := map()
         },
         tunnels :=
             #{
@@ -120,10 +122,21 @@ reason the two are separate.
                 transit := non_neg_integer(),
                 pending := non_neg_integer(),
                 exploratory_outbound := non_neg_integer(),
-                exploratory_inbound := non_neg_integer()
+                exploratory_inbound := non_neg_integer(),
+                detail := map(),
+                demands := map()
             },
-        netdb := #{ri := non_neg_integer(), ls := non_neg_integer()},
+        netdb := #{
+            ri := non_neg_integer(),
+            ls := non_neg_integer(),
+            lease_sets_detail := [map()],
+            atom() => non_neg_integer()
+        },
         sessions := non_neg_integer(),
+        %% Runtime config currently in force (held, not derived).
+        config := map(),
+        %% SAM session destination hashes (held, no private keys).
+        sam_sessions := [binary()],
         %% The dial transport preference currently in force: whether this router
         %% reaches for SSU2 first when dialing. Boot-time availability is a
         %% separate fact, so this can be flipped at runtime without changing it.
@@ -152,7 +165,13 @@ view() ->
         boot_time => i2p_counters:boot_time(),
         counters => i2p_counters:snapshot(),
         identity => identity_b64(i2p_peer:router_hash()),
-        peers => aggregate_peers(i2p_peer:status()),
+        peers => maps:merge(
+            aggregate_peers(i2p_peer:status()),
+            #{
+                dialed => i2p_peer:dialed(),
+                detail => i2p_peer:status()
+            }
+        ),
         tunnels => #{
             outbound => map_size(maps:get(tunnels, Tunnels)),
             inbound => map_size(maps:get(inbound, Tunnels)),
@@ -162,15 +181,74 @@ view() ->
             exploratory_outbound =>
                 map_size(maps:get(exploratory, Tunnels, #{})),
             exploratory_inbound =>
-                map_size(maps:get(exploratory_in, Tunnels, #{}))
+                map_size(maps:get(exploratory_in, Tunnels, #{})),
+            detail => redact_tunnel_detail(Tunnels),
+            demands => i2p_tunnel_srv:demands()
         },
-        netdb => #{ri => i2p_netdb_srv:count(), ls => i2p_netdb_srv:ls_count()},
+        netdb => maps:merge(
+            i2p_netdb_srv:stats(),
+            #{
+                ri => i2p_netdb_srv:count(),
+                ls => i2p_netdb_srv:ls_count(),
+                lease_sets_detail => lease_set_detail()
+            }
+        ),
         sessions => length(i2p_sam_sup:client_sessions()),
+        config => i2p_config_srv:get_all(),
+        sam_sessions => [Hash || {Hash, _Pid, _Priv} <- i2p_sam_sup:client_sessions()],
         ssu2_preferred => i2p_identity:ssu2_preferred(),
         ssu2 => i2p_ssu2_sup:rtt_summary(),
         reachability_detail => i2p_ssu2_reachability:detail(),
         gauges => i2p_counters:gauges()
     }.
+
+-doc "Held LeaseSet detail: one entry per stored LeaseSet, with its leases.".
+-spec lease_set_detail() ->
+    [#{key := binary(), expires := term(), leases := [any()], published := non_neg_integer()}].
+lease_set_detail() ->
+    Keys = i2p_netdb_srv:ls_keys(),
+    [
+        begin
+            case i2p_netdb_srv:find_ls(K) of
+                {ok, LS} ->
+                    #{
+                        key => K,
+                        leases => i2p_leaset:leases(LS),
+                        published => i2p_leaset:published(LS),
+                        expires => i2p_leaset:expires(LS)
+                    };
+                _ ->
+                    #{key => K}
+            end
+        end
+     || K <- Keys
+    ].
+
+%% Tunnel internals carry data-layer keys and fragment payloads. The status
+%% view is an operator surface, so strip key material before it leaves the
+%% core rather than relying on every consumer to ignore it.
+redact_tunnel_detail(Tunnels) ->
+    maps:map(fun(_Kind, Entries) -> redact(Entries) end, Tunnels).
+
+redact(Value) when is_map(Value) ->
+    maps:map(fun(_K, V) -> redact(V) end, maps:without(sensitive_tunnel_keys(), Value));
+redact(Value) when is_list(Value) ->
+    [redact(V) || V <- Value];
+redact(Value) ->
+    Value.
+
+sensitive_tunnel_keys() ->
+    [
+        layers,
+        frag_map,
+        hop_keys,
+        layer_key,
+        iv_key,
+        reply_key,
+        rgarlic_key,
+        rgarlic_tag,
+        gw_state
+    ].
 
 -doc """
 The read API's top-level keys, sorted.
@@ -184,12 +262,14 @@ means adding it here.
 view_keys() ->
     [
         boot_time,
+        config,
         counters,
         gauges,
         identity,
         netdb,
         peers,
         reachability_detail,
+        sam_sessions,
         sessions,
         ssu2,
         ssu2_preferred,

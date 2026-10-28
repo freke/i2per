@@ -61,6 +61,7 @@ end.
 
 -export([
     is_floodfill/0,
+    capacity_ok/0,
     flood_requested/1,
     replication_outbox/5
 ]).
@@ -68,9 +69,12 @@ end.
 -export_type([]).
 
 -doc """
-Whether this router is configured as a floodfill.
+Whether this router is a floodfill.
 
-Reads the `i2per` application env `floodfill` flag (boolean, default `false`).
+Reads the `i2per` application env `floodfill` flag, which may be `true`
+(force on), `false` (force off, the default) or `auto` (decide from
+`f:capacity_ok/0`, which checks the bandwidth class and published address
+against i2pd's floodfill requirements).
 
 Output: `true` when floodfill mode is enabled, `false` otherwise.
 """.
@@ -78,8 +82,29 @@ Output: `true` when floodfill mode is enabled, `false` otherwise.
 is_floodfill() ->
     case application:get_env(i2per, floodfill) of
         {ok, true} -> true;
+        {ok, auto} -> capacity_ok();
         _ -> false
     end.
+
+-doc """
+Whether this router has the capacity and published presence i2pd requires
+before it will act as a floodfill.
+
+i2pd requires a public (published) NTCP2 address and a bandwidth class of
+at least `O` (its default for a floodfill is `X`). A router below that
+bandwidth or without a published address is not asked to be a floodfill,
+because it cannot serve the NetDb load.
+
+Output: `true` when the configured bandwidth class is `O` or higher and
+NTCP2 is published, `false` otherwise.
+""".
+-spec capacity_ok() -> boolean().
+capacity_ok() ->
+    Bandwidth = application:get_env(i2per, caps_bandwidth, $L),
+    Published = application:get_env(i2per, ntcp2_published, false),
+    PublishedOk = (Published =:= true),
+    BandwidthOk = lists:member(Bandwidth, [$O, $P, $X]),
+    BandwidthOk andalso PublishedOk.
 
 -doc """
 Whether a DatabaseStore's reply token asks us to flood the entry on.

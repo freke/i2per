@@ -41,6 +41,10 @@
     naming_lookup_not_found/1,
     naming_lookup_found/1,
     stream_loopback/1,
+    stream_connect_on_session_socket_rejected/1,
+    stream_connect_failure_keeps_session/1,
+    stream_connect_conn_dies_before_established/1,
+    stream_connect_unknown_session_id/1,
     unknown_command/1,
     stream_forward_bad_port/1,
     client_sessions_enumeration/1,
@@ -57,7 +61,9 @@
 
 %% Group B cases drive the wire through a mock i2p_peer; their bodies need the
 %% longer time budget for the streaming handshake round trips.
--define(GROUP_B, [stream_handshake, full_duplex, forward_e2e]).
+-define(GROUP_B, [
+    stream_handshake, full_duplex, forward_e2e, stream_connect_conn_dies_before_established
+]).
 
 %% The accept-path batch and its budget, matching the NTCP2 pair in
 %% `i2p_ntcp2_conn_SUITE`. Six against two seconds: the defect's floor is
@@ -134,6 +140,10 @@ all() ->
         naming_lookup_not_found,
         naming_lookup_found,
         stream_loopback,
+        stream_connect_on_session_socket_rejected,
+        stream_connect_failure_keeps_session,
+        stream_connect_conn_dies_before_established,
+        stream_connect_unknown_session_id,
         unknown_command,
         stream_forward_bad_port,
         client_sessions_enumeration,
@@ -882,7 +892,9 @@ naming_lookup_found(Config) ->
     ?assert(binary:match(Reply, <<"VALUE=">>) =/= nomatch),
     gen_tcp:close(Sock).
 
-%% SAM-to-SAM loopback over real sockets (ACCEPT then CONNECT).
+%% SAM-to-SAM loopback over real sockets (ACCEPT then CONNECT). SAM v3 gives
+%% every stream its own client-to-SAM socket, so ACCEPT holds SA and CONNECT
+%% arrives on a fresh SB-stream socket; SA and SS then carry the raw bytes.
 stream_loopback(_Config) ->
     Port = start_sam_listener(),
 
@@ -905,22 +917,175 @@ stream_loopback(_Config) ->
     send_cmd(SB, <<"SESSION CREATE STYLE=STREAM ID=sessionB">>),
     _ = recv_line(SB),
 
-    send_cmd(SB, <<"STREAM CONNECT ID=sessionB DESTINATION=", DestA_B64/binary>>),
-    ConnectReply = recv_line(SB),
+    {SS, ConnectReply} = sam_stream_socket(Port, <<"sessionB">>, DestA_B64),
     ?assert(binary:match(ConnectReply, <<"STREAM STATUS RESULT=OK">>) =/= nomatch),
+
+    %% SB (session B's socket) stays in line mode and open for the session's
+    %% lifetime; the stream lives on SS.
+    send_cmd(SB, <<"NAMING LOOKUP NAME=whatever.b32.i2p">>),
+    ?assertMatch({_, _}, binary:match(recv_line(SB), <<"NAMING REPLY">>)),
 
     %% Reads buffer until the handshake completes, so no settle sleep is
     %% needed before A's first write; the 5s recv timeouts are the guard.
     ok = gen_tcp:send(SA, <<"hello from A\n">>),
-    {ok, DataB} = gen_tcp:recv(SB, 0, 5000),
+    {ok, DataB} = gen_tcp:recv(SS, 0, 5000),
     ?assertEqual(<<"hello from A\n">>, DataB),
 
-    ok = gen_tcp:send(SB, <<"hello from B\n">>),
+    ok = gen_tcp:send(SS, <<"hello from B\n">>),
     {ok, DataA} = gen_tcp:recv(SA, 0, 5000),
     ?assertEqual(<<"hello from B\n">>, DataA),
 
     gen_tcp:close(SA),
-    gen_tcp:close(SB).
+    gen_tcp:close(SB),
+    gen_tcp:close(SS).
+
+%% SAM v3 gives every stream its own client-to-SAM socket, and i2pd enforces
+%% it: STREAM CONNECT on a socket that already ran SESSION CREATE is answered
+%% SESSION STATUS RESULT=I2P_ERROR MESSAGE="Socket already in use" and the
+%% socket is closed, which ends the session with it. Answering with a stream
+%% status instead would let a one-socket client pass against i2per and fail
+%% against every other bridge.
+stream_connect_on_session_socket_rejected(_Config) ->
+    Port = start_sam_listener(),
+    {ok, Sock} = connect_sam(Port),
+    send_cmd(Sock, <<"HELLO VERSION MIN=3.1 MAX=3.1">>),
+    _ = recv_line(Sock),
+    send_cmd(Sock, <<"DEST GENERATE SIGNATURE_TYPE=7">>),
+    DestB64 = recv_line(Sock),
+    send_cmd(Sock, <<"SESSION CREATE STYLE=STREAM ID=onesocket DESTINATION=", DestB64/binary>>),
+    _ = recv_line(Sock),
+
+    send_cmd(Sock, <<"STREAM CONNECT ID=onesocket DESTINATION=", DestB64/binary>>),
+    ?assertEqual(
+        <<"SESSION STATUS RESULT=I2P_ERROR MESSAGE=\"Socket already in use\"">>,
+        recv_line(Sock)
+    ),
+    ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0, 5000)).
+
+%% A connect that cannot even name a destination is answered CANT_REACH on the
+%% stream socket and closed (i2pd closes after every failure reply), while the
+%% session that owns the id stays alive and in line mode — a failed stream must
+%% not cost the client its session.
+stream_connect_failure_keeps_session(_Config) ->
+    Port = start_sam_listener(),
+    {ok, Sock} = connect_sam(Port),
+    send_cmd(Sock, <<"HELLO VERSION MIN=3.1 MAX=3.1">>),
+    _ = recv_line(Sock),
+    send_cmd(Sock, <<"DEST GENERATE SIGNATURE_TYPE=7">>),
+    DestB64 = recv_line(Sock),
+    send_cmd(Sock, <<"SESSION CREATE STYLE=STREAM ID=sessionC DESTINATION=", DestB64/binary>>),
+    _ = recv_line(Sock),
+
+    {ok, StreamSock} = connect_sam(Port),
+    send_cmd(StreamSock, <<"HELLO VERSION MIN=3.1 MAX=3.1">>),
+    _ = recv_line(StreamSock),
+    send_cmd(StreamSock, <<"STREAM CONNECT ID=sessionC DESTINATION=AAAA">>),
+    ?assertEqual(<<"STREAM STATUS RESULT=CANT_REACH DESTINATION=AAAA">>, recv_line(StreamSock)),
+    ?assertEqual({error, closed}, gen_tcp:recv(StreamSock, 0, 5000)),
+
+    send_cmd(Sock, <<"NAMING LOOKUP NAME=whatever.b32.i2p">>),
+    ?assertMatch({_, _}, binary:match(recv_line(Sock), <<"NAMING REPLY">>)),
+    gen_tcp:close(Sock).
+
+%% A network connect that gets as far as a live streaming connection is still
+%% answered when that connection dies before the SYN-ACK lands: CANT_REACH on
+%% the stream socket, naming the target, and the socket closes. This is the
+%% ordinary shape of an unreachable peer, so it must not take the socket down
+%% without a reply. Reaching the state needs a resolvable route, so the target
+%% gets a fabricated LeaseSet and the SYN goes into an injected outbound tunnel;
+%% the connection is then killed to stand in for a peer that never answers.
+stream_connect_conn_dies_before_established(_Config) ->
+    process_flag(trap_exit, true),
+    Router = make_router(),
+    Local = local_from(Router),
+    {ok, _} = i2p_sam_sup:start_link(),
+    {ok, _} = i2p_tunnel_srv:start_link(Local),
+    try
+        {DPub, _DPriv} = i2p_crypto:x25519_keygen(),
+        {SigPub, SigSeed} = i2p_crypto:ed25519_keygen(),
+        ServerId = i2p_keys:from_keys(DPub, SigPub),
+        RemoteB64 = i2p_keys:encode_b64(i2p_keys:to_binary(ServerId)),
+        NowSec = erlang:system_time(second),
+        EndMs = (erlang:system_time(millisecond) + 60000) band 16#FFFFFFFF,
+        LS =
+            i2p_leaset:build(
+                ServerId,
+                NowSec,
+                1,
+                #{},
+                [
+                    #{
+                        gateway => crypto:strong_rand_bytes(32),
+                        tunnel_id => 901,
+                        end_date => EndMs
+                    }
+                ],
+                SigSeed
+            ),
+        ?assertEqual(added, i2p_netdb_srv:store_ls(LS, NowSec)),
+
+        %% An outbound tunnel to carry the SYN, and the mock peer that collects
+        %% it instead of the wire.
+        Hop = make_router(),
+        {ok, _} = i2p_netdb_srv:store_binary(
+            i2p_router_info:to_binary(maps:get(ri, Hop)),
+            erlang:system_time(millisecond)
+        ),
+        ok = inject_outbound_entry(510, #{
+            tunnel_ids => [510, 511, 512],
+            router_hashes => [maps:get(hash, Hop) || _ <- lists:seq(1, 3)],
+            layers => [
+                #{
+                    layer_key => crypto:strong_rand_bytes(32),
+                    iv_key => crypto:strong_rand_bytes(32)
+                }
+             || _ <- lists:seq(1, 3)
+            ],
+            built_at => NowSec
+        }),
+        register_mock_peer(self()),
+
+        Port = start_sam_listener(),
+        {ok, Sock} = connect_sam(Port),
+        send_cmd(Sock, <<"HELLO VERSION MIN=3.1 MAX=3.1">>),
+        _ = recv_line(Sock),
+        send_cmd(Sock, <<"DEST GENERATE SIGNATURE_TYPE=7">>),
+        DestB64 = recv_line(Sock),
+        ClientHash = identity_hash(DestB64),
+        send_cmd(Sock, <<"SESSION CREATE STYLE=STREAM ID=dies DESTINATION=", DestB64/binary>>),
+        ?assertMatch({_, _}, binary:match(recv_line(Sock), <<"SESSION STATUS RESULT=OK">>)),
+
+        StreamSock = open_stream_socket(Port, <<"dies">>, RemoteB64),
+        _ = drain_frames(first_frame()),
+        Conn = wait_for_stream_conn(ClientHash),
+        exit(Conn, kill),
+
+        ?assertEqual(
+            <<"STREAM STATUS RESULT=CANT_REACH DESTINATION=", RemoteB64/binary>>,
+            recv_line(StreamSock, 10000)
+        ),
+        ?assertEqual({error, closed}, gen_tcp:recv(StreamSock, 0, 5000)),
+
+        %% The stream died; the session did not.
+        send_cmd(Sock, <<"NAMING LOOKUP NAME=whatever.b32.i2p">>),
+        ?assertMatch({_, _}, binary:match(recv_line(Sock), <<"NAMING REPLY">>)),
+        gen_tcp:close(Sock)
+    after
+        unregister_mock_peer()
+    end.
+
+%% An unknown session id on a fresh socket is INVALID_ID, and the socket is
+%% closed after it (i2pd's SAM_STREAM_STATUS_INVALID_ID reply is a closing
+%% reply). The session lookup comes first: the destination is never parsed for
+%% an id nobody owns.
+stream_connect_unknown_session_id(_Config) ->
+    Port = start_sam_listener(),
+    {ok, Sock} = connect_sam(Port),
+    send_cmd(Sock, <<"HELLO VERSION MIN=3.1 MAX=3.1">>),
+    _ = recv_line(Sock),
+    send_cmd(Sock, <<"STREAM CONNECT ID=nosuchsession DESTINATION=AAAAAAAA">>),
+    ?assertEqual(<<"STREAM STATUS RESULT=INVALID_ID">>, recv_line(Sock)),
+    ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0, 5000)).
 
 unknown_command(_Config) ->
     Port = start_sam_listener(),
@@ -1141,8 +1306,9 @@ stream_handshake(_Config) ->
 
         register_mock_peer(self()),
 
-        %% --- CONNECT: no OK until the handshake completes ---
-        send_cmd(Sock, <<"STREAM CONNECT ID=cli DESTINATION=", RemoteB64/binary>>),
+        %% --- CONNECT on the stream socket SAM v3 requires: no OK until the
+        %% handshake completes, and the reply lands on this socket ---
+        StreamSock = open_stream_socket(Port, <<"cli">>, RemoteB64),
 
         %% Capture and play the outbound leg; unwrap the SYN.
         Wires = drain_frames(first_frame()),
@@ -1189,13 +1355,16 @@ stream_handshake(_Config) ->
         }),
 
         %% The SYN-ACK flows back through the client session to its conn;
-        %% only then does the socket see RESULT=OK.
-        OKLine = recv_line(Sock, 10000),
+        %% only then does the stream socket see RESULT=OK. The session socket
+        %% stays in line mode throughout.
+        OKLine = recv_line(StreamSock, 10000),
         ?assert(binary:match(OKLine, <<"RESULT=OK">>) =/= nomatch),
+        send_cmd(Sock, <<"NAMING LOOKUP NAME=whatever.b32.i2p">>),
+        ?assertMatch({_, _}, binary:match(recv_line(Sock), <<"NAMING REPLY">>)),
 
         %% Data: socket bytes become a sequenced data packet on the wire.
         Msg = <<"GET / HTTP/1.0">>,
-        ok = gen_tcp:send(Sock, Msg),
+        ok = gen_tcp:send(StreamSock, Msg),
         DataWires = drain_frames([]),
         ReassembledData = reassemble_first_message(DataWires, HopKeys),
         {ok, #{body := DataGarlic}} = i2p_i2np:decode_std(ReassembledData),
@@ -1210,6 +1379,7 @@ stream_handshake(_Config) ->
             erlang:error(server_data_timeout)
         end,
 
+        gen_tcp:close(StreamSock),
         gen_tcp:close(Sock),
         exit(ServerConn, kill)
     after
@@ -1295,8 +1465,9 @@ full_duplex(_Config) ->
 
         %% Client dials FIRST — with no pending ACCEPT yet, the local pairing
         %% shortcut cannot fire and the SYN takes the tunnel path (what a
-        %% two-router deployment looks like).
-        send_cmd(CliSock, <<"STREAM CONNECT ID=cli DESTINATION=", SrvB64/binary>>),
+        %% two-router deployment looks like). CONNECT goes on its own socket;
+        %% CliSock stays the session's line-mode socket.
+        CliStream = open_stream_socket(Port, <<"cli">>, SrvB64),
 
         put(fd_keys, [
             {cli, CliDPriv},
@@ -1322,11 +1493,11 @@ full_duplex(_Config) ->
         {ok, SynAckPkt} = i2p_streaming:decode(SynAckWire),
         ?assert(i2p_streaming:has_flag(SynAckPkt, i2p_streaming:flag_synchronize())),
         inject_via_inbound(CliRecvID, SynAckWire, CliId),
-        OKLine = recv_line(CliSock, 10000),
+        OKLine = recv_line(CliStream, 10000),
         ?assert(binary:match(OKLine, <<"RESULT=OK">>) =/= nomatch),
 
         %% --- Bidirectional data across the pinned routes ---
-        ok = gen_tcp:send(CliSock, <<"ping through the tunnels">>),
+        ok = gen_tcp:send(CliStream, <<"ping through the tunnels">>),
         {PingWire, Seen3} = pull_data(HopKeys, SrvDPriv, Seen2),
         {ok, PingPkt} = i2p_streaming:decode(PingWire),
         ?assertEqual(<<"ping through the tunnels">>, i2p_streaming:payload(PingPkt)),
@@ -1336,8 +1507,9 @@ full_duplex(_Config) ->
         ok = gen_tcp:send(SrvSock, <<"pong from the far end">>),
         {PongWire, _Seen4} = pull_data(HopKeys, CliDPriv, Seen3),
         inject_via_inbound(CliRecvID, PongWire, CliId),
-        {ok, <<"pong from the far end">>} = gen_tcp:recv(CliSock, 0, 5000),
+        {ok, <<"pong from the far end">>} = gen_tcp:recv(CliStream, 0, 5000),
 
+        gen_tcp:close(CliStream),
         gen_tcp:close(CliSock),
         gen_tcp:close(SrvSock),
         ok
@@ -1421,34 +1593,39 @@ forward_e2e(_Config) ->
         ]),
         ok = fd_mock(),
 
-        %% --- Client 1 connects; relay handshake through the tunnels ---
-        send_cmd(Sock1, <<"STREAM CONNECT ID=cli1 DESTINATION=", FwdB64/binary>>),
-        {OKLine1, SeenH1} = drive_handshake(Sock1, HopKeys, Cli1, Fwd, Cli1R, FwdRecvID, 0),
+        %% --- Client 1 connects on its own stream socket; relay handshake
+        %% through the tunnels ---
+        Stream1 = open_stream_socket(Port, <<"cli1">>, FwdB64),
+        {OKLine1, SeenH1} =
+            drive_handshake(Stream1, HopKeys, Cli1, Fwd, Cli1R, FwdRecvID, 0),
         ?assert(binary:match(OKLine1, <<"RESULT=OK">>) =/= nomatch),
 
         %% --- Client 2 dials the same destination while stream one is
         %% established: the binding persists across accepted streams ---
-        send_cmd(Sock2, <<"STREAM CONNECT ID=cli2 DESTINATION=", FwdB64/binary>>),
-        {OKLine2, SeenH2} = drive_handshake(Sock2, HopKeys, Cli2, Fwd, Cli2R, FwdRecvID, SeenH1),
+        Stream2 = open_stream_socket(Port, <<"cli2">>, FwdB64),
+        {OKLine2, SeenH2} =
+            drive_handshake(Stream2, HopKeys, Cli2, Fwd, Cli2R, FwdRecvID, SeenH1),
         ?assert(binary:match(OKLine2, <<"RESULT=OK">>) =/= nomatch),
 
         %% --- Echo round trips on BOTH streams ---
-        ok = gen_tcp:send(Sock1, <<"one for the echo">>),
+        ok = gen_tcp:send(Stream1, <<"one for the echo">>),
         {Ping1, SeenA} = pull_data(HopKeys, maps:get(dpriv, Fwd), SeenH2),
         inject_via_inbound(FwdRecvID, Ping1, maps:get(id, Fwd)),
         %% The relay pipes to the local echo service; the echoed bytes come
         %% back over the outbound tunnel and must be delivered to the client.
         {Echo1, SeenB} = pull_data(HopKeys, maps:get(dpriv, Cli1), SeenA),
         inject_via_inbound(Cli1R, Echo1, maps:get(id, Cli1)),
-        {ok, <<"one for the echo">>} = gen_tcp:recv(Sock1, 0, 5000),
+        {ok, <<"one for the echo">>} = gen_tcp:recv(Stream1, 0, 5000),
 
-        ok = gen_tcp:send(Sock2, <<"two for the echo">>),
+        ok = gen_tcp:send(Stream2, <<"two for the echo">>),
         {Ping2, SeenC} = pull_data(HopKeys, maps:get(dpriv, Fwd), SeenB),
         inject_via_inbound(FwdRecvID, Ping2, maps:get(id, Fwd)),
         {Echo2, _SeenD} = pull_data(HopKeys, maps:get(dpriv, Cli2), SeenC),
         inject_via_inbound(Cli2R, Echo2, maps:get(id, Cli2)),
-        {ok, <<"two for the echo">>} = gen_tcp:recv(Sock2, 0, 5000),
+        {ok, <<"two for the echo">>} = gen_tcp:recv(Stream2, 0, 5000),
 
+        gen_tcp:close(Stream1),
+        gen_tcp:close(Stream2),
         gen_tcp:close(Sock1),
         gen_tcp:close(Sock2),
         gen_tcp:close(FwdSock),
@@ -1538,6 +1715,28 @@ recv_line(Sock, Acc, Timeout) ->
 
 %% Event-driven wait for the LeaseSet publication: polls the NetDb under a
 %% deadline instead of sleeping a fixed number of ticks.
+%% The destination hash a DESTINATION blob names.
+identity_hash(DestB64) ->
+    <<Identity:391/binary, _/binary>> = i2p_keys:decode_b64(DestB64),
+    {ok, Id} = i2p_keys:parse(Identity),
+    i2p_keys:hash(Id).
+
+%% Wait for a session's connect-role stream connection to appear in the demux
+%% registry: until it does, the hand-off has not happened.
+wait_for_stream_conn(DestHash) ->
+    wait_for_stream_conn(DestHash, 200).
+
+wait_for_stream_conn(DestHash, 0) ->
+    erlang:error({no_stream_conn, DestHash});
+wait_for_stream_conn(DestHash, N) ->
+    case ets:match_object(i2p_sam_sup, {{conn, DestHash, '_'}, '_'}) of
+        [{{conn, DestHash, _MyId}, Conn}] ->
+            Conn;
+        [] ->
+            timer:sleep(20),
+            wait_for_stream_conn(DestHash, N - 1)
+    end.
+
 wait_for_ls(DestHash) ->
     ok = i2p_ct_helpers:await(
         fun() ->
@@ -1626,6 +1825,25 @@ sam_session(Port, ID, DestB64) ->
     Reply = recv_line(Sock),
     ?assert(binary:match(Reply, <<"RESULT=OK">>) =/= nomatch),
     {ok, Sock}.
+
+%% Open the socket SAM v3 requires for one stream: a fresh connection, HELLO,
+%% then STREAM CONNECT. Returns the socket and the STREAM STATUS line, which
+%% arrives on this socket — never on the session's.
+sam_stream_socket(Port, ID, TargetB64) ->
+    Sock = open_stream_socket(Port, ID, TargetB64),
+    {Sock, recv_line(Sock, 10000)}.
+
+%% open_stream_socket/3 — the same socket without waiting for its status: the
+%% network cases drive the handshake by hand, and the OK line only follows it.
+open_stream_socket(Port, ID, TargetB64) ->
+    {ok, Sock} = connect_sam(Port),
+    send_cmd(Sock, <<"HELLO VERSION MIN=3.1 MAX=3.1">>),
+    ?assertMatch(<<"HELLO REPLY RESULT=OK", _/binary>>, recv_line(Sock)),
+    send_cmd(
+        Sock,
+        <<"STREAM CONNECT ID=", ID/binary, " DESTINATION=", TargetB64/binary>>
+    ),
+    Sock.
 
 %% Deliver one streaming packet to its recipient session by pushing it into
 %% that session's inbound tunnel (the OBEP leg). TargetId is the identity
