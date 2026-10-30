@@ -19,7 +19,7 @@ parse(
         Src:4/binary, Dst:4/binary, Rest/binary>>
 ) ->
     HeaderBytes = IHL * 4,
-    case byte_size(Rest) >= HeaderBytes - 20 of
+    case IHL >= 5 andalso byte_size(Rest) >= HeaderBytes - 20 of
         true ->
             Payload = binary:part(Rest, HeaderBytes - 20, byte_size(Rest) - (HeaderBytes - 20)),
             {ok, #{
@@ -43,7 +43,7 @@ tcp_parse(
         _Checksum:16, _Urgent:16, Rest/binary>>
 ) ->
     DataOffset = Off * 4,
-    case byte_size(Rest) >= DataOffset - 20 of
+    case Off >= 5 andalso byte_size(Rest) >= DataOffset - 20 of
         true ->
             Payload = binary:part(Rest, DataOffset - 20, byte_size(Rest) - (DataOffset - 20)),
             {ok, #{

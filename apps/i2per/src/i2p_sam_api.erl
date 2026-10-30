@@ -37,7 +37,11 @@ Vsn = i2p_sam_api:version(),
     close_session/1,
     stop_session/1,
     session_dest_b64/1,
-    raw_send/2
+    raw_send/2,
+    datagram_send/2,
+    datagram_send/3,
+    datagram2_send/2,
+    datagram2_send/3
 ]).
 
 %% The specs are contracts: these may grow beyond today's literal success
@@ -53,7 +57,11 @@ Vsn = i2p_sam_api:version(),
         stream_send/2,
         stream_close/1,
         session_dest_b64/1,
-        raw_send/2
+        raw_send/2,
+        datagram_send/2,
+        datagram_send/3,
+        datagram2_send/2,
+        datagram2_send/3
     ]}
 ).
 
@@ -248,39 +256,73 @@ resolvable by the address book. `Payload` is sent as-is, garlic-wrapped to
 the target. Returns `ok` or `{error, Reason}`.
 """.
 -spec raw_send(binary() | string(), binary() | iolist()) -> ok | {error, term()}.
-raw_send(Target, Payload) when is_list(Target) ->
-    raw_send(list_to_binary(Target), Payload);
 raw_send(Target, Payload) ->
-    Bin = iolist_to_binary(Payload),
-    case resolve_raw_target(Target) of
-        {ok, Route} ->
-            i2p_client:send_wire(Route, Bin),
-            ok;
-        {error, Reason} ->
-            {error, Reason}
-    end.
+    i2p_client:send_raw(Target, Payload).
 
-%% resolve_raw_target/1 — resolve a name/destination to a route, mirroring
-%% SAM's RAW SEND target resolution.
-resolve_raw_target(Target) ->
-    case i2p_keys:from_b64(Target) of
-        {ok, Identity} ->
-            normalize_route(i2p_client:route_to_dest(i2p_keys:to_binary(Identity)));
-        {error, _} ->
-            case i2p_addressbook:resolve(Target) of
-                {ok, DestB64} ->
-                    case i2p_keys:from_b64(DestB64) of
-                        {ok, Identity} ->
-                            normalize_route(i2p_client:route_to_dest(i2p_keys:to_binary(Identity)));
-                        {error, _} ->
-                            {error, bad_destination}
-                    end;
-                {error, _} ->
-                    {error, not_found}
-            end
-    end.
+%% ---- datagram send (EK3AAZK slice 8S0YR6J) ----
 
-normalize_route({ok, _} = R) ->
-    R;
-normalize_route(error) ->
-    {error, no_route}.
+-doc """
+Send a repliable datagram anonymously.
+
+A transient source identity is generated for this one datagram and signs it,
+so the receiver can address a reply to its destination but the router keeps
+no session for it. `Target` is a base64 destination, a `.b32.i2p` address, or
+an address-book name; `Payload` is the datagram body. Returns `ok` or
+`{error, Reason}`.
+""".
+-spec datagram_send(binary() | string(), binary() | iolist()) -> ok | {error, term()}.
+datagram_send(Target, Payload) ->
+    datagram_send_anonymous(repliable, Target, Payload).
+
+-doc """
+Send a datagram, from a session or anonymously.
+
+`datagram_send(Session, Target, Payload)` sends a repliable datagram under
+`Session`'s destination, where `Session` is the pid from
+`f:create_session/0-1` or a destination map from `f:create_destination/0-1`.
+`datagram_send(Kind, Target, Payload)` with `Kind` either `repliable` or
+`datagram2` generates a transient identity and sends anonymously. Raw
+datagrams carry no sender identity, so they go through `f:raw_send/2`.
+""".
+-spec datagram_send(
+    pid() | map() | repliable | datagram2, binary() | string(), binary() | iolist()
+) -> ok | {error, term()}.
+datagram_send(Kind, Target, Payload) when Kind =:= repliable; Kind =:= datagram2 ->
+    datagram_send_anonymous(Kind, Target, Payload);
+datagram_send(Session, Target, Payload) ->
+    datagram_send_session(repliable, Session, Target, Payload).
+
+-doc "Send a Datagram2 anonymously (transient source identity).".
+-spec datagram2_send(binary() | string(), binary() | iolist()) -> ok | {error, term()}.
+datagram2_send(Target, Payload) ->
+    datagram_send_anonymous(datagram2, Target, Payload).
+
+-doc """
+Send a Datagram2 under `Session`'s destination.
+
+`Session` is the pid from `f:create_session/0-1` or a destination map from
+`f:create_destination/0-1`. Datagram2 signatures cover the target's hash as
+well as the payload, so a captured frame cannot be replayed to another
+destination.
+""".
+-spec datagram2_send(pid() | map(), binary() | string(), binary() | iolist()) ->
+    ok | {error, term()}.
+datagram2_send(Session, Target, Payload) ->
+    datagram_send_session(datagram2, Session, Target, Payload).
+
+%% ---- datagram helpers ----
+
+datagram_send_anonymous(Kind, Target, Payload) ->
+    #{identity := Identity, sign_priv := SignPriv} = i2p_keys:generate_with_privkeys(),
+    i2p_client:send_datagram(Kind, i2p_keys:to_binary(Identity), SignPriv, Target, Payload).
+
+datagram_send_session(Kind, Pid, Target, Payload) when is_pid(Pid) ->
+    gen_server:call(Pid, {datagram_send, Kind, Target, Payload}, 15000);
+datagram_send_session(Kind, SessionMap, Target, Payload) when is_map(SessionMap) ->
+    case maps:get(identity, SessionMap, undefined) of
+        undefined ->
+            datagram_send_anonymous(Kind, Target, Payload);
+        Identity ->
+            SignPriv = maps:get(sign_priv, SessionMap),
+            i2p_client:send_datagram(Kind, i2p_keys:to_binary(Identity), SignPriv, Target, Payload)
+    end.

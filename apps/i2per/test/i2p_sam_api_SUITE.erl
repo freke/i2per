@@ -18,7 +18,11 @@
     session_dest_b64_roundtrips/1,
     naming_lookup_passthrough/1,
     stream_connect_no_route_is_clean/1,
-    raw_send_no_route_is_clean/1
+    raw_send_no_route_is_clean/1,
+    datagram_send_no_route_is_clean/1,
+    datagram2_send_no_route_is_clean/1,
+    session_datagram_send_no_route_is_clean/1,
+    destination_map_datagram_send_no_route_is_clean/1
 ]).
 
 -define(APP, i2per).
@@ -29,7 +33,11 @@ all() ->
         session_dest_b64_roundtrips,
         naming_lookup_passthrough,
         stream_connect_no_route_is_clean,
-        raw_send_no_route_is_clean
+        raw_send_no_route_is_clean,
+        datagram_send_no_route_is_clean,
+        datagram2_send_no_route_is_clean,
+        session_datagram_send_no_route_is_clean,
+        destination_map_datagram_send_no_route_is_clean
     ].
 
 suite() ->
@@ -68,6 +76,51 @@ raw_send_no_route_is_clean(_Config) ->
         Result = i2p_sam_api:raw_send(<<"not-a-destination">>, <<"payload">>),
         %% raw_send returns ok (fire-and-forget) or {error, _}; never crashes.
         ?assert(Result =:= ok orelse element(1, Result) =:= error)
+    end).
+
+%% Anonymous sends generate a transient identity and then fail to route, which
+%% is the path a SAM client takes when it sends before the target is known.
+datagram_send_no_route_is_clean(_Config) ->
+    ok = with_router(fun() ->
+        ?assertMatch({error, _}, i2p_sam_api:datagram_send(<<"not-a-destination">>, <<"payload">>)),
+        ?assertMatch(
+            {error, _},
+            i2p_sam_api:datagram_send(datagram2, <<"not-a-destination">>, <<"payload">>)
+        )
+    end).
+
+datagram2_send_no_route_is_clean(_Config) ->
+    ok = with_router(fun() ->
+        ?assertMatch(
+            {error, _}, i2p_sam_api:datagram2_send(<<"not-a-destination">>, <<"payload">>)
+        )
+    end).
+
+%% Session-scoped sends go through the client session's own keys, so this
+%% covers the gen_server call rather than the anonymous path.
+session_datagram_send_no_route_is_clean(_Config) ->
+    ok = with_router(fun() ->
+        {ok, Pid, _DestB64} = i2p_sam_api:create_session(),
+        ?assertMatch(
+            {error, _}, i2p_sam_api:datagram_send(Pid, <<"not-a-destination">>, <<"payload">>)
+        ),
+        ?assertMatch(
+            {error, _}, i2p_sam_api:datagram2_send(Pid, <<"not-a-destination">>, <<"payload">>)
+        )
+    end).
+
+%% A destination map carries the keys directly, so the send does not need a
+%% session process.
+destination_map_datagram_send_no_route_is_clean(_Config) ->
+    ok = with_router(fun() ->
+        Dest = i2p_sam_api:create_destination(),
+        ?assertMatch(
+            {error, _}, i2p_sam_api:datagram_send(Dest, <<"not-a-destination">>, <<"payload">>)
+        ),
+        ?assertMatch(
+            {error, _},
+            i2p_sam_api:datagram2_send(Dest, <<"not-a-destination">>, <<"payload">>)
+        )
     end).
 
 %% ---- helpers (mirrored from i2p_read_api_SUITE) ----

@@ -1005,74 +1005,34 @@ payload_step(#{read := Read} = State, Data) ->
 %% STATUS reply, and an unroutable target drops silently.
 -spec finish_send(send_kind(), binary(), binary(), state()) -> state().
 finish_send(Kind, DestB64, Payload, State) ->
-    case resolve_send_target(DestB64) of
-        {ok, Route} ->
-            Wire =
-                case {Kind, maps:get(style, State, undefined)} of
-                    {raw, _} ->
-                        Payload;
-                    {datagram2, _} ->
-                        datagram2_wire(Payload, State, Route);
-                    {repliable, datagram2} ->
-                        datagram2_wire(Payload, State, Route);
-                    {repliable, _} ->
-                        datagram_wire(repliable, Payload, State)
-                end,
-            i2p_client:send_wire(Route, Wire),
+    Style = maps:get(style, State, undefined),
+    FromDest = i2p_keys:to_binary(maps:get(dest, State)),
+    SignPriv = maps:get(sign_priv, State),
+    EffectiveKind =
+        case {Kind, Style} of
+            {repliable, datagram2} -> datagram2;
+            {datagram2, _} -> datagram2;
+            {repliable, _} -> repliable;
+            {raw, _} -> raw
+        end,
+    case EffectiveKind of
+        raw ->
+            _ = i2p_client:send_raw(DestB64, Payload),
             State;
-        error ->
+        _ ->
+            _ = i2p_client:send_datagram(EffectiveKind, FromDest, SignPriv, DestB64, Payload),
             State
     end.
 
-%% datagram_wire/3 — build the garlic Data-clove payload for one send.
--spec datagram_wire(send_kind(), binary(), state()) -> binary().
-datagram_wire(repliable, Payload, State) ->
-    {ok, Wire} =
-        i2p_datagram:encode(
-            i2p_keys:to_binary(maps:get(dest, State)),
-            maps:get(sign_priv, State),
-            Payload
-        ),
-    Wire.
+%% (removed: delegated to m:i2p_client)
 
-%% datagram2_wire/3 — build a Datagram2 garlic Data-clove payload for one send.
--spec datagram2_wire(binary(), state(), i2p_client:route()) -> binary().
-datagram2_wire(Payload, State, Route) ->
-    TargetHash = maps:get(dest_hash, Route),
-    {ok, Wire} =
-        i2p_datagram:encode2(
-            i2p_keys:to_binary(maps:get(dest, State)),
-            maps:get(sign_priv, State),
-            TargetHash,
-            Payload
-        ),
-    Wire.
+%% (removed: delegated to m:i2p_client)
 
-%% resolve_send_target/1 — a base64 destination (or address-book name)
-%% resolved to a lease route like STREAM CONNECT.
--spec resolve_send_target(binary()) -> {ok, i2p_client:route()} | error.
-resolve_send_target(TargetB64) ->
-    case target_identity(TargetB64) of
-        {ok, #{bin := DestBin}} -> i2p_client:route_to_dest(DestBin);
-        error -> resolve_book_target(TargetB64)
-    end.
+%% (removed: delegated to m:i2p_client)
 
-%% resolve_book_target/1 — the base64 parse failed: retry through the
-%% address book (hosts.txt names from subscriptions).
--spec resolve_book_target(binary()) -> {ok, i2p_client:route()} | error.
-resolve_book_target(TargetB64) ->
-    case i2p_addressbook:resolve(TargetB64) of
-        {ok, DestB64} -> resolve_direct_target(DestB64);
-        {error, _} -> error
-    end.
+%% (removed: delegated to m:i2p_client)
 
-%% resolve_direct_target/1 — route to a plain base64 destination blob.
--spec resolve_direct_target(binary()) -> {ok, i2p_client:route()} | error.
-resolve_direct_target(DestB64) ->
-    case target_identity(DestB64) of
-        {ok, #{bin := Bin}} -> i2p_client:route_to_dest(Bin);
-        error -> error
-    end.
+%% (removed: delegated to m:i2p_client)
 
 %% deliver_datagram/2 — announce an authenticated inbound repliable
 %% datagram on the control socket (sender destination + size line, then the
@@ -1088,7 +1048,8 @@ deliver_datagram(Wire, State) ->
                 <<" SIZE=">>,
                 integer_to_binary(byte_size(Payload))
             ]),
-            ok = gen_tcp:send(maps:get(sock, State), Payload),
+            SendFn = maps:get(send_fn, State),
+            ok = SendFn(Payload),
             State;
         error ->
             State
@@ -1121,7 +1082,8 @@ deliver_datagram2(Wire, State) ->
                         <<" SIZE=">>,
                         integer_to_binary(byte_size(Payload))
                     ]),
-                    ok = gen_tcp:send(maps:get(sock, State), Payload),
+                    SendFn = maps:get(send_fn, State),
+                    ok = SendFn(Payload),
                     State#{replay_window => W1}
             end;
         error ->
@@ -1136,7 +1098,8 @@ deliver_raw(Payload, State) ->
         <<"RAW RECEIVED SIZE=">>,
         integer_to_binary(byte_size(Payload))
     ]),
-    ok = gen_tcp:send(maps:get(sock, State), Payload),
+    SendFn = maps:get(send_fn, State),
+    ok = SendFn(Payload),
     State.
 
 %% stream_send/2 — the streaming connection's transport (see

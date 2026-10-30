@@ -32,7 +32,10 @@ ok = i2p_tunnel_srv:inject(Injection, {tunnel, Gateway, TunnelID}, StdMsg).
     wrap_payload/2,
     unwrap_payload/2,
     route_to_dest/1,
-    send_wire/2
+    send_wire/2,
+    send_datagram/5,
+    send_raw/2,
+    datagram_wire/5
 ]).
 
 -export_type([route/0]).
@@ -247,6 +250,75 @@ send_wire(#{out_tid := OutTid, gw := Gw, tid := Tid, dest_pub := DestPub}, Wire)
         error -> i2p_counters:add(client_messages_dropped_no_tunnel, 1)
     end.
 
+-doc """
+Resolve `Target` and send it one datagram from `FromDest` signed by `SignPriv`.
+
+`Kind` selects the wrapper: `repliable` wraps `Payload` in a Datagram1 clove
+that carries `FromDest` and its signature, and `datagram2` uses the Datagram2
+format, whose signature also covers the target's destination hash. A raw
+datagram carries no sender identity at all and goes through `f:send_raw/2`.
+
+`Target` may be a base64 destination, a `.b32.i2p` address, or an
+address-book name. Output: `ok` once the wire frame enters the outbound
+tunnel, `{error, no_route}` when the target does not resolve to a lease, or
+`{error, encode_failed}` when the sender destination and keys cannot produce
+a frame.
+""".
+-spec send_datagram(
+    repliable | datagram2,
+    binary(),
+    i2p_crypto:ed25519_seed(),
+    binary() | string(),
+    binary() | iolist()
+) -> ok | {error, term()}.
+send_datagram(Kind, FromDest, SignPriv, Target, Payload) ->
+    case resolve_send_target(Target) of
+        {ok, Route} ->
+            TargetHash = maps:get(dest_hash, Route),
+            BinPayload = iolist_to_binary(Payload),
+            case datagram_wire(Kind, FromDest, SignPriv, TargetHash, BinPayload) of
+                {ok, Wire} ->
+                    send_wire(Route, Wire),
+                    ok;
+                error ->
+                    {error, encode_failed}
+            end;
+        error ->
+            {error, no_route}
+    end.
+
+-doc """
+Resolve `Target` and send it `Payload` bare, with no sender identity.
+
+The receiver learns nothing about the sender, so a raw datagram cannot be
+replied to. Output: `ok`, or `{error, no_route}` when `Target` does not
+resolve to a lease.
+""".
+-spec send_raw(binary() | string(), binary() | iolist()) -> ok | {error, term()}.
+send_raw(Target, Payload) ->
+    case resolve_send_target(Target) of
+        {ok, Route} ->
+            send_wire(Route, iolist_to_binary(Payload)),
+            ok;
+        error ->
+            {error, no_route}
+    end.
+
+-doc """
+Build the Data-clove payload for one datagram without sending it.
+
+`TargetHash` is the target destination's 32-byte hash, which only
+`datagram2` signs over. Output: `{ok, Wire}` or `error` when the sender
+destination, the hash, or the payload does not fit the format.
+""".
+-spec datagram_wire(
+    repliable | datagram2, binary(), i2p_crypto:ed25519_seed(), binary(), binary()
+) -> {ok, binary()} | error.
+datagram_wire(repliable, FromDest, SignPriv, _TargetHash, Payload) ->
+    i2p_datagram:encode(FromDest, SignPriv, Payload);
+datagram_wire(datagram2, FromDest, SignPriv, TargetHash, Payload) ->
+    i2p_datagram:encode2(FromDest, SignPriv, TargetHash, Payload).
+
 %% lease_route/2 — finish route resolution once the identity parses.
 -spec lease_route(i2p_keys:identity(), binary()) -> {ok, route()} | error.
 lease_route(Identity, DestBin) ->
@@ -302,5 +374,32 @@ finish_lease_route(Gw, Tid, Identity, DestBin, DestHash) ->
                 dest_hash => DestHash
             }};
         error ->
+            error
+    end.
+
+%% resolve_send_target/1 — a datagram target as a base64 destination, a
+%% .b32.i2p name, or an address-book hostname, resolved to a lease route.
+-spec resolve_send_target(binary() | string()) -> {ok, route()} | error.
+resolve_send_target(Target) when is_list(Target) ->
+    resolve_send_target(list_to_binary(Target));
+resolve_send_target(Target) when is_binary(Target) ->
+    case i2p_keys:from_b64(Target) of
+        {ok, Identity} ->
+            route_to_dest(i2p_keys:to_binary(Identity));
+        {error, _} ->
+            resolve_book_target(Target)
+    end.
+
+%% resolve_book_target/1 — the base64 parse failed: retry through the
+%% address book, then route to the destination it returned.
+-spec resolve_book_target(binary()) -> {ok, route()} | error.
+resolve_book_target(Target) ->
+    case i2p_addressbook:resolve(Target) of
+        {ok, DestB64} ->
+            case i2p_keys:from_b64(DestB64) of
+                {ok, Identity} -> route_to_dest(i2p_keys:to_binary(Identity));
+                {error, _} -> error
+            end;
+        {error, _} ->
             error
     end.
