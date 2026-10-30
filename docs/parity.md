@@ -8,15 +8,15 @@ are not in scope and do not change 1.0.0. See `3M0RBXX` for the decision and
 
 ## Snapshot
 
-- **i2pd version:** 3.0.0
-- **Date taken:** 2026-10-21 (snapshot bumped on i2pd 3.0.0 release; interop
-  suite re-run pending, see `94S9H7K`)
+- **i2pd version:** 2.61.0
+- **Date taken:** 2026-10-07
 - **i2per release at snapshot:** 0.8.0
-- **Source of the capability list:** i2pd 3.0.0 release notes plus the
+- **Source of the capability list:** i2pd 2.61.0 release notes plus the
   capabilities exercised by `scripts/interop_i2pd.sh` and
   `docs/protocol.md`.
-- **Previous snapshot:** 2.61.0 (2026-10-07). Per the header, capabilities new in
-  3.0.0 do not change 1.0.0 unless explicitly absorbed (see "1.0.0 material").
+- **Previous snapshot:** none — 2.61.0 is the baseline for 1.0.0. Per the header,
+  capabilities appearing in a later i2pd release do not change 1.0.0 unless
+  explicitly absorbed (see "1.0.0 material").
 
 Rows are one verdict, not prose: **done** (implemented and exercised),
 **partial** (implemented partially / bounded / off by default), or **absent**
@@ -26,56 +26,44 @@ Rows are one verdict, not prose: **done** (implemented and exercised),
 
 | Capability | Verdict | Notes |
 |---|---|---|
-| NTCP2 transport (incl. data phase) | done | `apps/i2per` NTCP2; see `docs/protocol.md` |
+| NTCP2 transport (incl. data phase) | done | `apps/i2per` NTCP2; see `docs/protocol.md`; tests: `i2p_ntcp2_tests`, `i2p_ntcp2_conn_SUITE`, `i2p_ntcp2_vectors_SUITE` |
 | NTCP1 (legacy) | absent | excluded by maintainer decision |
-| SSU2 transport (handshake + data phase) | done | session establishment verified in interop; data phase replayed hermetically from committed i2pd vectors |
+| SSU2 transport (handshake + data phase) | done | session establishment verified in interop; data phase replayed hermetically from committed i2pd vectors; tests: `i2p_ssu2_tests`, `i2p_ssu2_handshake_SUITE`, `i2p_ssu2_e2e_SUITE`, `i2p_ssu2_vectors_SUITE` |
 | SSU2 path migration | absent | excluded; blocks 18/19 stay keepalive-echo |
-| SSU2 congestion control / RTT | done | window-based congestion control and RTT estimation (`RC68AGE`) |
+| SSU2 congestion control / RTT | done | window-based congestion control and RTT estimation (`RC68AGE`); tests: `i2p_ssu2_cc_SUITE`, `i2p_ssu2_cc_tests` |
 | SSU1 (legacy) | absent | excluded by maintainer decision |
-| ECIES encryption / garlic | done | LeaseSet2, garlic clove handling |
+| ECIES encryption / garlic | done | LeaseSet2, garlic clove handling; tests: `i2p_ecies_tests`, `i2p_garlic_tests` |
 | ElGamal / AES legacy crypto | absent | excluded by maintainer decision |
 | Static-key (NTCP1) crypto | absent | legacy, excluded |
-| Tunnel creation v0.1 (ECIES) | done | 3-hop outbound and inbound |
-| Tunnel build v2 (variable tunnels) | done | hop cap raised to 7 (i2pd parity); default build stays 3 hops |
-| Transit tunnel participation | partial | available, bounded, off by default |
-| Inbound gateway role | done | |
+| Tunnel creation v0.1 (ECIES) | done | 3-hop outbound and inbound; tests: `i2p_tunnel_tests`, `i2p_tunnel_srv_SUITE` |
+| Tunnel build v2 (variable tunnels) | done | hop cap raised to 7 (i2pd parity, `NUM_HOPS`/`MAX_HOPS`); default build stays 3 hops; tests: `i2p_tunnel_tests` |
+| Transit tunnel participation | partial | available, bounded (transit_max_tunnels default 10, transit_bandwidth_kbps default 64; 0 disables); on by default with a small cap; tests: `i2p_tunnel_srv_SUITE` |
+| Inbound gateway role | done | tests: `i2p_tunnel_srv_SUITE` |
 | Outbound gateway role | done | client send runs in caller process (ADR 0003) |
-| Streaming protocol | done | implemented; field accessors read through and written around (#C252TF7); i2pd 3.0.0 new UDP tunnels window/ack policy |
-| NetDb (lookup / store) | done | RI and LeaseSet lookups; i2pd 3.0.0 faster lookups, rejects LS type 1 from ECIES sessions, rejects ipv4-mapped ipv6 in RI |
-| Floodfill participation | partial | available, off by default |
-| LeaseSet v2 | done | |
-| LeaseSet v1 | partial | receive, store and serve (store type 1); publishing not supported (X25519 + Ed25519 forces LeaseSet2) |
-| Encrypted / Meta LeaseSets | partial | type 5 (EncryptedLeaseSet) stored, expired and served; type 7 (MetaLeaseSet) stored but not re-broadcast; publishing not supported |
-| SAM v3 | done | `i2p_sam_srv`; i2pd 3.0.0 ships SAM 3.3 — extensions (offline keys, multi-dest) are 1.0.0 candidates |
+| Streaming protocol | done | implemented; field accessors read through and written around (#C252TF7); tests: `i2p_streaming_tests`, `i2p_stream_tests`, `i2p_stream_conn_SUITE` |
+| NetDb (lookup / store) | done | RI and LeaseSet lookups; tests: `i2p_netdb_tests`, `i2p_lookup_srv_SUITE` |
+| Floodfill participation | partial | available, off by default (floodfill env: true/false/auto; auto uses capacity_ok gate: bandwidth class O+ and published NTCP2); tests: `i2p_floodfill_tests`, `i2p_floodfill_SUITE` |
+| LeaseSet v2 | done | tests: `i2p_leaset_tests` |
+| LeaseSet v1 | partial | receive, store and serve (store type 1); publishing not supported (X25519 + Ed25519 forces LeaseSet2); tests: `i2p_leaset_v1_smoke_tests`, `i2p_netdb_v1_tests` |
+| Encrypted / Meta LeaseSets | partial | type 5 (EncryptedLeaseSet) stored, expired and served; type 7 (MetaLeaseSet) stored but not re-broadcast; publishing not supported; tests: `i2p_netdb_tests` |
+| SAM v3 | done | `i2p_sam_srv`; tests: `i2p_sam_SUITE`, `i2p_sam_api_SUITE` |
 | I2CP | absent | excluded by maintainer decision |
-| Datagram2 | done | codec (`encode2`/`decode2`, signature over target hash) + options Mapping (flag bit 4) + offline signatures (flag bit 5, checked against the destination's own signing key) + bounded per-destination replay window + SAM `STYLE=DATAGRAM2` / `DATAGRAM2 SEND` with `DATAGRAM2 RECEIVED` |
-| Addressbook (subscribe) | done | |
-| Addressbook (publish) | done | dump merged book to configured hosts_file (i2pd addressbook.hostsfile parity), atomic rewrite, counters/events; serve via operator eepsite/server tunnel |
-| Multi-destination client tunnels | absent | i2pd 3.0.0; operator surface, undecided |
-| Torrents tunnels (RPC/magnets/PEX/DHT/datagram trackers) | absent | i2pd 3.0.0; out of scope for 1.0.0 |
+| Datagram2 | done | codec (`encode2`/`decode2`, signature over target hash) + options Mapping (flag bit 4) + offline signatures (flag bit 5, checked against the destination's own signing key) + bounded per-destination replay window + SAM `STYLE=DATAGRAM2` / `DATAGRAM2 SEND` with `DATAGRAM2 RECEIVED`; tests: `i2p_datagram_tests`, `i2p_datagram_replay_tests`, `i2p_sam_datagram_SUITE` |
+| Addressbook (subscribe) | done | tests: `i2p_addressbook_SUITE`, `i2p_addressbook_subs_tests` |
+| Addressbook (publish) | done | dump merged book to configured hosts_file (i2pd addressbook.hostsfile parity), atomic rewrite, counters/events; serve via operator eepsite/server tunnel; tests: `i2p_addressbook_SUITE` |
 | Post-quantum (ML-KEM) NTCP2 | absent | i2pd 2.59+; new crypto, out of scope per header |
-| Charlie / introducer role | done | in-session RelayResponse and out-of-session HolePunch (type 11), rate-limited and endpoint-checked (`A740VAB`) |
-| Automatic NetDb-driven Charlie selection | done | SSU2 + peer_test + public address candidates; uniform random; one Charlie per cycle; per-Alice 60s rate limit; code-2 reject on failure |
-| Peer testing | done | measured reachability ladder |
-| Measured reachability | done | see `CD7ZBVH` |
-| TUN interface | done (separate app) | `i2per_tun` companion app (ADR 0001), shape (a) flow translator (SAM STREAM + RAW/DATAGRAM helpers) |
-| SOCKS / HTTP proxy / BOB / I2PControl | done (separate app) | `i2per_proxy` companion app; i2pd 3.0.0 adds `LocalDestinationInfo` to I2PControl |
-| In-built status monitor | done (separate app) | `i2per_status` presentation app; held fields rendered (peers/tunnels/netdb/config/SAM), derived rates and reachability ladder; absent: graceful shutdown, non-SAM service rows, peer-test error reasons |
-| UPnP / NAT traversal service | done (separate app) | `i2p_upnp_srv` (off by default, hot-switchable); SSDP discovery, SOAP port mapping with renewal |
+| Charlie / introducer role | done | in-session RelayResponse and out-of-session HolePunch (type 11), rate-limited and endpoint-checked (`A740VAB`); tests: `i2p_relay_tests`, `i2p_ssu2_relay_SUITE` |
+| Automatic NetDb-driven Charlie selection | done | SSU2 + peer_test + public address candidates; uniform random; one Charlie per cycle; per-Alice 60s rate limit; code-2 reject on failure; tests: `i2p_ssu2_peertest_SUITE` |
+| Peer testing | done | measured reachability ladder; tests: `i2p_peertest_tests`, `i2p_ssu2_peertest_SUITE` |
+| Measured reachability | done | see `CD7ZBVH`; tests: `i2p_ssu2_reachability_SUITE` |
+| TUN interface | done (separate app) | `i2per_tun` companion app (ADR 0001), shape (a) flow translator (SAM STREAM + RAW/DATAGRAM helpers); tests: `i2per_tun_*_tests` |
+| SOCKS / HTTP proxy / BOB / I2PControl | partial (separate app) | SOCKS and HTTP proxy implemented and shipped as `i2per_proxy`; BOB protocol and I2PControl not implemented (I2PControl is 3.x work, see `TZFYB9R`); tests: `i2per_proxy_*_tests` |
+| In-built status monitor | done (separate app) | `i2per_status` presentation app; held fields rendered (peers/tunnels/netdb/config/SAM), derived rates and reachability ladder; absent: graceful shutdown, non-SAM service rows, peer-test error reasons; tests: `i2per_status_*_tests` |
+| UPnP / NAT traversal service | done (separate app) | `i2p_upnp_srv` (off by default, hot-switchable); SSDP discovery, SOAP port mapping with renewal; tests: `i2p_upnp_srv_tests` |
 
 ## 1.0.0 material explicitly listed
 
-- LeaseSet v1, EncryptedLeaseSet, MetaLeaseSet (offline keys now in i2pd 3.0.0).
-- SOCKS / HTTP proxy / BOB / I2PControl console (delivered as `i2per_proxy`).
-- TUN interface (delivered as `i2per_tun`).
-- SAM 3.3 extensions (offline keys, multi-destination) — candidate from i2pd 3.0.0.
-
-## New in i2pd 3.0.0 — out of scope for 1.0.0 (post-snapshot)
-
-- Torrents tunnels with RPC, magnets, PEX, DHT, datagram trackers.
-- Multi-destination client tunnels.
-- Post-quantum (ML-KEM) NTCP2/SSU2 crypto.
-- New UDP tunnels window and ack policy.
+None as of 0.9.0: operator console and TUN shipped as companion apps; LeaseSet v1 / EncryptedLeaseSet / MetaLeaseSet partials are bounded by design (publishing not supported) and tracked in their rows above; BOB / I2PControl are out of 1.0.0 scope.
 
 ## Freshness
 
@@ -86,8 +74,8 @@ follow-up ticket at that point so the refresh is scheduled rather than hoped for
 ## Recapturing the committed vectors
 
 `apps/i2per/test/fixtures/i2pd_ssu2_data_phase.term` holds SSU2 data-phase
-datagrams captured from i2pd 2.61.0 — the version this capture still covers
-until it is refreshed for the 3.0.0 snapshot above (interop rerun pending) — and
+datagrams captured from i2pd 2.61.0 — the version this capture covers for the
+2.61.0 snapshot above — and
 `apps/i2per/test/fixtures/i2pd_ntcp2_handshake.term` holds an NTCP2 XK handshake
 and the data phase that followed it. `i2p_ssu2_vectors_SUITE` and
 `i2p_ntcp2_vectors_SUITE` replay them in the hermetic gate. The captures are
