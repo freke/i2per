@@ -126,7 +126,7 @@ hot_stop_and_start(_Config) ->
     ok = i2p_config_srv:set(relay_coord, false),
     ct:pal(
         "DEBUG after stop relay: which_children=~0p env=~0p",
-        [supervisor:which_children(i2per_sup), application:get_env(?APP, relay_coord)]
+        [supervisor:which_children(i2p_optional_sup), application:get_env(?APP, relay_coord)]
     ),
     false = i2p_relay_coord:enabled(),
     [i2p_peertest_coord] = lists:sort(coordinator_children()),
@@ -225,7 +225,7 @@ relay_coord_serves_a_tag_through_the_router(Config) ->
 coordinator_children() ->
     [
         Id
-     || {Id, Pid, worker, _Modules} <- supervisor:which_children(i2per_sup),
+     || {Id, Pid, worker, _Modules} <- supervisor:which_children(i2p_optional_sup),
         is_pid(Pid),
         Id =:= i2p_relay_coord orelse Id =:= i2p_peertest_coord
     ].

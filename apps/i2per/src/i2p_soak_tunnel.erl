@@ -1036,7 +1036,21 @@ router_pids() ->
             undefined ->
                 [];
             _ ->
-                [Pid || {_Id, Pid, _, _} <- supervisor:which_children(i2per_sup), is_pid(Pid)]
+                DomainPids = [
+                    Pid
+                 || {_Id, Pid, supervisor, _} <- supervisor:which_children(i2per_sup), is_pid(Pid)
+                ],
+                DirectPids = [
+                    Pid
+                 || {_Id, Pid, Type, _} <- supervisor:which_children(i2per_sup),
+                    is_pid(Pid),
+                    Type =/= supervisor
+                ],
+                DirectPids ++
+                    lists:append([
+                        [P || {_Id, P, _, _} <- supervisor:which_children(D), is_pid(P)]
+                     || D <- DomainPids
+                    ])
         end,
     Candidates = [Supervisor | Children] ++ [whereis(i2p_tunnel_srv)],
     lists:usort([Pid || Pid <- Candidates, is_pid(Pid)]).

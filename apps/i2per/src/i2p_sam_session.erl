@@ -458,10 +458,6 @@ handle_session_create(Style, Id, DestBlob64, Lengths, State) ->
             DestHash = i2p_keys:hash(Dest),
             DestB64 = i2p_keys:to_b64(Dest),
             i2p_sam_sup:session_register(Id, self(), DestHash, Style, CPriv),
-            %% Every session form needs a LeaseSet2 so remote peers can find
-            %% the destination's inbound tunnels; the router retries until
-            %% one exists. A demanded inbound length steers which tunnel the
-            %% lease names.
             i2p_tunnel_srv:publish_lease_set(Dest, SPriv, in_len(Lengths)),
             register_lengths(Lengths),
             send_line(State, <<"SESSION STATUS RESULT=OK DESTINATION=", DestB64/binary>>),
@@ -478,7 +474,7 @@ handle_session_create(Style, Id, DestBlob64, Lengths, State) ->
             };
         {error, _} ->
             send_line(State, <<"SESSION STATUS RESULT=I2P_ERROR MESSAGE=\"bad destination\"">>),
-            exit({protocol_error, bad_destination})
+            State
     end.
 
 %% register_lengths/1 — hand this session's length demands to the tunnel
@@ -1165,7 +1161,11 @@ resolve_destination(undefined, _State) ->
 resolve_destination(<<"TRANSIENT">>, State) ->
     resolve_destination(undefined, State);
 resolve_destination(DestB64, _State) ->
-    i2p_keys:parse_dest_blob(i2p_keys:decode_b64(DestB64)).
+    try
+        i2p_keys:parse_dest_blob(i2p_keys:decode_b64(DestB64))
+    catch
+        _:_ -> {error, bad_dest}
+    end.
 
 -spec decode_dest_b64(binary()) -> {ok, i2p_crypto:hash()} | {error, term()}.
 decode_dest_b64(B64) ->

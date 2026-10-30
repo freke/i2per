@@ -54,7 +54,7 @@ suite() ->
 %% what is running, so the home belongs in it.
 stats_is_a_supervised_child(_Config) ->
     ok = with_router(fun() ->
-        Children = supervisor:which_children(i2per_sup),
+        Children = supervisor:which_children(i2p_core_sup),
         ?assert(lists:keymember(i2p_counters, 1, Children)),
         {i2p_counters, Pid, worker, _Modules} = lists:keyfind(i2p_counters, 1, Children),
         ?assert(is_pid(Pid)),
