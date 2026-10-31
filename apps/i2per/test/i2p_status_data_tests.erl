@@ -89,3 +89,68 @@ peer_without_a_status_is_still_counted_test() ->
         #{connected => 0, connecting => 0, other => 1},
         i2p_status_data:aggregate_peers(#{<<"a">> => #{attempts => 0}})
     ).
+
+%% `lease_set_detail/0` never returns a partial entry: every map it yields
+%% carries all of `key`, `expires`, `leases` and `published`. A LeaseSet that
+%% expired between `ls_keys/0` and `find_ls/1` is dropped rather than emitted
+%% as `#{key => K}`.
+lease_set_detail_returns_complete_entries_test() ->
+    Owner = ensure_netdb(),
+    try
+        SeedKey = new_seed_key(),
+        {Identity, Seed} = identity_seed(SeedKey),
+        NowSec = now_sec(),
+        LS = i2p_leaset:build(Identity, NowSec, 7, fixture_leases(1), Seed),
+        added = i2p_netdb_srv:store_ls(LS, NowSec),
+        LSKey = i2p_leaset:hash(LS),
+        Entries = i2p_status_data:lease_set_detail(),
+        ?assert(lists:any(fun(E) -> maps:get(key, E, undefined) =:= LSKey end, Entries)),
+        lists:foreach(
+            fun(E) ->
+                ?assert(maps:is_key(key, E)),
+                ?assert(maps:is_key(expires, E)),
+                ?assert(maps:is_key(leases, E)),
+                ?assert(maps:is_key(published, E))
+            end,
+            Entries
+        )
+    after
+        case Owner of
+            started -> gen_server:stop(whereis(i2p_netdb_srv));
+            existing -> ok
+        end
+    end.
+
+%%% --------------------------------------------------------------------------
+%%% Fixtures
+%%% --------------------------------------------------------------------------
+
+ensure_netdb() ->
+    application:unset_env(i2per, data_dir),
+    case whereis(i2p_netdb_srv) of
+        undefined ->
+            {ok, _Pid} = i2p_netdb_srv:start_link(),
+            started;
+        _Pid ->
+            existing
+    end.
+
+now_sec() ->
+    erlang:system_time(second).
+
+new_seed_key() ->
+    {{SPub, Seed}, {CPub, _}} = {i2p_crypto:ed25519_keygen(), i2p_crypto:x25519_keygen()},
+    {{SPub, Seed}, {CPub, crypto:strong_rand_bytes(32)}}.
+
+identity_seed({{SPub, Seed}, {CPub, _}}) ->
+    {i2p_keys:from_keys(CPub, SPub), Seed}.
+
+fixture_leases(N) ->
+    [
+        #{
+            gateway => crypto:strong_rand_bytes(32),
+            tunnel_id => I + 1,
+            end_date => (erlang:system_time(second) * 1000 + 60 * 1000) band 16#FFFFFFFF
+        }
+     || I <- lists:seq(0, N - 1)
+    ].
