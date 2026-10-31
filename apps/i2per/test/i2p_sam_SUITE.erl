@@ -980,7 +980,7 @@ stream_connect_failure_keeps_session(_Config) ->
     send_cmd(StreamSock, <<"HELLO VERSION MIN=3.1 MAX=3.1">>),
     _ = recv_line(StreamSock),
     send_cmd(StreamSock, <<"STREAM CONNECT ID=sessionC DESTINATION=AAAA">>),
-    ?assertEqual(<<"STREAM STATUS RESULT=CANT_REACH DESTINATION=AAAA">>, recv_line(StreamSock)),
+    ?assertEqual(<<"STREAM STATUS RESULT=CANT_REACH_PEER MESSAGE=AAAA">>, recv_line(StreamSock)),
     ?assertEqual({error, closed}, gen_tcp:recv(StreamSock, 0, 5000)),
 
     send_cmd(Sock, <<"NAMING LOOKUP NAME=whatever.b32.i2p">>),
@@ -1061,7 +1061,7 @@ stream_connect_conn_dies_before_established(_Config) ->
         exit(Conn, kill),
 
         ?assertEqual(
-            <<"STREAM STATUS RESULT=CANT_REACH DESTINATION=", RemoteB64/binary>>,
+            <<"STREAM STATUS RESULT=CANT_REACH_PEER MESSAGE=", RemoteB64/binary>>,
             recv_line(StreamSock, 10000)
         ),
         ?assertEqual({error, closed}, gen_tcp:recv(StreamSock, 0, 5000)),

@@ -1134,7 +1134,7 @@ start it on demand. See the full
   This is a limitation of the bridge, not a reading of the spec.
 - A `STREAM CONNECT` that fails is answered on the stream socket and that
   socket is closed — `STREAM STATUS RESULT=INVALID_ID` for an id no live
-  STREAM session owns, `STREAM STATUS RESULT=CANT_REACH DESTINATION=…` when
+  STREAM session owns, `STREAM STATUS RESULT=CANT_REACH_PEER MESSAGE=…` when
   the target cannot be resolved or a route cannot be built.
 - `HELLO` must be accepted before other commands. `SESSION CREATE` reports
   `RESULT=OK` as soon as the session is registered; it does not wait for a

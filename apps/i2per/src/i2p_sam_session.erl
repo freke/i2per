@@ -359,7 +359,7 @@ handle_control_info(
 ) ->
     B64 = maps:get(pending_connect_b64, State, <<>>),
     send_line(State, [
-        <<"STREAM STATUS RESULT=CANT_REACH DESTINATION=">>,
+        <<"STREAM STATUS RESULT=CANT_REACH_PEER MESSAGE=">>,
         B64
     ]),
     Cleared = cleared_conn(State#{connecting => false}),
@@ -705,7 +705,7 @@ apply_connect_result({paired, PeerPid}, #{sock := Sock} = State) ->
         })};
 apply_connect_result(cant_reach, State) ->
     send_line(State, [
-        <<"STREAM STATUS RESULT=CANT_REACH DESTINATION=">>,
+        <<"STREAM STATUS RESULT=CANT_REACH_PEER MESSAGE=">>,
         maps:get(pending_connect_b64, State, <<>>)
     ]),
     {stop, normal, clear_pending_connect(State#{connecting => false})};

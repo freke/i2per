@@ -237,7 +237,7 @@ reached, charged to the `stream_conns_refused_limit` counter.
 **Every caller must handle the refusal**, because the count is driven by remote
 peers rather than by anything local. Three sites create these: the SAM STREAM
 CONNECT path (a client is waiting on a SAM reply, so it gets
-`STREAM STATUS RESULT=CANT_REACH`), the STREAM ACCEPT path and the server-tunnel
+`STREAM STATUS RESULT=CANT_REACH_PEER`), the STREAM ACCEPT path and the server-tunnel
 relay path (both an unsolicited inbound SYN with no client to answer, so the SYN
 is dropped and the sender retries).
 """.
