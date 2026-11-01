@@ -25,6 +25,41 @@ parse_naming_reply_test() ->
 parse_stream_status_test() ->
     ?assertEqual(ok, i2per_proxy_sam:parse_stream_status(<<"STREAM STATUS RESULT=OK">>)).
 
+sam_recv_line_timeout_test() ->
+    {ok, LSock1} = gen_tcp:listen(0, [binary, {packet, raw}, {active, false}, {reuseaddr, true}]),
+    {ok, {_, Port1}} = inet:sockname(LSock1),
+    spawn(fun() ->
+        case gen_tcp:accept(LSock1, 5000) of
+            {ok, S} ->
+                timer:sleep(50),
+                gen_tcp:send(S, <<"STREAM STATUS RESULT=OK\n">>);
+            _ ->
+                ok
+        end
+    end),
+    {ok, Client1} = gen_tcp:connect("127.0.0.1", Port1, [binary, {active, false}], 5000),
+    ?assertEqual(
+        {ok, <<"STREAM STATUS RESULT=OK">>},
+        i2per_proxy_sam:sam_recv_line(Client1, 200)
+    ),
+    gen_tcp:close(Client1),
+    gen_tcp:close(LSock1),
+    {ok, LSock2} = gen_tcp:listen(0, [binary, {packet, raw}, {active, false}, {reuseaddr, true}]),
+    {ok, {_, Port2}} = inet:sockname(LSock2),
+    spawn(fun() ->
+        case gen_tcp:accept(LSock2, 5000) of
+            {ok, S} ->
+                timer:sleep(50),
+                gen_tcp:send(S, <<"STREAM STATUS RESULT=OK\n">>);
+            _ ->
+                ok
+        end
+    end),
+    {ok, Client2} = gen_tcp:connect("127.0.0.1", Port2, [binary, {active, false}], 5000),
+    ?assertMatch({error, timeout}, i2per_proxy_sam:sam_recv_line(Client2, 10)),
+    gen_tcp:close(Client2),
+    gen_tcp:close(LSock2).
+
 naming_lookup_rejects_injection_test() ->
     ?assertEqual(
         {error, {sam_naming_lookup_failed, invalid_name}},
