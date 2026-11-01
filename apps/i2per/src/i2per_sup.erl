@@ -645,28 +645,19 @@ reseed_child_spec(Opts) ->
 %% `m:i2p_config_srv` lives in the application environment and survives a
 %% supervisor crash — meaning the coordinators a hot set started come back with
 %% the router. Boot, restart, and a hot set therefore all consult one predicate.
-coordinator_children(LocalSeeds) ->
-    case LocalSeeds of
-        {ok, Local, _Seeds, _Listen} ->
-            %% Inlined in the comprehension, not computed here: the
-            %% comprehension evaluates its expression only when the gate is
-            %% true, which is what makes inlining the guard — a boot with both
-            %% coordinators disabled must not build a spec nothing asked for.
-            [
-                coordinator_child(i2p_peertest_coord, coord_local_of(Local))
-             || i2p_peertest_coord:enabled()
-            ] ++
-                [
-                    coordinator_child(i2p_relay_coord, coord_local_of(Local))
-                 || i2p_relay_coord:enabled()
-                ];
-        error ->
-            %% No identity: there is no RouterInfo to route with, so neither
-            %% coordinator can run. The hot set reports the same refusal as
-            %% `{error, no_identity}` rather than starting a coordinator that
-            %% holds nothing.
-            []
-    end.
+coordinator_children({ok, Local, _Seeds, _Listen}) ->
+    %% Inlined in the comprehension, not computed here: the
+    %% comprehension evaluates its expression only when the gate is
+    %% true, which is what makes inlining the guard — a boot with both
+    %% coordinators disabled must not build a spec nothing asked for.
+    [
+        coordinator_child(i2p_peertest_coord, coord_local_of(Local))
+     || i2p_peertest_coord:enabled()
+    ] ++
+        [
+            coordinator_child(i2p_relay_coord, coord_local_of(Local))
+         || i2p_relay_coord:enabled()
+        ].
 
 coordinator_child(Module, CoordLocal) ->
     #{

@@ -119,7 +119,7 @@ dialled once the handshake completed (`sock` is `undefined` while dialling).
 -doc "Internal session state.".
 -type state() :: #{
     sock => gen_tcp:socket(),
-    send_fn => fun((iodata()) -> ok | {error, term()}),
+    send_fn := fun((iodata()) -> ok | {error, term()}),
     phase := phase(),
     local := i2p_peer:local_keys(),
     session_id => session_id(),
@@ -334,13 +334,13 @@ handle_control_info(
     erlang:demonitor(maps:get(pending_session_mon, State), [flush]),
     apply_connect_result(Result, State);
 handle_control_info(
-    {sam_stream_accept_result, Ref, Result}, #{pending_accept_ref := Ref} = State
-) ->
+    {sam_stream_accept_result, Ref, Result}, State
+) when is_map_key(pending_accept_ref, State) andalso map_get(pending_accept_ref, State) =:= Ref ->
     erlang:demonitor(maps:get(pending_session_mon, State), [flush]),
     apply_accept_result(Result, State);
 handle_control_info(
-    {sam_stream_forward_result, Ref, Result}, #{pending_forward_ref := Ref} = State
-) ->
+    {sam_stream_forward_result, Ref, Result}, State
+) when is_map_key(pending_forward_ref, State) andalso map_get(pending_forward_ref, State) =:= Ref ->
     erlang:demonitor(maps:get(pending_session_mon, State), [flush]),
     apply_forward_result(Result, State);
 %% A connection announces its demux key as its very first act, which can beat
@@ -407,12 +407,11 @@ handle_control_info({stream_closed, _Conn}, State) ->
 handle_control_info({stream_reset, _Conn}, State) ->
     {stop, normal, State};
 handle_control_info(
-    {'DOWN', Mon, process, _Pid, _Reason},
-    #{
-        conn_mon := Mon,
-        connecting := true
-    } = State
-) ->
+    {'DOWN', Mon, process, _Pid, _Reason}, State
+) when
+    is_map_key(conn_mon, State) andalso map_get(conn_mon, State) =:= Mon andalso
+        is_map_key(connecting, State) andalso map_get(connecting, State) =:= true
+->
     B64 = maps:get(pending_connect_b64, State, <<>>),
     send_line(State, [
         <<"STREAM STATUS RESULT=CANT_REACH_PEER MESSAGE=">>,
@@ -427,23 +426,35 @@ handle_control_info(
         false -> {stop, normal, Cleared}
     end;
 handle_control_info(
-    {'DOWN', Mon, process, _Pid, _Reason}, #{pending_connect_ref := Ref, pending_session_mon := Mon} = State
-) when Ref =/= undefined ->
+    {'DOWN', Mon, process, _Pid, _Reason}, State
+) when
+    is_map_key(pending_session_mon, State) andalso map_get(pending_session_mon, State) =:= Mon andalso
+        is_map_key(pending_connect_ref, State) andalso
+        map_get(pending_connect_ref, State) =/= undefined
+->
     %% The session died before it could answer: the id no longer names a
     %% session, so this connect can never become a stream.
     send_line(State, <<"STREAM STATUS RESULT=INVALID_ID">>),
     {stop, normal, clear_pending_connect(State#{connecting => false})};
 handle_control_info(
-    {'DOWN', Mon, process, _Pid, _Reason}, #{pending_accept_ref := Ref, pending_session_mon := Mon} = State
-) when Ref =/= undefined ->
+    {'DOWN', Mon, process, _Pid, _Reason}, State
+) when
+    is_map_key(pending_session_mon, State) andalso map_get(pending_session_mon, State) =:= Mon andalso
+        is_map_key(pending_accept_ref, State) andalso
+        map_get(pending_accept_ref, State) =/= undefined
+->
     send_line(State, <<"STREAM STATUS RESULT=INVALID_ID">>),
     {stop, normal, State#{
         pending_accept_ref => undefined,
         pending_session_mon => undefined
     }};
 handle_control_info(
-    {'DOWN', Mon, process, _Pid, _Reason}, #{pending_forward_ref := Ref, pending_session_mon := Mon} = State
-) when Ref =/= undefined ->
+    {'DOWN', Mon, process, _Pid, _Reason}, State
+) when
+    is_map_key(pending_session_mon, State) andalso map_get(pending_session_mon, State) =:= Mon andalso
+        is_map_key(pending_forward_ref, State) andalso
+        map_get(pending_forward_ref, State) =/= undefined
+->
     send_line(State, <<"STREAM STATUS RESULT=INVALID_ID">>),
     {stop, normal, clear_pending_forward(State)};
 handle_control_info(
@@ -633,7 +644,14 @@ invalid_id(State) ->
 %% socket as its pending STREAM ACCEPT listener. The session answers with the
 %% destination it serves, and this socket becomes raw for the one stream that
 %% later arrives.
--spec request_accept(pid(), state()) -> state().
+-spec request_accept(pid(), #{buf := <<>>, phase := established, _ => _}) ->
+    #{
+        buf := <<>>,
+        pending_accept_ref := reference(),
+        pending_session_mon := reference(),
+        phase := established,
+        _ => _
+    }.
 request_accept(SessionPid, State) ->
     Ref = make_ref(),
     Mon = erlang:monitor(process, SessionPid),
@@ -646,7 +664,16 @@ request_accept(SessionPid, State) ->
 %% request_forward/4 — ask the session that owns the destination to bind its
 %% STREAM FORWARD target. The session owns the binding and the relay; this
 %% socket only carries the command and its reply.
--spec request_forward(pid(), binary(), inet:port_number(), state()) -> state().
+-spec request_forward(pid(), binary() | undefined, char(), #{
+    buf := <<>>, phase := established, _ => _
+}) ->
+    #{
+        buf := <<>>,
+        pending_forward_ref := reference(),
+        pending_session_mon := reference(),
+        phase := established,
+        _ => _
+    }.
 request_forward(SessionPid, HostBin, Port, State) ->
     Ref = make_ref(),
     Mon = erlang:monitor(process, SessionPid),
@@ -781,7 +808,8 @@ cleared_conn(State) ->
 %% inbound stream the session will hand to it.
 -spec apply_accept_result(term(), state()) ->
     {noreply, state()} | {stop, normal, state()}.
-apply_accept_result({accepted, DestB64, DestHash}, #{sock := Sock} = State) ->
+apply_accept_result({accepted, DestB64, DestHash}, State) when is_map_key(sock, State) ->
+    Sock = maps:get(sock, State),
     send_line(State, DestB64),
     ok = inet:setopts(Sock, [{active, once}]),
     {noreply, State#{
@@ -794,11 +822,31 @@ apply_accept_result(_Other, State) ->
     {stop, normal, State}.
 
 %% apply_forward_result/2 — the stream socket's half of a delegated FORWARD.
--spec apply_forward_result(term(), state()) -> {noreply, state()} | {stop, normal, state()}.
-apply_forward_result(ok, State) ->
+-spec apply_forward_result(term(), #{local := term(), phase := phase(), _ => _}) ->
+    {noreply, #{
+        local := term(),
+        pending_forward_ref := 'undefined',
+        pending_session_mon := 'undefined',
+        phase := term(),
+        _ => _
+    }}
+    | {stop, normal, #{
+        local := term(),
+        pending_forward_ref := 'undefined',
+        pending_session_mon := 'undefined',
+        phase := term(),
+        _ => _
+    }}.
+apply_forward_result(ok, #{phase := Phase, local := Local} = State) when
+    Phase =:= hello orelse Phase =:= established orelse Phase =:= raw
+->
+    _ = Local,
     send_line(State, <<"STREAM STATUS RESULT=OK">>),
     {noreply, clear_pending_forward(State)};
-apply_forward_result(_Other, State) ->
+apply_forward_result(_Other, #{phase := Phase, local := Local} = State) when
+    Phase =:= hello orelse Phase =:= established orelse Phase =:= raw
+->
+    _ = Local,
     {stop, normal, clear_pending_forward(State)}.
 
 %% apply_connect_result/2 — the stream socket's half of a delegated connect.
@@ -1062,11 +1110,20 @@ target_identity(B64) ->
         error:_ -> error
     end.
 
--spec handle_stream_accept(session_id(), state()) -> state().
-handle_stream_accept(_Id, #{pending_accept_ref := Ref} = State) when Ref =/= undefined ->
+-spec handle_stream_accept(binary(), #{buf := <<>>, phase := established, _ => _}) ->
+    #{
+        buf := <<>>,
+        pending_accept_ref := reference(),
+        pending_session_mon := reference(),
+        phase := established,
+        _ => _
+    }.
+handle_stream_accept(_Id, State) when
+    is_map_key(pending_accept_ref, State) andalso map_get(pending_accept_ref, State) =/= undefined
+->
     send_line(State, <<"STREAM STATUS RESULT=I2P_ERROR MESSAGE=\"accept already in progress\"">>),
     State;
-handle_stream_accept(_Id, #{session_id := _} = State) ->
+handle_stream_accept(_Id, State) when is_map_key(session_id, State) ->
     %% SAM v3 gives every stream its own client-to-SAM socket. ACCEPT on the
     %% socket that ran SESSION CREATE is refused exactly as CONNECT is, so a
     %% one-socket client cannot pass against i2per and fail against i2pd.
@@ -1091,14 +1148,22 @@ handle_stream_accept(Id, State) ->
 %% TCP connection at Host:Port. Unlike ACCEPT the control socket stays in
 %% line mode and any number of concurrent streams may be relayed; the
 %% binding lives until the session dies.
--spec handle_stream_forward(session_id(), binary() | undefined, binary(), state()) ->
-    state().
-handle_stream_forward(_Id, _HostBin, _PortBin, #{pending_forward_ref := Ref} = State) when
-    Ref =/= undefined
+-spec handle_stream_forward(binary(), binary() | undefined, binary(), #{
+    buf := <<>>, phase := established, _ => _
+}) ->
+    #{
+        buf := <<>>,
+        pending_forward_ref := reference(),
+        pending_session_mon := reference(),
+        phase := established,
+        _ => _
+    }.
+handle_stream_forward(_Id, _HostBin, _PortBin, State) when
+    is_map_key(pending_forward_ref, State) andalso map_get(pending_forward_ref, State) =/= undefined
 ->
     send_line(State, <<"STREAM STATUS RESULT=I2P_ERROR MESSAGE=\"forward already in progress\"">>),
     State;
-handle_stream_forward(_Id, _HostBin, _PortBin, #{session_id := _} = State) ->
+handle_stream_forward(_Id, _HostBin, _PortBin, State) when is_map_key(session_id, State) ->
     %% STREAM FORWARD, like CONNECT and ACCEPT, is issued on a stream socket
     %% that names the session by ID; the session socket stays in line mode.
     send_line(State, <<"SESSION STATUS RESULT=I2P_ERROR MESSAGE=\"Socket already in use\"">>),

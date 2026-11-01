@@ -7,7 +7,7 @@
 -export([name/0, listen/2, dial/2, published_address/1, reachability/0]).
 
 -doc "Transport name atom.".
--spec name() -> atom().
+-spec name() -> ssu2.
 name() -> ssu2.
 
 -doc "Start the SSU2 supervisor/listener if requested.".
@@ -56,7 +56,7 @@ published_address(Local) ->
     end.
 
 -doc "SSU2 reachability via the reachability service.".
--spec reachability() -> reachable | firewalled | unknown | not_applicable.
+-spec reachability() -> reachable | firewalled | unknown.
 reachability() ->
     try
         i2p_ssu2_reachability:status()

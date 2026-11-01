@@ -5,8 +5,8 @@
 http_proxy_direct_path_test_() ->
     {"HTTP proxy exercises the core (erpc) path against a running router",
         {timeout, 60, fun() ->
-            i2per_proxy_core_router:start(),
             try
+                i2per_proxy_core_router:start(),
                 application:set_env(i2per_proxy, sam_port, closed_sam_port()),
                 application:set_env(i2per_proxy, sam_host, <<"127.0.0.1">>),
                 application:set_env(i2per_proxy, router_node, node()),

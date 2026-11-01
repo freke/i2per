@@ -30,8 +30,8 @@ tcp_pair() ->
 run_direct_path_test_() ->
     {"run/4 exercises the core (erpc) path against a running router",
         {timeout, 60, fun() ->
-            i2per_tun_core_router:start(),
             try
+                i2per_tun_core_router:start(),
                 Before = core_sessions(),
                 Port = closed_port(),
                 {Client, Host} = tcp_pair(),
@@ -48,8 +48,8 @@ run_direct_path_test_() ->
 run_session_direct_path_test_() ->
     {"run_session/3 exercises the core (erpc) path against a running router",
         {timeout, 60, fun() ->
-            i2per_tun_core_router:start(),
             try
+                i2per_tun_core_router:start(),
                 Before = core_sessions(),
                 Port = closed_port(),
                 Result = i2per_tun_flow:run_session(<<"peer.i2p">>, <<"127.0.0.1">>, Port),
@@ -63,8 +63,8 @@ run_session_direct_path_test_() ->
 run_raw_session_direct_path_test_() ->
     {"run_raw_session/3 exercises the core (erpc) path against a running router",
         {timeout, 60, fun() ->
-            i2per_tun_core_router:start(),
             try
+                i2per_tun_core_router:start(),
                 {ok, _SessionId, Pid} = i2per_tun_flow:run_raw_session(
                     <<"peer.i2p">>, <<"127.0.0.1">>, 7656
                 ),

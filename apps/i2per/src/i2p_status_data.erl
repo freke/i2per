@@ -204,7 +204,14 @@ view() ->
 
 -doc "Held LeaseSet detail: one entry per stored LeaseSet that can still be resolved, with its leases. Entries whose LeaseSet expired between listing and lookup are omitted, so every returned map carries all of key, expires, leases and published.".
 -spec lease_set_detail() ->
-    [#{key := binary(), expires := term(), leases := [any()], published := non_neg_integer()}].
+    [
+        #{
+            key := i2p_crypto:hash(),
+            expires := 0..16#FFFF,
+            leases := [any()],
+            published := non_neg_integer()
+        }
+    ].
 lease_set_detail() ->
     Keys = i2p_netdb_srv:ls_keys(),
     [

@@ -7,13 +7,16 @@
 -export([name/0, listen/2, dial/2, published_address/1, reachability/0]).
 
 -doc "Transport name atom.".
--spec name() -> atom().
+-spec name() -> ntcp2.
 name() -> ntcp2.
 
 -doc "Return the NTCP2 supervisor.".
 -spec listen(map(), map()) -> {ok, pid()} | {error, term()}.
 listen(_Local, _Opts) ->
-    {ok, whereis(i2p_ntcp2_sup)}.
+    case whereis(i2p_ntcp2_sup) of
+        Pid when is_pid(Pid) -> {ok, Pid};
+        _ -> {error, not_started}
+    end.
 
 -doc "Start a NTCP2 connection via supervisor.".
 -spec dial(map(), map()) -> {ok, pid()} | {error, term()} | {ok, pid(), term()}.
@@ -45,7 +48,7 @@ published_address(Local) ->
     end.
 
 -doc "NTCP2 has no separate peer-test reachability service.".
--spec reachability() -> reachable | firewalled | unknown | not_applicable.
+-spec reachability() -> not_applicable.
 reachability() -> not_applicable.
 
 -spec ntcp2_address_family(binary()) -> ipv4 | ipv6.
