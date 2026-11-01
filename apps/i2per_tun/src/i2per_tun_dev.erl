@@ -184,8 +184,10 @@ handle_cast(_Request, State) ->
 handle_info({?READY_TAG, Dev}, #state{dev = Dev} = State) ->
     {noreply, drain(State)};
 handle_info({'DOWN', _Mon, process, Pid, _Reason}, State) ->
+    DeadKeys = [K || {K, V} <- maps:to_list(State#state.sessions), V =:= Pid],
     Sessions = maps:filter(fun(_K, V) -> V =/= Pid end, State#state.sessions),
-    {noreply, State#state{sessions = Sessions}};
+    Flows = lists:foldl(fun(K, Acc) -> maps:remove(K, Acc) end, State#state.flows, DeadKeys),
+    {noreply, State#state{sessions = Sessions, flows = Flows}};
 handle_info(_Info, State) ->
     {noreply, State}.
 

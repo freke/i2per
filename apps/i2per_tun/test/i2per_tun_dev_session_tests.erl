@@ -126,7 +126,8 @@ monitor_teardown_test() ->
     try
         exit(SessPid, kill),
         timer:sleep(100),
-        ?assertEqual(0, maps:size(i2per_tun_dev:sessions(Pid)))
+        ?assertEqual(0, maps:size(i2per_tun_dev:sessions(Pid))),
+        ?assertEqual(0, maps:size(i2per_tun_dev:flows(Pid)))
     after
         stop_dev(Pid),
         stop_tcp_mock(Mock)
