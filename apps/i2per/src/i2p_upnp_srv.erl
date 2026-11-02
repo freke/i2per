@@ -27,7 +27,7 @@ Config: app env `i2per` -> `upnp` (boolean, default false), `upnp_name`
 
 -export([start_link/0, stop/0, enabled/0, status/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
--export([parse_locations/1]).
+-export([parse_locations/1, do_mapping/1, fetch_and_map/1]).
 
 -define(SSDP_ADDR, {239, 255, 255, 250}).
 -define(SSDP_PORT, 1900).
@@ -315,22 +315,34 @@ do_mapping(St) ->
                 V
         end,
     St2 = St#state{internal_ip = IP},
-    lists:foreach(
-        fun({Port, Proto}) ->
-            Body = add_port_mapping_body(Port, Proto, IP, St#state.name, ST),
-            Action = ST ++ "#AddPortMapping",
-            case soap_request(CU, Action, Body) of
-                {ok, _} ->
-                    catch i2p_counters:add(upnp_mapping_renewed, 1),
-                    catch i2p_events:notify({upnp_mapping_renewed, Port, Proto});
-                {error, Reason} ->
-                    catch i2p_counters:add(upnp_mapping_refused, 1),
-                    catch i2p_events:notify({upnp_mapping_refused, Port, Proto, Reason})
-            end
-        end,
-        St#state.ports
-    ),
-    St2.
+    Failed =
+        lists:foldl(
+            fun({Port, Proto}, Acc) ->
+                Body = add_port_mapping_body(Port, Proto, IP, St#state.name, ST),
+                Action = ST ++ "#AddPortMapping",
+                case soap_request(CU, Action, Body) of
+                    {ok, _} ->
+                        catch i2p_counters:add(upnp_mapping_renewed, 1),
+                        catch i2p_events:notify({upnp_mapping_renewed, Port, Proto}),
+                        Acc;
+                    {error, Reason} ->
+                        catch i2p_counters:add(upnp_mapping_refused, 1),
+                        catch i2p_events:notify({upnp_mapping_refused, Port, Proto, Reason}),
+                        true
+                end
+            end,
+            false,
+            St#state.ports
+        ),
+    case Failed of
+        true ->
+            %% The gateway refused or lost the mapping (e.g. it rebooted or
+            %% moved): drop the cached control URL and the accumulated SSDP
+            %% locations so the next renew tick rediscovers from scratch.
+            St2#state{control_url = undefined, locations = [], discovered = false};
+        false ->
+            St2
+    end.
 
 add_port_mapping_body(Port, Proto, IP, Name, ServiceType) ->
     iolist_to_binary([
