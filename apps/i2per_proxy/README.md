@@ -2,11 +2,12 @@
 
 Companion app (ADR 0001): exposes the router's I2P destinations to ordinary
 TCP clients as a SOCKS5 (and SOCKS4a) proxy and an HTTP proxy. The core stays
-data-only; this app reaches it over SAM on TCP, never through core modules.
+data-only; this app talks to it over Erlang distribution when the core node is
+reachable, falling back to SAM on TCP for non-Erlang or legacy deployments.
 
 ## What ships today
 
-- `i2per_proxy_http` — HTTP proxy: accepts `GET`/`POST`/`HEAD`, extracts the
+- `i2per_proxy_http` — HTTP proxy: accepts `GET` and `HEAD`, extracts the
   target host, opens a SAM STREAM session, forwards the request, relays the
   response.
 - `i2per_proxy_socks` — SOCKS5 CONNECT (no authentication, domain-name and
