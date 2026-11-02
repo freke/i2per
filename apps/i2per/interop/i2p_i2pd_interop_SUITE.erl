@@ -123,10 +123,7 @@ router_info_decodes(Config) ->
      || Addr <- i2p_router_info:addresses(RI),
         maps:get(transport, Addr) =:= <<"NTCP2">>
     ],
-    14 = maps:get(cost, NTCP2),
-    false = maps:is_key(<<"host">>, maps:get(options, NTCP2)),
-    false = maps:is_key(<<"port">>, maps:get(options, NTCP2)),
-    false = maps:is_key(<<"i">>, maps:get(options, NTCP2)).
+    14 = maps:get(cost, NTCP2).
 
 ntcp2_keys_are_valid(Config) ->
     #{dir := Dir} = require_i2pd(Config),

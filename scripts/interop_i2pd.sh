@@ -25,11 +25,12 @@
 #
 # The interop suite verifies our pure-Erlang NTCP2 XK handshake against the
 # real responder: msg1 -> msg2 -> msg3, then a data-phase frame i2pd must
-# decrypt and MAC-verify. The primary i2pd is configured as a firewalled
-# client (`reservedrange = true`, `ntcp2.published = false`) so the test
-# exercises the real non-published RouterInfo shape. The second responder
-# instance remains published because it must accept our loopback floodfill
-# RouterInfo and dial us back.
+# decrypt and MAC-verify. The primary i2pd runs published on both
+# transports so its NTCP2 and SSU2 listeners bind (2.61.0 only binds a
+# transport when at least one address is published) with reservedrange
+# disabled so loopback peers are not rejected. The second responder instance
+# stays published and isolated so it can accept our floodfill RouterInfo and
+# dial us back.
 #
 # This suite is excluded from `just check` because it does not live in an app's
 # test/ directory, which is the only place rebar3 auto-discovers suites from;
@@ -69,10 +70,10 @@ port = ${PORT}
 host = 127.0.0.1
 ipv6 = false
 netid = 2
-reservedrange = true
+reservedrange = false
 ntcp2.enabled = true
 ntcp2.port = ${PORT}
-ntcp2.published = false
+ntcp2.published = true
 ntcp2.version = 2
 ssu2.enabled = true
 ssu2.port = ${SSU2_PORT}
@@ -147,8 +148,7 @@ echo "responder log: ${RESP_LOG}"
 # like a broken SessionRequest and makes i2pd drop our real connection.
 for _attempt in $(seq 1 240); do
     if [[ -f "${DATA}/router.info" && -f "${DATA}/ntcp2.keys" && -f "${DATA}/ssu2.keys" ]] \
-        && { grep -q "Start listening v4 TCP port ${PORT}" "${LOG}" \
-            || grep -q "Accepting incoming connections at port ${PORT}" "${LOG}"; } \
+        && grep -q "Start listening v4 TCP port ${PORT}" "${LOG}" \
         && grep -q "Start listening on 0.0.0.0:${SSU2_PORT}" "${LOG}"; then
         break
     fi
@@ -160,8 +160,7 @@ for _attempt in $(seq 1 240); do
     sleep 0.5
 done
 
-if ! { grep -q "Start listening v4 TCP port ${PORT}" "${LOG}" \
-    || grep -q "Accepting incoming connections at port ${PORT}" "${LOG}"; } \
+if ! grep -q "Start listening v4 TCP port ${PORT}" "${LOG}" \
     || ! grep -q "Start listening on 0.0.0.0:${SSU2_PORT}" "${LOG}"; then
     echo "i2pd did not start NTCP2/SSU2 on ports ${PORT}/${SSU2_PORT} in time:" >&2
     tail -20 "${LOG}" >&2
@@ -172,8 +171,7 @@ fi
 # starting transports. Give it up to 5 minutes — it warms up in parallel.
 for _attempt in $(seq 1 600); do
     if [[ -f "${RESP_DATA}/router.info" && -f "${RESP_DATA}/ntcp2.keys" ]] \
-        && { grep -q "Start listening v4 TCP port ${RESP_PORT}" "${RESP_LOG}" \
-            || grep -q "Accepting incoming connections at port ${RESP_PORT}" "${RESP_LOG}"; }; then
+        && grep -q "Start listening v4 TCP port ${RESP_PORT}" "${RESP_LOG}"; then
         break
     fi
     if ! kill -0 "$(pgrep -f "${RESP_DATA}" | head -1)" 2>/dev/null; then
@@ -184,8 +182,7 @@ for _attempt in $(seq 1 600); do
     sleep 0.5
 done
 
-if ! { grep -q "Start listening v4 TCP port ${RESP_PORT}" "${RESP_LOG}" \
-    || grep -q "Accepting incoming connections at port ${RESP_PORT}" "${RESP_LOG}"; }; then
+if ! grep -q "Start listening v4 TCP port ${RESP_PORT}" "${RESP_LOG}"; then
     echo "responder i2pd did not start NTCP2 on port ${RESP_PORT} in time:" >&2
     tail -20 "${RESP_LOG}" >&2
     exit 1
