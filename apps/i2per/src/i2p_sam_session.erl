@@ -1449,7 +1449,7 @@ deliver_raw(Payload, State) ->
 
 %% stream_send/2 — the streaming connection's transport (see
 %% `f:i2p_client:send_wire/2`).
--spec stream_send(i2p_client:route(), binary()) -> ok | {error, term()}.
+-spec stream_send(i2p_client:route(), binary()) -> ok | {error, dropped_no_tunnel}.
 stream_send(Route, Data) ->
     i2p_client:send_wire(Route, Data).
 

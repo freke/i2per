@@ -42,7 +42,8 @@ configured() ->
                 true -> List;
                 false -> [ntcp2, ssu2]
             end;
-        _ -> [ntcp2, ssu2]
+        _ ->
+            [ntcp2, ssu2]
     end.
 
 -doc "Resolve configured transport atoms to their implementing modules.".
