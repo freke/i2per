@@ -1,6 +1,6 @@
 # Protocol Reference
 
-This document describes the I2P wire formats implemented by i2per 0.8.0.
+This document describes the I2P wire formats implemented by i2per 0.9.0.
 Unsupported formats and release limitations are listed explicitly.
 
 All multi-byte integers in I2P are big-endian unless otherwise noted. Ed25519
@@ -12,7 +12,7 @@ in the [I2P documentation](https://i2p.net/en/docs/).
 
 ## Release boundaries
 
-The 0.8.0 release does not implement NTCP1, SSU1, I2CP, or the legacy
+The 0.9.0 release does not implement NTCP1, SSU1, I2CP, or the legacy
 ElGamal/AES garlic formats. SSU2 path migration is also outside this release.
 LeaseSet v1 (store type 1), EncryptedLeaseSet (store type 5) and
 MetaLeaseSet (store type 7) are implemented (#VANCF02, #3G0Z06C), and
@@ -26,12 +26,13 @@ requester's signature, checks the asserted endpoint, and punches, and the
 relay accept now grants a session token that Bob validates on the redirect
 (see #BFKFGY0, #98GAVQK). Automatic NetDb-driven Charlie selection is
 implemented (#6TGF083), and the tunnel build accepts up to 7 hops (#K62PQHJ).
-The sections below describe only behavior that is present in 0.8.0. 0.8.0 makes
-no wire-format changes over 0.7.0: the work is operator surface (companion
-apps, UPnP, status monitor) and promotion (transit and floodfill, with an
-`auto` capacity mode and expiry accounting); automatic Charlie selection
-and the raised hop cap are control-plane behaviour rather than wire format;
-the Charlie RelayResponse and HolePunch
+The sections below describe only behavior that is present in 0.9.0. 0.9.0 makes
+no wire-format changes over 0.8.0: the work is a parity audit against the tree,
+transport modularity (behaviour + registry), the SAM TCP listener becoming a
+thin translator onto i2p_sam_api, hermetic tests for the proxy/tun direct-call
+path, and interop fixes; automatic Charlie selection and the raised hop cap are
+control-plane behaviour rather than wire format; the Charlie RelayResponse and
+HolePunch
 blocks and the measured-reachability caps remain as shipped in 0.3.0.
 ## Implemented
 
@@ -1124,14 +1125,15 @@ start it on demand. See the full
   `SESSION CREATE`; sending it on the session's own socket is refused with
   `SESSION STATUS RESULT=I2P_ERROR MESSAGE="Socket already in use"` and the
   socket is closed, which is exactly what i2pd does. The stream socket then
-  becomes raw for that one stream and the session socket keeps serving
-  `NAMING LOOKUP`, `STREAM ACCEPT`, and further connects.
-- `STREAM ACCEPT` is where i2per departs from that model. SAM v3 gives ACCEPT
-  the same shape as CONNECT — a fresh socket with its own `HELLO` — but the
-  bridge only lets the socket that ran `SESSION CREATE` accept: ACCEPT on any
-  other socket is answered `STREAM STATUS RESULT=I2P_ERROR MESSAGE="session id
-  mismatch"`, and the session socket itself goes raw for the accepted stream.
-  This is a limitation of the bridge, not a reading of the spec.
+  becomes raw for that one stream. The session socket keeps serving
+  `NAMING LOOKUP` and further connects; `STREAM ACCEPT` is issued on a
+  separate stream socket, as described below.
+- `STREAM ACCEPT` uses the same shape as `STREAM CONNECT`: a fresh
+  client-to-SAM socket with its own `HELLO`, which becomes raw for the
+  accepted stream. ACCEPT on the socket that ran `SESSION CREATE` is refused
+  with `SESSION STATUS RESULT=I2P_ERROR MESSAGE="Socket already in use"` and
+  the socket is closed, so the session socket stays in line mode and keeps
+  serving session commands.
 - A `STREAM CONNECT` that fails is answered on the stream socket and that
   socket is closed — `STREAM STATUS RESULT=INVALID_ID` for an id no live
   STREAM session owns, `STREAM STATUS RESULT=CANT_REACH_PEER MESSAGE=…` when
@@ -1210,7 +1212,7 @@ the legacy DSA-SHA1 form is not implemented.
 **Tunnel-length options:** `SESSION CREATE` accepts trailing
 `key=value` options; `inbound.length=N` / `outbound.length=N` set the hop
 count the router maintains for that session's tunnels. Values are clamped
-into 1..3 (the router's practical tunnel budget); a non-integer value is a
+into 1..7 (the router's maximum tunnel budget); a non-integer value is a
 protocol violation and kills the session. Demanded lengths feed the tunnel
 manager's pool targets — at least one active or pending tunnel per direction
 per demanded length exists while the session lives — and a session's
@@ -1248,9 +1250,9 @@ sequenceDiagram
 **Streaming over tunnels:** SAM STREAM sessions use I2P's streaming library
 for reliable ordered delivery, as described in the [Streaming
 protocol](#streaming-protocol) section below. The same-node local pairing
-(`STREAM ACCEPT` on the session socket plus `CONNECT` on a stream socket on
-one router) remains a direct pipe between those two sockets that bypasses
-tunnels entirely.
+(`STREAM ACCEPT` on a fresh stream socket plus `CONNECT` on another stream
+socket on one router) remains a direct pipe between those two sockets that
+bypasses tunnels entirely.
 
 ### LeaseSet2
 

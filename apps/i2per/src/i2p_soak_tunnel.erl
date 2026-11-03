@@ -1031,29 +1031,32 @@ supervisor, which is the one thing about it not in that list.
 -spec router_pids() -> [pid()].
 router_pids() ->
     Supervisor = whereis(i2per_sup),
-    Children =
-        case Supervisor of
-            undefined ->
-                [];
-            _ ->
-                DomainPids = [
-                    Pid
-                 || {_Id, Pid, supervisor, _} <- supervisor:which_children(i2per_sup), is_pid(Pid)
-                ],
-                DirectPids = [
-                    Pid
-                 || {_Id, Pid, Type, _} <- supervisor:which_children(i2per_sup),
-                    is_pid(Pid),
-                    Type =/= supervisor
-                ],
-                DirectPids ++
-                    lists:append([
-                        [P || {_Id, P, _, _} <- supervisor:which_children(D), is_pid(P)]
-                     || D <- DomainPids
-                    ])
-        end,
+    Children = supervisor_worker_pids(Supervisor),
     Candidates = [Supervisor | Children] ++ [whereis(i2p_tunnel_srv)],
     lists:usort([Pid || Pid <- Candidates, is_pid(Pid)]).
+
+%% Collect worker pids beneath a supervisor, recursing through nested
+%% supervisors so a new domain layer cannot disappear from the census.
+supervisor_worker_pids(undefined) ->
+    [];
+supervisor_worker_pids(Sup) when is_pid(Sup) ->
+    case catch supervisor:which_children(Sup) of
+        Children when is_list(Children) ->
+            lists:foldl(
+                fun
+                    ({_Id, Pid, supervisor, _}, Acc) when is_pid(Pid) ->
+                        [Pid | supervisor_worker_pids(Pid) ++ Acc];
+                    ({_Id, Pid, _Type, _}, Acc) when is_pid(Pid) ->
+                        [Pid | Acc];
+                    (_, Acc) ->
+                        Acc
+                end,
+                [],
+                Children
+            );
+        _ ->
+            []
+    end.
 
 -doc """
 Words the router's own processes are holding, after a forced full collection.

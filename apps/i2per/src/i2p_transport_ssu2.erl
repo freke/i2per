@@ -52,7 +52,12 @@ published_address(Local) ->
                 none
         end
     catch
-        _:_ -> none
+        Class:Reason:Stack ->
+            logger:warning(
+                "i2p_transport_ssu2:published_address failed: ~p:~p ~p",
+                [Class, Reason, Stack]
+            ),
+            none
     end.
 
 -doc "SSU2 reachability via the reachability service.".

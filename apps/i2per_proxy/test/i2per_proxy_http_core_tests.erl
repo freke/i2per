@@ -5,6 +5,7 @@
 http_proxy_direct_path_test_() ->
     {"HTTP proxy exercises the core (erpc) path against a running router",
         {timeout, 60, fun() ->
+            SavedEnv = save_proxy_env(),
             try
                 i2per_proxy_core_router:start(),
                 application:set_env(i2per_proxy, sam_port, closed_sam_port()),
@@ -30,9 +31,7 @@ http_proxy_direct_path_test_() ->
                     i2per_proxy_listener:stop(Pid)
                 end
             after
-                application:unset_env(i2per_proxy, sam_port),
-                application:unset_env(i2per_proxy, sam_host),
-                application:unset_env(i2per_proxy, router_node),
+                restore_proxy_env(SavedEnv),
                 i2per_proxy_core_router:stop()
             end
         end}}.
@@ -42,3 +41,15 @@ closed_sam_port() ->
     {ok, {_, Port}} = inet:sockname(LSock),
     gen_tcp:close(LSock),
     Port.
+
+save_proxy_env() ->
+    [{Key, application:get_env(i2per_proxy, Key)} || Key <- [sam_port, sam_host, router_node]].
+
+restore_proxy_env(Saved) ->
+    lists:foreach(
+        fun
+            ({Key, {ok, Value}}) -> application:set_env(i2per_proxy, Key, Value);
+            ({Key, undefined}) -> application:unset_env(i2per_proxy, Key)
+        end,
+        Saved
+    ).

@@ -1110,10 +1110,15 @@ stream_forward_bad_port(_Config) ->
     _ = recv_line(Sock),
     send_cmd(Sock, <<"SESSION CREATE STYLE=STREAM ID=fwd1">>),
     _ = recv_line(Sock),
-    send_cmd(Sock, <<"STREAM FORWARD ID=fwd1 PORT=notaport">>),
-    Reply = recv_line(Sock),
-    ?assert(binary:match(Reply, <<"RESULT=I2P_ERROR">>) =/= nomatch),
-    ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0, 5000)).
+    {ok, Ctl} = connect_sam(Port),
+    send_cmd(Ctl, <<"HELLO VERSION MIN=3.1 MAX=3.1">>),
+    _ = recv_line(Ctl),
+    send_cmd(Ctl, <<"STREAM FORWARD ID=fwd1 PORT=notaport">>),
+    ?assertEqual(
+        <<"STREAM STATUS RESULT=I2P_ERROR MESSAGE=\"bad port\"">>, recv_line(Ctl)
+    ),
+    ?assertEqual({error, closed}, gen_tcp:recv(Ctl, 0, 5000)),
+    gen_tcp:close(Sock).
 
 %% Every session form is a candidate for end-to-end delivery; the owning
 %% session dispatches the opened payload by its style.

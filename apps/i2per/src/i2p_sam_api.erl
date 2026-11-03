@@ -265,9 +265,10 @@ raw_send(Target, Payload) ->
 Send a repliable datagram anonymously.
 
 A transient source identity is generated for this one datagram and signs it,
-so the receiver can address a reply to its destination but the router keeps
-no session for it. `Target` is a base64 destination, a `.b32.i2p` address, or
-an address-book name; `Payload` is the datagram body. Returns `ok` or
+but no LeaseSet is published for that identity and the router keeps no session
+for it, so the send is one-way: a reply addressed to the transient source
+cannot be delivered. `Target` is a base64 destination, a `.b32.i2p` address,
+or an address-book name; `Payload` is the datagram body. Returns `ok` or
 `{error, Reason}`.
 """.
 -spec datagram_send(binary() | string(), binary() | iolist()) -> ok | {error, term()}.
@@ -281,8 +282,9 @@ Send a datagram, from a session or anonymously.
 `Session`'s destination, where `Session` is the pid from
 `f:create_session/0-1` or a destination map from `f:create_destination/0-1`.
 `datagram_send(Kind, Target, Payload)` with `Kind` either `repliable` or
-`datagram2` generates a transient identity and sends anonymously. Raw
-datagrams carry no sender identity, so they go through `f:raw_send/2`.
+`datagram2` generates a transient identity and sends anonymously; no LeaseSet
+is published for that identity, so the send is one-way. Raw datagrams carry
+no sender identity, so they go through `f:raw_send/2`.
 """.
 -spec datagram_send(
     pid() | map() | repliable | datagram2, binary() | string(), binary() | iolist()
@@ -317,7 +319,10 @@ datagram_send_anonymous(Kind, Target, Payload) ->
     i2p_client:send_datagram(Kind, i2p_keys:to_binary(Identity), SignPriv, Target, Payload).
 
 datagram_send_session(Kind, Pid, Target, Payload) when is_pid(Pid) ->
-    gen_server:call(Pid, {datagram_send, Kind, Target, Payload}, 15000);
+    %% The session may have to resolve an uncached target, which has an
+    %% 18-second lookup deadline; leave margin so the call returns the
+    %% session's verdict instead of exiting the caller first.
+    gen_server:call(Pid, {datagram_send, Kind, Target, Payload}, 25000);
 datagram_send_session(Kind, SessionMap, Target, Payload) when is_map(SessionMap) ->
     case maps:get(identity, SessionMap, undefined) of
         undefined ->

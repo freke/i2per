@@ -6,6 +6,53 @@ CI refuses a tag that disagrees.
 
 ## [Unreleased]
 
+_(nothing yet)_
+
+## [0.9.0] — 2026-11-02
+
+**The parity-and-hardening release.** 0.8.0 landed the operator surface; 0.9.0
+audits every docs/parity.md verdict against the tree, runs the soak and live
+smoke against a real i2pd and records the result, and lands transport
+modularity plus the SAM refactor — so transports can be added or removed
+without core edits and the SAM TCP listener is a thin translator onto
+i2p_sam_api. No wire-format changes over 0.8.0, so an 0.8.0 `data_dir` is
+read unchanged.
+
+### Added
+
+- **Transport modularity.** A behaviour + registry for transports, with
+  per-transport reachability, ready dispatch and a type union, plus a boot
+  matrix across ssu2/ntcp2/both/neither (#Z2DRRT5).
+- **SAM refactor.** The SAM TCP listener becomes a thin translator onto
+  i2p_sam_api; STREAM ACCEPT and STREAM FORWARD move to their own socket;
+  refusal replies use CANT_REACH_PEER MESSAGE= (#EK3AAZK, #CW1GSZ7,
+  #TEHF4CA).
+- **Hermetic tests.** i2per_proxy and i2per_tun direct-call paths covered;
+  core-test harness starts only missing managers and stops only its own
+  (#GCG32QC, #S58GQB9).
+- **Soak and live smoke.** Run against a real i2pd 2.61.0; all six interop
+  cases pass (#8C9B3NJ, #ZVFFADC).
+
+### Changed
+
+- **Parity audit.** Every docs/parity.md verdict re-checked against the tree
+  with evidence citations; BOB/I2PControl formally excluded from 1.0.0 scope
+  (#4Y3Q67H, #TV31DT0).
+- **README claims.** Three claims contradicted by the tree corrected (proxy
+  methods, proxy SAM-only, tun listen_host) (#YQBPYTJ).
+
+### Fixed
+
+- UPnP never re-discovers a gateway that moved (#EQV4M98).
+- i2p_status_data:lease_set_detail/0 returns entries its own spec forbids
+  (#6S6PSGS).
+- i2per_tun_ip crashes the TUN device on a malformed header length
+  (#NKPA3CJ).
+- i2per_tun_dev flows map grows for the life of the process (#DY8SCVT).
+- i2per_tun_dev SAM session creation blocks the TUN reader up to 15s per
+  new flow (#S84MPBW).
+- i2per_tun_sam:naming_lookup accepts injection characters (#SCDVZEW).
+
 ## [0.8.0] — 2026-10-25
 
 **The operator-surface release.** 0.7.0 filled in the data plane; 0.8.0 lands

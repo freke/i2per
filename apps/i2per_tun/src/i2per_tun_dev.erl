@@ -53,7 +53,13 @@ tests).
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
--doc "Start the device owner with overrides (sam_host, sam_port, destinations, spawn_sessions, dev_name).".
+-doc """
+Start the device owner with overrides.
+
+Recognised keys: `sam_host`, `sam_port`, `destinations`, `spawn_sessions`,
+`dev_name`, and `max_inflight_session_creates` (also readable from the
+`i2per_tun` application environment; defaults to `?DEFAULT_MAX_INFLIGHT`).
+""".
 -spec start_link(map()) -> {ok, pid()} | {error, term()}.
 start_link(Opts) when is_map(Opts) ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [Opts], []).
@@ -241,17 +247,40 @@ handle_info({'DOWN', MonRef, process, Pid, _Reason}, State) ->
                     {noreply, State};
                 _ ->
                     Sessions = maps:filter(fun(_K, V) -> V =/= Pid end, State#state.sessions),
-                    Flows = lists:foldl(fun(K, Acc) -> maps:remove(K, Acc) end, State#state.flows, DeadKeys),
+                    Flows = lists:foldl(
+                        fun(K, Acc) -> maps:remove(K, Acc) end, State#state.flows, DeadKeys
+                    ),
                     {noreply, State#state{sessions = Sessions, flows = Flows}}
             end
     end;
 handle_info(_Info, State) ->
     {noreply, State}.
 
-terminate(_Reason, #state{dev = Dev, tun_mod = TunMod, sessions = Sessions}) ->
+terminate(_Reason, #state{dev = Dev, tun_mod = TunMod, sessions = Sessions, inflight = Inflight}) ->
+    %% Cancel any in-flight session-creation workers so a worker cannot
+    %% create a holder after the device has exited. Holders already reported
+    %% are stopped via sessions below; holders reported during shutdown are
+    %% drained from the mailbox.
+    lists:foreach(
+        fun({WorkerPid, _MonRef}) -> exit(WorkerPid, kill) end,
+        maps:values(Inflight)
+    ),
+    %% Drain any session_ready messages already in the mailbox and stop the
+    %% holders they name, so a holder created during shutdown is stopped
+    %% rather than omitted from sessions.
+    drain_session_ready(),
     lists:foreach(fun(Pid) -> catch i2per_tun_flow:stop_session(Pid) end, maps:values(Sessions)),
     _ = TunMod:stop(Dev),
     ok.
+
+drain_session_ready() ->
+    receive
+        {session_ready, _Key, HoldPid} when is_pid(HoldPid) ->
+            catch i2per_tun_flow:stop_session(HoldPid),
+            drain_session_ready()
+    after 0 ->
+        ok
+    end.
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
@@ -274,9 +303,17 @@ maybe_spawn_session(Key, Parsed, State) ->
                             DstIp = ip_to_binary(maps:get(dst, Parsed)),
                             case maps:find(DstIp, State#state.destinations) of
                                 {ok, DestHost} ->
-                                    case map_size(State#state.inflight) < State#state.max_inflight of
+                                    case
+                                        map_size(State#state.inflight) < State#state.max_inflight
+                                    of
                                         true ->
-                                            start_session_create(Key, DestHost, State#state.sam_host, State#state.sam_port, State);
+                                            start_session_create(
+                                                Key,
+                                                DestHost,
+                                                State#state.sam_host,
+                                                State#state.sam_port,
+                                                State
+                                            );
                                         false ->
                                             {State#state.sessions, State}
                                     end;
@@ -307,9 +344,19 @@ maybe_spawn_raw_session(Key, Parsed, State) ->
                                     DstIp = ip_to_binary(maps:get(dst, Parsed)),
                                     case maps:find(DstIp, State#state.destinations) of
                                         {ok, DestHost} ->
-                                            case map_size(State#state.inflight) < State#state.max_inflight of
+                                            case
+                                                map_size(State#state.inflight) <
+                                                    State#state.max_inflight
+                                            of
                                                 true ->
-                                                    start_raw_session_create(Key, DestHost, UdpPayload, State#state.sam_host, State#state.sam_port, State);
+                                                    start_raw_session_create(
+                                                        Key,
+                                                        DestHost,
+                                                        UdpPayload,
+                                                        State#state.sam_host,
+                                                        State#state.sam_port,
+                                                        State
+                                                    );
                                                 false ->
                                                     {State#state.sessions, State}
                                             end;
@@ -340,9 +387,7 @@ start_raw_session_create(Key, DestHost, UdpPayload, SamHost, SamPort, State) ->
         case i2per_tun_flow:run_raw_session(DestHost, SamHost, SamPort) of
             {ok, _SessionId, HoldPid} ->
                 _ = catch i2per_tun_flow:send_raw(HoldPid, UdpPayload),
-                Parent ! {session_ready, Key, HoldPid};
-            _ ->
-                ok
+                Parent ! {session_ready, Key, HoldPid}
         end
     end),
     Inflight = (State#state.inflight)#{Key => {Pid, MonRef}},
@@ -367,25 +412,14 @@ dev_name() ->
     end.
 
 max_inflight_from_opts(Opts) ->
-    Keys = [max_inflight_session_creates, max_inflight_creates, max_session_creates, max_inflight],
-    Value = lists:foldl(
-        fun(K, Acc) ->
-            case Acc of
-                undefined ->
-                    case maps:find(K, Opts) of
-                        {ok, V} when is_integer(V), V > 0 -> V;
-                        _ -> undefined
-                    end;
-                _ ->
-                    Acc
+    case maps:find(max_inflight_session_creates, Opts) of
+        {ok, V} when is_integer(V), V > 0 ->
+            V;
+        _ ->
+            case application:get_env(i2per_tun, max_inflight_session_creates) of
+                {ok, V} when is_integer(V), V > 0 -> V;
+                _ -> ?DEFAULT_MAX_INFLIGHT
             end
-        end,
-        undefined,
-        Keys
-    ),
-    case Value of
-        undefined -> ?DEFAULT_MAX_INFLIGHT;
-        V -> V
     end.
 
 inflight_key_for_mon(Inflight, MonRef) ->

@@ -1,7 +1,7 @@
 # i2per
 
 `i2per` is an Erlang/OTP implementation of an I2P router with a SAM v3 client
-bridge. This repository contains the 0.8.0 release. It implements the modern
+bridge. This repository contains the 0.9.0 release. It implements the modern
 X25519 and Ed25519 protocol surface, including NTCP2, SSU2, ECIES tunnel
 creation, LeaseSet2, the I2P streaming protocol, and bounded tunnel relay
 participation.
@@ -9,21 +9,23 @@ participation.
 The project interoperates with I2P routers. It does not bundle code from
 `i2pd` or `i2p-java`; the repository's `NOTICE` file records the attribution.
 
-> **Status: 0.8.0 is in preparation.** The release page
+> **Status: 0.9.0 has been released.** The release page
 > (<https://github.com/freke/i2per/releases>) will carry the relx tarball and its
 > provenance MANIFEST, built by CI from the tag rather than by a person
 > remembering to run `just release`. The documentation site is published from the
 > same tag at <https://freke.github.io/i2per/>. `CHANGELOG.md` records what
 > changed, including the known issues an operator should know about.
 >
-> 0.8.0 is the operator-surface release: TUN and the proxy/console land as
-> companion apps, UPnP port mapping ships as a bounded off-by-default service,
-> transit and floodfill gain an `auto` capacity mode and expiry accounting, and
-> the status monitor renders its held fields — so a router can be run, reached
-> and observed like an i2pd, with the core staying data-only (ADR 0001). The
-> logging floor and test gate carry forward. No wire-format changes over 0.7.0,
-> so a 0.7.0 `data_dir` is read unchanged. The external i2pd interoperability
-> suite remains a local diagnostic; it is not a required CI gate.
+> 0.9.0 is the parity-and-hardening release: every docs/parity.md verdict
+> is audited against the tree, the soak and live smoke run against a real i2pd
+> and the result is recorded, transport modularity lands as a behaviour +
+> registry so a transport adapter can contribute a RouterInfo address (its
+> startup and dial paths still need core wiring), the SAM
+> TCP listener becomes a thin translator onto i2p_sam_api, and the proxy/tun
+> direct-call paths gain hermetic tests. The logging floor and test gate carry
+> forward. No wire-format changes over 0.8.0, so an 0.8.0 `data_dir` is read
+> unchanged. The external i2pd interoperability suite is a required diagnostic
+> for the release; all six cases pass against i2pd 2.61.0.
 > See [ADR 0001](https://github.com/freke/i2per/blob/main/docs/adr/0001-data-only-core-with-presentation-apps.md),
 > [ADR 0002](https://github.com/freke/i2per/blob/main/docs/adr/0002-the-logging-floor-the-bus-is-the-instrument.md)
 > and the [changelog](CHANGELOG.md) for the reasoning.
@@ -157,6 +159,29 @@ The project interoperates with I2P routers. It does not bundle code from
 - **Scope:** 0.8.0 anchors on the operator surface; parity audit, soak and
   live smoke are deferred to 0.9.0.
 
+## Included in 0.9.0
+
+- **Parity audit:** every docs/parity.md verdict re-checked against the tree,
+  with evidence citations and corrections (BOB/I2PControl formally excluded
+  from 1.0.0 scope).
+- **Soak and live smoke:** the soak and live-smoke harnesses run against a
+  real i2pd 2.61.0; all six interop cases pass (NTCP2 published on both i2pd
+  instances + SSU2 handshake).
+- **Transport modularity:** a behaviour + registry lets an adapter contribute
+  a RouterInfo address and per-transport reachability; starting and dialing
+  remain fixed to the NTCP2 and SSU2 paths (boot matrix across
+  ssu2/ntcp2/both/neither).
+- **SAM refactor:** the SAM TCP listener becomes a thin translator onto
+  i2p_sam_api; STREAM ACCEPT and STREAM FORWARD move to their own socket;
+  refusal replies use CANT_REACH_PEER MESSAGE=.
+- **Hermetic tests:** i2per_proxy and i2per_tun direct-call paths covered;
+  core-test harness starts only missing managers.
+- **Hardening:** UPnP re-discovers a moved gateway; TUN flows map pruning;
+  async SAM session creation; naming_lookup injection guard; tun_ip malformed
+  header guard; status_data lease_set_detail filtering.
+- **Scope:** 0.9.0 anchors on parity, soak/live smoke and transport
+  modularity; 1.0.0 parity target is frozen in docs/parity.md.
+
 The default profile is a local client. It does not contact the live network,
 publish a floodfill RouterInfo, or accept public transit unless an operator
 explicitly enables those choices.
@@ -224,7 +249,7 @@ Wait for `===> Booted i2per`, then run these checks at the Erlang prompt:
 application:ensure_all_started(i2per).
 true = is_pid(whereis(i2per_sup)).
 %% The version string moves with each release; it is the app's own {vsn, ...}.
-{ok, "0.8.0"} = application:get_key(i2per, vsn).
+{ok, "0.9.0"} = application:get_key(i2per, vsn).
 ```
 
 The successful results are `{ok,[i2per]}`, `true`, and `ok`. Leave the shell
@@ -417,7 +442,7 @@ application:set_env(i2per, addressbook, #{
 Values already present in `sys.config` or the application environment take
 precedence over values in `i2per.conf`. In particular, edit the release's
 `releases/<vsn>/sys.config` to change the shipped `./data` directory (the
-directory is named after the release, so it carries the version — `0.8.0` for
+directory is named after the release, so it carries the version — `0.9.0` for
 this release). A
 persistent boot requires `data_dir` and `seeds` in the application environment.
 The release profile sets `live_network = false` and `ntcp2_published = false`;
@@ -548,7 +573,7 @@ part of the normal gate. `just live-smoke` is an offline self-check. Use
 
 ## Release limitations
 
-The 0.8.0 release does not implement NTCP1, SSU1, I2CP, or the legacy
+The 0.9.0 release does not implement NTCP1, SSU1, I2CP, or the legacy
 ElGamal/AES crypto formats. SSU2 path migration is outside this release.
 Floodfill and transit participation are available as bounded features, and
 transit gains an `auto` capacity mode plus expiry accounting; neither is
@@ -560,9 +585,9 @@ implemented. The TUN interface ships as the `i2per_tun` companion app and the
 operator console as `i2per_proxy` (ADR 0001); UPnP/NAT traversal ships as
 `i2p_upnp_srv`, off by default and hot-switchable, opening the pinhole only
 (it does not publish a reachable RouterAddress by itself). In-place relup upgrades
-are not supported; upgrading means installing a new tarball. 0.8.0 keeps the
-0.7.0 wire format and adds the operator surface and transit/floodfill
-promotion; a `data_dir` written by 0.7.0 is read unchanged.
+are not supported; upgrading means installing a new tarball. 0.9.0 keeps the
+0.8.0 wire format and adds the parity audit, transport modularity, SAM
+refactor and interop fixes; a `data_dir` written by 0.8.0 is read unchanged.
 
 `CHANGELOG.md` lists the known issues for this release: the event bus's far
 side is unbounded if a subscriber node stops draining (OTP 28 offers no cap

@@ -22,7 +22,12 @@ listen(_Local, _Opts) ->
 -spec dial(map(), map()) -> {ok, pid()} | {error, term()} | {ok, pid(), term()}.
 dial(_Peer, Opts) ->
     try
-        i2p_ntcp2_sup:start_connection(maps:get(child_spec, Opts, maps:get(spec, Opts)))
+        Spec =
+            case maps:find(child_spec, Opts) of
+                {ok, S} -> S;
+                error -> maps:get(spec, Opts)
+            end,
+        i2p_ntcp2_sup:start_connection(Spec)
     catch
         _:_ -> {error, not_available}
     end.
@@ -44,7 +49,12 @@ published_address(Local) ->
             false -> i2p_router_info:ntcp2_nonpublished_address(ntcp2_address_family(Host), Pub)
         end
     catch
-        _:_ -> none
+        Class:Reason:Stack ->
+            logger:warning(
+                "i2p_transport_ntcp2:published_address failed: ~p:~p ~p",
+                [Class, Reason, Stack]
+            ),
+            none
     end.
 
 -doc "NTCP2 has no separate peer-test reachability service.".

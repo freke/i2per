@@ -141,6 +141,9 @@ dialled once the handshake completed (`sock` is `undefined` while dialling).
     pending_connect_ref => reference() | undefined,
     pending_session_mon => reference() | undefined,
     pending_stream_started => {pid(), 0..16#FFFFFFFF} | undefined,
+    pending_stream_data => [{pid(), binary()}],
+    listener_mon => reference() | undefined,
+    listener_pid => pid() | undefined,
     delegated => #{reference() => pid()},
     forward => forward_target() | undefined,
     fwd_relays => #{pid() => fwd_relay()},
@@ -324,7 +327,7 @@ handle_control_info({sam_stream_accepted, ConnPid, DestHash}, State) ->
             _ ->
                 State1
         end,
-    {noreply, State2};
+    flush_pending_stream_data(ConnPid, State2);
 %% The session answered a delegated connect. One message carries both the
 %% verdict and the stream, so the status line is written before any relayed
 %% byte can be: the client is entitled to read STREAM STATUS first.
@@ -380,6 +383,18 @@ handle_control_info({stream_established, _Conn, _PeerHash}, State) ->
     %% Arrived before this socket's connection was registered (or for a
     %% connection it does not own): nothing to signal.
     {noreply, State};
+handle_control_info({stream_data, Conn, Bytes}, State) when
+    is_pid(Conn), is_binary(Bytes), not is_map_key(conn, State)
+->
+    %% The connection's first payload can beat the accept/connect hand-off.
+    %% Hold it in arrival order and flush it once the connection is registered.
+    Pending = maps:get(pending_stream_data, State, []),
+    {noreply, State#{pending_stream_data => Pending ++ [{Conn, Bytes}]}};
+handle_control_info({stream_data, Conn, Bytes}, #{conn := undefined} = State) when
+    is_pid(Conn), is_binary(Bytes)
+->
+    Pending = maps:get(pending_stream_data, State, []),
+    {noreply, State#{pending_stream_data => Pending ++ [{Conn, Bytes}]}};
 handle_control_info({stream_data, Conn, Bytes}, #{send_fn := SendFn, conn := Conn} = State) when
     is_pid(Conn)
 ->
@@ -463,6 +478,21 @@ handle_control_info(
     %% The stream socket went away: its stream goes with it.
     i2p_stream_conn:close(maps:get(Mon, Delegated)),
     {noreply, State#{delegated => maps:remove(Mon, Delegated)}};
+handle_control_info({'DOWN', Mon, process, Pid, _Reason}, #{listener_mon := Mon} = State) ->
+    %% The ACCEPT socket that registered as listener died. Drop the
+    %% registration only if it still points at that socket; a newer ACCEPT may
+    %% have replaced it.
+    DestHash = maps:get(dest_hash, State, undefined),
+    case DestHash of
+        undefined ->
+            ok;
+        _ ->
+            case i2p_sam_sup:listener_lookup(DestHash) of
+                {ok, Pid} -> i2p_sam_sup:listener_unregister(DestHash);
+                _ -> ok
+            end
+    end,
+    {noreply, State#{listener_mon => undefined, listener_pid => undefined}};
 handle_control_info({'DOWN', Mon, process, _Pid, Reason}, #{conn_mon := Mon} = _State) ->
     exit({stream_conn_died, Reason});
 handle_control_info({'DOWN', _Mon, process, _Pid, _Reason}, State) ->
@@ -691,9 +721,14 @@ request_forward(SessionPid, HostBin, Port, State) ->
 %% stays in line mode.
 -spec delegate_accept(reference(), pid(), state()) -> state().
 delegate_accept(Ref, From, #{dest := Dest, dest_hash := DestHash} = State) ->
+    case maps:get(listener_mon, State, undefined) of
+        undefined -> ok;
+        OldMon -> erlang:demonitor(OldMon, [flush])
+    end,
     i2p_sam_sup:listener_register(DestHash, From),
+    Mon = erlang:monitor(process, From),
     From ! {sam_stream_accept_result, Ref, {accepted, i2p_keys:to_b64(Dest), DestHash}},
-    State.
+    State#{listener_mon => Mon, listener_pid => From}.
 
 %% delegate_forward/5 — the session half of a stream socket's FORWARD. Bind the
 %% destination to the local service; the session owns the binding and the relay
@@ -884,7 +919,7 @@ apply_connect_result({conn, ConnPid, DestHash}, State) ->
             _ ->
                 State1
         end,
-    {noreply, State2};
+    flush_pending_stream_data(ConnPid, State2);
 apply_connect_result({paired, PeerPid}, #{sock := Sock} = State) ->
     %% Same-router shortcut: the target had a pending STREAM ACCEPT, so the
     %% two sockets relay raw bytes to each other.
@@ -903,6 +938,41 @@ apply_connect_result(cant_reach, State) ->
 apply_connect_result(invalid_id, State) ->
     send_line(State, <<"STREAM STATUS RESULT=INVALID_ID">>),
     {stop, normal, clear_pending_connect(State#{connecting => false})}.
+
+%% flush_pending_stream_data/2 — a SYN may carry payload before the
+%% accept/connect hand-off reaches us. Deliver those bytes in arrival order now
+%% that the connection is registered. Only entries whose stored Conn matches
+%% ConnPid are processed; stale entries are dropped. Returns {noreply, State}
+%% or {stop, normal, State} so callers can propagate a stop result.
+-spec flush_pending_stream_data(pid(), state()) ->
+    {noreply, state()} | {stop, normal, state()}.
+flush_pending_stream_data(ConnPid, State) ->
+    Pending = maps:get(pending_stream_data, State, []),
+    {Matching, Stale} = lists:partition(
+        fun({Conn, _Bytes}) -> Conn =:= ConnPid end,
+        Pending
+    ),
+    Result = lists:foldl(
+        fun({_Conn, Bytes}, Acc) ->
+            case Acc of
+                {noreply, S} ->
+                    case handle_control_info({stream_data, ConnPid, Bytes}, S) of
+                        {noreply, S2} -> {noreply, S2};
+                        {stop, normal, S2} -> {stop, normal, S2}
+                    end;
+                {stop, normal, S} ->
+                    {stop, normal, S}
+            end
+        end,
+        {noreply, State},
+        Matching
+    ),
+    case Result of
+        {noreply, NewState} ->
+            {noreply, NewState#{pending_stream_data => Stale}};
+        {stop, normal, NewState} ->
+            {stop, normal, NewState#{pending_stream_data => Stale}}
+    end.
 
 clear_pending_connect(State) ->
     State#{
@@ -1379,7 +1449,7 @@ deliver_raw(Payload, State) ->
 
 %% stream_send/2 — the streaming connection's transport (see
 %% `f:i2p_client:send_wire/2`).
--spec stream_send(i2p_client:route(), binary()) -> ok.
+-spec stream_send(i2p_client:route(), binary()) -> ok | {error, term()}.
 stream_send(Route, Data) ->
     i2p_client:send_wire(Route, Data).
 

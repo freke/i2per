@@ -37,7 +37,11 @@ supervision entry points.
 -spec configured() -> [atom()].
 configured() ->
     case application:get_env(i2per, transports) of
-        {ok, List} when is_list(List) -> List;
+        {ok, List} when is_list(List), List =/= [] ->
+            case lists:any(fun(T) -> T =:= ntcp2 orelse T =:= ssu2 end, List) of
+                true -> List;
+                false -> [ntcp2, ssu2]
+            end;
         _ -> [ntcp2, ssu2]
     end.
 
@@ -84,7 +88,12 @@ published_address(Name, Local) ->
     try
         Mod:published_address(Local)
     catch
-        _:_ -> none
+        Class:Reason:Stack ->
+            logger:warning(
+                "i2p_transport:published_address(~p) failed: ~p:~p ~p",
+                [Name, Class, Reason, Stack]
+            ),
+            none
     end.
 
 -doc "Collect published addresses from all configured transports.".

@@ -273,13 +273,38 @@ sam_recv_line(Sock, Acc) when is_binary(Acc) ->
     sam_recv_line(Sock, Acc, 5000).
 
 sam_recv_line(Sock, Acc, Timeout) ->
-    case gen_tcp:recv(Sock, 1, Timeout) of
+    Deadline =
+        case Timeout of
+            infinity -> infinity;
+            _ -> erlang:monotonic_time(millisecond) + Timeout
+        end,
+    sam_recv_line_loop(Sock, Acc, Deadline).
+
+sam_recv_line_loop(Sock, Acc, infinity) ->
+    case gen_tcp:recv(Sock, 1, infinity) of
         {ok, <<"\n">>} ->
             {ok, Acc};
         {ok, Byte} when byte_size(Acc) < 8192 ->
-            sam_recv_line(Sock, <<Acc/binary, Byte/binary>>, Timeout);
+            sam_recv_line_loop(Sock, <<Acc/binary, Byte/binary>>, infinity);
         {ok, _} ->
             {error, line_too_long};
         {error, Reason} ->
             {error, Reason}
+    end;
+sam_recv_line_loop(Sock, Acc, Deadline) ->
+    Remaining = Deadline - erlang:monotonic_time(millisecond),
+    case Remaining =< 0 of
+        true ->
+            {error, timeout};
+        false ->
+            case gen_tcp:recv(Sock, 1, Remaining) of
+                {ok, <<"\n">>} ->
+                    {ok, Acc};
+                {ok, Byte} when byte_size(Acc) < 8192 ->
+                    sam_recv_line_loop(Sock, <<Acc/binary, Byte/binary>>, Deadline);
+                {ok, _} ->
+                    {error, line_too_long};
+                {error, Reason} ->
+                    {error, Reason}
+            end
     end.

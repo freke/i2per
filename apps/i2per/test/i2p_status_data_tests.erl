@@ -95,7 +95,7 @@ peer_without_a_status_is_still_counted_test() ->
 %% expired between `ls_keys/0` and `find_ls/1` is dropped rather than emitted
 %% as `#{key => K}`.
 lease_set_detail_returns_complete_entries_test() ->
-    Owner = ensure_netdb(),
+    {Owner, SavedDataDir} = ensure_netdb(),
     try
         SeedKey = new_seed_key(),
         {Identity, Seed} = identity_seed(SeedKey),
@@ -118,6 +118,10 @@ lease_set_detail_returns_complete_entries_test() ->
         case Owner of
             started -> gen_server:stop(whereis(i2p_netdb_srv));
             existing -> ok
+        end,
+        case SavedDataDir of
+            {ok, Value} -> application:set_env(i2per, data_dir, Value);
+            undefined -> application:unset_env(i2per, data_dir)
         end
     end.
 
@@ -126,13 +130,14 @@ lease_set_detail_returns_complete_entries_test() ->
 %%% --------------------------------------------------------------------------
 
 ensure_netdb() ->
-    application:unset_env(i2per, data_dir),
     case whereis(i2p_netdb_srv) of
         undefined ->
+            SavedDataDir = application:get_env(i2per, data_dir),
+            application:unset_env(i2per, data_dir),
             {ok, _Pid} = i2p_netdb_srv:start_link(),
-            started;
+            {started, SavedDataDir};
         _Pid ->
-            existing
+            {existing, undefined}
     end.
 
 now_sec() ->
