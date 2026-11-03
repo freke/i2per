@@ -137,7 +137,8 @@ ensure_netdb() ->
             {ok, _Pid} = i2p_netdb_srv:start_link(),
             {started, SavedDataDir};
         _Pid ->
-            {existing, undefined}
+            SavedDataDir = application:get_env(i2per, data_dir),
+            {existing, SavedDataDir}
     end.
 
 now_sec() ->

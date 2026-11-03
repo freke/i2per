@@ -355,7 +355,7 @@ do_mapping(St) ->
             %% The gateway refused or lost the mapping (e.g. it rebooted or
             %% moved): drop the cached control URL and the accumulated SSDP
             %% locations so the next renew tick rediscovers from scratch.
-            St2#state{
+            St3#state{
                 control_url = undefined,
                 locations = [],
                 discovered = false,

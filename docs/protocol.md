@@ -556,10 +556,7 @@ encodings. The implementation is `m:i2p_keys`.
 
 - Ed25519 signatures (sig type 7, little-endian, RFC 8032): keygen/sign/verify.
 - X25519 Diffie-Hellman (crypto type 4, RFC 7748).
-- Elligator2 encoding/decoding of X25519 ephemeral keys (reference
-  `Elligator2.java` vectors).
-- HKDF-SHA256 (RFC 5869), the Noise `MixHash`/`MixKey` primitives, and the
-  pure key-derivation steps of the ECIES ratchets (`dh_initialize` and friends).
+- HKDF-SHA256 (RFC 5869) and the Noise `MixHash`/`MixKey` primitives.
 - ChaCha20-Poly1305 AEAD (RFC 7539 §2.8) in split and sealed forms, with the
   zero and Existing Session counter nonces.
 
@@ -1132,8 +1129,8 @@ start it on demand. See the full
   client-to-SAM socket with its own `HELLO`, which becomes raw for the
   accepted stream. ACCEPT on the socket that ran `SESSION CREATE` is refused
   with `SESSION STATUS RESULT=I2P_ERROR MESSAGE="Socket already in use"` and
-  the socket is closed, so the session socket stays in line mode and keeps
-  serving session commands.
+  that socket is closed, ending the session; `STREAM ACCEPT` must therefore
+  run on a separate socket.
 - A `STREAM CONNECT` that fails is answered on the stream socket and that
   socket is closed — `STREAM STATUS RESULT=INVALID_ID` for an id no live
   STREAM session owns, `STREAM STATUS RESULT=CANT_REACH_PEER MESSAGE=…` when
@@ -1772,10 +1769,11 @@ the firewalled-remote path.
 
 #### Seeing a park while it is happening
 
-The counter and the event are reported *after* a park ends. A park is up to ~10s
-direct and up to ~60s through an introducer, and for that whole time the peer is
-still `connecting` — so the read API has to describe the attempt in progress, not
-only its outcome.
+The counter and the event are reported *after* a park ends. A park runs for up to
+`handshake_retry_ms` x `handshake_max_resends` on a direct dial, and up to
+`f:i2p_ssu2_conn:dial_budget_ms/0` through an introducer, and for that whole time
+the peer is still `connecting` — so the read API has to describe the attempt in
+progress, not only its outcome.
 
 `i2p_peer:status/0` reports `transport` as **the transport being attempted**, and
 the dialing process announces each attempt to the manager as it makes it. Before

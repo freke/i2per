@@ -721,6 +721,24 @@ request_forward(SessionPid, HostBin, Port, State) ->
 %% stays in line mode.
 -spec delegate_accept(reference(), pid(), state()) -> state().
 delegate_accept(Ref, From, #{dest := Dest, dest_hash := DestHash} = State) ->
+    case i2p_sam_sup:listener_lookup(DestHash) of
+        {ok, ExistingPid} when ExistingPid =/= From ->
+            case is_process_alive(ExistingPid) of
+                true ->
+                    %% A live listener is already registered for this
+                    %% destination (typically from another stream socket). Do
+                    %% not overwrite the ETS row and orphan that socket; reject
+                    %% the new request with an explicit status instead.
+                    From ! {sam_stream_accept_result, Ref, {rejected, accept_listener_registered}},
+                    State;
+                false ->
+                    register_accept_listener(Ref, From, Dest, DestHash, State)
+            end;
+        _ ->
+            register_accept_listener(Ref, From, Dest, DestHash, State)
+    end.
+
+register_accept_listener(Ref, From, Dest, DestHash, State) ->
     case maps:get(listener_mon, State, undefined) of
         undefined -> ok;
         OldMon -> erlang:demonitor(OldMon, [flush])
@@ -733,7 +751,8 @@ delegate_accept(Ref, From, #{dest := Dest, dest_hash := DestHash} = State) ->
 %% delegate_forward/5 — the session half of a stream socket's FORWARD. Bind the
 %% destination to the local service; the session owns the binding and the relay
 %% table, and the socket only carries the command and its reply.
--spec delegate_forward(reference(), binary(), inet:port_number(), pid(), state()) -> state().
+-spec delegate_forward(reference(), binary() | undefined, inet:port_number(), pid(), state()) ->
+    state().
 delegate_forward(Ref, HostBin, Port, From, State) ->
     DestHash = maps:get(dest_hash, State),
     Host = i2p_sam_parse:host_string(HostBin),
@@ -850,6 +869,20 @@ apply_accept_result({accepted, DestB64, DestHash}, State) when is_map_key(sock, 
     {noreply, State#{
         phase => raw,
         dest_hash => DestHash,
+        pending_accept_ref => undefined,
+        pending_session_mon => undefined
+    }};
+apply_accept_result({rejected, accept_listener_registered}, State) when is_map_key(sock, State) ->
+    send_line(
+        State, <<"STREAM STATUS RESULT=I2P_ERROR MESSAGE=\"accept listener already registered\"">>
+    ),
+    {stop, normal, State#{
+        pending_accept_ref => undefined,
+        pending_session_mon => undefined
+    }};
+apply_accept_result({rejected, _}, State) when is_map_key(sock, State) ->
+    send_line(State, <<"STREAM STATUS RESULT=I2P_ERROR MESSAGE=\"accept already in progress\"">>),
+    {stop, normal, State#{
         pending_accept_ref => undefined,
         pending_session_mon => undefined
     }};

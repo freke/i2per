@@ -262,7 +262,13 @@ terminate(_Reason, #state{dev = Dev, tun_mod = TunMod, sessions = Sessions, infl
     %% are stopped via sessions below; holders reported during shutdown are
     %% drained from the mailbox.
     lists:foreach(
-        fun({WorkerPid, _MonRef}) -> exit(WorkerPid, kill) end,
+        fun({WorkerPid, MonRef}) ->
+            exit(WorkerPid, kill),
+            receive
+                {'DOWN', MonRef, process, WorkerPid, _} -> ok
+            after 1000 -> ok
+            end
+        end,
         maps:values(Inflight)
     ),
     %% Drain any session_ready messages already in the mailbox and stop the
