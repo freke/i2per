@@ -33,70 +33,94 @@ close_session_ends_the_session_test() ->
     wait_until_dead(Pid, 100).
 
 no_listener_registered_for_headless_session_test() ->
-    ensure_sam_sup(),
-    {ok, Pid, DestB64} = i2p_sam_api:create_session(),
-    try
-        {ok, Identity} = i2p_keys:from_b64(DestB64),
-        DestHash = i2p_keys:hash(Identity),
-        ?assertEqual(not_found, i2p_sam_sup:listener_lookup(DestHash))
-    after
-        i2p_sam_api:close_session(Pid)
-    end.
+    with_sam_sup(fun() ->
+        {ok, Pid, DestB64} = i2p_sam_api:create_session(),
+        try
+            {ok, Identity} = i2p_keys:from_b64(DestB64),
+            DestHash = i2p_keys:hash(Identity),
+            ?assertEqual(not_found, i2p_sam_sup:listener_lookup(DestHash))
+        after
+            i2p_sam_api:close_session(Pid)
+        end
+    end).
 
 stream_connect_replies_ok_and_registers_conn_test() ->
-    ensure_sam_sup(),
-    with_fake_client(fun() ->
-        {ok, Pid, DestB64} = i2p_sam_api:create_session(#{}),
-        try
-            Res = i2p_sam_api:stream_connect(Pid, DestB64, self()),
-            ?assertMatch({ok, _}, Res),
-            {ok, ConnPid} = Res,
-            ?assert(is_process_alive(ConnPid)),
-            St = sys:get_state(Pid),
-            Conns = maps:get(conns, St, #{}),
-            ?assert(maps:is_key(ConnPid, Conns))
-        after
-            catch i2p_sam_api:close_session(Pid)
-        end
+    with_sam_sup(fun() ->
+        with_fake_client(fun() ->
+            {ok, Pid, DestB64} = i2p_sam_api:create_session(#{}),
+            try
+                Res = i2p_sam_api:stream_connect(Pid, DestB64, self()),
+                ?assertMatch({ok, _}, Res),
+                {ok, ConnPid} = Res,
+                ?assert(is_process_alive(ConnPid)),
+                St = sys:get_state(Pid),
+                Conns = maps:get(conns, St, #{}),
+                ?assert(maps:is_key(ConnPid, Conns))
+            after
+                catch i2p_sam_api:close_session(Pid)
+            end
+        end)
     end).
 
 %% A session spawned only to serve one stream_connect/3 must not outlive the
 %% stream. Before this, the destination-map branch returned the connection and
 %% leaked the session behind it (FZKBZ1H).
 ephemeral_session_stops_when_its_only_conn_dies_test() ->
-    ensure_sam_sup(),
-    with_fake_client(fun() ->
-        {ok, Pid, DestB64} = i2p_sam_api:create_session(#{ephemeral => true}),
-        ?assert(is_process_alive(Pid)),
-        {ok, ConnPid} = i2p_sam_api:stream_connect(Pid, DestB64, self()),
-        exit(ConnPid, kill),
-        wait_until_dead(Pid, 100)
+    with_sam_sup(fun() ->
+        with_fake_client(fun() ->
+            {ok, Pid, DestB64} = i2p_sam_api:create_session(#{ephemeral => true}),
+            ?assert(is_process_alive(Pid)),
+            {ok, ConnPid} = i2p_sam_api:stream_connect(Pid, DestB64, self()),
+            exit(ConnPid, kill),
+            wait_until_dead(Pid, 100)
+        end)
     end).
 
 %% The owner still owns a session it created itself: losing a connection must
 %% not stop it. This is the behaviour the ephemeral cleanup must not change.
 caller_owned_session_survives_its_conn_dying_test() ->
-    ensure_sam_sup(),
-    with_fake_client(fun() ->
-        {ok, Pid, DestB64} = i2p_sam_api:create_session(),
-        try
-            {ok, ConnPid} = i2p_sam_api:stream_connect(Pid, DestB64, self()),
-            exit(ConnPid, kill),
-            timer:sleep(50),
-            ?assert(is_process_alive(Pid))
-        after
-            i2p_sam_api:close_session(Pid)
-        end
+    with_sam_sup(fun() ->
+        with_fake_client(fun() ->
+            {ok, Pid, DestB64} = i2p_sam_api:create_session(),
+            try
+                {ok, ConnPid} = i2p_sam_api:stream_connect(Pid, DestB64, self()),
+                exit(ConnPid, kill),
+                timer:sleep(50),
+                ?assert(is_process_alive(Pid))
+            after
+                i2p_sam_api:close_session(Pid)
+            end
+        end)
     end).
+
+%% The full eunit run shares one node, so the supervisor may already be up: take
+%% it if it is not, and stop only a supervisor this case started. Leaving one
+%% behind is what made every later core test fail on `already_started`.
+with_sam_sup(Fun) ->
+    case ensure_sam_sup() of
+        started ->
+            try
+                Fun()
+            after
+                stop_sam_sup()
+            end;
+        already_running ->
+            Fun()
+    end.
 
 ensure_sam_sup() ->
     case whereis(i2p_sam_sup) of
         undefined ->
             {ok, SupPid} = i2p_sam_sup:start_link(),
-            unlink(SupPid);
+            unlink(SupPid),
+            started;
         _ ->
-            ok
+            already_running
     end.
+
+stop_sam_sup() ->
+    _ = catch gen_server:stop(i2p_sam_sup),
+    ok.
 
 %% Replace i2p_client with a stub so a connect reaches the stream-conn layer
 %% without a running router. i2p_stream_conn then has a route to send on.

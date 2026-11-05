@@ -24,8 +24,9 @@ over SAM on TCP, never through core modules.
 
 One SAM session per concurrent TCP flow, so `max_sam_sessions` (default 32) is
 this app's ceiling. Document a TUN profile with a higher value for busy hosts.
-The SAM listener is loopback-only by default; remote-node operation is an
-operator `listen_host` decision.
+The host-facing listener binds loopback by default; binding it elsewhere means
+passing `listen_host` in the listener's start options (there is no `listen_host`
+app env knob).
 
 ## Platform
 
@@ -52,8 +53,8 @@ Two tiers:
 `max_sam_sessions` (default 32) is this app's concurrency ceiling: one SAM
 session per concurrent TCP flow, so a busy host needs a TUN profile with a
 higher value. The SAM listener is loopback-only by default; remote-node
-operation is an operator `listen_host` decision (see `listen_host` app env /
-`i2per_tun_listener`).
+operation is a `listen_host` option passed to `i2per_tun_listener:start_link/1`
+(there is no `listen_host` app env knob).
 
 ## Running it for real (privileged, by hand)
 

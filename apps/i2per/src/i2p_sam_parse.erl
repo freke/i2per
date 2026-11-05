@@ -108,7 +108,7 @@ Output: `{ok, Hash}` when the base32 body decodes to exactly 32 bytes;
 -spec parse_b32_address(binary()) -> {ok, i2p_crypto:hash()} | error.
 parse_b32_address(Addr) ->
     case binary:match(Addr, <<".b32.i2p">>) of
-        {Pos, 8} ->
+        {Pos, 8} when Pos + 8 =:= byte_size(Addr) ->
             B32 = binary:part(Addr, 0, Pos),
             case base32_to_bytes(B32) of
                 <<Hash:32/binary>> -> {ok, Hash};

@@ -17,3 +17,18 @@
 -dist_listen false
 -start_epmd false
 +K true
+
+## Scheduler busy-wait thresholds, set on purpose (#VXRH456). The emulator
+## default is `medium` for normal schedulers and `short` for dirty CPU
+## schedulers (erts_early_init_scheduling, unchanged OTP 25 -> OTP 29), so the
+## tree already runs warm and this is a cost bound, not a fix: measured
+## against the soak's own transit load, ingress latency into i2p_tunnel_srv
+## is flat at p50 1-2 us quiet, 37 us at 50 frames/s and 152 us saturated,
+## the same for none, very_short, medium, long and very_long at +S 1, +S 2
+## and +S 16. What the threshold does move is idle CPU on a many-core host:
+## at a 100 Hz wake pattern the default `medium` costs up to ~12% of one
+## core and `very_long` ~43%, while `very_short` costs ~6%. This release
+## therefore ships the shortest threshold with a spin at all -- the value
+## with no measured latency change and the smallest burn.
++sbwt very_short
++sbwtdcpu very_short

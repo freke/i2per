@@ -50,6 +50,33 @@ std_message_roundtrip_test() ->
 
 %%%%%%%%% Helpers %%%%%%%%%
 
+%% The two signed datagram wrappers build frames the receiving end accepts:
+%% repliable verifies against the sender destination, and Datagram2 verifies
+%% against the sender *and* the target it was signed for.
+datagram_wire_roundtrip_test() ->
+    #{identity := Identity, sign_priv := SignSeed} = i2p_keys:generate_with_privkeys(),
+    FromDest = i2p_keys:to_binary(Identity),
+    Payload = <<"datagram payload">>,
+    {ok, Repliable} = i2p_client:datagram_wire(repliable, FromDest, SignSeed, <<>>, Payload),
+    ?assertMatch({ok, #{from := FromDest, payload := Payload}}, i2p_datagram:decode(Repliable)),
+    TargetHash = crypto:strong_rand_bytes(32),
+    {ok, D2} = i2p_client:datagram_wire(datagram2, FromDest, SignSeed, TargetHash, Payload),
+    ?assertMatch(
+        {ok, #{from := FromDest, payload := Payload}}, i2p_datagram:decode2(D2, TargetHash)
+    ),
+    %% Datagram2 binds the target: the same frame does not decode elsewhere.
+    ?assertEqual(error, i2p_datagram:decode2(D2, crypto:strong_rand_bytes(32))).
+
+%% A sender that is not a 391-byte destination cannot be wrapped or signed.
+datagram_wire_bad_sender_test() ->
+    SignSeed = element(2, i2p_crypto:ed25519_keygen()),
+    ?assertEqual(
+        error, i2p_client:datagram_wire(repliable, <<"short">>, SignSeed, <<>>, <<"p">>)
+    ),
+    ?assertEqual(
+        error, i2p_client:datagram_wire(datagram2, <<"short">>, SignSeed, <<0:256>>, <<"p">>)
+    ).
+
 fixture_ls(OffsetMsList) ->
     Identity = i2p_keys:from_keys(
         element(1, i2p_crypto:x25519_keygen()),

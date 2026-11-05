@@ -9,9 +9,12 @@ socket. Inbound/outbound byte flow happens through `m:i2p_stream_conn`
 processes that report `{stream_data, Conn, Bytes}` to their owner, so a
 companion app can read and write streams directly.
 
-This is the client side only: no `STREAM ACCEPT`/`FORWARD`, no datagram
-sessions. Companion apps that need to accept inbound streams will get
-those in a later slice.
+This is the client side only: no `STREAM ACCEPT`/`FORWARD` and no datagram
+sessions, so nothing here accepts inbound connections or receives datagrams.
+Outbound datagrams do go through it: `{datagram_send, Kind, Target, Payload}`
+sends under the session's destination, which is what a companion app needs to
+answer a repliable datagram. Companion apps that need to accept inbound
+streams will get those in a later slice.
 
 ## Ownership
 
@@ -77,6 +80,17 @@ init(#{identity := Identity, crypto_priv := CPriv, sign_priv := SPriv} = Args) -
 handle_call({stream_connect, Target, Owner}, _From, State) ->
     {Result, State2} = do_stream_connect(Target, Owner, State),
     {reply, Result, State2};
+handle_call({datagram_send, Kind, Target, Payload}, _From, State) ->
+    Result =
+        case Kind of
+            raw ->
+                i2p_client:send_raw(Target, Payload);
+            _ ->
+                i2p_client:send_datagram(
+                    Kind, maps:get(dest_bin, State), maps:get(sign_priv, State), Target, Payload
+                )
+        end,
+    {reply, Result, State};
 handle_call(dest_b64, _From, #{dest_b64 := B64} = State) ->
     {reply, B64, State};
 handle_call(stop, _From, State) ->

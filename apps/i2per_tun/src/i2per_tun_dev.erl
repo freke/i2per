@@ -11,22 +11,26 @@ automatically.
 
 Each readiness message drains the device until `eagain`, then re-arms. The
 packet handler counts packets/bytes, maintains per-flow packet counts, and,
-for a new TCP flow whose destination IP is in the static map, opens and holds
-a SAM STREAM session (via `m:i2per_tun_flow:run_session/3`) keyed by the flow.
-Session spawning is synchronous within the drain and can be disabled with the
-`spawn_sessions` option (used by tests).
+for a new TCP or UDP flow whose destination IP is in the static map, starts
+session creation in a worker and applies the result asynchronously
+(`{session_ready, Key, HoldPid}`), so the drain keeps reading. Session
+creation is bounded to a small number of concurrent in-flight creates.
+Session spawning can be disabled with the `spawn_sessions` option (used by
+tests).
 """.
 
 -behaviour(gen_server).
 
 -export([start_link/0, start_link/1, stats/0, stats/1, flows/0, flows/1, sessions/0, sessions/1]).
 -export([inject/1, inject/2]).
+-export([inflight/0, inflight/1]).
 -export([udp_payload/1]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -define(READY_TAG, i2per_tun_ready).
 -define(DEFAULT_DEV_NAME, <<"i2per0">>).
+-define(DEFAULT_MAX_INFLIGHT, 4).
 
 -record(state, {
     dev :: term(),
@@ -36,6 +40,8 @@ Session spawning is synchronous within the drain and can be disabled with the
     bytes = 0 :: non_neg_integer(),
     flows = #{} :: #{term() => non_neg_integer()},
     sessions = #{} :: #{term() => pid()},
+    inflight = #{} :: #{term() => {pid(), reference()}},
+    max_inflight = ?DEFAULT_MAX_INFLIGHT :: pos_integer(),
     sam_host = <<"127.0.0.1">> :: binary(),
     sam_port = 7656 :: inet:port_number(),
     destinations = #{} :: #{binary() => binary()},
@@ -47,7 +53,13 @@ Session spawning is synchronous within the drain and can be disabled with the
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
--doc "Start the device owner with overrides (sam_host, sam_port, destinations, spawn_sessions, dev_name).".
+-doc """
+Start the device owner with overrides.
+
+Recognised keys: `sam_host`, `sam_port`, `destinations`, `spawn_sessions`,
+`dev_name`, and `max_inflight_session_creates` (also readable from the
+`i2per_tun` application environment; defaults to `?DEFAULT_MAX_INFLIGHT`).
+""".
 -spec start_link(map()) -> {ok, pid()} | {error, term()}.
 start_link(Opts) when is_map(Opts) ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [Opts], []).
@@ -122,6 +134,29 @@ stats(Pid) ->
         _:_ -> undefined
     end.
 
+-doc "Read the number of in-flight session creates. `undefined` if the owner is not running.".
+-spec inflight() -> non_neg_integer() | undefined.
+inflight() ->
+    case whereis(?MODULE) of
+        undefined ->
+            undefined;
+        _Pid ->
+            try gen_server:call(?MODULE, inflight, 1000) of
+                N when is_integer(N) -> N
+            catch
+                _:_ -> undefined
+            end
+    end.
+
+-doc "Read the number of in-flight session creates for a named device process.".
+-spec inflight(pid() | atom()) -> non_neg_integer() | undefined.
+inflight(Pid) ->
+    try gen_server:call(Pid, inflight, 1000) of
+        N when is_integer(N) -> N
+    catch
+        _:_ -> undefined
+    end.
+
 -doc "Feed one packet through the device's flow/session logic (test seam).".
 -spec inject(binary()) -> ok | {error, term()}.
 inject(Packet) when is_binary(Packet) ->
@@ -150,6 +185,7 @@ init([Opts]) when is_map(Opts) ->
     SamPort = maps:get(sam_port, Opts, i2per_tun_config:sam_port()),
     Destinations = maps:get(destinations, Opts, i2per_tun_config:destinations()),
     Spawn = maps:get(spawn_sessions, Opts, true),
+    MaxInflight = max_inflight_from_opts(Opts),
     case TunMod:open(Name) of
         {ok, Dev} ->
             ok = TunMod:arm(Dev, self()),
@@ -160,7 +196,8 @@ init([Opts]) when is_map(Opts) ->
                 sam_host = SamHost,
                 sam_port = SamPort,
                 destinations = Destinations,
-                spawn_sessions = Spawn
+                spawn_sessions = Spawn,
+                max_inflight = MaxInflight
             }};
         {error, Reason} ->
             {stop, {tun_open_failed, Name, Reason}}
@@ -172,6 +209,8 @@ handle_call(flows, _From, #state{flows = F} = State) ->
     {reply, F, State};
 handle_call(sessions, _From, #state{sessions = S} = State) ->
     {reply, S, State};
+handle_call(inflight, _From, #state{inflight = I} = State) ->
+    {reply, map_size(I), State};
 handle_call({inject, Pkt}, _From, State) ->
     {reply, ok, handle_packet(Pkt, State)};
 handle_call(_Request, _From, State) ->
@@ -183,69 +222,182 @@ handle_cast(_Request, State) ->
 %% One readiness notification per arm; drain until eagain, then re-arm.
 handle_info({?READY_TAG, Dev}, #state{dev = Dev} = State) ->
     {noreply, drain(State)};
-handle_info({'DOWN', _Mon, process, Pid, _Reason}, State) ->
-    Sessions = maps:filter(fun(_K, V) -> V =/= Pid end, State#state.sessions),
-    {noreply, State#state{sessions = Sessions}};
+handle_info({session_ready, Key, HoldPid}, State) when is_pid(HoldPid) ->
+    MonRef =
+        case maps:find(Key, State#state.inflight) of
+            {ok, {_WorkerPid, MR}} -> MR;
+            error -> undefined
+        end,
+    case MonRef of
+        undefined -> ok;
+        _ -> demonitor(MonRef, [flush])
+    end,
+    monitor(process, HoldPid),
+    Sessions = (State#state.sessions)#{Key => HoldPid},
+    Inflight = maps:remove(Key, State#state.inflight),
+    {noreply, State#state{sessions = Sessions, inflight = Inflight}};
+handle_info({'DOWN', MonRef, process, Pid, _Reason}, State) ->
+    case inflight_key_for_mon(State#state.inflight, MonRef) of
+        {ok, Key} ->
+            {noreply, State#state{inflight = maps:remove(Key, State#state.inflight)}};
+        error ->
+            DeadKeys = [K || {K, V} <- maps:to_list(State#state.sessions), V =:= Pid],
+            case DeadKeys of
+                [] ->
+                    {noreply, State};
+                _ ->
+                    Sessions = maps:filter(fun(_K, V) -> V =/= Pid end, State#state.sessions),
+                    Flows = lists:foldl(
+                        fun(K, Acc) -> maps:remove(K, Acc) end, State#state.flows, DeadKeys
+                    ),
+                    {noreply, State#state{sessions = Sessions, flows = Flows}}
+            end
+    end;
 handle_info(_Info, State) ->
     {noreply, State}.
 
-terminate(_Reason, #state{dev = Dev, tun_mod = TunMod, sessions = Sessions}) ->
+terminate(_Reason, #state{dev = Dev, tun_mod = TunMod, sessions = Sessions, inflight = Inflight}) ->
+    %% Cancel any in-flight session-creation workers so a worker cannot
+    %% create a holder after the device has exited. Holders already reported
+    %% are stopped via sessions below; holders reported during shutdown are
+    %% drained from the mailbox.
+    lists:foreach(
+        fun({WorkerPid, MonRef}) ->
+            exit(WorkerPid, kill),
+            receive
+                {'DOWN', MonRef, process, WorkerPid, _} -> ok
+            after 1000 -> ok
+            end
+        end,
+        maps:values(Inflight)
+    ),
+    %% Drain any session_ready messages already in the mailbox and stop the
+    %% holders they name, so a holder created during shutdown is stopped
+    %% rather than omitted from sessions.
+    drain_session_ready(),
     lists:foreach(fun(Pid) -> catch i2per_tun_flow:stop_session(Pid) end, maps:values(Sessions)),
     _ = TunMod:stop(Dev),
     ok.
+
+drain_session_ready() ->
+    receive
+        {session_ready, _Key, HoldPid} when is_pid(HoldPid) ->
+            catch i2per_tun_flow:stop_session(HoldPid),
+            drain_session_ready()
+    after 0 ->
+        ok
+    end.
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
 %% Internal
 
-maybe_spawn_session(Key, Parsed, State, Sessions) ->
+maybe_spawn_session(Key, Parsed, State) ->
     case State#state.spawn_sessions of
         false ->
-            Sessions;
+            {State#state.sessions, State};
         true ->
-            DstIp = ip_to_binary(maps:get(dst, Parsed)),
-            case maps:find(DstIp, State#state.destinations) of
-                {ok, DestHost} ->
-                    SH = State#state.sam_host,
-                    SP = State#state.sam_port,
-                    case i2per_tun_flow:run_session(DestHost, SH, SP) of
-                        {ok, _SessionId, HoldPid} ->
-                            monitor(process, HoldPid),
-                            maps:put(Key, HoldPid, Sessions);
-                        {error, _} ->
-                            Sessions
-                    end;
-                error ->
-                    Sessions
-            end
-    end.
-
-maybe_spawn_raw_session(Key, Parsed, State, Sessions) ->
-    case State#state.spawn_sessions of
-        false ->
-            Sessions;
-        true ->
-            case udp_payload(Parsed) of
-                {error, _} ->
-                    Sessions;
-                {ok, UdpPayload} ->
-                    DstIp = ip_to_binary(maps:get(dst, Parsed)),
-                    case maps:find(DstIp, State#state.destinations) of
-                        {ok, DestHost} ->
-                            SH = State#state.sam_host,
-                            SP = State#state.sam_port,
-                            case i2per_tun_flow:run_raw_session(DestHost, SH, SP) of
-                                {ok, _SessionId, HoldPid} ->
-                                    monitor(process, HoldPid),
-                                    _ = i2per_tun_flow:send_raw(HoldPid, UdpPayload),
-                                    maps:put(Key, HoldPid, Sessions)
-                            end;
-                        error ->
-                            Sessions
+            case maps:is_key(Key, State#state.sessions) of
+                true ->
+                    {State#state.sessions, State};
+                false ->
+                    case maps:is_key(Key, State#state.inflight) of
+                        true ->
+                            {State#state.sessions, State};
+                        false ->
+                            DstIp = ip_to_binary(maps:get(dst, Parsed)),
+                            case maps:find(DstIp, State#state.destinations) of
+                                {ok, DestHost} ->
+                                    case
+                                        map_size(State#state.inflight) < State#state.max_inflight
+                                    of
+                                        true ->
+                                            start_session_create(
+                                                Key,
+                                                DestHost,
+                                                State#state.sam_host,
+                                                State#state.sam_port,
+                                                State
+                                            );
+                                        false ->
+                                            {State#state.sessions, State}
+                                    end;
+                                error ->
+                                    {State#state.sessions, State}
+                            end
                     end
             end
     end.
+
+maybe_spawn_raw_session(Key, Parsed, State) ->
+    case State#state.spawn_sessions of
+        false ->
+            {State#state.sessions, State};
+        true ->
+            case maps:is_key(Key, State#state.sessions) of
+                true ->
+                    {State#state.sessions, State};
+                false ->
+                    case maps:is_key(Key, State#state.inflight) of
+                        true ->
+                            {State#state.sessions, State};
+                        false ->
+                            case udp_payload(Parsed) of
+                                {error, _} ->
+                                    {State#state.sessions, State};
+                                {ok, UdpPayload} ->
+                                    DstIp = ip_to_binary(maps:get(dst, Parsed)),
+                                    case maps:find(DstIp, State#state.destinations) of
+                                        {ok, DestHost} ->
+                                            case
+                                                map_size(State#state.inflight) <
+                                                    State#state.max_inflight
+                                            of
+                                                true ->
+                                                    start_raw_session_create(
+                                                        Key,
+                                                        DestHost,
+                                                        UdpPayload,
+                                                        State#state.sam_host,
+                                                        State#state.sam_port,
+                                                        State
+                                                    );
+                                                false ->
+                                                    {State#state.sessions, State}
+                                            end;
+                                        error ->
+                                            {State#state.sessions, State}
+                                    end
+                            end
+                    end
+            end
+    end.
+
+start_session_create(Key, DestHost, SamHost, SamPort, State) ->
+    Parent = self(),
+    {Pid, MonRef} = spawn_monitor(fun() ->
+        case i2per_tun_flow:run_session(DestHost, SamHost, SamPort) of
+            {ok, _SessionId, HoldPid} ->
+                Parent ! {session_ready, Key, HoldPid};
+            _ ->
+                ok
+        end
+    end),
+    Inflight = (State#state.inflight)#{Key => {Pid, MonRef}},
+    {State#state.sessions, State#state{inflight = Inflight}}.
+
+start_raw_session_create(Key, DestHost, UdpPayload, SamHost, SamPort, State) ->
+    Parent = self(),
+    {Pid, MonRef} = spawn_monitor(fun() ->
+        case i2per_tun_flow:run_raw_session(DestHost, SamHost, SamPort) of
+            {ok, _SessionId, HoldPid} ->
+                _ = catch i2per_tun_flow:send_raw(HoldPid, UdpPayload),
+                Parent ! {session_ready, Key, HoldPid}
+        end
+    end),
+    Inflight = (State#state.inflight)#{Key => {Pid, MonRef}},
+    {State#state.sessions, State#state{inflight = Inflight}}.
 
 -spec udp_payload(map()) -> {ok, binary()} | {error, not_udp}.
 udp_payload(Parsed) ->
@@ -263,6 +415,23 @@ dev_name() ->
     case application:get_env(i2per_tun, dev_name) of
         {ok, Name} when is_binary(Name), byte_size(Name) > 0 -> Name;
         _ -> ?DEFAULT_DEV_NAME
+    end.
+
+max_inflight_from_opts(Opts) ->
+    case maps:find(max_inflight_session_creates, Opts) of
+        {ok, V} when is_integer(V), V > 0 ->
+            V;
+        _ ->
+            case application:get_env(i2per_tun, max_inflight_session_creates) of
+                {ok, V} when is_integer(V), V > 0 -> V;
+                _ -> ?DEFAULT_MAX_INFLIGHT
+            end
+    end.
+
+inflight_key_for_mon(Inflight, MonRef) ->
+    case [K || {K, {_Pid, MR}} <- maps:to_list(Inflight), MR =:= MonRef] of
+        [Key | _] -> {ok, Key};
+        [] -> error
     end.
 
 drain(#state{dev = Dev, tun_mod = TunMod, name = Name} = State) ->
@@ -293,7 +462,7 @@ handle_packet(Pkt, State) ->
             Key = i2per_tun_ip:flow_key(Parsed),
             Proto = maps:get(protocol, Parsed, 0),
             NewFlows = maps:update_with(Key, fun(N) -> N + 1 end, 1, State#state.flows),
-            NewSessions =
+            {NewSessions, State1} =
                 case maps:is_key(Key, State#state.sessions) of
                     true ->
                         case Proto of
@@ -302,21 +471,21 @@ handle_packet(Pkt, State) ->
                                     {ok, UdpPayload} ->
                                         Pid = maps:get(Key, State#state.sessions),
                                         _ = i2per_tun_flow:send_raw(Pid, UdpPayload),
-                                        State#state.sessions;
+                                        {State#state.sessions, State};
                                     {error, _} ->
-                                        State#state.sessions
+                                        {State#state.sessions, State}
                                 end;
                             _ ->
-                                State#state.sessions
+                                {State#state.sessions, State}
                         end;
                     false ->
                         case Proto of
-                            17 -> maybe_spawn_raw_session(Key, Parsed, State, State#state.sessions);
-                            6 -> maybe_spawn_session(Key, Parsed, State, State#state.sessions);
-                            _ -> State#state.sessions
+                            17 -> maybe_spawn_raw_session(Key, Parsed, State);
+                            6 -> maybe_spawn_session(Key, Parsed, State);
+                            _ -> {State#state.sessions, State}
                         end
                 end,
-            State#state{
+            State1#state{
                 packets = State#state.packets + 1,
                 bytes = State#state.bytes + byte_size(Pkt),
                 flows = NewFlows,

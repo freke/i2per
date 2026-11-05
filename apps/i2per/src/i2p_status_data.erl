@@ -31,7 +31,7 @@ The core supplies totals and its boot time; deriving a rate is the consumer's
 job, by sampling twice and subtracting. Nothing here computes one.
 """.
 
--export([view/0, view_keys/0, aggregate_peers/1]).
+-export([view/0, view_keys/0, aggregate_peers/1, lease_set_detail/0]).
 
 %% Bumped whenever a key is added. Not bumped for a value change, because a
 %% value change is not allowed: see the additive-only contract above.
@@ -202,26 +202,27 @@ view() ->
         gauges => i2p_counters:gauges()
     }.
 
--doc "Held LeaseSet detail: one entry per stored LeaseSet, with its leases.".
+-doc "Held LeaseSet detail: one entry per stored LeaseSet that can still be resolved, with its leases. Entries whose LeaseSet expired between listing and lookup are omitted, so every returned map carries all of key, expires, leases and published.".
 -spec lease_set_detail() ->
-    [#{key := binary(), expires := term(), leases := [any()], published := non_neg_integer()}].
+    [
+        #{
+            key := i2p_crypto:hash(),
+            expires := 0..16#FFFF,
+            leases := [any()],
+            published := non_neg_integer()
+        }
+    ].
 lease_set_detail() ->
     Keys = i2p_netdb_srv:ls_keys(),
     [
-        begin
-            case i2p_netdb_srv:find_ls(K) of
-                {ok, LS} ->
-                    #{
-                        key => K,
-                        leases => i2p_leaset:leases(LS),
-                        published => i2p_leaset:published(LS),
-                        expires => i2p_leaset:expires(LS)
-                    };
-                _ ->
-                    #{key => K}
-            end
-        end
-     || K <- Keys
+        #{
+            key => K,
+            leases => i2p_leaset:leases(LS),
+            published => i2p_leaset:published(LS),
+            expires => i2p_leaset:expires(LS)
+        }
+     || K <- Keys,
+        {ok, LS} <- [i2p_netdb_srv:find_ls(K)]
     ].
 
 %% Tunnel internals carry data-layer keys and fragment payloads. The status

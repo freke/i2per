@@ -12,11 +12,16 @@ sockets and their lifetimes stay together.
 -export([
     open_stream/3,
     hello/1,
+    hello/2,
     session_create/1,
+    session_create/2,
     naming_lookup/2,
+    naming_lookup/3,
     stream_connect/3,
+    stream_connect/4,
     sam_recv_line/1,
     sam_recv_line/2,
+    sam_recv_line/3,
     parse_hello/1,
     parse_session_status/1,
     parse_naming_reply/1,
@@ -45,9 +50,14 @@ open_stream(SamHost, SamPort, Host) ->
     end.
 
 hello(Sock) ->
+    hello(Sock, 5000).
+
+-doc "As `f:hello/1`, with `Timeout` (ms) bounding the HELLO reply.".
+-spec hello(gen_tcp:socket(), timeout()) -> ok | {error, term()}.
+hello(Sock, Timeout) ->
     case gen_tcp:send(Sock, <<"HELLO VERSION MIN=3.1 MAX=3.1\n">>) of
         ok ->
-            case sam_recv_line(Sock) of
+            case sam_recv_line(Sock, Timeout) of
                 {ok, Line} -> parse_hello(Line);
                 {error, _} = Err -> Err
             end;
@@ -56,6 +66,12 @@ hello(Sock) ->
     end.
 
 session_create(Sock) ->
+    session_create(Sock, 60000).
+
+-doc "As `f:session_create/1`, with `Timeout` (ms) bounding the SESSION STATUS reply.".
+-spec session_create(gen_tcp:socket(), timeout()) ->
+    {ok, binary(), binary()} | {error, term()}.
+session_create(Sock, Timeout) ->
     Id = iolist_to_binary([
         <<"proxy-">>, integer_to_binary(erlang:unique_integer([positive, monotonic]))
     ]),
@@ -66,7 +82,7 @@ session_create(Sock) ->
     ],
     case gen_tcp:send(Sock, Cmd) of
         ok ->
-            case sam_recv_line(Sock) of
+            case sam_recv_line(Sock, Timeout) of
                 {ok, Line} ->
                     case parse_session_status(Line) of
                         {ok, DestB64} -> {ok, Id, DestB64};
@@ -92,12 +108,20 @@ reaches the bridge so a proxy client cannot inject SAM commands.
 naming_lookup(Sock, Host) when is_list(Host) ->
     naming_lookup(Sock, list_to_binary(Host));
 naming_lookup(Sock, Host) when is_binary(Host) ->
+    naming_lookup(Sock, Host, 15000).
+
+-doc "As `f:naming_lookup/2`, with `Timeout` (ms) bounding the NAMING REPLY.".
+-spec naming_lookup(gen_tcp:socket(), binary() | string(), timeout()) ->
+    {ok, binary()} | {error, term()}.
+naming_lookup(Sock, Host, Timeout) when is_list(Host) ->
+    naming_lookup(Sock, list_to_binary(Host), Timeout);
+naming_lookup(Sock, Host, Timeout) when is_binary(Host) ->
     case valid_host(Host) of
         true ->
             Cmd = [<<"NAMING LOOKUP NAME=">>, Host, <<"\n">>],
             case gen_tcp:send(Sock, Cmd) of
                 ok ->
-                    case sam_recv_line(Sock) of
+                    case sam_recv_line(Sock, Timeout) of
                         {ok, Line} -> parse_naming_reply(Line);
                         {error, _} = Err -> Err
                     end;
@@ -109,10 +133,16 @@ naming_lookup(Sock, Host) when is_binary(Host) ->
     end.
 
 stream_connect(Sock, SessionId, TargetB64) ->
+    stream_connect(Sock, SessionId, TargetB64, 60000).
+
+-doc "As `f:stream_connect/3`, with `Timeout` (ms) bounding the STREAM STATUS reply.".
+-spec stream_connect(gen_tcp:socket(), binary(), binary(), timeout()) ->
+    ok | {error, term()}.
+stream_connect(Sock, SessionId, TargetB64, Timeout) ->
     Cmd = [<<"STREAM CONNECT ID=">>, SessionId, <<" DESTINATION=">>, TargetB64, <<"\n">>],
     case gen_tcp:send(Sock, Cmd) of
         ok ->
-            case sam_recv_line(Sock) of
+            case sam_recv_line(Sock, Timeout) of
                 {ok, Line} -> parse_stream_status(Line);
                 {error, _} = Err -> Err
             end;
@@ -227,18 +257,54 @@ valid_host(Bin) ->
         binary_to_list(Bin)
     ).
 
-sam_recv_line(Sock) -> sam_recv_line(Sock, <<>>).
+sam_recv_line(Sock) -> sam_recv_line(Sock, 5000).
+
+%% `Timeout` is in milliseconds (or `infinity`). It is threaded through
+%% every call so no command shares one module-level ceiling: HELLO uses a
+%% short bound (5 s), NAMING LOOKUP a medium one (15 s), and SESSION CREATE
+%% and STREAM CONNECT a long one (60 s), because the latter wait on this
+%% router's own tunnel work rather than a network round trip.
 
 %% Read exactly one byte at a time so bytes after the newline stay in the
 %% socket buffer for the stream data that follows the handshake.
-sam_recv_line(Sock, Acc) ->
-    case gen_tcp:recv(Sock, 1, 5000) of
+sam_recv_line(Sock, Timeout) when is_integer(Timeout); Timeout =:= infinity ->
+    sam_recv_line(Sock, <<>>, Timeout);
+sam_recv_line(Sock, Acc) when is_binary(Acc) ->
+    sam_recv_line(Sock, Acc, 5000).
+
+sam_recv_line(Sock, Acc, Timeout) ->
+    Deadline =
+        case Timeout of
+            infinity -> infinity;
+            _ -> erlang:monotonic_time(millisecond) + Timeout
+        end,
+    sam_recv_line_loop(Sock, Acc, Deadline).
+
+sam_recv_line_loop(Sock, Acc, infinity) ->
+    case gen_tcp:recv(Sock, 1, infinity) of
         {ok, <<"\n">>} ->
             {ok, Acc};
         {ok, Byte} when byte_size(Acc) < 8192 ->
-            sam_recv_line(Sock, <<Acc/binary, Byte/binary>>);
+            sam_recv_line_loop(Sock, <<Acc/binary, Byte/binary>>, infinity);
         {ok, _} ->
             {error, line_too_long};
         {error, Reason} ->
             {error, Reason}
+    end;
+sam_recv_line_loop(Sock, Acc, Deadline) ->
+    Remaining = Deadline - erlang:monotonic_time(millisecond),
+    case Remaining =< 0 of
+        true ->
+            {error, timeout};
+        false ->
+            case gen_tcp:recv(Sock, 1, Remaining) of
+                {ok, <<"\n">>} ->
+                    {ok, Acc};
+                {ok, Byte} when byte_size(Acc) < 8192 ->
+                    sam_recv_line_loop(Sock, <<Acc/binary, Byte/binary>>, Deadline);
+                {ok, _} ->
+                    {error, line_too_long};
+                {error, Reason} ->
+                    {error, Reason}
+            end
     end.

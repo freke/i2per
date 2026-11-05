@@ -43,7 +43,7 @@ The `Local` identity map is computed once and shared between all managers.
 
 -behaviour(supervisor).
 
--export([start_link/0, init/1, apply_coordinator/2, apply_upnp/1]).
+-export([start_link/0, init/1, apply_coordinator/2, apply_upnp/1, enable/1, disable/1]).
 
 -spec start_link() -> {ok, pid()} | {error, term()}.
 start_link() ->
@@ -52,28 +52,93 @@ start_link() ->
 init([]) ->
     LocalSeeds = resolve_local(),
     report_started_as(LocalSeeds),
-    Children =
-        [
-            %% Counter home before the bus, deliberately. `i2p_events:start_link/0`
-            %% samples the backlog gauge once before its first tick so the figure
-            %% exists from boot rather than after one interval -- and that sample is
-            %% a documented no-op while this process is absent. The other order left
-            %% the read API carrying no backlog at all for the first tick, with an
-            %% absent gauge indistinguishable from a sampler that had died.
-            counters_child(),
-            events_child(),
-            config_srv_child(),
-            peer_rep_child(),
-            reachability_child()
-        ] ++
-            %% A list, because the NetDb brings two processes. A supervisor's child
-            %% list must be **flat** — a list of lists is not a valid spec, and it
-            %% fails as a `start_spec` badmatch from every test that boots the app.
-            netdb_children() ++
-            ntcp2_sup_children(LocalSeeds) ++ ssu2_sup_children(LocalSeeds) ++
-            manager_children(LocalSeeds) ++ coordinator_children(LocalSeeds) ++
-            upnp_children(),
+    %% Build each domain group's child list, then wrap each non-empty (or always)
+    %% group in its own supervisor. `i2per_sup` itself stays `one_for_one` and
+    %% only holds the domain supervisors, so a crash in one domain restarts that
+    %% domain's supervisor rather than the whole core.
+    CoreChildren = [
+        %% Counter home before the bus, deliberately. `i2p_events:start_link/0`
+        %% samples the backlog gauge once before its first tick so the figure
+        %% exists from boot rather than after one interval -- and that sample is
+        %% a documented no-op while this process is absent. The other order left
+        %% the read API carrying no backlog at all for the first tick, with an
+        %% absent gauge indistinguishable from a sampler that had died.
+        counters_child(),
+        events_child(),
+        config_srv_child(),
+        peer_rep_child(),
+        reachability_child()
+    ],
+    NetDbChildren = netdb_children(),
+    {PeerChildren, TunnelChildren, ClientChildren, OptionalChildren} =
+        domain_children(LocalSeeds),
+    TransportChildren = transport_children(LocalSeeds),
+    Children = [
+        domain_sup_spec(i2p_core_sup, i2p_core_sup, CoreChildren),
+        domain_sup_spec(i2p_netdb_sup, i2p_netdb_sup, NetDbChildren),
+        domain_sup_spec(i2p_peer_sup, i2p_peer_sup, PeerChildren),
+        domain_sup_spec(i2p_tunnel_sup, i2p_tunnel_sup, TunnelChildren),
+        domain_sup_spec(i2p_transport_sup, i2p_transport_sup, TransportChildren),
+        domain_sup_spec(i2p_client_sup, i2p_client_sup, ClientChildren),
+        domain_sup_spec(i2p_optional_sup, i2p_optional_sup, OptionalChildren)
+    ],
     {ok, {#{strategy => one_for_one, intensity => 10, period => 10}, Children}}.
+
+%% Split the manager/coordinator/upnp/reseed children into their domain groups.
+%% `error` (no identity) keeps every identity-dependent group empty, matching
+%% the previous `manager_children(error) -> []` behaviour.
+-spec domain_children(local_seeds()) ->
+    {[supervisor:child_spec()], [supervisor:child_spec()], [supervisor:child_spec()], [
+        supervisor:child_spec()
+    ]}.
+domain_children({ok, Local, Seeds, Listen}) ->
+    PeerChildren = [
+        peer_child_spec(Local, Seeds),
+        lookup_srv_child_spec(Local)
+    ],
+    TunnelChildren =
+        [
+            tunnel_srv_child_spec(Local)
+        ] ++ server_tunnels_children(),
+    ClientChildren =
+        [
+            sam_sup_child_spec(Local, Listen),
+            addressbook_child_spec()
+        ] ++ subs_children() ++ addressbook_pub_children(),
+    OptionalChildren =
+        coordinator_children({ok, Local, Seeds, Listen}) ++
+            upnp_children() ++ reseed_children(),
+    {PeerChildren, TunnelChildren, ClientChildren, OptionalChildren};
+domain_children(error) ->
+    {[], [], [], upnp_children()}.
+
+%% Config-driven transport children (Z2DRRT5): only the transports listed in
+%% app env `i2per` -> `transports` (default [ntcp2, ssu2]) are brought up.
+-spec transport_children(local_seeds()) -> [supervisor:child_spec()].
+transport_children(LocalSeeds) ->
+    Registered = i2p_transport:configured(),
+    Ntcp2 =
+        case lists:member(ntcp2, Registered) of
+            true -> ntcp2_sup_children(LocalSeeds);
+            false -> []
+        end,
+    Ssu2 =
+        case lists:member(ssu2, Registered) of
+            true -> ssu2_sup_children(LocalSeeds);
+            false -> []
+        end,
+    Ntcp2 ++ Ssu2.
+
+-spec domain_sup_spec(atom(), module(), [supervisor:child_spec()]) -> supervisor:child_spec().
+domain_sup_spec(Id, Module, Children) ->
+    #{
+        id => Id,
+        start => {Module, start_link, [Children]},
+        restart => permanent,
+        shutdown => infinity,
+        type => supervisor,
+        modules => [Module]
+    }.
 
 %% ADR 0002's "it started and I don't know with what".
 %%
@@ -443,23 +508,7 @@ coord_local_of(Local) ->
         error -> Base
     end.
 
-%% Compute Local once; start peer + tunnel + SAM managers when configured.
-manager_children({ok, Local, Seeds, Listen}) ->
-    [
-        peer_child_spec(Local, Seeds),
-        tunnel_srv_child_spec(Local),
-        sam_sup_child_spec(Local, Listen)
-    ] ++
-        [
-            lookup_srv_child_spec(Local),
-            addressbook_child_spec()
-        ] ++
-        subs_children() ++
-        addressbook_pub_children() ++
-        server_tunnels_children() ++ reseed_children();
-manager_children(error) ->
-    [].
-
+%% (manager_children/1 folded into domain_children/1)
 %% reseed_children/0 — the one-shot bootstrap worker (`m:i2p_reseed_srv`)
 %% when app env `i2per` -> `reseed` is enabled. The NetDb threshold is
 %% checked by the worker itself: supervisor specs are built before any child
@@ -596,28 +645,19 @@ reseed_child_spec(Opts) ->
 %% `m:i2p_config_srv` lives in the application environment and survives a
 %% supervisor crash — meaning the coordinators a hot set started come back with
 %% the router. Boot, restart, and a hot set therefore all consult one predicate.
-coordinator_children(LocalSeeds) ->
-    case LocalSeeds of
-        {ok, Local, _Seeds, _Listen} ->
-            %% Inlined in the comprehension, not computed here: the
-            %% comprehension evaluates its expression only when the gate is
-            %% true, which is what makes inlining the guard — a boot with both
-            %% coordinators disabled must not build a spec nothing asked for.
-            [
-                coordinator_child(i2p_peertest_coord, coord_local_of(Local))
-             || i2p_peertest_coord:enabled()
-            ] ++
-                [
-                    coordinator_child(i2p_relay_coord, coord_local_of(Local))
-                 || i2p_relay_coord:enabled()
-                ];
-        error ->
-            %% No identity: there is no RouterInfo to route with, so neither
-            %% coordinator can run. The hot set reports the same refusal as
-            %% `{error, no_identity}` rather than starting a coordinator that
-            %% holds nothing.
-            []
-    end.
+coordinator_children({ok, Local, _Seeds, _Listen}) ->
+    %% Inlined in the comprehension, not computed here: the
+    %% comprehension evaluates its expression only when the gate is
+    %% true, which is what makes inlining the guard — a boot with both
+    %% coordinators disabled must not build a spec nothing asked for.
+    [
+        coordinator_child(i2p_peertest_coord, coord_local_of(Local))
+     || i2p_peertest_coord:enabled()
+    ] ++
+        [
+            coordinator_child(i2p_relay_coord, coord_local_of(Local))
+         || i2p_relay_coord:enabled()
+        ].
 
 coordinator_child(Module, CoordLocal) ->
     #{
@@ -655,7 +695,7 @@ coord_local() ->
     end.
 
 start_coord(Key, Spec) ->
-    case supervisor:start_child(?MODULE, Spec) of
+    case supervisor:start_child(i2p_optional_sup, Spec) of
         {ok, _Pid} ->
             application:set_env(i2per, Key, true),
             ok;
@@ -663,11 +703,8 @@ start_coord(Key, Spec) ->
             application:set_env(i2per, Key, true),
             ok;
         {error, already_present} ->
-            %% Present but not running: a previous stop that did not delete, or
-            %% a failed restart. Delete and start fresh — a stopped-but-present
-            %% child must not be the reason the switch appears broken.
-            _ = supervisor:delete_child(?MODULE, coord_id(Key)),
-            case supervisor:start_child(?MODULE, Spec) of
+            _ = supervisor:delete_child(i2p_optional_sup, coord_id(Key)),
+            case supervisor:start_child(i2p_optional_sup, Spec) of
                 {ok, _Pid} ->
                     application:set_env(i2per, Key, true),
                     ok;
@@ -680,9 +717,9 @@ start_coord(Key, Spec) ->
 
 stop_coord(Key) ->
     Id = coord_id(Key),
-    case supervisor:terminate_child(?MODULE, Id) of
+    case supervisor:terminate_child(i2p_optional_sup, Id) of
         ok ->
-            _ = supervisor:delete_child(?MODULE, Id),
+            _ = supervisor:delete_child(i2p_optional_sup, Id),
             application:set_env(i2per, Key, false),
             ok;
         {error, not_found} ->
@@ -699,17 +736,16 @@ stop_coord(Key) ->
 -spec apply_upnp(boolean()) -> ok | {error, term()}.
 apply_upnp(true) ->
     Prev = application:get_env(i2per, upnp),
-    %% `i2p_upnp_srv:init/1` reads this key, so it must be true before the start.
     application:set_env(i2per, upnp, true),
     Result =
-        case supervisor:start_child(?MODULE, upnp_child()) of
+        case supervisor:start_child(i2p_optional_sup, upnp_child()) of
             {ok, _Pid} ->
                 ok;
             {error, {already_started, _Pid}} ->
                 ok;
             {error, already_present} ->
-                _ = supervisor:delete_child(?MODULE, i2p_upnp_srv),
-                case supervisor:start_child(?MODULE, upnp_child()) of
+                _ = supervisor:delete_child(i2p_optional_sup, i2p_upnp_srv),
+                case supervisor:start_child(i2p_optional_sup, upnp_child()) of
                     {ok, _Pid} -> ok;
                     {error, Reason} -> {error, Reason}
                 end;
@@ -727,9 +763,9 @@ apply_upnp(true) ->
             Err
     end;
 apply_upnp(false) ->
-    case supervisor:terminate_child(?MODULE, i2p_upnp_srv) of
+    case supervisor:terminate_child(i2p_optional_sup, i2p_upnp_srv) of
         ok ->
-            _ = supervisor:delete_child(?MODULE, i2p_upnp_srv),
+            _ = supervisor:delete_child(i2p_optional_sup, i2p_upnp_srv),
             application:set_env(i2per, upnp, false),
             ok;
         {error, not_found} ->
@@ -738,6 +774,21 @@ apply_upnp(false) ->
         {error, Reason} ->
             {error, Reason}
     end.
+
+%% Generic enable/disable entry points. Today only the coordinator and UPnP
+%% switches are hot; other components are boot-time. These delegate to the
+%% existing apply_* paths so callers have one shape regardless of component.
+-spec enable(term()) -> ok | {error, term()}.
+enable(relay_coord) -> apply_coordinator(relay_coord, true);
+enable(peertest_coord) -> apply_coordinator(peertest_coord, true);
+enable(upnp) -> apply_upnp(true);
+enable(_) -> {error, not_supported}.
+
+-spec disable(term()) -> ok | {error, term()}.
+disable(relay_coord) -> apply_coordinator(relay_coord, false);
+disable(peertest_coord) -> apply_coordinator(peertest_coord, false);
+disable(upnp) -> apply_upnp(false);
+disable(_) -> {error, not_supported}.
 
 %% The supervisor child id each enable key drives. The key and the id are
 %% different atoms — `relay_coord` names the setting, `i2p_relay_coord` names

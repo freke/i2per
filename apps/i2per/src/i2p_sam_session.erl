@@ -10,12 +10,14 @@ SAM v3 gives *each* I2P stream a client-to-SAM socket of its own, and the
 role a process plays is decided by the first command it answers.
 
 A **session socket** runs `SESSION CREATE` and keeps the line protocol for
-its whole life: `NAMING LOOKUP`, `DATAGRAM SEND` / `RAW SEND`, and for
-STREAM sessions `STREAM FORWARD` and `STREAM ACCEPT`. DATAGRAM and RAW
+its whole life: `NAMING LOOKUP`, `DATAGRAM SEND` / `RAW SEND`. STREAM
+sessions additionally accept `STREAM FORWARD` and `STREAM ACCEPT`, but those
+are issued on a separate stream socket that names the session by ID; the
+session socket itself stays in line mode for its whole life. DATAGRAM and RAW
 sessions stay in line mode; their inbound traffic surfaces as
 `DATAGRAM RECEIVED` / `RAW RECEIVED` announcements followed by the payload
-bytes. `STREAM ACCEPT` is the one command that takes the socket raw, because
-it hands the whole control socket to a single inbound stream.
+bytes. `STREAM ACCEPT` is the command that hands a stream socket to a single
+inbound stream.
 
 A **stream socket** is a fresh connection that carries `STREAM CONNECT` and
 then becomes raw for that one stream. It owns no destination: it looks the
@@ -117,7 +119,7 @@ dialled once the handshake completed (`sock` is `undefined` while dialling).
 -doc "Internal session state.".
 -type state() :: #{
     sock => gen_tcp:socket(),
-    send_fn => fun((iodata()) -> ok | {error, term()}),
+    send_fn := fun((iodata()) -> ok | {error, term()}),
     phase := phase(),
     local := i2p_peer:local_keys(),
     session_id => session_id(),
@@ -139,6 +141,9 @@ dialled once the handshake completed (`sock` is `undefined` while dialling).
     pending_connect_ref => reference() | undefined,
     pending_session_mon => reference() | undefined,
     pending_stream_started => {pid(), 0..16#FFFFFFFF} | undefined,
+    pending_stream_data => [{pid(), binary()}],
+    listener_mon => reference() | undefined,
+    listener_pid => pid() | undefined,
     delegated => #{reference() => pid()},
     forward => forward_target() | undefined,
     fwd_relays => #{pid() => fwd_relay()},
@@ -190,6 +195,14 @@ handle_call(_Request, _From, State) ->
 %% stream it opened, and a socket owns the connection it was handed. Pre-
 %% SESSION CREATE sockets (hello phase, and stream sockets) have no session_id
 %% and announce nothing.
+terminate(_Reason, #{session_id := Id, dest_hash := DestHash} = State) ->
+    i2p_events:notify({sam_session_closed, Id}),
+    i2p_sam_sup:session_unregister(Id),
+    i2p_sam_sup:listener_unregister(DestHash),
+    i2p_sam_sup:forward_unregister(DestHash),
+    close_conn(State),
+    close_delegated(State),
+    ok;
 terminate(_Reason, #{session_id := Id} = State) ->
     i2p_events:notify({sam_session_closed, Id}),
     i2p_sam_sup:session_unregister(Id),
@@ -291,6 +304,30 @@ handle_control_info({stream_pair, PeerPid}, #{sock := Sock} = State) ->
 %% its lifetime.
 handle_control_info({stream_connect, Ref, TargetB64, From}, State) when is_pid(From) ->
     {noreply, delegate_stream(Ref, TargetB64, From, State)};
+handle_control_info({stream_accept, Ref, From}, State) when is_pid(From) ->
+    {noreply, delegate_accept(Ref, From, State)};
+handle_control_info({stream_forward, Ref, HostBin, Port, From}, State) when is_pid(From) ->
+    {noreply, delegate_forward(Ref, HostBin, Port, From, State)};
+handle_control_info({sam_stream_accepted, ConnPid, DestHash}, State) ->
+    %% An accept-role connection spawned for a stream socket we registered as
+    %% the listener for this destination. The socket owns it from here.
+    Mon = erlang:monitor(process, ConnPid),
+    State1 = State#{
+        conn => ConnPid,
+        conn_mon => Mon,
+        conn_myid => undefined,
+        dest_hash => DestHash,
+        connecting => false
+    },
+    State2 =
+        case maps:get(pending_stream_started, State1, undefined) of
+            {stream_started, ConnPid, _MyId} = Started ->
+                {noreply, Registered} = handle_control_info(Started, State1),
+                Registered#{pending_stream_started => undefined};
+            _ ->
+                State1
+        end,
+    flush_pending_stream_data(ConnPid, State2);
 %% The session answered a delegated connect. One message carries both the
 %% verdict and the stream, so the status line is written before any relayed
 %% byte can be: the client is entitled to read STREAM STATUS first.
@@ -299,6 +336,16 @@ handle_control_info(
 ) ->
     erlang:demonitor(maps:get(pending_session_mon, State), [flush]),
     apply_connect_result(Result, State);
+handle_control_info(
+    {sam_stream_accept_result, Ref, Result}, State
+) when is_map_key(pending_accept_ref, State) andalso map_get(pending_accept_ref, State) =:= Ref ->
+    erlang:demonitor(maps:get(pending_session_mon, State), [flush]),
+    apply_accept_result(Result, State);
+handle_control_info(
+    {sam_stream_forward_result, Ref, Result}, State
+) when is_map_key(pending_forward_ref, State) andalso map_get(pending_forward_ref, State) =:= Ref ->
+    erlang:demonitor(maps:get(pending_session_mon, State), [flush]),
+    apply_forward_result(Result, State);
 %% A connection announces its demux key as its very first act, which can beat
 %% the session's hand-off message: hold it until the stream is ours.
 handle_control_info(
@@ -306,6 +353,14 @@ handle_control_info(
 ) when
     Ref =/= undefined
 ->
+    {noreply, State#{pending_stream_started => Started}};
+handle_control_info(
+    {stream_started, _Conn, _MyId} = Started, State
+) when not is_map_key(conn, State) ->
+    {noreply, State#{pending_stream_started => Started}};
+handle_control_info(
+    {stream_started, _Conn, _MyId} = Started, #{conn := undefined} = State
+) ->
     {noreply, State#{pending_stream_started => Started}};
 handle_control_info({stream_started, Conn, MyId}, #{conn := Conn} = State) ->
     %% The conn announces its stream ID — the demux key for inbound packets.
@@ -324,6 +379,22 @@ handle_control_info({stream_established, Conn, _PeerHash}, #{conn := Conn} = Sta
     %% Inbound (ACCEPT-side) connection: the socket has been raw
     %% since STREAM ACCEPT; nothing further to signal.
     {noreply, State};
+handle_control_info({stream_established, _Conn, _PeerHash}, State) ->
+    %% Arrived before this socket's connection was registered (or for a
+    %% connection it does not own): nothing to signal.
+    {noreply, State};
+handle_control_info({stream_data, Conn, Bytes}, State) when
+    is_pid(Conn), is_binary(Bytes), not is_map_key(conn, State)
+->
+    %% The connection's first payload can beat the accept/connect hand-off.
+    %% Hold it in arrival order and flush it once the connection is registered.
+    Pending = maps:get(pending_stream_data, State, []),
+    {noreply, State#{pending_stream_data => Pending ++ [{Conn, Bytes}]}};
+handle_control_info({stream_data, Conn, Bytes}, #{conn := undefined} = State) when
+    is_pid(Conn), is_binary(Bytes)
+->
+    Pending = maps:get(pending_stream_data, State, []),
+    {noreply, State#{pending_stream_data => Pending ++ [{Conn, Bytes}]}};
 handle_control_info({stream_data, Conn, Bytes}, #{send_fn := SendFn, conn := Conn} = State) when
     is_pid(Conn)
 ->
@@ -351,15 +422,14 @@ handle_control_info({stream_closed, _Conn}, State) ->
 handle_control_info({stream_reset, _Conn}, State) ->
     {stop, normal, State};
 handle_control_info(
-    {'DOWN', Mon, process, _Pid, _Reason},
-    #{
-        conn_mon := Mon,
-        connecting := true
-    } = State
-) ->
+    {'DOWN', Mon, process, _Pid, _Reason}, State
+) when
+    is_map_key(conn_mon, State) andalso map_get(conn_mon, State) =:= Mon andalso
+        is_map_key(connecting, State) andalso map_get(connecting, State) =:= true
+->
     B64 = maps:get(pending_connect_b64, State, <<>>),
     send_line(State, [
-        <<"STREAM STATUS RESULT=CANT_REACH DESTINATION=">>,
+        <<"STREAM STATUS RESULT=CANT_REACH_PEER MESSAGE=">>,
         B64
     ]),
     Cleared = cleared_conn(State#{connecting => false}),
@@ -371,18 +441,58 @@ handle_control_info(
         false -> {stop, normal, Cleared}
     end;
 handle_control_info(
-    {'DOWN', Mon, process, _Pid, _Reason}, #{pending_session_mon := Mon} = State
-) ->
+    {'DOWN', Mon, process, _Pid, _Reason}, State
+) when
+    is_map_key(pending_session_mon, State) andalso map_get(pending_session_mon, State) =:= Mon andalso
+        is_map_key(pending_connect_ref, State) andalso
+        map_get(pending_connect_ref, State) =/= undefined
+->
     %% The session died before it could answer: the id no longer names a
     %% session, so this connect can never become a stream.
     send_line(State, <<"STREAM STATUS RESULT=INVALID_ID">>),
     {stop, normal, clear_pending_connect(State#{connecting => false})};
+handle_control_info(
+    {'DOWN', Mon, process, _Pid, _Reason}, State
+) when
+    is_map_key(pending_session_mon, State) andalso map_get(pending_session_mon, State) =:= Mon andalso
+        is_map_key(pending_accept_ref, State) andalso
+        map_get(pending_accept_ref, State) =/= undefined
+->
+    send_line(State, <<"STREAM STATUS RESULT=INVALID_ID">>),
+    {stop, normal, State#{
+        pending_accept_ref => undefined,
+        pending_session_mon => undefined
+    }};
+handle_control_info(
+    {'DOWN', Mon, process, _Pid, _Reason}, State
+) when
+    is_map_key(pending_session_mon, State) andalso map_get(pending_session_mon, State) =:= Mon andalso
+        is_map_key(pending_forward_ref, State) andalso
+        map_get(pending_forward_ref, State) =/= undefined
+->
+    send_line(State, <<"STREAM STATUS RESULT=INVALID_ID">>),
+    {stop, normal, clear_pending_forward(State)};
 handle_control_info(
     {'DOWN', Mon, process, _Pid, _Reason}, #{delegated := Delegated} = State
 ) when is_map_key(Mon, Delegated) ->
     %% The stream socket went away: its stream goes with it.
     i2p_stream_conn:close(maps:get(Mon, Delegated)),
     {noreply, State#{delegated => maps:remove(Mon, Delegated)}};
+handle_control_info({'DOWN', Mon, process, Pid, _Reason}, #{listener_mon := Mon} = State) ->
+    %% The ACCEPT socket that registered as listener died. Drop the
+    %% registration only if it still points at that socket; a newer ACCEPT may
+    %% have replaced it.
+    DestHash = maps:get(dest_hash, State, undefined),
+    case DestHash of
+        undefined ->
+            ok;
+        _ ->
+            case i2p_sam_sup:listener_lookup(DestHash) of
+                {ok, Pid} -> i2p_sam_sup:listener_unregister(DestHash);
+                _ -> ok
+            end
+    end,
+    {noreply, State#{listener_mon => undefined, listener_pid => undefined}};
 handle_control_info({'DOWN', Mon, process, _Pid, Reason}, #{conn_mon := Mon} = _State) ->
     exit({stream_conn_died, Reason});
 handle_control_info({'DOWN', _Mon, process, _Pid, _Reason}, State) ->
@@ -458,10 +568,6 @@ handle_session_create(Style, Id, DestBlob64, Lengths, State) ->
             DestHash = i2p_keys:hash(Dest),
             DestB64 = i2p_keys:to_b64(Dest),
             i2p_sam_sup:session_register(Id, self(), DestHash, Style, CPriv),
-            %% Every session form needs a LeaseSet2 so remote peers can find
-            %% the destination's inbound tunnels; the router retries until
-            %% one exists. A demanded inbound length steers which tunnel the
-            %% lease names.
             i2p_tunnel_srv:publish_lease_set(Dest, SPriv, in_len(Lengths)),
             register_lengths(Lengths),
             send_line(State, <<"SESSION STATUS RESULT=OK DESTINATION=", DestB64/binary>>),
@@ -478,7 +584,7 @@ handle_session_create(Style, Id, DestBlob64, Lengths, State) ->
             };
         {error, _} ->
             send_line(State, <<"SESSION STATUS RESULT=I2P_ERROR MESSAGE=\"bad destination\"">>),
-            exit({protocol_error, bad_destination})
+            State
     end.
 
 %% register_lengths/1 — hand this session's length demands to the tunnel
@@ -564,7 +670,96 @@ invalid_id(State) ->
     send_line(State, <<"STREAM STATUS RESULT=INVALID_ID">>),
     exit({protocol_error, invalid_session_id}).
 
+%% request_accept/2 — ask the session that owns the destination to register this
+%% socket as its pending STREAM ACCEPT listener. The session answers with the
+%% destination it serves, and this socket becomes raw for the one stream that
+%% later arrives.
+-spec request_accept(pid(), #{buf := <<>>, phase := established, _ => _}) ->
+    #{
+        buf := <<>>,
+        pending_accept_ref := reference(),
+        pending_session_mon := reference(),
+        phase := established,
+        _ => _
+    }.
+request_accept(SessionPid, State) ->
+    Ref = make_ref(),
+    Mon = erlang:monitor(process, SessionPid),
+    SessionPid ! {stream_accept, Ref, self()},
+    State#{
+        pending_accept_ref => Ref,
+        pending_session_mon => Mon
+    }.
+
+%% request_forward/4 — ask the session that owns the destination to bind its
+%% STREAM FORWARD target. The session owns the binding and the relay; this
+%% socket only carries the command and its reply.
+-spec request_forward(pid(), binary() | undefined, char(), #{
+    buf := <<>>, phase := established, _ => _
+}) ->
+    #{
+        buf := <<>>,
+        pending_forward_ref := reference(),
+        pending_session_mon := reference(),
+        phase := established,
+        _ => _
+    }.
+request_forward(SessionPid, HostBin, Port, State) ->
+    Ref = make_ref(),
+    Mon = erlang:monitor(process, SessionPid),
+    SessionPid ! {stream_forward, Ref, HostBin, Port, self()},
+    State#{
+        pending_forward_ref => Ref,
+        pending_session_mon => Mon
+    }.
+
 %%%%%%% %%% Delegated streams %%%%%%%
+
+%% delegate_accept/3 — the session half of a stream socket's ACCEPT. Register
+%% the socket as the pending listener for this destination, so an inbound SYN
+%% is handed to it; answer it with the destination it now serves. The session
+%% stays in line mode.
+-spec delegate_accept(reference(), pid(), state()) -> state().
+delegate_accept(Ref, From, #{dest := Dest, dest_hash := DestHash} = State) ->
+    case i2p_sam_sup:listener_lookup(DestHash) of
+        {ok, ExistingPid} when ExistingPid =/= From ->
+            case is_process_alive(ExistingPid) of
+                true ->
+                    %% A live listener is already registered for this
+                    %% destination (typically from another stream socket). Do
+                    %% not overwrite the ETS row and orphan that socket; reject
+                    %% the new request with an explicit status instead.
+                    From ! {sam_stream_accept_result, Ref, {rejected, accept_listener_registered}},
+                    State;
+                false ->
+                    register_accept_listener(Ref, From, Dest, DestHash, State)
+            end;
+        _ ->
+            register_accept_listener(Ref, From, Dest, DestHash, State)
+    end.
+
+register_accept_listener(Ref, From, Dest, DestHash, State) ->
+    case maps:get(listener_mon, State, undefined) of
+        undefined -> ok;
+        OldMon -> erlang:demonitor(OldMon, [flush])
+    end,
+    i2p_sam_sup:listener_register(DestHash, From),
+    Mon = erlang:monitor(process, From),
+    From ! {sam_stream_accept_result, Ref, {accepted, i2p_keys:to_b64(Dest), DestHash}},
+    State#{listener_mon => Mon, listener_pid => From}.
+
+%% delegate_forward/5 — the session half of a stream socket's FORWARD. Bind the
+%% destination to the local service; the session owns the binding and the relay
+%% table, and the socket only carries the command and its reply.
+-spec delegate_forward(reference(), binary() | undefined, inet:port_number(), pid(), state()) ->
+    state().
+delegate_forward(Ref, HostBin, Port, From, State) ->
+    DestHash = maps:get(dest_hash, State),
+    Host = i2p_sam_parse:host_string(HostBin),
+    i2p_sam_sup:forward_register(DestHash, Host, Port),
+    State2 = State#{forward => #{host => Host, port => Port}},
+    From ! {sam_stream_forward_result, Ref, ok},
+    State2.
 
 %% delegate_stream/4 — the session half of a stream socket's CONNECT. Decide
 %% how the connect reaches its target and answer the socket in one message, so
@@ -662,6 +857,66 @@ track_delegated(Mon, ConnPid, State) ->
 cleared_conn(State) ->
     State#{conn => undefined, conn_mon => undefined, conn_myid => undefined}.
 
+%% apply_accept_result/2 — the stream socket's half of a delegated ACCEPT. The
+%% destination's reply line is written and the socket goes raw, waiting for the
+%% inbound stream the session will hand to it.
+-spec apply_accept_result(term(), state()) ->
+    {noreply, state()} | {stop, normal, state()}.
+apply_accept_result({accepted, DestB64, DestHash}, State) when is_map_key(sock, State) ->
+    Sock = maps:get(sock, State),
+    send_line(State, DestB64),
+    ok = inet:setopts(Sock, [{active, once}]),
+    {noreply, State#{
+        phase => raw,
+        dest_hash => DestHash,
+        pending_accept_ref => undefined,
+        pending_session_mon => undefined
+    }};
+apply_accept_result({rejected, accept_listener_registered}, State) when is_map_key(sock, State) ->
+    send_line(
+        State, <<"STREAM STATUS RESULT=I2P_ERROR MESSAGE=\"accept listener already registered\"">>
+    ),
+    {stop, normal, State#{
+        pending_accept_ref => undefined,
+        pending_session_mon => undefined
+    }};
+apply_accept_result({rejected, _}, State) when is_map_key(sock, State) ->
+    send_line(State, <<"STREAM STATUS RESULT=I2P_ERROR MESSAGE=\"accept already in progress\"">>),
+    {stop, normal, State#{
+        pending_accept_ref => undefined,
+        pending_session_mon => undefined
+    }};
+apply_accept_result(_Other, State) ->
+    {stop, normal, State}.
+
+%% apply_forward_result/2 — the stream socket's half of a delegated FORWARD.
+-spec apply_forward_result(term(), #{local := term(), phase := phase(), _ => _}) ->
+    {noreply, #{
+        local := term(),
+        pending_forward_ref := 'undefined',
+        pending_session_mon := 'undefined',
+        phase := term(),
+        _ => _
+    }}
+    | {stop, normal, #{
+        local := term(),
+        pending_forward_ref := 'undefined',
+        pending_session_mon := 'undefined',
+        phase := term(),
+        _ => _
+    }}.
+apply_forward_result(ok, #{phase := Phase, local := Local} = State) when
+    Phase =:= hello orelse Phase =:= established orelse Phase =:= raw
+->
+    _ = Local,
+    send_line(State, <<"STREAM STATUS RESULT=OK">>),
+    {noreply, clear_pending_forward(State)};
+apply_forward_result(_Other, #{phase := Phase, local := Local} = State) when
+    Phase =:= hello orelse Phase =:= established orelse Phase =:= raw
+->
+    _ = Local,
+    {stop, normal, clear_pending_forward(State)}.
+
 %% apply_connect_result/2 — the stream socket's half of a delegated connect.
 %% Every failure replies and then ends the socket, as i2pd does: once CONNECT
 %% has been sent, that socket can never carry another command or stream.
@@ -697,7 +952,7 @@ apply_connect_result({conn, ConnPid, DestHash}, State) ->
             _ ->
                 State1
         end,
-    {noreply, State2};
+    flush_pending_stream_data(ConnPid, State2);
 apply_connect_result({paired, PeerPid}, #{sock := Sock} = State) ->
     %% Same-router shortcut: the target had a pending STREAM ACCEPT, so the
     %% two sockets relay raw bytes to each other.
@@ -709,7 +964,7 @@ apply_connect_result({paired, PeerPid}, #{sock := Sock} = State) ->
         })};
 apply_connect_result(cant_reach, State) ->
     send_line(State, [
-        <<"STREAM STATUS RESULT=CANT_REACH DESTINATION=">>,
+        <<"STREAM STATUS RESULT=CANT_REACH_PEER MESSAGE=">>,
         maps:get(pending_connect_b64, State, <<>>)
     ]),
     {stop, normal, clear_pending_connect(State#{connecting => false})};
@@ -717,11 +972,52 @@ apply_connect_result(invalid_id, State) ->
     send_line(State, <<"STREAM STATUS RESULT=INVALID_ID">>),
     {stop, normal, clear_pending_connect(State#{connecting => false})}.
 
+%% flush_pending_stream_data/2 — a SYN may carry payload before the
+%% accept/connect hand-off reaches us. Deliver those bytes in arrival order now
+%% that the connection is registered. Only entries whose stored Conn matches
+%% ConnPid are processed; stale entries are dropped. Returns {noreply, State}
+%% or {stop, normal, State} so callers can propagate a stop result.
+-spec flush_pending_stream_data(pid(), state()) ->
+    {noreply, state()} | {stop, normal, state()}.
+flush_pending_stream_data(ConnPid, State) ->
+    Pending = maps:get(pending_stream_data, State, []),
+    {Matching, Stale} = lists:partition(
+        fun({Conn, _Bytes}) -> Conn =:= ConnPid end,
+        Pending
+    ),
+    Result = lists:foldl(
+        fun({_Conn, Bytes}, Acc) ->
+            case Acc of
+                {noreply, S} ->
+                    case handle_control_info({stream_data, ConnPid, Bytes}, S) of
+                        {noreply, S2} -> {noreply, S2};
+                        {stop, normal, S2} -> {stop, normal, S2}
+                    end;
+                {stop, normal, S} ->
+                    {stop, normal, S}
+            end
+        end,
+        {noreply, State},
+        Matching
+    ),
+    case Result of
+        {noreply, NewState} ->
+            {noreply, NewState#{pending_stream_data => Stale}};
+        {stop, normal, NewState} ->
+            {stop, normal, NewState#{pending_stream_data => Stale}}
+    end.
+
 clear_pending_connect(State) ->
     State#{
         pending_connect_ref => undefined,
         pending_session_mon => undefined,
         pending_connect_b64 => undefined
+    }.
+
+clear_pending_forward(State) ->
+    State#{
+        pending_forward_ref => undefined,
+        pending_session_mon => undefined
     }.
 
 %% dispatch_stream_packet/2 — a garlic payload opened under this
@@ -782,22 +1078,54 @@ route_and_accept(Pkt, State) ->
 %% treat the same `{error, stream_limit}` differently.
 -spec start_accept_conn(i2p_client:route(), i2p_streaming:packet(), state()) -> state().
 start_accept_conn(Route, Pkt, State) ->
-    ConnOpts = #{
-        role => accept,
-        syn => Pkt,
-        owner => self(),
-        send_fn => fun(Wire) -> stream_send(Route, Wire) end,
-        local_seed => maps:get(sign_priv, State),
-        local_dest_bin =>
-            i2p_keys:to_binary(maps:get(dest, State)),
-        local_dest_hash => maps:get(dest_hash, State)
-    },
-    case i2p_sam_sup:start_stream_conn(ConnOpts) of
-        {ok, ConnPid} ->
-            Mon = erlang:monitor(process, ConnPid),
-            accept_spawned(ConnPid, Mon, State);
-        {error, _Reason} ->
-            State
+    DestHash = maps:get(dest_hash, State),
+    case i2p_sam_sup:listener_lookup(DestHash) of
+        {ok, ListenerPid} ->
+            %% STREAM ACCEPT path: hand the stream to the socket that issued
+            %% ACCEPT. The session no longer owns the socket, but it keeps the
+            %% connection in its delegated set so it can take it down on exit.
+            i2p_sam_sup:listener_unregister(DestHash),
+            ConnOpts = #{
+                role => accept,
+                syn => Pkt,
+                owner => ListenerPid,
+                send_fn => fun(Wire) -> stream_send(Route, Wire) end,
+                local_seed => maps:get(sign_priv, State),
+                local_dest_bin =>
+                    i2p_keys:to_binary(maps:get(dest, State)),
+                local_dest_hash => DestHash
+            },
+            case i2p_sam_sup:start_stream_conn(ConnOpts) of
+                {ok, ConnPid} ->
+                    Mon = erlang:monitor(process, ConnPid),
+                    ListenerPid ! {sam_stream_accepted, ConnPid, DestHash},
+                    track_delegated(Mon, ConnPid, State);
+                {error, _Reason} ->
+                    State
+            end;
+        not_found ->
+            case i2p_sam_sup:forward_lookup(DestHash) of
+                {ok, {_Host, _Port}} ->
+                    ConnOpts = #{
+                        role => accept,
+                        syn => Pkt,
+                        owner => self(),
+                        send_fn => fun(Wire) -> stream_send(Route, Wire) end,
+                        local_seed => maps:get(sign_priv, State),
+                        local_dest_bin =>
+                            i2p_keys:to_binary(maps:get(dest, State)),
+                        local_dest_hash => DestHash
+                    },
+                    case i2p_sam_sup:start_stream_conn(ConnOpts) of
+                        {ok, ConnPid} ->
+                            Mon = erlang:monitor(process, ConnPid),
+                            accept_spawned(ConnPid, Mon, State);
+                        {error, _Reason} ->
+                            State
+                    end;
+                not_found ->
+                    State
+            end
     end.
 
 %% accept_spawned/3 — wire up a just-spawned accept-role connection: a
@@ -885,37 +1213,83 @@ target_identity(B64) ->
         error:_ -> error
     end.
 
--spec handle_stream_accept(session_id(), state()) -> state().
-handle_stream_accept(Id, #{session_id := Id, dest_hash := DestHash} = State) ->
-    i2p_sam_sup:listener_register(DestHash, self()),
-    send_line(State, i2p_keys:to_b64(maps:get(dest, State))),
-    %% Wait for stream_pair message from the CONNECT side
-    State#{phase => raw};
-handle_stream_accept(_Id, State) ->
-    send_line(State, <<"STREAM STATUS RESULT=I2P_ERROR MESSAGE=\"session id mismatch\"">>),
-    State.
+-spec handle_stream_accept(binary(), #{buf := <<>>, phase := established, _ => _}) ->
+    #{
+        buf := <<>>,
+        pending_accept_ref := reference(),
+        pending_session_mon := reference(),
+        phase := established,
+        _ => _
+    }.
+handle_stream_accept(_Id, State) when
+    is_map_key(pending_accept_ref, State) andalso map_get(pending_accept_ref, State) =/= undefined
+->
+    send_line(State, <<"STREAM STATUS RESULT=I2P_ERROR MESSAGE=\"accept already in progress\"">>),
+    State;
+handle_stream_accept(_Id, State) when is_map_key(session_id, State) ->
+    %% SAM v3 gives every stream its own client-to-SAM socket. ACCEPT on the
+    %% socket that ran SESSION CREATE is refused exactly as CONNECT is, so a
+    %% one-socket client cannot pass against i2per and fail against i2pd.
+    send_line(State, <<"SESSION STATUS RESULT=I2P_ERROR MESSAGE=\"Socket already in use\"">>),
+    exit({protocol_error, socket_already_in_use});
+handle_stream_accept(Id, State) ->
+    case i2p_sam_sup:session_lookup(Id) of
+        {ok, {SessionPid, _DestHash, stream}} ->
+            case is_process_alive(SessionPid) of
+                true ->
+                    request_accept(SessionPid, State);
+                false ->
+                    i2p_sam_sup:session_unregister(Id),
+                    invalid_id(State)
+            end;
+        _ ->
+            invalid_id(State)
+    end.
 
 %% handle_stream_forward/4 — bind a local service to this destination
 %% (SAM v3 STREAM FORWARD): every inbound peer stream is relayed to a fresh
 %% TCP connection at Host:Port. Unlike ACCEPT the control socket stays in
 %% line mode and any number of concurrent streams may be relayed; the
 %% binding lives until the session dies.
--spec handle_stream_forward(session_id(), binary() | undefined, binary(), state()) ->
-    state().
-handle_stream_forward(Id, HostBin, PortBin, #{session_id := Id, dest_hash := DestHash} = State) ->
+-spec handle_stream_forward(binary(), binary() | undefined, binary(), #{
+    buf := <<>>, phase := established, _ => _
+}) ->
+    #{
+        buf := <<>>,
+        pending_forward_ref := reference(),
+        pending_session_mon := reference(),
+        phase := established,
+        _ => _
+    }.
+handle_stream_forward(_Id, _HostBin, _PortBin, State) when
+    is_map_key(pending_forward_ref, State) andalso map_get(pending_forward_ref, State) =/= undefined
+->
+    send_line(State, <<"STREAM STATUS RESULT=I2P_ERROR MESSAGE=\"forward already in progress\"">>),
+    State;
+handle_stream_forward(_Id, _HostBin, _PortBin, State) when is_map_key(session_id, State) ->
+    %% STREAM FORWARD, like CONNECT and ACCEPT, is issued on a stream socket
+    %% that names the session by ID; the session socket stays in line mode.
+    send_line(State, <<"SESSION STATUS RESULT=I2P_ERROR MESSAGE=\"Socket already in use\"">>),
+    exit({protocol_error, socket_already_in_use});
+handle_stream_forward(Id, HostBin, PortBin, State) ->
     case i2p_sam_parse:parse_port(PortBin) of
         {ok, Port} ->
-            Host = i2p_sam_parse:host_string(HostBin),
-            i2p_sam_sup:forward_register(DestHash, Host, Port),
-            send_line(State, <<"STREAM STATUS RESULT=OK">>),
-            State#{forward => #{host => Host, port => Port}};
+            case i2p_sam_sup:session_lookup(Id) of
+                {ok, {SessionPid, _DestHash, stream}} ->
+                    case is_process_alive(SessionPid) of
+                        true ->
+                            request_forward(SessionPid, HostBin, Port, State);
+                        false ->
+                            i2p_sam_sup:session_unregister(Id),
+                            invalid_id(State)
+                    end;
+                _ ->
+                    invalid_id(State)
+            end;
         error ->
             send_line(State, <<"STREAM STATUS RESULT=I2P_ERROR MESSAGE=\"bad port\"">>),
             exit({protocol_error, bad_forward_port})
-    end;
-handle_stream_forward(_Id, _HostBin, _PortBin, State) ->
-    send_line(State, <<"STREAM STATUS RESULT=I2P_ERROR MESSAGE=\"session id mismatch\"">>),
-    State.
+    end.
 
 %% handle_datagram_send/4 — the command half of DATAGRAM/RAW SEND: validate
 %% parameters and arm a fixed-size payload read. The bytes following the
@@ -1009,74 +1383,34 @@ payload_step(#{read := Read} = State, Data) ->
 %% STATUS reply, and an unroutable target drops silently.
 -spec finish_send(send_kind(), binary(), binary(), state()) -> state().
 finish_send(Kind, DestB64, Payload, State) ->
-    case resolve_send_target(DestB64) of
-        {ok, Route} ->
-            Wire =
-                case {Kind, maps:get(style, State, undefined)} of
-                    {raw, _} ->
-                        Payload;
-                    {datagram2, _} ->
-                        datagram2_wire(Payload, State, Route);
-                    {repliable, datagram2} ->
-                        datagram2_wire(Payload, State, Route);
-                    {repliable, _} ->
-                        datagram_wire(repliable, Payload, State)
-                end,
-            i2p_client:send_wire(Route, Wire),
+    Style = maps:get(style, State, undefined),
+    FromDest = i2p_keys:to_binary(maps:get(dest, State)),
+    SignPriv = maps:get(sign_priv, State),
+    EffectiveKind =
+        case {Kind, Style} of
+            {repliable, datagram2} -> datagram2;
+            {datagram2, _} -> datagram2;
+            {repliable, _} -> repliable;
+            {raw, _} -> raw
+        end,
+    case EffectiveKind of
+        raw ->
+            _ = i2p_client:send_raw(DestB64, Payload),
             State;
-        error ->
+        _ ->
+            _ = i2p_client:send_datagram(EffectiveKind, FromDest, SignPriv, DestB64, Payload),
             State
     end.
 
-%% datagram_wire/3 — build the garlic Data-clove payload for one send.
--spec datagram_wire(send_kind(), binary(), state()) -> binary().
-datagram_wire(repliable, Payload, State) ->
-    {ok, Wire} =
-        i2p_datagram:encode(
-            i2p_keys:to_binary(maps:get(dest, State)),
-            maps:get(sign_priv, State),
-            Payload
-        ),
-    Wire.
+%% (removed: delegated to m:i2p_client)
 
-%% datagram2_wire/3 — build a Datagram2 garlic Data-clove payload for one send.
--spec datagram2_wire(binary(), state(), i2p_client:route()) -> binary().
-datagram2_wire(Payload, State, Route) ->
-    TargetHash = maps:get(dest_hash, Route),
-    {ok, Wire} =
-        i2p_datagram:encode2(
-            i2p_keys:to_binary(maps:get(dest, State)),
-            maps:get(sign_priv, State),
-            TargetHash,
-            Payload
-        ),
-    Wire.
+%% (removed: delegated to m:i2p_client)
 
-%% resolve_send_target/1 — a base64 destination (or address-book name)
-%% resolved to a lease route like STREAM CONNECT.
--spec resolve_send_target(binary()) -> {ok, i2p_client:route()} | error.
-resolve_send_target(TargetB64) ->
-    case target_identity(TargetB64) of
-        {ok, #{bin := DestBin}} -> i2p_client:route_to_dest(DestBin);
-        error -> resolve_book_target(TargetB64)
-    end.
+%% (removed: delegated to m:i2p_client)
 
-%% resolve_book_target/1 — the base64 parse failed: retry through the
-%% address book (hosts.txt names from subscriptions).
--spec resolve_book_target(binary()) -> {ok, i2p_client:route()} | error.
-resolve_book_target(TargetB64) ->
-    case i2p_addressbook:resolve(TargetB64) of
-        {ok, DestB64} -> resolve_direct_target(DestB64);
-        {error, _} -> error
-    end.
+%% (removed: delegated to m:i2p_client)
 
-%% resolve_direct_target/1 — route to a plain base64 destination blob.
--spec resolve_direct_target(binary()) -> {ok, i2p_client:route()} | error.
-resolve_direct_target(DestB64) ->
-    case target_identity(DestB64) of
-        {ok, #{bin := Bin}} -> i2p_client:route_to_dest(Bin);
-        error -> error
-    end.
+%% (removed: delegated to m:i2p_client)
 
 %% deliver_datagram/2 — announce an authenticated inbound repliable
 %% datagram on the control socket (sender destination + size line, then the
@@ -1092,7 +1426,8 @@ deliver_datagram(Wire, State) ->
                 <<" SIZE=">>,
                 integer_to_binary(byte_size(Payload))
             ]),
-            ok = gen_tcp:send(maps:get(sock, State), Payload),
+            SendFn = maps:get(send_fn, State),
+            ok = SendFn(Payload),
             State;
         error ->
             State
@@ -1125,7 +1460,8 @@ deliver_datagram2(Wire, State) ->
                         <<" SIZE=">>,
                         integer_to_binary(byte_size(Payload))
                     ]),
-                    ok = gen_tcp:send(maps:get(sock, State), Payload),
+                    SendFn = maps:get(send_fn, State),
+                    ok = SendFn(Payload),
                     State#{replay_window => W1}
             end;
         error ->
@@ -1140,12 +1476,13 @@ deliver_raw(Payload, State) ->
         <<"RAW RECEIVED SIZE=">>,
         integer_to_binary(byte_size(Payload))
     ]),
-    ok = gen_tcp:send(maps:get(sock, State), Payload),
+    SendFn = maps:get(send_fn, State),
+    ok = SendFn(Payload),
     State.
 
 %% stream_send/2 — the streaming connection's transport (see
 %% `f:i2p_client:send_wire/2`).
--spec stream_send(i2p_client:route(), binary()) -> ok.
+-spec stream_send(i2p_client:route(), binary()) -> ok | {error, dropped_no_tunnel}.
 stream_send(Route, Data) ->
     i2p_client:send_wire(Route, Data).
 
@@ -1165,7 +1502,11 @@ resolve_destination(undefined, _State) ->
 resolve_destination(<<"TRANSIENT">>, State) ->
     resolve_destination(undefined, State);
 resolve_destination(DestB64, _State) ->
-    i2p_keys:parse_dest_blob(i2p_keys:decode_b64(DestB64)).
+    try
+        i2p_keys:parse_dest_blob(i2p_keys:decode_b64(DestB64))
+    catch
+        _:_ -> {error, bad_dest}
+    end.
 
 -spec decode_dest_b64(binary()) -> {ok, i2p_crypto:hash()} | {error, term()}.
 decode_dest_b64(B64) ->

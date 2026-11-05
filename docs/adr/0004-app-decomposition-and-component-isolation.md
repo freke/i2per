@@ -32,7 +32,7 @@ over Erlang distribution (`gen_server` calls / `erpc`). They can run on any node
 | App | Owns | Status |
 |---|---|---|
 | `i2per_status` | Status web + versioned read API | Shipped |
-| `i2per_proxy` | HTTP/SOCKS/BOB/I2PControl | Shipped (SAM-based; refactor to Erlang calls is E1CHFWF) |
+| `i2per_proxy` | HTTP/SOCKS (BOB and I2PControl out of 1.0.0 scope; see `docs/parity.md`) | Shipped (SAM-based; refactor to Erlang calls is E1CHFWF) |
 | `i2per_tun` | TUN interface | Shipped (SAM-based; refactor to Erlang calls is E1CHFWF) |
 | `i2per_sam` | SAM bridge (TCP 7656) | Candidate (extract from core; pairs with E1CHFWF) |
 | `i2per_server_tunnels` | Server tunnel TCP listeners | Candidate |

@@ -1546,7 +1546,8 @@ attempt_announced(PeerHash, Transport) ->
 %% in `t:i2p_events:event/0`, at the `f:notify/1` call site.
 ssu2_connect(PeerHash, RemoteRI, Local) ->
     case
-        i2p_identity:ssu2_preferred() andalso
+        lists:member(ssu2, i2p_transport:configured()) andalso
+            i2p_identity:ssu2_preferred() andalso
             erlang:whereis(i2p_ssu2_listener) =/= undefined andalso
             i2p_router_info:ssu2_address_options(RemoteRI) =/= error
     of
@@ -1751,26 +1752,30 @@ our_endpoint(Local) ->
     end.
 
 ntcp2_connect(PeerHash, RemoteRI, Local, Owner) ->
-    %% The fallback announces itself too, and not as a detail: without it a peer
-    %% whose SSU2 leg parked would keep reporting `ssu2` for the whole NTCP2 dial
-    %% that followed, which is the same lie one transport later.
-    ok = attempt_announced(PeerHash, ntcp2),
-    Args = #{
-        role => alice,
-        remote_ri => RemoteRI,
-        local => Local,
-        owner => Owner,
-        handshake_timeout => ?HANDSHAKE_TIMEOUT
-    },
-    case i2p_ntcp2_sup:start_connection(i2p_ntcp2_sup:conn_child(Args)) of
-        {ok, ConnPid} ->
-            Owner ! {conn_started, PeerHash, ConnPid, ntcp2};
-        {ok, ConnPid, _} ->
-            Owner ! {conn_started, PeerHash, ConnPid, ntcp2};
-        {error, Reason} ->
-            Owner ! {connect_failed, PeerHash, {supervisor, Reason}}
+    case lists:member(ntcp2, i2p_transport:configured()) of
+        false ->
+            Owner ! {connect_failed, PeerHash, {not_configured, ntcp2}};
+        true ->
+            %% The fallback announces itself too, and not as a detail: without it a peer
+            %% whose SSU2 leg parked would keep reporting `ssu2` for the whole NTCP2 dial
+            %% that followed, which is the same lie one transport later.
+            ok = attempt_announced(PeerHash, ntcp2),
+            Args = #{
+                role => alice,
+                remote_ri => RemoteRI,
+                local => Local,
+                owner => Owner,
+                handshake_timeout => ?HANDSHAKE_TIMEOUT
+            },
+            case i2p_ntcp2_sup:start_connection(i2p_ntcp2_sup:conn_child(Args)) of
+                {ok, ConnPid} ->
+                    Owner ! {conn_started, PeerHash, ConnPid, ntcp2};
+                {ok, ConnPid, _} ->
+                    Owner ! {conn_started, PeerHash, ConnPid, ntcp2};
+                {error, Reason} ->
+                    Owner ! {connect_failed, PeerHash, {supervisor, Reason}}
+            end
     end.
-
 handle_frame(ConnPid, Payload, State) ->
     case i2p_framing:decode_blocks(Payload) of
         {ok, Blocks} ->

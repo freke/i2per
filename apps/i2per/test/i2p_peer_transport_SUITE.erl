@@ -8,13 +8,14 @@
 %% and floodfill-publish scenarios live in `i2p_peer_discovery_SUITE` and the
 %% direct unit tests.
 %%
-%% Listeners bind at port 0 and close in `after` blocks. The slow fallback case
-%% allows the SSU2 handshake budget before the NTCP2 leg appears; the backoff
-%% case walks the configured retry windows. The two park cases do not: they arm
-%% the retransmit schedule down, or answer on the first reply, so a park costs
-%% milliseconds rather than the ten seconds it costs a real dial. The
+%% Listeners bind at port 0 and close in `after` blocks. The backoff case walks
+%% the configured retry windows. The three park cases do not: they arm the
+%% retransmit schedule down, or answer on the first reply, so a park costs
+%% milliseconds rather than the nine seconds it costs a real dial. The
 %% read-during-a-park case arms it *up* instead, to a window wide enough to read
-%% the peer from inside the park rather than only after it.
+%% the peer from inside the park rather than only after it. The fallback case
+%% arms it down too, which is why it asserts a four-step policy inside one
+%% sub-second park instead of a fallback inside a 60 s timetrap.
 
 -module(i2p_peer_transport_SUITE).
 
@@ -57,6 +58,30 @@
 %% than merely reach its end. See `arm_handshake/1`.
 -define(OBSERVE_RETRY_MS, 125).
 
+%% The fallback case's park, armed down through `arm_handshake/1`: two resends at
+%% 50 ms, so the SSU2 leg gives up in ~150 ms and the NTCP2 leg behind it is
+%% reachable inside the case. Both are the production app-env levers an operator
+%% sets — the same argument `arm_sndbuf/1` makes — so the case reaches the stall
+%% through a configured product behaviour rather than a private mechanism.
+%%
+%% One timer fires per resend plus the one that gives up, which is why the count
+%% is `?FALLBACK_RESENDS + 1` and not `?FALLBACK_RESENDS`; see the note on the
+%% earliest budget in `arm_handshake/1`.
+-define(FALLBACK_RETRY_MS, 50).
+-define(FALLBACK_RESENDS, 2).
+-define(FALLBACK_PARK_MS, (?FALLBACK_RETRY_MS * (?FALLBACK_RESENDS + 1))).
+
+%% Twenty parks. Wide enough for the abandon plus a loopback NTCP2 handshake
+%% behind it, and three orders below the ~11 s the case used to spend waiting
+%% inside its own 60 s timetrap. Written as a multiple of the park it covers, so
+%% retuning the park moves the waits with it instead of leaving a second number
+%% to keep in step.
+-define(FALLBACK_LEG_MS, (20 * ?FALLBACK_PARK_MS)).
+
+%% The poll backoff `f:await_peer_status/3` and `f:await_attempting_ssu2/2`
+%% sleep on, so a poll count can be written as the duration it stands for.
+-define(POLL_MS, 25).
+
 %% The `connecting` deadline the wedged-dial case runs at. Long enough that the
 %% SSU2 park underneath it is unambiguously still in progress when it fires — at
 %% `?OBSERVE_RETRY_MS` the park is ~7.5 s at the sixty resends this case arms, so
@@ -85,9 +110,9 @@ all() ->
 %% ---------------------------------------------------------------------------
 %% Per-case lifecycle: the `ssu2` setting must be set before the app
 %% and its SSU2 supervisor come up. App stop and unset_env in
-%% end_per_testcase leave a clean envelope for the next case. The fallback
-%% scenario spends ~20s in the SSU2 handshake budget, so it gets a wider
-%% timetrap.
+%% end_per_testcase leave a clean envelope for the next case. Every case runs on
+%% the suite's 30 s timetrap now; the one that reads inside a park wider than
+%% its own window asks for more.
 %% ---------------------------------------------------------------------------
 
 init_per_testcase(Case, Config) ->
@@ -134,6 +159,17 @@ arm_handshake(ssu2_park_on_a_dead_port_is_reported_with_its_reason) ->
 arm_handshake(a_peer_parked_on_ssu2_reports_ssu2_not_ntcp2) ->
     application:set_env(?APP, handshake_retry_ms, ?OBSERVE_RETRY_MS),
     application:set_env(?APP, handshake_max_resends, 4);
+%% The fallback case reads the whole policy — attempted, abandoned, second leg,
+%% ended on NTCP2 — and every step of it lands inside a park. At the default
+%% nine resends the park is ~9 s, so a case that asserts four things about it
+%% spends most of its time waiting to look. Armed down to ~150 ms it becomes a
+%% sub-second case, and it gets sharper rather than weaker: configured, it can
+%% now tell a correct derived bound from a reintroduced hardcoded literal,
+%% because a park that ignored these two keys would take the old ~11 s and miss
+%% every window below.
+arm_handshake(transport_falls_back_to_ntcp2) ->
+    application:set_env(?APP, handshake_retry_ms, ?FALLBACK_RETRY_MS),
+    application:set_env(?APP, handshake_max_resends, ?FALLBACK_RESENDS);
 arm_handshake(_Case) ->
     ok.
 
@@ -180,8 +216,6 @@ arm_ssu2(transport_enable_udp_serves_but_dials_ntcp2) ->
 arm_ssu2(_Case) ->
     ok.
 
-timetrap_for(transport_falls_back_to_ntcp2) ->
-    60000;
 timetrap_for(a_peer_parked_on_ssu2_reports_ssu2_not_ntcp2) ->
     60000;
 timetrap_for(_Case) ->
@@ -281,10 +315,30 @@ transport_ssu2_when_available(_Config) ->
         i2p_ssu2_listener:stop(AL)
     end.
 
-%% The remote advertises an SSU2 address nothing answers. The SSU2 handshake
-%% times out (the fixed ~20s connect budget), the dial falls back to NTCP2,
-%% and the same queued work completes over TCP. Slow by design, hence the
-%% explicit 60s timetrap on this scenario.
+%% The remote advertises an SSU2 address nothing answers. What is under test is
+%% the *order* — SSU2 attempted, the park abandoned, NTCP2 second, ended on
+%% NTCP2 — and each of those four is read rather than inferred from the outcome.
+%%
+%% **Why this is not a timetrap.** It used to assert that a fallback happened
+%% inside a 60 s timetrap, which is a statement about the harness: a product
+%% bound of 59 seconds passed it, and a bound of 150 ms passed it identically.
+%% Now that the park is a configured ~150 ms, each step is a fact or an absence
+%% that cannot be produced any other way:
+%%
+%% - `f:await_attempting_ssu2/2` is the attempt, read from the peer's own
+%%   `connecting`/`ssu2` rather than assumed from the transport it ended on.
+%% - the park counter delta is the abandon, and `ssu2_dials_parked` is charged
+%%   when the park *ends*, so reading it after the fallback makes the absence
+%%   real rather than a dial caught a moment into a park.
+%% - the queued lookup arriving on the NTCP2 listener is the second leg, and it
+%%   carries the work queued before the first one was abandoned.
+%% - `transport := ntcp2` on a connected peer is where it ended.
+%%
+%% The waits are multiples of the configured park (`?FALLBACK_LEG_MS`), so
+%% retuning `arm_handshake/1` moves them; the CT timetrap stays in force over
+%% all of it, since `i2p_admission:admit/2` is a real `gen_server:call(...,
+%% infinity)` on this path and the timetrap is the harness's liveness guarantee
+%% rather than a claim about the product.
 transport_falls_back_to_ntcp2(_Config) ->
     {A, B, _C} = trio(),
     {AL, APort} = ssu2_listener(A),
@@ -295,15 +349,17 @@ transport_falls_back_to_ntcp2(_Config) ->
         BRI = ssu2_ri_at(listen_port(LB), DeadPort, B),
         BHash = i2p_router_info:hash(BRI),
         AHash = maps:get(hash, ALocal),
+        Before = counter(ssu2_dials_parked),
         start_peer(ALocal, [BRI]),
         ok = i2p_peer:lookup(BHash, exploratory),
-        %% ~20s of SSU2 handshake retries to the dead port, then the NTCP2
-        %% dial over B's listener with the queued lookup intact.
-        {CB, {lookup, Exploratory}} = await_frame(40000),
+        %% A peer at `connecting` over `ssu2` has committed and not yet
+        %% finished, which is the interval the rest of the case is about.
+        ok = await_attempting_ssu2(BHash, ?FALLBACK_LEG_MS div ?POLL_MS),
+        {CB, {lookup, Exploratory}} = await_frame(?FALLBACK_LEG_MS),
         #{type := exploratory, key := AHash} = Exploratory,
         {store, _} = recv_db_store(CB),
-        %% 25 ms polls x 1600 = 40 s budget for the SSU2-attempt window.
-        await_peer_status(BHash, connected, 1600),
+        await_peer_status(BHash, connected, ?FALLBACK_LEG_MS div ?POLL_MS),
+        ?assertEqual(1, counter(ssu2_dials_parked) - Before),
         #{status := connected, transport := ntcp2} = peer_status(BHash),
         i2p_peer:stop()
     after
@@ -1093,8 +1149,8 @@ listen_port(Listener) ->
 await_frame() ->
     await_frame(?TIMEOUT).
 
-%% As `f:await_frame/0` with an explicit timeout (the NTCP2 leg of the fallback
-%% scenario only appears after the ~20s SSU2 handshake budget).
+%% As `f:await_frame/0` with an explicit timeout — the fallback case, whose
+%% NTCP2 leg only appears once the configured park has been abandoned.
 await_frame(TimeoutMs) ->
     i2p_ct_helpers:wait_msg(
         fun
@@ -1123,10 +1179,10 @@ db_msg(#{type := 10, body := Body}) ->
     {ok, MsgID, TimeMs} = i2p_i2np:decode_delivery_status(Body),
     {delivery_status, MsgID, TimeMs}.
 
-%% Documented load-safe window: 400 polls x 25ms = 10s wall-clock budget for
-%% the peer manager to reach a status, which covers the SSU2->NTCP2 handshake
-%% (~20s, see the 1600-iteration variant below). The poll is deadline-bounded;
-%% the 40s variant exists for the slow fallback path.
+%% Documented load-safe window: 400 polls x ?POLL_MS = 10s wall-clock budget for
+%% the peer manager to reach a status, which covers an SSU2 park and the NTCP2
+%% handshake behind it. The poll is deadline-bounded; a case that reads a wider
+%% window passes its own poll count in, as the fallback case does.
 await_peer_status(Hash, Status) ->
     await_peer_status(Hash, Status, 400).
 

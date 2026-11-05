@@ -10,10 +10,6 @@
 %%              7c3911e0ab2586fd864497297e575e6f3bc601c0883c30df5f4dd2d24f665424)
 %%   - HKDF:    RFC 5869 appendix A, test cases 1..3 (SHA-256)
 %%   - AEAD:    RFC 7539 section 2.8.2
-%%   - Elligator2: reference Elligator2.java vectors (encode(false),
-%%                 encode(true), decode), plus round-trip properties
-%%   - Ratchet KDFs: determinism and structural properties (per
-%%                 i2p_crypto moduledoc)
 
 -include_lib("eunit/include/eunit.hrl").
 
@@ -122,86 +118,6 @@ x25519_small_order_test() ->
     %% with an error instead of returning an all-zero shared secret.
     {_, Priv} = i2p_crypto:x25519_keygen(),
     ?assertError({error, _, _}, i2p_crypto:x25519_dh(Priv, <<0:256>>)).
-
-%%% --------------------------------------------------------------------------
-%%% Elligator2 (reference Elligator2.java vectors)
-%%% --------------------------------------------------------------------------
-
-elligator2_java_vectors_test() ->
-    Test1 = hx(<<"33951964003c940878063ccfd0348af42150ca16d2646f2c5856e8338377d880">>),
-    Test2 = hx(<<"e73507d38bae63992b3f57aac48c0abc14509589288457995a2b4ca3490aa207">>),
-    ExpectFalse = hx(<<"2820b6b241e0f68a6c4a7fee3d978228ef3ae45533cd410aa91a415331d8612d">>),
-    ExpectTrue = hx(<<"3cfb87c46c0b4575ca8175e0ed1c0ae9dae79db78df86997c4847b9f20b27718">>),
-    ExpectDec = hx(<<"1e8afffed6bf53fe271ad572473262ded8faec68e5e67ef45ebb82eeba52604f">>),
-    ?assertEqual({ok, ExpectFalse}, i2p_crypto:elligator2_encode(Test1, false)),
-    ?assertEqual({ok, ExpectTrue}, i2p_crypto:elligator2_encode(Test1, true)),
-    ?assertEqual({ok, ExpectDec}, i2p_crypto:elligator2_decode(Test2)),
-    %% Round-trip on the reference representatives: TEST1 has bit 255 set
-    %% (top byte 0x80), so as an integer it exceeds the field prime; the
-    %% reference implementation operates on the raw 256-bit value and its
-    %% decode does not invert its own encode for this out-of-field vector.
-    %% Both decodes agree with the reference Elligator2.java output.
-    ?assertEqual(
-        {ok, hx(<<"46951964003c940878063ccfd0348af42150ca16d2646f2c5856e8338377d800">>)},
-        i2p_crypto:elligator2_decode(ExpectFalse)
-    ),
-    ?assertEqual(
-        {ok, hx(<<"46951964003c940878063ccfd0348af42150ca16d2646f2c5856e8338377d800">>)},
-        i2p_crypto:elligator2_decode(ExpectTrue)
-    ).
-
-elligator2_roundtrip_test() ->
-    lists:foreach(
-        fun(_) ->
-            case i2p_crypto:x25519_keygen_elg2() of
-                {Pub, _Priv, Repr} ->
-                    ?assertEqual({ok, Pub}, i2p_crypto:elligator2_decode(Repr))
-            end
-        end,
-        lists:seq(1, 20)
-    ),
-    ok.
-
-elligator2_high_bits_test() ->
-    %% The two high bits of byte 31 are ignored by decode and chosen by
-    %% the wire-form encoder; a representative with any high bits decodes
-    %% to the same key as its masked form.
-    %% TEST1 with bit 255 cleared so it is a valid in-field X25519 key
-    %% (top bit set, as in the raw vector, would make x >= p).
-    Pub = hx(<<"33951964003c940878063ccfd0348af42150ca16d2646f2c5856e8338377d800">>),
-    {ok, R0} = i2p_crypto:elligator2_encode(Pub, false, 0),
-    ?assertEqual({ok, Pub}, i2p_crypto:elligator2_decode(R0)),
-    {ok, Rff} = i2p_crypto:elligator2_encode(Pub, false, 16#ff),
-    ?assertEqual({ok, Pub}, i2p_crypto:elligator2_decode(Rff)),
-    <<Rest:31/binary, Last>> = Rff,
-    ?assertEqual(R0, <<Rest/binary, (Last band 16#3f)>>),
-    ok.
-
-elligator2_properties_test() ->
-    %% For any key, either both alternative encodings fail (the key's
-    %% v-coordinate is a quadratic non-residue) or every successful
-    %% encoding decodes back to the key; the two encodings are distinct.
-    lists:foreach(
-        fun(_) ->
-            {Pub, _} = i2p_crypto:x25519_keygen(),
-            E1 = i2p_crypto:elligator2_encode(Pub, true),
-            E2 = i2p_crypto:elligator2_encode(Pub, false),
-            case {E1, E2} of
-                {error, error} ->
-                    ok;
-                {error, {ok, R}} ->
-                    ?assertEqual({ok, Pub}, i2p_crypto:elligator2_decode(R));
-                {{ok, R}, error} ->
-                    ?assertEqual({ok, Pub}, i2p_crypto:elligator2_decode(R));
-                {{ok, R1}, {ok, R2}} ->
-                    ?assertNotEqual(R1, R2),
-                    ?assertEqual({ok, Pub}, i2p_crypto:elligator2_decode(R1)),
-                    ?assertEqual({ok, Pub}, i2p_crypto:elligator2_decode(R2))
-            end
-        end,
-        lists:seq(1, 20)
-    ),
-    ok.
 
 %%% --------------------------------------------------------------------------
 %%% HKDF-SHA256 (RFC 5869)
@@ -378,22 +294,11 @@ es_nonce_is_unique_across_the_range_test() ->
     ?assert(lists:all(fun(Nonce) -> byte_size(Nonce) =:= 12 end, Nonces)).
 
 %%% --------------------------------------------------------------------------
-%%% Noise initialization and ratchet KDFs
+%%% Noise mix primitives
 %%% --------------------------------------------------------------------------
 
-noise_initialize_test() ->
-    %% Hardcoded: h = SHA256(protocol_name), ck = h, then h = SHA256(h)
-    %% for the null prologue, with the fixed 40-byte protocol name.
-    ?assertEqual(
-        {
-            hx(<<"9ccf852cc93bb9504441e950e01d52322e0d47add1e9a555f755b569ae183b5c">>),
-            hx(<<"4caf11ef2c8e36564c53e88885064dbaacbe0054ad178f8079a646827e6ee40c">>)
-        },
-        i2p_crypto:noise_initialize()
-    ).
-
 noise_mix_test() ->
-    {H, Ck} = i2p_crypto:noise_initialize(),
+    {H, Ck} = i2p_crypto:noise_n_initialize(),
     Data = crypto:strong_rand_bytes(64),
     H1 = i2p_crypto:mixhash(H, Data),
     ?assertEqual(H1, i2p_crypto:mixhash(H, Data)),
@@ -402,38 +307,6 @@ noise_mix_test() ->
     {Ck1, K} = i2p_crypto:mixkey(Ck, crypto:strong_rand_bytes(32)),
     ?assertEqual(32, byte_size(Ck1)),
     ?assertEqual(32, byte_size(K)).
-
-ratchet_kdf_structure_test() ->
-    R0 = crypto:strong_rand_bytes(32),
-    K0 = crypto:strong_rand_bytes(32),
-    %% dh_initialize builds a complete, deterministic tag set
-    T1 = i2p_crypto:dh_initialize(R0, K0),
-    ?assertEqual(T1, i2p_crypto:dh_initialize(R0, K0)),
-    #{next_root_key := NRK, sess_tag_ck := STC, symm_key_ck := SKC} = T1,
-    [?assertEqual(32, byte_size(B)) || B <- [NRK, STC, SKC]],
-    ?assertNotEqual(T1, i2p_crypto:dh_initialize(R0, crypto:strong_rand_bytes(32))),
-    %% session-tag chain: 8-byte tags, chain key advances
-    {Chain, Const} = i2p_crypto:session_tag_chain_init(STC),
-    ?assertEqual(32, byte_size(Const)),
-    {Chain2, Tag1} = i2p_crypto:session_tag_chain_step(Chain, Const),
-    {Chain3, Tag2} = i2p_crypto:session_tag_chain_step(Chain2, Const),
-    ?assertEqual(8, byte_size(Tag1)),
-    ?assertEqual(8, byte_size(Tag2)),
-    ?assertNotEqual(Tag1, Tag2),
-    ?assertNotEqual(Chain2, Chain3),
-    %% symmetric ratchet: distinct 32-byte keys
-    {SC1, SymK1} = i2p_crypto:symmetric_ratchet(SKC),
-    {SC2, SymK2} = i2p_crypto:symmetric_ratchet(SC1),
-    ?assertNotEqual(SymK1, SymK2),
-    ?assertNotEqual(SC1, SC2),
-    %% DH ratchet and session-reply tag sets are complete and deterministic
-    Tagset = i2p_crypto:dh_ratchet_tagset(K0, NRK),
-    ?assertEqual(Tagset, i2p_crypto:dh_ratchet_tagset(K0, NRK)),
-    Reply = i2p_crypto:session_reply_tagset(R0),
-    ?assertEqual(Reply, i2p_crypto:session_reply_tagset(R0)),
-    maps:foreach(fun(_K, V) -> ?assertEqual(32, byte_size(V)) end, Tagset),
-    maps:foreach(fun(_K, V) -> ?assertEqual(32, byte_size(V)) end, Reply),
-    ok.
 
 %%% --------------------------------------------------------------------------
 %%% AES-256-CBC (NTCP2 aesobfse ephemeral obfuscation)

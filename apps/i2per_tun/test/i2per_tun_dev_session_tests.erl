@@ -95,6 +95,28 @@ mock_sam_raw(LSock) ->
             ok
     end.
 
+%% ---------------------------------------------------------------- helpers
+
+wait_for_sessions(_Pid, 0, _Timeout) ->
+    ok;
+wait_for_sessions(Pid, N, Timeout) ->
+    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    wait_for_sessions_loop(Pid, N, Deadline).
+
+wait_for_sessions_loop(Pid, N, Deadline) ->
+    case maps:size(i2per_tun_dev:sessions(Pid)) >= N of
+        true ->
+            ok;
+        false ->
+            case erlang:monotonic_time(millisecond) >= Deadline of
+                true ->
+                    timeout;
+                false ->
+                    timer:sleep(10),
+                    wait_for_sessions_loop(Pid, N, Deadline)
+            end
+    end.
+
 %% ---------------------------------------------------------------- tests
 
 session_spawning_test() ->
@@ -102,6 +124,7 @@ session_spawning_test() ->
     Pid = start_dev(Port),
     try
         ?assertEqual(ok, i2per_tun_dev:inject(Pid, tcp_packet())),
+        ?assertEqual(ok, wait_for_sessions(Pid, 1, 5000)),
         ?assertEqual(1, maps:size(i2per_tun_dev:sessions(Pid))),
         ?assertEqual(1, maps:size(i2per_tun_dev:flows(Pid))),
         ?assertEqual(ok, i2per_tun_dev:inject(Pid, tcp_packet())),
@@ -122,11 +145,13 @@ monitor_teardown_test() ->
     {Mock, Port} = start_tcp_mock(),
     Pid = start_dev(Port),
     i2per_tun_dev:inject(Pid, tcp_packet()),
+    ?assertEqual(ok, wait_for_sessions(Pid, 1, 5000)),
     SessPid = hd(maps:values(i2per_tun_dev:sessions(Pid))),
     try
         exit(SessPid, kill),
         timer:sleep(100),
-        ?assertEqual(0, maps:size(i2per_tun_dev:sessions(Pid)))
+        ?assertEqual(0, maps:size(i2per_tun_dev:sessions(Pid))),
+        ?assertEqual(0, maps:size(i2per_tun_dev:flows(Pid)))
     after
         stop_dev(Pid),
         stop_tcp_mock(Mock)
@@ -137,6 +162,7 @@ stats_test() ->
     Pid = start_dev(Port),
     try
         i2per_tun_dev:inject(Pid, tcp_packet()),
+        ?assertEqual(ok, wait_for_sessions(Pid, 1, 5000)),
         i2per_tun_dev:inject(Pid, tcp_packet()),
         S = i2per_tun_dev:stats(Pid),
         ?assertEqual(2, maps:get(packets, S)),
@@ -165,6 +191,7 @@ udp_wiring_test() ->
     Pid = start_dev(Port),
     try
         ?assertEqual(ok, i2per_tun_dev:inject(Pid, udp_packet())),
+        ?assertEqual(ok, wait_for_sessions(Pid, 1, 5000)),
         ?assertEqual(1, maps:size(i2per_tun_dev:sessions(Pid))),
         ?assertEqual(1, maps:size(i2per_tun_dev:flows(Pid)))
     after

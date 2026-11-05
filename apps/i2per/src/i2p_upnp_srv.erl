@@ -27,7 +27,7 @@ Config: app env `i2per` -> `upnp` (boolean, default false), `upnp_name`
 
 -export([start_link/0, stop/0, enabled/0, status/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
--export([parse_locations/1]).
+-export([parse_locations/1, do_mapping/1, fetch_and_map/1]).
 
 -define(SSDP_ADDR, {239, 255, 255, 250}).
 -define(SSDP_PORT, 1900).
@@ -41,6 +41,10 @@ Config: app env `i2per` -> `upnp` (boolean, default false), `upnp_name`
     socket = undefined :: gen_udp:socket() | undefined,
     locations = [] :: [binary()],
     control_url = undefined :: string() | undefined,
+    %% Control URL of the gateway where mappings were successfully created.
+    %% Kept separately from the discovery cache so shutdown can still remove
+    %% them after a later renew loses or rediscovers the gateway.
+    mapping_control_url = undefined :: string() | undefined,
     service_type = "urn:schemas-upnp-org:service:WANIPConnection:1" :: string(),
     internal_ip = undefined :: string() | undefined,
     ports = [] :: [{pos_integer(), string()}],
@@ -149,9 +153,16 @@ handle_info(_Info, St) ->
 
 -spec terminate(term(), #state{}) -> ok.
 terminate(_Reason, St) ->
-    case St#state.control_url of
+    %% The discovery cache is cleared when a renew loses the gateway. Keep the
+    %% last gateway that accepted a mapping so its rows are still removed.
+    CleanupUrl =
+        case St#state.control_url of
+            undefined -> St#state.mapping_control_url;
+            Url -> Url
+        end,
+    case CleanupUrl of
         undefined -> ok;
-        _ -> delete_mappings(St)
+        _ -> delete_mappings(St#state{control_url = CleanupUrl})
     end,
     case St#state.socket of
         undefined -> ok;
@@ -315,22 +326,44 @@ do_mapping(St) ->
                 V
         end,
     St2 = St#state{internal_ip = IP},
-    lists:foreach(
-        fun({Port, Proto}) ->
-            Body = add_port_mapping_body(Port, Proto, IP, St#state.name, ST),
-            Action = ST ++ "#AddPortMapping",
-            case soap_request(CU, Action, Body) of
-                {ok, _} ->
-                    catch i2p_counters:add(upnp_mapping_renewed, 1),
-                    catch i2p_events:notify({upnp_mapping_renewed, Port, Proto});
-                {error, Reason} ->
-                    catch i2p_counters:add(upnp_mapping_refused, 1),
-                    catch i2p_events:notify({upnp_mapping_refused, Port, Proto, Reason})
-            end
+    {Failed, AnySucceeded} =
+        lists:foldl(
+            fun({Port, Proto}, {AccFailed, AccSucceeded}) ->
+                Body = add_port_mapping_body(Port, Proto, IP, St#state.name, ST),
+                Action = ST ++ "#AddPortMapping",
+                case soap_request(CU, Action, Body) of
+                    {ok, _} ->
+                        catch i2p_counters:add(upnp_mapping_renewed, 1),
+                        catch i2p_events:notify({upnp_mapping_renewed, Port, Proto}),
+                        {AccFailed, true};
+                    {error, Reason} ->
+                        catch i2p_counters:add(upnp_mapping_refused, 1),
+                        catch i2p_events:notify({upnp_mapping_refused, Port, Proto, Reason}),
+                        {true, AccSucceeded}
+                end
+            end,
+            {false, false},
+            St#state.ports
+        ),
+    St3 =
+        case AnySucceeded of
+            true -> St2#state{mapping_control_url = CU};
+            false -> St2
         end,
-        St#state.ports
-    ),
-    St2.
+    case Failed of
+        true ->
+            %% The gateway refused or lost the mapping (e.g. it rebooted or
+            %% moved): drop the cached control URL and the accumulated SSDP
+            %% locations so the next renew tick rediscovers from scratch.
+            St3#state{
+                control_url = undefined,
+                locations = [],
+                discovered = false,
+                internal_ip = undefined
+            };
+        false ->
+            St3
+    end.
 
 add_port_mapping_body(Port, Proto, IP, Name, ServiceType) ->
     iolist_to_binary([

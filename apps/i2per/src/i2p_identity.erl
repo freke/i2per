@@ -135,11 +135,23 @@ build_local(
     NowMs
 ) ->
     Pub = i2p_keys:public_key(Identity),
-    NTCP2 =
-        case ntcp2_published() of
-            true -> i2p_router_info:ntcp2_address(Host, Port, Pub, IV);
-            false -> i2p_router_info:ntcp2_nonpublished_address(address_family(Host), Pub)
-        end,
+    Configured = i2p_transport:configured(),
+    Ssu2Enabled = lists:member(ssu2, Configured) andalso ssu2_available(),
+    Intro = intro_key(Priv),
+    %% Published addresses are collected by iterating the configured transports
+    %% (Z2DRRT5): NTCP2 and SSU2 each contribute their own address when enabled,
+    %% and contribute nothing when disabled or unavailable.
+    TransportLocal = #{
+        host => Host,
+        port => Port,
+        ssu2_port => ssu2_port(Port),
+        static_pub => Pub,
+        iv => IV,
+        published => ntcp2_published(),
+        ntcp2_published => ntcp2_published(),
+        intro_key => Intro
+    },
+    Addresses = i2p_transport:published_addresses(TransportLocal),
     %% `router.version` is the I2P API compatibility marker, not the i2per
     %% application release number.
     Opts = #{
@@ -147,36 +159,23 @@ build_local(
         <<"router.version">> => <<"0.9.74">>,
         <<"caps">> => local_caps()
     },
-    case ssu2_available() of
+    RI = i2p_router_info:build(Identity, NowMs, Addresses, Opts, Seed),
+    Base = #{
+        static_priv => Priv,
+        static_pub => Pub,
+        hash => i2p_router_info:hash(RI),
+        iv => IV,
+        port => Port,
+        sign_seed => Seed,
+        sign_pub => i2p_keys:signing_key(Identity),
+        ri => RI
+    },
+    case Ssu2Enabled of
         true ->
-            Intro = intro_key(Priv),
-            SSU2Port = ssu2_port(Port),
-            SSU2 = i2p_router_info:ssu2_address(Host, SSU2Port, Pub, Intro),
-            RI = i2p_router_info:build(Identity, NowMs, [NTCP2, SSU2], Opts, Seed),
-            #{
-                static_priv => Priv,
-                static_pub => Pub,
-                hash => i2p_router_info:hash(RI),
-                iv => IV,
-                port => Port,
-                sign_seed => Seed,
-                sign_pub => i2p_keys:signing_key(Identity),
-                intro_key => Intro,
-                ssu2_addr => SSU2,
-                ri => RI
-            };
+            SSU2 = i2p_transport:published_address(ssu2, TransportLocal),
+            Base#{intro_key => Intro, ssu2_addr => SSU2};
         false ->
-            RI = i2p_router_info:build(Identity, NowMs, [NTCP2], Opts, Seed),
-            #{
-                static_priv => Priv,
-                static_pub => Pub,
-                hash => i2p_router_info:hash(RI),
-                iv => IV,
-                port => Port,
-                sign_seed => Seed,
-                sign_pub => i2p_keys:signing_key(Identity),
-                ri => RI
-            }
+            Base
     end.
 
 -doc """
@@ -321,12 +320,6 @@ ntcp2_published() ->
     case application:get_env(i2per, ntcp2_published) of
         {ok, false} -> false;
         _ -> true
-    end.
-
-address_family(Host) ->
-    case inet:parse_ipv4_address(binary_to_list(Host)) of
-        {ok, _} -> ipv4;
-        {error, _} -> ipv6
     end.
 
 allow_private_host() ->

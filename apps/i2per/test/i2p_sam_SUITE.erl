@@ -905,8 +905,12 @@ stream_loopback(_Config) ->
     DestA_B64 = recv_line(SA),
     send_cmd(SA, <<"SESSION CREATE STYLE=STREAM ID=sessionA DESTINATION=", DestA_B64/binary>>),
     _ = recv_line(SA),
-    send_cmd(SA, <<"STREAM ACCEPT ID=sessionA">>),
-    AcceptReply = recv_line(SA),
+
+    {ok, AcceptSock} = connect_sam(Port),
+    send_cmd(AcceptSock, <<"HELLO VERSION MIN=3.1 MAX=3.1">>),
+    _ = recv_line(AcceptSock),
+    send_cmd(AcceptSock, <<"STREAM ACCEPT ID=sessionA">>),
+    AcceptReply = recv_line(AcceptSock),
     ?assert(byte_size(AcceptReply) > 100),
 
     {ok, SB} = connect_sam(Port),
@@ -920,21 +924,22 @@ stream_loopback(_Config) ->
     {SS, ConnectReply} = sam_stream_socket(Port, <<"sessionB">>, DestA_B64),
     ?assert(binary:match(ConnectReply, <<"STREAM STATUS RESULT=OK">>) =/= nomatch),
 
-    %% SB (session B's socket) stays in line mode and open for the session's
-    %% lifetime; the stream lives on SS.
-    send_cmd(SB, <<"NAMING LOOKUP NAME=whatever.b32.i2p">>),
-    ?assertMatch({_, _}, binary:match(recv_line(SB), <<"NAMING REPLY">>)),
+    %% SA (session A's socket) stays in line mode and open for the session's
+    %% lifetime; the stream lives on AcceptSock.
+    send_cmd(SA, <<"NAMING LOOKUP NAME=whatever.b32.i2p">>),
+    ?assertMatch({_, _}, binary:match(recv_line(SA), <<"NAMING REPLY">>)),
 
     %% Reads buffer until the handshake completes, so no settle sleep is
     %% needed before A's first write; the 5s recv timeouts are the guard.
-    ok = gen_tcp:send(SA, <<"hello from A\n">>),
+    ok = gen_tcp:send(AcceptSock, <<"hello from A\n">>),
     {ok, DataB} = gen_tcp:recv(SS, 0, 5000),
     ?assertEqual(<<"hello from A\n">>, DataB),
 
     ok = gen_tcp:send(SS, <<"hello from B\n">>),
-    {ok, DataA} = gen_tcp:recv(SA, 0, 5000),
+    {ok, DataA} = gen_tcp:recv(AcceptSock, 0, 5000),
     ?assertEqual(<<"hello from B\n">>, DataA),
 
+    gen_tcp:close(AcceptSock),
     gen_tcp:close(SA),
     gen_tcp:close(SB),
     gen_tcp:close(SS).
@@ -980,7 +985,7 @@ stream_connect_failure_keeps_session(_Config) ->
     send_cmd(StreamSock, <<"HELLO VERSION MIN=3.1 MAX=3.1">>),
     _ = recv_line(StreamSock),
     send_cmd(StreamSock, <<"STREAM CONNECT ID=sessionC DESTINATION=AAAA">>),
-    ?assertEqual(<<"STREAM STATUS RESULT=CANT_REACH DESTINATION=AAAA">>, recv_line(StreamSock)),
+    ?assertEqual(<<"STREAM STATUS RESULT=CANT_REACH_PEER MESSAGE=AAAA">>, recv_line(StreamSock)),
     ?assertEqual({error, closed}, gen_tcp:recv(StreamSock, 0, 5000)),
 
     send_cmd(Sock, <<"NAMING LOOKUP NAME=whatever.b32.i2p">>),
@@ -1061,7 +1066,7 @@ stream_connect_conn_dies_before_established(_Config) ->
         exit(Conn, kill),
 
         ?assertEqual(
-            <<"STREAM STATUS RESULT=CANT_REACH DESTINATION=", RemoteB64/binary>>,
+            <<"STREAM STATUS RESULT=CANT_REACH_PEER MESSAGE=", RemoteB64/binary>>,
             recv_line(StreamSock, 10000)
         ),
         ?assertEqual({error, closed}, gen_tcp:recv(StreamSock, 0, 5000)),
@@ -1105,10 +1110,15 @@ stream_forward_bad_port(_Config) ->
     _ = recv_line(Sock),
     send_cmd(Sock, <<"SESSION CREATE STYLE=STREAM ID=fwd1">>),
     _ = recv_line(Sock),
-    send_cmd(Sock, <<"STREAM FORWARD ID=fwd1 PORT=notaport">>),
-    Reply = recv_line(Sock),
-    ?assert(binary:match(Reply, <<"RESULT=I2P_ERROR">>) =/= nomatch),
-    ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0, 5000)).
+    {ok, Ctl} = connect_sam(Port),
+    send_cmd(Ctl, <<"HELLO VERSION MIN=3.1 MAX=3.1">>),
+    _ = recv_line(Ctl),
+    send_cmd(Ctl, <<"STREAM FORWARD ID=fwd1 PORT=notaport">>),
+    ?assertEqual(
+        <<"STREAM STATUS RESULT=I2P_ERROR MESSAGE=\"bad port\"">>, recv_line(Ctl)
+    ),
+    ?assertEqual({error, closed}, gen_tcp:recv(Ctl, 0, 5000)),
+    gen_tcp:close(Sock).
 
 %% Every session form is a candidate for end-to-end delivery; the owning
 %% session dispatches the opened payload by its style.
@@ -1169,8 +1179,12 @@ proxy_loopback(Config) ->
     DestB64 = i2p_keys:encode_b64(DestBlob),
     send_cmd(SA, [<<"SESSION CREATE STYLE=STREAM ID=server DESTINATION=">>, DestB64]),
     _ = recv_line(SA),
-    send_cmd(SA, <<"STREAM ACCEPT ID=server">>),
-    _ = recv_line(SA),
+
+    {ok, AcceptSock} = connect_sam(SamPort),
+    send_cmd(AcceptSock, <<"HELLO VERSION MIN=3.1 MAX=3.1">>),
+    _ = recv_line(AcceptSock),
+    send_cmd(AcceptSock, <<"STREAM ACCEPT ID=server">>),
+    _ = recv_line(AcceptSock),
 
     %% Start proxy
     HttpPort = i2p_ct_helpers:free_port(),
@@ -1198,7 +1212,7 @@ proxy_loopback(Config) ->
     ok = gen_tcp:send(ClientSock, HttpRequest),
 
     %% Server: read forwarded HTTP request from SAM stream
-    {ok, ServerRecv} = gen_tcp:recv(SA, 0, 5000),
+    {ok, ServerRecv} = gen_tcp:recv(AcceptSock, 0, 5000),
     ?assert(byte_size(ServerRecv) > 0),
 
     %% Server: send HTTP response back
@@ -1208,7 +1222,7 @@ proxy_loopback(Config) ->
         <<"\r\n">>,
         <<"Hello I2P">>
     ],
-    ok = gen_tcp:send(SA, ServerResp),
+    ok = gen_tcp:send(AcceptSock, ServerResp),
 
     %% Test client: read HTTP response from proxy
     {ok, ClientRecv} = gen_tcp:recv(ClientSock, 0, 5000),
@@ -1216,6 +1230,7 @@ proxy_loopback(Config) ->
     ?assert(binary:match(ClientRecv, <<"Hello I2P">>) =/= nomatch),
 
     gen_tcp:close(ClientSock),
+    gen_tcp:close(AcceptSock),
     gen_tcp:close(SA),
     i2p_sam_proxy:stop(ProxyPid).
 
@@ -1461,6 +1476,10 @@ full_duplex(_Config) ->
         {ok, SrvSock} = sam_session(Port, <<"srv">>, SrvB64),
         ?assertMatch(#{leases := [_]}, wait_for_ls(SrvHash)),
 
+        {ok, SrvAccept} = connect_sam(Port),
+        send_cmd(SrvAccept, <<"HELLO VERSION MIN=3.1 MAX=3.1">>),
+        _ = recv_line(SrvAccept),
+
         ok = fd_mock(),
 
         %% Client dials FIRST — with no pending ACCEPT yet, the local pairing
@@ -1481,8 +1500,8 @@ full_duplex(_Config) ->
 
         %% Only now does the server announce ACCEPT (reply line echoes its
         %% destination); the queued SYN below must find its listener.
-        send_cmd(SrvSock, <<"STREAM ACCEPT ID=srv">>),
-        AcceptLine = recv_line(SrvSock),
+        send_cmd(SrvAccept, <<"STREAM ACCEPT ID=srv">>),
+        AcceptLine = recv_line(SrvAccept),
         ?assertEqual(i2p_keys:encode_b64(i2p_keys:to_binary(SrvId)), AcceptLine),
 
         inject_via_inbound(SrvRecvID, SynWire, SrvId),
@@ -1502,15 +1521,16 @@ full_duplex(_Config) ->
         {ok, PingPkt} = i2p_streaming:decode(PingWire),
         ?assertEqual(<<"ping through the tunnels">>, i2p_streaming:payload(PingPkt)),
         inject_via_inbound(SrvRecvID, PingWire, SrvId),
-        {ok, <<"ping through the tunnels">>} = gen_tcp:recv(SrvSock, 0, 5000),
+        {ok, <<"ping through the tunnels">>} = gen_tcp:recv(SrvAccept, 0, 5000),
 
-        ok = gen_tcp:send(SrvSock, <<"pong from the far end">>),
+        ok = gen_tcp:send(SrvAccept, <<"pong from the far end">>),
         {PongWire, _Seen4} = pull_data(HopKeys, CliDPriv, Seen3),
         inject_via_inbound(CliRecvID, PongWire, CliId),
         {ok, <<"pong from the far end">>} = gen_tcp:recv(CliStream, 0, 5000),
 
         gen_tcp:close(CliStream),
         gen_tcp:close(CliSock),
+        gen_tcp:close(SrvAccept),
         gen_tcp:close(SrvSock),
         ok
     after
@@ -1566,11 +1586,14 @@ forward_e2e(_Config) ->
         {EchoPort, EchoAcceptor} = echo_server(),
         Port = start_sam_listener(),
         {ok, FwdSock} = sam_session(Port, <<"fwd">>, FwdB64),
+        {ok, FwdCtl} = connect_sam(Port),
+        send_cmd(FwdCtl, <<"HELLO VERSION MIN=3.1 MAX=3.1">>),
+        _ = recv_line(FwdCtl),
         send_cmd(
-            FwdSock,
+            FwdCtl,
             <<"STREAM FORWARD ID=fwd PORT=", (integer_to_binary(EchoPort))/binary>>
         ),
-        ForwardReply = recv_line(FwdSock),
+        ForwardReply = recv_line(FwdCtl),
         ?assert(binary:match(ForwardReply, <<"STREAM STATUS RESULT=OK">>) =/= nomatch),
         ?assertMatch(
             {ok, {"127.0.0.1", EchoPort}},
@@ -1628,6 +1651,7 @@ forward_e2e(_Config) ->
         gen_tcp:close(Stream2),
         gen_tcp:close(Sock1),
         gen_tcp:close(Sock2),
+        gen_tcp:close(FwdCtl),
         gen_tcp:close(FwdSock),
         exit(EchoAcceptor, kill),
         ok

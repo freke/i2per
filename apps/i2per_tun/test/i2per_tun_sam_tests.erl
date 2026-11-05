@@ -101,3 +101,43 @@ sam_recv_line_preserves_bytes_after_newline_test() ->
     gen_tcp:close(Client),
     gen_tcp:close(Server),
     gen_tcp:close(LSock).
+
+%% A slow reply is accepted when the (long) deadline allows it and rejected
+%% when the (short) one does not, proving the bound is applied per call rather
+%% than a module-level constant.
+sam_recv_line_timeout_test() ->
+    %% long bound accepts a reply that arrives after a short delay
+    {ok, LSock1} = gen_tcp:listen(0, [binary, {packet, raw}, {active, false}, {reuseaddr, true}]),
+    {ok, {_, Port1}} = inet:sockname(LSock1),
+    spawn(fun() ->
+        case gen_tcp:accept(LSock1, 5000) of
+            {ok, S} ->
+                timer:sleep(50),
+                gen_tcp:send(S, <<"STREAM STATUS RESULT=OK\n">>);
+            _ ->
+                ok
+        end
+    end),
+    {ok, Client1} = gen_tcp:connect("127.0.0.1", Port1, [binary, {active, false}], 5000),
+    ?assertEqual(
+        {ok, <<"STREAM STATUS RESULT=OK">>},
+        i2per_tun_sam:sam_recv_line(Client1, 200)
+    ),
+    gen_tcp:close(Client1),
+    gen_tcp:close(LSock1),
+    %% short bound rejects the same slow reply
+    {ok, LSock2} = gen_tcp:listen(0, [binary, {packet, raw}, {active, false}, {reuseaddr, true}]),
+    {ok, {_, Port2}} = inet:sockname(LSock2),
+    spawn(fun() ->
+        case gen_tcp:accept(LSock2, 5000) of
+            {ok, S} ->
+                timer:sleep(50),
+                gen_tcp:send(S, <<"STREAM STATUS RESULT=OK\n">>);
+            _ ->
+                ok
+        end
+    end),
+    {ok, Client2} = gen_tcp:connect("127.0.0.1", Port2, [binary, {active, false}], 5000),
+    ?assertMatch({error, timeout}, i2per_tun_sam:sam_recv_line(Client2, 10)),
+    gen_tcp:close(Client2),
+    gen_tcp:close(LSock2).
