@@ -51,7 +51,8 @@ ok = i2p_tunnel_relay:send_tunnel_data(FirstHopHash, Frame).
 
 -export([
     handle_routed_i2np/4,
-    send_tunnel_data/2
+    send_tunnel_data/2,
+    reassemble/2
 ]).
 
 -export_type([transit_denied_reason/0, store_result/0]).
@@ -706,9 +707,12 @@ inject_at_gateway(StdMsg, Info, Entry, State) ->
     Entry1 = Entry#{gw_state => GwState},
     State#{transit := maps:update(TunnelID, Entry1, maps:get(transit, State))}.
 
-%% reassemble/2 — turn parsed fragments into complete standard-header I2NP
-%% messages. Single-frame messages pass straight through; fragmented ones
-%% are concatenated from the fragment map once their last piece arrives.
+-doc """
+Turn parsed fragments into complete standard-header I2NP messages.
+
+Single-frame messages pass straight through; fragmented ones are
+concatenated from the fragment map once their last piece arrives.
+""".
 -spec reassemble(
     [map()], #{i2p_i2np:message_id() => #{non_neg_integer() => binary()}}
 ) ->
@@ -732,9 +736,15 @@ complete_fragment(#{type := follow_on, msg_id := MsgID, last := true}, Map) ->
     case maps:find(MsgID, Map) of
         {ok, Pieces} when map_size(Pieces) > 0 ->
             Num = maps:size(Pieces),
-            Msg =
-                <<<<(maps:get(I, Pieces))/binary>> || I <- lists:seq(0, Num - 1)>>,
-            {ok, Msg, maps:remove(MsgID, Map)};
+            Indices = lists:seq(0, Num - 1),
+            case lists:all(fun(I) -> maps:is_key(I, Pieces) end, Indices) of
+                true ->
+                    Msg =
+                        <<<<(maps:get(I, Pieces))/binary>> || I <- Indices>>,
+                    {ok, Msg, maps:remove(MsgID, Map)};
+                false ->
+                    none
+            end;
         _ ->
             none
     end;

@@ -269,6 +269,27 @@ gateway_tunnel_multi_fragment_roundtrip_test() ->
     Reassembled = list_to_binary(AllData),
     ?assertEqual(Msg, Reassembled).
 
+%%%%%%%%% parse_tunnel_data + reassemble multi-fragment %%%%%%%%%
+
+parse_tunnel_data_reassemble_multi_fragment_test() ->
+    TunnelID = 42,
+    TargetHash = crypto:strong_rand_bytes(32),
+    Target = {9999, TargetHash},
+    Msg = crypto:strong_rand_bytes(2000),
+    FragMap0 = #{},
+    {ok, Wire1, State1} = i2p_tunnel:gateway(TunnelID, tunnel, Target, Msg, #{frag_map => FragMap0}),
+    {ok, Wire2, State2} = i2p_tunnel:gateway(TunnelID, tunnel, Target, <<>>, State1),
+    {ok, Wire3, State3} = i2p_tunnel:gateway(TunnelID, tunnel, Target, <<>>, State2),
+    ?assertEqual(done, i2p_tunnel:gateway(TunnelID, tunnel, Target, <<>>, State3)),
+    <<_:32/big, IV1:16/binary, Payload1:1008/binary>> = Wire1,
+    <<_:32/big, IV2:16/binary, Payload2:1008/binary>> = Wire2,
+    <<_:32/big, IV3:16/binary, Payload3:1008/binary>> = Wire3,
+    {ok, Frag1, FragMap1} = i2p_tunnel:parse_tunnel_data(Payload1, IV1, FragMap0),
+    {ok, Frag2, FragMap2} = i2p_tunnel:parse_tunnel_data(Payload2, IV2, FragMap1),
+    {ok, Frag3, FragMap3} = i2p_tunnel:parse_tunnel_data(Payload3, IV3, FragMap2),
+    {Msgs, _FragMap4} = i2p_tunnel_relay:reassemble(Frag1 ++ Frag2 ++ Frag3, FragMap3),
+    ?assertEqual([Msg], Msgs).
+
 %%%%%%%%% process_otbrm rejects mismatched lengths %%%%%%%%%
 
 process_otbrm_mismatched_lengths_test() ->

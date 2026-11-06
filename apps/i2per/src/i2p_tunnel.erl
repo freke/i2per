@@ -587,8 +587,12 @@ parse_tunnel_data(Payload, IV, FragMap) when
     %% test — a head clause here would silently rebind it instead.
     case checksum(Rest, IV) of
         Cksum ->
-            Fragments = parse_fragments(Rest, FragMap, []),
-            {ok, Fragments, FragMap};
+            case parse_fragments(Rest, FragMap, []) of
+                {ok, Fragments, FragMap1} ->
+                    {ok, Fragments, FragMap1};
+                error ->
+                    error
+            end;
         _ ->
             error
     end;
@@ -713,9 +717,16 @@ write_fragment_body(DeliveryType, Target, Msg, FragNum, MsgID) ->
     DataSize = min(byte_size(Msg), MaxData),
     FragmentData = binary:part(Msg, 0, DataSize),
     Remaining = binary:part(Msg, DataSize, byte_size(Msg) - DataSize),
-    {Flag, ExtraHeader} = fragment_header(
+    {Flag0, ExtraHeader} = fragment_header(
         DeliveryType, Target, FragNum, IsFirst, IsFragmented, MsgID1Actual
     ),
+    Last = Remaining =:= <<>>,
+    Flag =
+        Flag0 bor
+            (case Last of
+                true -> 1;
+                false -> 0
+            end),
     Instructions = <<Flag:8, ExtraHeader/binary, DataSize:16/big, FragmentData/binary>>,
     %% Total payload body (rest after checksum) = 0x00 + padding + instructions = 1004 bytes
     TargetSize = 1003 - byte_size(Instructions),
@@ -787,8 +798,8 @@ scan_delimiter(<<_:8, Rest/binary>>) -> scan_delimiter(Rest).
 
 %% parse_delivery_instructions/3 — parse one or more fragments from the
 %% instructions portion (after the 0x00 delimiter).
-parse_delivery_instructions(<<>>, _FragMap, Acc) ->
-    lists:reverse(Acc);
+parse_delivery_instructions(<<>>, FragMap, Acc) ->
+    {ok, lists:reverse(Acc), FragMap};
 parse_delivery_instructions(<<Flag:8, Rest/binary>>, FragMap, Acc) ->
     IsFirst = (Flag band 16#80) =:= 0,
     DeliveryType = (Flag bsr 5) band 16#03,
