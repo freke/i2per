@@ -1770,7 +1770,7 @@ the firewalled-remote path.
 #### Seeing a park while it is happening
 
 The counter and the event are reported *after* a park ends. A park runs for up to
-`handshake_retry_ms` x `handshake_max_resends` on a direct dial, and up to
+`handshake_retry_ms` x (`handshake_max_resends` + 1) on a direct dial, and up to
 `f:i2p_ssu2_conn:dial_budget_ms/0` through an introducer, and for that whole time
 the peer is still `connecting` — so the read API has to describe the attempt in
 progress, not only its outcome.

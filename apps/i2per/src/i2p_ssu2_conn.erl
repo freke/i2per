@@ -441,14 +441,14 @@ connect_via_introducer(LocalKeys, BobOpts, RIBlock, Listener, Relay) ->
 %% app-env keys an operator actually sets.
 -spec handshake_budget_ms() -> pos_integer().
 handshake_budget_ms() ->
-    handshake_retry_ms() * handshake_max_resends().
+    handshake_retry_ms() * (handshake_max_resends() + 1).
 
 -doc """
 The longest a single SSU2 leg of one outbound dial can block, in milliseconds.
 
 Two legs exist and they are bounded differently. A direct handshake is bounded by
 its SessionRequest retransmit budget: `handshake_retry_ms` times
-`handshake_max_resends`, both app-env keys on the `i2per` application. The
+`handshake_max_resends() + 1`, both app-env keys on the `i2per` application. The
 indirect leg through an introducer is bounded by a wait with a 15 s floor. The
 longer of the two is what a caller bounding the *whole* dial needs, so it is
 asked for here rather than restated, and it moves when an operator retunes the
