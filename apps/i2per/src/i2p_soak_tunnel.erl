@@ -1030,32 +1030,59 @@ supervisor, which is the one thing about it not in that list.
 """.
 -spec router_pids() -> [pid()].
 router_pids() ->
+    case router_pids_try(3) of
+        {ok, Pids} ->
+            Pids;
+        {error, Reason} ->
+            error({enumeration_failed, Reason})
+    end.
+
+router_pids_try(0) ->
+    {error, enumeration_failed};
+router_pids_try(N) ->
     Supervisor = whereis(i2per_sup),
-    Children = supervisor_worker_pids(Supervisor),
-    Candidates = [Supervisor | Children] ++ [whereis(i2p_tunnel_srv)],
-    lists:usort([Pid || Pid <- Candidates, is_pid(Pid)]).
+    case supervisor_worker_pids(Supervisor) of
+        {ok, Children} ->
+            Candidates = [Supervisor | Children] ++ [whereis(i2p_tunnel_srv)],
+            {ok, lists:usort([Pid || Pid <- Candidates, is_pid(Pid)])};
+        {error, _} ->
+            timer:sleep(10),
+            router_pids_try(N - 1)
+    end.
 
 %% Collect worker pids beneath a supervisor, recursing through nested
 %% supervisors so a new domain layer cannot disappear from the census.
+%%
+%% Returns `{ok, Pids}` or `{error, Reason}`: a supervisor that exits between
+%% its parent's enumeration and this recursion (or one that cannot be queried)
+%% must not be silently treated as having no children, because that would drop
+%% its entire subtree from the census. The caller retries the whole enumeration
+%% from the root instead.
 supervisor_worker_pids(undefined) ->
-    [];
+    {ok, []};
 supervisor_worker_pids(Sup) when is_pid(Sup) ->
     case catch supervisor:which_children(Sup) of
         Children when is_list(Children) ->
-            lists:foldl(
-                fun
-                    ({_Id, Pid, supervisor, _}, Acc) when is_pid(Pid) ->
-                        [Pid | supervisor_worker_pids(Pid) ++ Acc];
-                    ({_Id, Pid, _Type, _}, Acc) when is_pid(Pid) ->
-                        [Pid | Acc];
-                    (_, Acc) ->
-                        Acc
-                end,
-                [],
-                Children
-            );
+            collect_supervisor_children(Children, []);
         _ ->
-            []
+            {error, {which_children_failed, Sup}}
+    end.
+
+collect_supervisor_children([], Acc) ->
+    {ok, Acc};
+collect_supervisor_children([Child | Rest], Acc) ->
+    case Child of
+        {_Id, Pid, supervisor, _} when is_pid(Pid) ->
+            case supervisor_worker_pids(Pid) of
+                {ok, Sub} ->
+                    collect_supervisor_children(Rest, [Pid | Sub] ++ Acc);
+                {error, _} = Err ->
+                    Err
+            end;
+        {_Id, Pid, _Type, _} when is_pid(Pid) ->
+            collect_supervisor_children(Rest, [Pid | Acc]);
+        _ ->
+            collect_supervisor_children(Rest, Acc)
     end.
 
 -doc """
