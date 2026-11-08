@@ -145,7 +145,9 @@ The project interoperates with I2P routers. It does not bundle code from
 - **Companion apps:** `i2per_proxy` (operator console and SOCKS/HTTP proxy
   surfaces) and `i2per_tun` (TUN interface, shape (a) flow translator) talk
   to the core over Erlang instead of SAM, per ADR 0001; hermetic CT suites
-  cover the TUN datapath.
+  cover the TUN flow translator. The TUN packet data path is out of 1.0.0
+  scope (T57SS4F): it writes raw stream payload into the packet-oriented TUN
+  device and does not synthesize IP packets.
 - **UPnP / NAT traversal:** `i2p_upnp_srv`, bounded and off by default, with
   SSDP discovery, SOAP port mapping and renewal, hot-switchable. Opens the
   pinhole only; it does not publish a reachable RouterAddress by itself.
@@ -581,8 +583,9 @@ enabled by the shipped default profile. Automatic NetDb-driven Charlie
 selection is implemented, and the tunnel build accepts up to 7 hops. LeaseSet
 v1, EncryptedLeaseSet and MetaLeaseSet are implemented, Datagram2 (Proposal
 163) is implemented with replay protection, and addressbook publication is
-implemented. The TUN interface ships as the `i2per_tun` companion app and the
-operator console as `i2per_proxy` (ADR 0001); UPnP/NAT traversal ships as
+implemented. The `i2per_tun` companion app ships (ADR 0001) but its packet data path is
+out of 1.0.0 scope (T57SS4F); the operator console ships as `i2per_proxy`
+(ADR 0001); UPnP/NAT traversal ships as
 `i2p_upnp_srv`, off by default and hot-switchable, opening the pinhole only
 (it does not publish a reachable RouterAddress by itself). In-place relup upgrades
 are not supported; upgrading means installing a new tarball. 0.9.0 keeps the

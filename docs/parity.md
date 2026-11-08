@@ -56,14 +56,14 @@ Rows are one verdict, not prose: **done** (implemented and exercised),
 | Automatic NetDb-driven Charlie selection | done | SSU2 + peer_test + public address candidates; uniform random; one Charlie per cycle; per-Alice 60s rate limit; code-2 reject on failure; tests: `i2p_ssu2_peertest_SUITE` |
 | Peer testing | done | measured reachability ladder; tests: `i2p_peertest_tests`, `i2p_ssu2_peertest_SUITE` |
 | Measured reachability | done | see `CD7ZBVH`; tests: `i2p_ssu2_reachability_SUITE` |
-| TUN interface | done (separate app) | `i2per_tun` companion app (ADR 0001), shape (a) flow translator (SAM STREAM + RAW/DATAGRAM helpers); tests: `i2per_tun_*_tests` |
+| TUN interface | partial (separate app) | `i2per_tun` companion app (ADR 0001), shape (a) flow translator (SAM STREAM + RAW/DATAGRAM helpers); the packet data path is out of 1.0.0 scope - it writes raw stream payload into the packet-oriented TUN device (no TCP termination / IP synthesis; see `T57SS4F`); tests: `i2per_tun_*_tests` |
 | SOCKS / HTTP proxy / BOB / I2PControl | partial (separate app) | SOCKS and HTTP proxy implemented and shipped as `i2per_proxy`; BOB protocol and I2PControl not implemented (I2PControl is 3.x work, see `TZFYB9R`); tests: `i2per_proxy_*_tests` |
 | In-built status monitor | done (separate app) | `i2per_status` presentation app; held fields rendered (peers/tunnels/netdb/config/SAM), derived rates and reachability ladder; absent: graceful shutdown, non-SAM service rows, peer-test error reasons; tests: `i2per_status_*_tests` |
 | UPnP / NAT traversal service | done (separate app) | `i2p_upnp_srv` (off by default, hot-switchable); SSDP discovery, SOAP port mapping with renewal; tests: `i2p_upnp_srv_tests` |
 
 ## 1.0.0 material explicitly listed
 
-None as of 0.9.0: operator console and TUN shipped as companion apps; LeaseSet v1 / EncryptedLeaseSet / MetaLeaseSet partials are bounded by design (publishing not supported) and tracked in their rows above; BOB / I2PControl are out of 1.0.0 scope.
+None as of 0.9.0: operator console shipped as a companion app; `i2per_tun` ships as a companion app but its packet data path is out of 1.0.0 scope (flow translator writes raw stream payload to a packet-oriented device; no TCP termination / IP synthesis - see `T57SS4F`); LeaseSet v1 / EncryptedLeaseSet / MetaLeaseSet partials are bounded by design (publishing not supported) and tracked in their rows above; BOB / I2PControl and the TUN packet data path are out of 1.0.0 scope.
 
 ## Freshness
 
