@@ -100,6 +100,7 @@ defaults to 1730 bytes. Peer-offer normalization happens during the handshake.
 -doc "Internal connection state.".
 -type state() :: #{
     owner := pid(),
+    owner_mon => reference(),
     send_fn := fun((binary()) -> ok),
     seed := i2p_crypto:ed25519_seed(),
     dest_bin := binary(),
@@ -250,6 +251,9 @@ handle_info(connect_timeout, #{status := connecting, owner := Owner} = State) ->
     {stop, normal, State};
 handle_info(connect_timeout, State) ->
     {noreply, State};
+handle_info({'DOWN', Mon, process, _Owner, _Reason}, #{owner_mon := Mon} = State) ->
+    %% The process that reads this stream is gone; nothing can drain it.
+    {stop, normal, State};
 handle_info(_Msg, State) ->
     {noreply, State}.
 
@@ -606,8 +610,10 @@ normalize_peer_mtu(_PeerMTU) ->
     exit({protocol_error, invalid_max_packet_size}).
 
 base_state(Opts) ->
+    Owner = maps:get(owner, Opts),
     Base = #{
-        owner => maps:get(owner, Opts),
+        owner => Owner,
+        owner_mon => erlang:monitor(process, Owner),
         send_fn => maps:get(send_fn, Opts),
         seed => maps:get(local_seed, Opts),
         dest_bin => maps:get(local_dest_bin, Opts),

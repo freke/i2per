@@ -132,7 +132,8 @@ create_destination(Opts) ->
 -doc """
 Create a headless client session.
 
-`Opts` may carry `tunnel_lengths`, a map of `in_len`/`out_len` hop counts.
+`Opts` may carry `tunnel_lengths`, a map of `in_len`/`out_len` hop counts,
+and `owner`, the pid of the process that owns the session.
 Returns `{ok, Pid, DestB64}` where `Pid` is the session process and
 `DestB64` is this session's destination, or `{error, Reason}`.
 
@@ -142,6 +143,11 @@ timeout exits abnormally as it delivers the reply, so a link would kill
 the session at creation. The caller owns it: it lives until
 `f:close_session/1`, and every caller has to close it on *every* path,
 including the one where the connect it was created for then fails.
+
+Pass `owner => self()` in `Opts` and the session watches that process: if
+it dies without closing the session, the session stops and takes its
+connections with it. Without `owner`, a crashed companion app leaks the
+session and everything behind it.
 """.
 -spec create_session() -> {ok, pid(), binary()} | {error, term()}.
 create_session() ->
@@ -156,7 +162,8 @@ create_session(Opts) ->
         crypto_priv => CPriv,
         sign_priv => SPriv,
         tunnel_lengths => maps:get(tunnel_lengths, Opts, #{}),
-        ephemeral => maps:get(ephemeral, Opts, false)
+        ephemeral => maps:get(ephemeral, Opts, false),
+        owner => maps:get(owner, Opts, undefined)
     },
     case i2p_client_session:start(Args) of
         {ok, Pid} ->

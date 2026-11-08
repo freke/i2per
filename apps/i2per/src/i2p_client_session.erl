@@ -25,6 +25,12 @@ erpc spawns for a call with a timeout exits *abnormally* as it delivers
 the reply, so a link would kill the session before the caller could use
 it. See `f:i2p_sam_api:create_session/1` for the callers' side.
 
+Because the creating call is not the owner, a session cannot infer its
+owner from the caller. Pass the owning process as `owner` in `Args` and
+the session monitors it, stopping (and closing its connections) when that
+process dies without calling `f:i2p_sam_api:close_session/1`. A session
+started without `owner` keeps the old explicit-close contract.
+
 The one exception is a session started with `ephemeral => true`, which
 `f:i2p_sam_api:stream_connect/3` uses when it is given a destination map
 rather than a session pid: it stops itself when its last connection ends,
@@ -44,10 +50,11 @@ so the caller has nothing to close.
 Start a headless client session, unlinked from the caller.
 
 Input: `Args` — a map with `identity`, `crypto_priv`, `sign_priv`, and
-optional `tunnel_lengths` and `ephemeral`.
+optional `tunnel_lengths`, `ephemeral` and `owner`.
 Output: `{ok, Pid}` or `{error, Reason}`. The caller owns the session and
 must stop it with `f:i2p_sam_api:close_session/1`; nothing else will, unless
-`ephemeral` is true and its last connection has ended.
+`owner` is a pid that exits, or `ephemeral` is true and its last connection
+has ended.
 """.
 -spec start(map()) -> {ok, pid()} | {error, term()}.
 start(#{identity := _} = Args) ->
@@ -59,6 +66,7 @@ init(#{identity := Identity, crypto_priv := CPriv, sign_priv := SPriv} = Args) -
     DestB64 = i2p_keys:to_b64(Identity),
     Lengths = maps:get(tunnel_lengths, Args, #{}),
     Ephemeral = maps:get(ephemeral, Args, false),
+    OwnerMon = monitor_owner(maps:get(owner, Args, undefined)),
     %% Publish a LeaseSet so remote peers can reach us, mirroring SAM's
     %% SESSION CREATE. Best-effort: a router that is not fully booted
     %% (hermetic unit tests) simply leaves the publish pending.
@@ -73,6 +81,7 @@ init(#{identity := Identity, crypto_priv := CPriv, sign_priv := SPriv} = Args) -
         dest_bin => DestBin,
         tunnel_lengths => Lengths,
         ephemeral => Ephemeral,
+        owner_mon => OwnerMon,
         conns => #{},
         monitors => #{}
     }}.
@@ -126,6 +135,12 @@ handle_info({stream_reset, Conn}, State) when is_pid(Conn) ->
         stop -> {stop, normal, State2};
         continue -> {noreply, State2}
     end;
+handle_info({'DOWN', Mon, process, _Owner, _Reason}, #{owner_mon := Mon} = State) when
+    Mon =/= undefined
+->
+    %% The companion app that owns this session is gone. Stop so the
+    %% published LeaseSet, tunnels and stream connections go with it.
+    {stop, normal, State};
 handle_info({'DOWN', Mon, process, ConnPid, _Reason}, State) when is_pid(ConnPid) ->
     Monitors = maps:get(monitors, State, #{}),
     case maps:get(ConnPid, Monitors, undefined) of
@@ -186,6 +201,11 @@ ephemeral_stop(_) ->
     continue.
 
 %% ---- helpers ----
+
+monitor_owner(Owner) when is_pid(Owner) ->
+    erlang:monitor(process, Owner);
+monitor_owner(_) ->
+    undefined.
 
 in_len(Lengths) ->
     maps:get(in_len, Lengths, 3).

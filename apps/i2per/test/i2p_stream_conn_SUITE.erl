@@ -32,7 +32,8 @@
     malformed_packet_kills_connection/1,
     unsigned_close_is_refused/1,
     wrong_replay_hash_syn_refused/1,
-    tampered_syn_refused/1
+    tampered_syn_refused/1,
+    owner_death_stops_connection/1
 ]).
 
 -define(TIMEOUT, 10000).
@@ -61,7 +62,8 @@ all() ->
         malformed_packet_kills_connection,
         unsigned_close_is_refused,
         wrong_replay_hash_syn_refused,
-        tampered_syn_refused
+        tampered_syn_refused,
+        owner_death_stops_connection
     ].
 
 init_per_testcase(_Case, Config) ->
@@ -575,6 +577,35 @@ tampered_syn_refused(_Config) ->
             local_dest_bin => maps:get(dest_bin, B),
             local_dest_hash => maps:get(dest_hash, B)
         }).
+
+%% A connection whose owner has died has nobody to deliver to, so it stops
+%% instead of holding a stream and its timers alive.
+owner_death_stops_connection(_Config) ->
+    A = make_dest(),
+    B = make_dest(),
+    Owner = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    {ok, Conn} = i2p_stream_conn:start_link(#{
+        role => connect,
+        owner => Owner,
+        send_fn => fun(_) -> ok end,
+        local_seed => maps:get(seed, A),
+        local_dest_bin => maps:get(dest_bin, A),
+        local_dest_hash => maps:get(dest_hash, A),
+        remote_dest_bin => maps:get(dest_bin, B),
+        remote_dest_hash => maps:get(dest_hash, B)
+    }),
+    track(Conn),
+    ?assert(is_process_alive(Conn)),
+    MRef = erlang:monitor(process, Conn),
+    exit(Owner, kill),
+    receive
+        {'DOWN', MRef, process, Conn, _} -> ok
+    after ?TIMEOUT -> ?assert(false)
+    end.
 
 %% ---------------------------------------------------------------------------
 %% Helpers
