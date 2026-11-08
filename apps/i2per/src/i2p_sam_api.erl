@@ -109,19 +109,25 @@ create_destination() ->
 
 -doc """
 Generate a fresh destination, honoring `sig_type` in `Opts` (default 7,
-Ed25519, the only type this router supports).
+Ed25519, the only type this router supports). Returns
+`{error, {unsupported_sig_type, T}}` when `sig_type` is present and not 7.
 """.
--spec create_destination(map()) -> map().
-create_destination(_Opts) ->
-    #{identity := Identity, crypto_priv := CPriv, sign_priv := SPriv} =
-        i2p_keys:generate_with_privkeys(),
-    DestB64 = i2p_keys:to_b64(Identity),
-    #{
-        identity => Identity,
-        crypto_priv => CPriv,
-        sign_priv => SPriv,
-        dest_b64 => DestB64
-    }.
+-spec create_destination(map()) -> map() | {error, {unsupported_sig_type, term()}}.
+create_destination(Opts) ->
+    case maps:get(sig_type, Opts, 7) of
+        7 ->
+            #{identity := Identity, crypto_priv := CPriv, sign_priv := SPriv} =
+                i2p_keys:generate_with_privkeys(),
+            DestB64 = i2p_keys:to_b64(Identity),
+            #{
+                identity => Identity,
+                crypto_priv => CPriv,
+                sign_priv => SPriv,
+                dest_b64 => DestB64
+            };
+        Other ->
+            {error, {unsupported_sig_type, Other}}
+    end.
 
 -doc """
 Create a headless client session.
