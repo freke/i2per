@@ -732,12 +732,17 @@ reassemble(Fragments, FragMap0) ->
 %% complete_fragment/2 — emit a message when this fragment completes it.
 complete_fragment(#{type := first, msg_id := MsgID, last := true, data := Data}, Map) ->
     {ok, Data, maps:remove(MsgID, Map)};
-complete_fragment(#{type := follow_on, msg_id := MsgID, last := true}, Map) ->
+complete_fragment(
+    #{type := follow_on, msg_id := MsgID, last := true, frag_num := LastFragNum}, Map
+) ->
     case maps:find(MsgID, Map) of
         {ok, Pieces} when map_size(Pieces) > 0 ->
-            Num = maps:size(Pieces),
-            Indices = lists:seq(0, Num - 1),
-            case lists:all(fun(I) -> maps:is_key(I, Pieces) end, Indices) of
+            Total = LastFragNum + 1,
+            Indices = lists:seq(0, Total - 1),
+            case
+                map_size(Pieces) =:= Total andalso
+                    lists:all(fun(I) -> maps:is_key(I, Pieces) end, Indices)
+            of
                 true ->
                     Msg =
                         <<<<(maps:get(I, Pieces))/binary>> || I <- Indices>>,
