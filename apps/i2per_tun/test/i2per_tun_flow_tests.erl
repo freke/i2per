@@ -84,3 +84,43 @@ tcp_pair() ->
     {ok, Host} = gen_tcp:accept(LSock, 5000),
     gen_tcp:close(LSock),
     {Client, Host}.
+
+dev_collect_loop(Parent) ->
+    dev_collect_loop(Parent, <<>>).
+
+dev_collect_loop(Parent, Acc) ->
+    receive
+        {tun_write, Bytes} ->
+            Parent ! {dev_received, Bytes},
+            dev_collect_loop(Parent, <<Acc/binary, Bytes/binary>>);
+        stop ->
+            ok
+    end.
+
+held_session_devpid_forwards_and_retains_nothing_test_() ->
+    {"a held SAM session with a DevPid forwards bytes and retains nothing",
+        {timeout, 30, fun() ->
+            Self = self(),
+            DevPid = spawn(fun() -> dev_collect_loop(Self) end),
+            Mock = i2per_tun_mock_sam:start(fun(StreamSock) ->
+                gen_tcp:send(StreamSock, <<"hello-bytes">>),
+                timer:sleep(200)
+            end),
+            {_, SamPort, _} = Mock,
+            try
+                {ok, _SessionId, Pid} = i2per_tun_flow:run_session(
+                    <<"peer.i2p">>, <<"127.0.0.1">>, SamPort, 5000, DevPid
+                ),
+                receive
+                    {dev_received, Bytes} ->
+                        ?assertEqual(<<"hello-bytes">>, Bytes)
+                after 5000 ->
+                    ?assert(false)
+                end,
+                ?assertEqual(<<>>, i2per_tun_flow:received(Pid)),
+                i2per_tun_flow:stop_session(Pid)
+            after
+                i2per_tun_mock_sam:stop(Mock),
+                exit(DevPid, kill)
+            end
+        end}}.

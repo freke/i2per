@@ -58,6 +58,8 @@ ok = i2p_stream_conn:close(Conn).
     handle_packet/2
 ]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
+%% Exposed for testing the receive-window bounds (SCX0S7G).
+-export([ingest_data/2, current_gaps/1]).
 -export_type([opts/0]).
 
 -define(DEFAULT_WINDOW, 8).
@@ -357,8 +359,16 @@ cond_ingest(_Plain, Payload, Seq, Contig, false, Reorder, State) when
         recv_contig => Contig + length(InOrder),
         reorder => Reorder1
     }};
-cond_ingest(_Plain, Payload, Seq, _Contig, false, Reorder, State) ->
-    {true, State#{reorder => Reorder#{Seq => Payload}}}.
+cond_ingest(_Plain, Payload, Seq, Contig, false, Reorder, State) ->
+    %% Drop anything outside the receive window or once the reorder
+    %% buffer is full: a peer cannot force unbounded allocation.
+    Window = maps:get(window, State, ?DEFAULT_WINDOW),
+    case Seq =< Contig + Window andalso map_size(Reorder) < Window of
+        true ->
+            {true, State#{reorder => Reorder#{Seq => Payload}}};
+        false ->
+            {false, State}
+    end.
 
 drain_from(Next, Reorder, Acc) ->
     case maps:take(Next, Reorder) of
@@ -414,8 +424,17 @@ send_plain_ack(#{peer_id := PeerId} = State) ->
     transmit(i2p_streaming:encode(P), State),
     State.
 
-current_gaps(#{recv_contig := Contig, reorder := Reorder}) ->
-    MaxSeen = lists:max([Contig | maps:keys(Reorder)]),
+current_gaps(#{recv_contig := Contig, reorder := Reorder} = State) ->
+    Window = maps:get(window, State, ?DEFAULT_WINDOW),
+    %% Compute gaps from the sorted keys actually present, capped to the
+    %% receive window so a peer-supplied extreme sequence number cannot
+    %% drive an unbounded lists:seq/2.
+    MaxSeen0 =
+        case maps:keys(Reorder) of
+            [] -> Contig;
+            Keys -> lists:max([Contig | Keys])
+        end,
+    MaxSeen = min(MaxSeen0, Contig + Window),
     [S || S <- lists:seq(Contig + 1, MaxSeen), not maps:is_key(S, Reorder)].
 
 %%%%%%% %%% Acknowledgement processing %%%%%%%
@@ -441,10 +460,13 @@ process_ack(Pkt, State) ->
             ),
             Counts0 = maps:get(nack_counts, State),
             Counts1 = maps:filter(fun(Seq, _) -> Seq > AckThrough end, Counts0),
+            %% Only count NACKs for sequences we actually have in flight, so a
+            %% peer cannot grow nack_counts without bound.
+            NackedInflight = [S || S <- Nacked, maps:is_key(S, Inflight)],
             Counts = lists:foldl(
                 fun(S, M) -> M#{S => maps:get(S, M, 0) + 1} end,
                 Counts1,
-                Nacked
+                NackedInflight
             ),
             fast_resend(Counts, State#{
                 inflight => Kept,
