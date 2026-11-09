@@ -7,7 +7,8 @@ Opens the two sockets SAM v3 requires: a session socket that carries the
 handshake (`HELLO`, `SESSION CREATE`, `NAMING LOOKUP`) and stays open for the
 life of the session, and a stream socket that carries `HELLO` and
 `STREAM CONNECT` and then relays bytes in both directions until either side
-closes. Runs in the caller's process.
+closes (or, if configured, until both directions have been idle for
+`m:i2per_tun_config:relay_idle_timeout/0`). Runs in the caller's process.
 
 `f:run_session/3` opens and holds a SAM STREAM session for a flow without a
 host TCP socket attached yet — used by the TUN packet path to establish a
@@ -36,7 +37,8 @@ session was created and the connect that followed failed.
     try_core_run_session/1, try_core_run_session/2,
     hold_core_session/3, hold_core_session/4, hold_core_session/5,
     run_session_sam/4, run_session_sam/5,
-    hold_session/2, hold_session/3, hold_session/4
+    hold_session/2, hold_session/3, hold_session/4,
+    relay/2
 ]).
 
 -spec run(gen_tcp:socket(), binary(), binary(), inet:port_number()) -> ok | {error, term()}.
@@ -72,15 +74,16 @@ try_core_run(TcpSock, DestHost) ->
     end.
 
 relay_core(TcpSock, ConnPid) ->
-    _ = inet:setopts(TcpSock, [{active, once}]),
-    relay_core_loop(TcpSock, ConnPid).
+    Idle = i2per_tun_config:relay_idle_timeout(),
+    _ = inet:setopts(TcpSock, [{active, once}, {keepalive, true}]),
+    relay_core_loop(TcpSock, ConnPid, Idle).
 
-relay_core_loop(TcpSock, ConnPid) ->
+relay_core_loop(TcpSock, ConnPid, Idle) ->
     receive
         {tcp, TcpSock, Data} ->
             _ = i2p_sam_api:stream_send(ConnPid, Data),
             _ = inet:setopts(TcpSock, [{active, once}]),
-            relay_core_loop(TcpSock, ConnPid);
+            relay_core_loop(TcpSock, ConnPid, Idle);
         {tcp_closed, TcpSock} ->
             i2p_sam_api:stream_close(ConnPid),
             ok;
@@ -89,12 +92,12 @@ relay_core_loop(TcpSock, ConnPid) ->
             ok;
         {stream_data, ConnPid, Bytes} ->
             _ = gen_tcp:send(TcpSock, Bytes),
-            relay_core_loop(TcpSock, ConnPid);
+            relay_core_loop(TcpSock, ConnPid, Idle);
         {stream_closed, ConnPid} ->
             ok;
         {stream_reset, ConnPid} ->
             ok
-    after 300000 ->
+    after Idle ->
         i2p_sam_api:stream_close(ConnPid),
         ok
     end.
@@ -113,34 +116,57 @@ run_sam(TcpSock, DestHost, SamHost, SamPort) ->
     end.
 
 relay(TcpSock, SamSock) ->
-    %% Put both sockets in active mode? Simpler: spawn a forwarder each direction.
+    Idle = i2per_tun_config:relay_idle_timeout(),
+    keepalive(TcpSock),
+    keepalive(SamSock),
     Parent = self(),
     P1 = spawn_link(fun() -> forward(TcpSock, SamSock, Parent) end),
     P2 = spawn_link(fun() -> forward(SamSock, TcpSock, Parent) end),
+    wait(P1, P2, Idle).
+
+%% Without an application-level idle timeout, the OS keepalive is what notices
+%% a peer that vanished without closing its socket. Best-effort: a socket that
+%% refuses the option (for instance one owned by another process) still relays.
+keepalive(Sock) ->
+    _ = inet:setopts(Sock, [{keepalive, true}]),
+    ok.
+
+wait(P1, P2, Timeout) ->
     receive
         {done, P1} ->
-            receive
-                {done, P2} -> ok
-            after 5000 -> ok
-            end;
+            await(P2, 5000);
         {done, P2} ->
-            receive
-                {done, P1} -> ok
-            after 5000 -> ok
-            end
-    after 300000 ->
+            await(P1, 5000);
+        {activity, _} ->
+            wait(P1, P2, Timeout)
+    after Timeout ->
         exit(P1, kill),
         exit(P2, kill),
         ok
+    end.
+
+%% One direction has closed. Give the other a moment to flush what is already
+%% in flight, then return so the caller closes both sockets.
+await(P, Timeout) ->
+    receive
+        {done, P} -> ok
+    after Timeout -> ok
     end.
 
 forward(Src, Dst, Parent) ->
     case gen_tcp:recv(Src, 0, 30000) of
         {ok, Data} ->
             case gen_tcp:send(Dst, Data) of
-                ok -> forward(Src, Dst, Parent);
-                {error, _} -> Parent ! {done, self()}
+                ok ->
+                    Parent ! {activity, self()},
+                    forward(Src, Dst, Parent);
+                {error, _} ->
+                    Parent ! {done, self()}
             end;
+        {error, timeout} ->
+            %% An idle direction is normal: keep the flow alive and let the
+            %% shared idle timer in wait/3, not this per-read timeout, bound it.
+            forward(Src, Dst, Parent);
         {error, _} ->
             Parent ! {done, self()}
     end.

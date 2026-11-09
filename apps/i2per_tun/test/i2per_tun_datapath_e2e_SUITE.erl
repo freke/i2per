@@ -76,17 +76,22 @@ end_to_end_byte_delivery(_Config) ->
         ok
     end.
 
-wait_for_sessions(_Pid, 0, _Timeout) -> ok;
+wait_for_sessions(_Pid, 0, _Timeout) ->
+    ok;
 wait_for_sessions(Pid, N, Timeout) ->
     Deadline = erlang:monotonic_time(millisecond) + Timeout,
     wait_for_sessions_loop(Pid, N, Deadline).
 
 wait_for_sessions_loop(Pid, N, Deadline) ->
     case maps:size(i2per_tun_dev:sessions(Pid)) >= N of
-        true -> ok;
+        true ->
+            ok;
         false ->
             case erlang:monotonic_time(millisecond) >= Deadline of
-                true -> ct:fail(session_timeout);
-                false -> timer:sleep(10), wait_for_sessions_loop(Pid, N, Deadline)
+                true ->
+                    ct:fail(session_timeout);
+                false ->
+                    timer:sleep(10),
+                    wait_for_sessions_loop(Pid, N, Deadline)
             end
     end.

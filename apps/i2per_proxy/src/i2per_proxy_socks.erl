@@ -107,15 +107,16 @@ try_core_connect(ClientSock, Host) ->
     end.
 
 relay_core(ClientSock, ConnPid, Node) ->
-    _ = inet:setopts(ClientSock, [{active, once}]),
-    relay_core_loop(ClientSock, ConnPid, Node).
+    Idle = i2per_proxy_config:relay_idle_timeout(),
+    _ = inet:setopts(ClientSock, [{active, once}, {keepalive, true}]),
+    relay_core_loop(ClientSock, ConnPid, Node, Idle).
 
-relay_core_loop(ClientSock, ConnPid, Node) ->
+relay_core_loop(ClientSock, ConnPid, Node, Idle) ->
     receive
         {tcp, ClientSock, Data} ->
             _ = catch erpc:call(Node, i2p_sam_api, stream_send, [ConnPid, Data]),
             _ = inet:setopts(ClientSock, [{active, once}]),
-            relay_core_loop(ClientSock, ConnPid, Node);
+            relay_core_loop(ClientSock, ConnPid, Node, Idle);
         {tcp_closed, ClientSock} ->
             _ = catch erpc:call(Node, i2p_sam_api, stream_close, [ConnPid]),
             ok;
@@ -124,12 +125,12 @@ relay_core_loop(ClientSock, ConnPid, Node) ->
             ok;
         {stream_data, ConnPid, Bytes} ->
             _ = gen_tcp:send(ClientSock, Bytes),
-            relay_core_loop(ClientSock, ConnPid, Node);
+            relay_core_loop(ClientSock, ConnPid, Node, Idle);
         {stream_closed, ConnPid} ->
             ok;
         {stream_reset, ConnPid} ->
             ok
-    after 300000 ->
+    after Idle ->
         _ = catch erpc:call(Node, i2p_sam_api, stream_close, [ConnPid]),
         ok
     end.

@@ -16,3 +16,12 @@ sam_defaults_test() ->
     application:unset_env(i2per_tun, sam_port),
     ?assertEqual(<<"127.0.0.1">>, i2per_tun_config:sam_host()),
     ?assertEqual(7656, i2per_tun_config:sam_port()).
+
+relay_idle_timeout_test() ->
+    application:unset_env(i2per_tun, relay_idle_timeout_ms),
+    ?assertEqual(infinity, i2per_tun_config:relay_idle_timeout()),
+    application:set_env(i2per_tun, relay_idle_timeout_ms, 0),
+    ?assertEqual(infinity, i2per_tun_config:relay_idle_timeout()),
+    application:set_env(i2per_tun, relay_idle_timeout_ms, 120000),
+    ?assertEqual(120000, i2per_tun_config:relay_idle_timeout()),
+    application:unset_env(i2per_tun, relay_idle_timeout_ms).

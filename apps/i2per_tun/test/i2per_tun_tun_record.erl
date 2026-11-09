@@ -15,8 +15,11 @@ read(_Dev) -> {error, eagain}.
 
 write(_Dev, Packet) ->
     case whereis(i2per_tun_record_sink) of
-        undefined -> ok;
-        Pid -> Pid ! {tun_write, Packet}, ok
+        undefined ->
+            ok;
+        Pid ->
+            Pid ! {tun_write, Packet},
+            ok
     end.
 
 arm(_Dev, _Pid) -> ok.
@@ -30,8 +33,11 @@ register_sink(Pid) ->
 
 unregister_sink() ->
     case whereis(i2per_tun_record_sink) of
-        undefined -> ok;
-        _Pid -> unregister(i2per_tun_record_sink), ok
+        undefined ->
+            ok;
+        _Pid ->
+            unregister(i2per_tun_record_sink),
+            ok
     end.
 
 %% Collect up to N tun_write messages within Timeout ms.
