@@ -723,17 +723,18 @@ stream_conn_opts() ->
 %% failure it caused was in a module two directories away from the fault, and it
 %% took the whole tier red rather than one case.
 %%
-%% A dedicated owner keeps that message in a mailbox nothing else reads. It exits
-%% after the announcement, because that is all it is here for: the stream id is
-%% what a real owner needs (a SAM session registers it as the demux key), and this
-%% case asserts about admission, not about demultiplexing. Nothing in
-%% `i2p_stream_conn` monitors its owner, so an owner that has gone is only ever a
-%% pid that no longer resolves, and the connection does not die of it.
+%% A dedicated owner keeps that message in a mailbox nothing else reads. It stays
+%% alive for the life of the case: `f:i2p_stream_conn` monitors its owner, so an
+%% owner that exits takes the connection with it, and the cap case would then
+%% count zero children and admit every dial. A sleeper is safe here because the
+%% case asserts about admission, not about demultiplexing; `with_sup/2` kills the
+%% supervisor and its children afterwards.
 stream_owner() ->
     spawn(fun() ->
         receive
             {stream_started, _Conn, _MyId} -> ok
-        end
+        end,
+        timer:sleep(infinity)
     end).
 
 sleeper_child(Tag) ->
