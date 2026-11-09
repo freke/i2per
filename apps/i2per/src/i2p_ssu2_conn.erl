@@ -1494,10 +1494,14 @@ handle_keepalive(Blocks, State) ->
 %% The SSU2 PeerTest (transport-level reachability probe) carried as a block
 %% (type 10) inside Data messages for messages 1-4 (see `m:i2p_peertest` and
 %% `docs/protocol.md`). In-session responses and explicit Alice initiation are
-%% implemented. Automatic NetDb-driven Charlie selection is not implemented in
-%% this release. The dispatch keys off the session's peer-test discriminator
-%% (`f:peertest_discriminator/2`): an explicit peer-test role when the session
-%% carries one, otherwise the default handshake-role-and-message inference.
+%% implemented. On Bob's side, when a peer-test coordinator owns this session
+%% the message-1 block is deferred to it, which forwards Alice's request to a
+%% NetDb-selected Charlie session (or replies with the deterministic code-2
+%% reject "no Charlie available" if none is reachable); without a coordinator
+%% the same code-2 reject is returned directly. The dispatch keys off the
+%% session's peer-test discriminator (`f:peertest_discriminator/2`): an
+%% explicit peer-test role when the session carries one, otherwise the default
+%% handshake-role-and-message inference.
 handle_peertest(Blocks, State) ->
     Block = lists:keyfind(peertest, 1, Blocks),
     case {peertest_discriminator(Block, State), Block} of
