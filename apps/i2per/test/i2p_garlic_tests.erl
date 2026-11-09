@@ -399,7 +399,7 @@ dispatch_db_store_unimplemented_type_test_() ->
         ?_assertEqual(
             {ignored, {unsupported_type, Type}}, dispatch_unimplemented_db_store(Type)
         )
-     || Type <- [5, 7]
+     || Type <- [2, 4, 6, 8, 255]
     ].
 
 dispatch_db_store_unknown_byte_test_() ->
@@ -452,12 +452,12 @@ dispatch_unknown_type_test() ->
 %% on the wire, and an operator cannot act on either until they know which.
 ignored_store_reasons_are_distinct_test() ->
     Key = crypto:strong_rand_bytes(32),
-    Unimplemented = <<Key/binary, 5:8, 0:32/big, (crypto:strong_rand_bytes(64))/binary>>,
+    Unimplemented = <<Key/binary, 2:8, 0:32/big, (crypto:strong_rand_bytes(64))/binary>>,
     Undecodable = #{type => 1, body => <<>>},
     NotAStore = #{type => 42, body => <<"data">>},
     ?assertEqual(
         [
-            {ignored, {unsupported_type, 5}},
+            {ignored, {unsupported_type, 2}},
             {ignored, undecodable_store},
             {ignored, not_a_db_message}
         ],

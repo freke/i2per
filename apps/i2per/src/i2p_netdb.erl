@@ -1628,8 +1628,11 @@ remove_expired(Store, NowMs, NowSec) when is_integer(NowMs), is_integer(NowSec) 
     KeptV1 = partition_ls_v1(V1Maps0, NowSec),
     V1Order0 = maps:get(lease_sets_v1_order, Store2),
     KeptV1Order = [K || K <- V1Order0, maps:is_key(K, KeptV1)],
-    %% Types 5 and 7 carry no published timestamp, so age them out against a
-    %% fixed ceiling from their insertion time instead.
+    %% Types 5 (EncryptedLeaseSet) and 7 (MetaLeaseSet) are stored verbatim and
+    %% are not decoded here, so their published/expires fields are not read and
+    %% no lease-validity expiry is applied. They age out against a fixed
+    %% insertion-time ceiling (?RAW_LS_MAX_AGE_SEC) instead. Decoding their
+    %% expiry and expiring on it is deliberately deferred; see 4XKN2ZZ.
     Maps5 = maps:get(lease_sets_5, Store2),
     Time5 = maps:get(lease_sets_5_time, Store2),
     Order5 = maps:get(lease_sets_5_order, Store2),

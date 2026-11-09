@@ -528,6 +528,12 @@ dispatch_local_message(StdMsg, State) ->
                     notify_lookup(Key, lease, store_lease(LsBin));
                 {store, router, Key, RiBin, _Ts} ->
                     notify_lookup(Key, router, store_router(RiBin));
+                {store, ls5, Key, LsBin, _Ts} ->
+                    _ = store_ls5(Key, LsBin),
+                    ok;
+                {store, ls7, Key, LsBin, _Ts} ->
+                    _ = store_ls7(Key, LsBin),
+                    ok;
                 {search_reply, #{key := Key, peers := Peers}} ->
                     notify_search_reply(Key, Peers);
                 {ignored, _Reason} ->
@@ -589,6 +595,13 @@ store_lease(LsBin) ->
 store_lease_v1(LsBin) ->
     outcome(i2p_netdb_srv:store_ls_v1_binary(LsBin, erlang:system_time(second))).
 
+-spec store_ls5(i2p_crypto:hash(), binary()) -> store_result().
+store_ls5(Key, LsBin) ->
+    outcome(i2p_netdb_srv:store_ls_5_binary(Key, LsBin, erlang:system_time(second))).
+
+-spec store_ls7(i2p_crypto:hash(), binary()) -> store_result().
+store_ls7(Key, LsBin) ->
+    outcome(i2p_netdb_srv:store_ls_7_binary(Key, LsBin, erlang:system_time(second))).
 %% Two accepted shapes and two refused ones, across two NetDb entry points that do not
 %% spell the vocabulary identically: `store_binary/2` says `too_old` where
 %% `store_ls_binary/2` says `expired`.
@@ -869,6 +882,13 @@ dispatch_one_clove(_ConnPid, PeerHash, #{type := T, data := Data}, State) when
             Outcome = store_lease(LsBin),
             replicate_clove_store(1, Key, LsBin, PeerHash, State),
             notify_lookup(Key, lease, Outcome),
+            State;
+        {store, ls5, Key, LsBin, _Ts} ->
+            _ = store_ls5(Key, LsBin),
+            replicate_clove_store(5, Key, LsBin, PeerHash, State),
+            State;
+        {store, ls7, Key, LsBin, _Ts} ->
+            _ = store_ls7(Key, LsBin),
             State;
         {lookup, Parsed} ->
             OurHash = maps:get(hash, maps:get(local, State)),

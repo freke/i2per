@@ -45,7 +45,7 @@ Rows are one verdict, not prose: **done** (implemented and exercised),
 | Floodfill participation | partial | available, off by default (floodfill env: true/false/auto; auto uses capacity_ok gate: bandwidth class O+ and published NTCP2); tests: `i2p_floodfill_tests`, `i2p_floodfill_SUITE` |
 | LeaseSet v2 | done | tests: `i2p_leaset_tests` |
 | LeaseSet v1 | partial | receive, store and serve (store type 1); publishing not supported (X25519 + Ed25519 forces LeaseSet2); tests: `i2p_leaset_v1_smoke_tests`, `i2p_netdb_v1_tests` |
-| Encrypted / Meta LeaseSets | partial | type 5 (EncryptedLeaseSet) stored, expired and served; type 7 (MetaLeaseSet) stored but not re-broadcast; publishing not supported; tests: `i2p_netdb_tests` |
+| Encrypted / Meta LeaseSets | partial | type 5 (EncryptedLeaseSet) and type 7 (MetaLeaseSet) stored and served verbatim, capacity- and age-bounded by a fixed 24 h insertion ceiling (`?RAW_LS_MAX_AGE_SEC` in `i2p_netdb`); no lease-validity expiry is decoded (the record's published/expires fields are not parsed), so the ceiling is the expiry; type 7 is not re-broadcast; publishing not supported; tests: `i2p_netdb_raw_tests` |
 | SAM v3 | done | `i2p_sam_srv`; tests: `i2p_sam_SUITE`, `i2p_sam_api_SUITE` |
 | I2CP | absent | excluded by maintainer decision |
 | Datagram2 | done | codec (`encode2`/`decode2`, signature over target hash) + options Mapping (flag bit 4) + offline signatures (flag bit 5, checked against the destination's own signing key) + bounded per-destination replay window + SAM `STYLE=DATAGRAM2` / `DATAGRAM2 SEND` with `DATAGRAM2 RECEIVED`; tests: `i2p_datagram_tests`, `i2p_datagram_replay_tests`, `i2p_sam_datagram_SUITE` |
