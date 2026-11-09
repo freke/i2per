@@ -67,12 +67,7 @@ init(#{identity := Identity, crypto_priv := CPriv, sign_priv := SPriv} = Args) -
     Lengths = maps:get(tunnel_lengths, Args, #{}),
     Ephemeral = maps:get(ephemeral, Args, false),
     OwnerMon = monitor_owner(maps:get(owner, Args, undefined)),
-    %% Publish a LeaseSet so remote peers can reach us, mirroring SAM's
-    %% SESSION CREATE. Best-effort: a router that is not fully booted
-    %% (hermetic unit tests) simply leaves the publish pending.
-    catch i2p_tunnel_srv:publish_lease_set(Identity, SPriv, in_len(Lengths)),
-    catch register_lengths(Lengths, self()),
-    {ok, #{
+    State = #{
         identity => Identity,
         crypto_priv => CPriv,
         sign_priv => SPriv,
@@ -84,7 +79,26 @@ init(#{identity := Identity, crypto_priv := CPriv, sign_priv := SPriv} = Args) -
         owner_mon => OwnerMon,
         conns => #{},
         monitors => #{}
-    }}.
+    },
+    %% Publish a LeaseSet so remote peers can reach us, mirroring SAM's
+    %% SESSION CREATE. When no tunnel server is running (hermetic unit
+    %% tests) the publish is skipped outright rather than swallowed by a
+    %% catch, so that case stays explicit. When a tunnel server is running,
+    %% a failure to publish or to register tunnel demand is reported
+    %% instead of being hidden behind {ok, Pid}.
+    case whereis(i2p_tunnel_srv) of
+        undefined ->
+            {ok, State};
+        _ ->
+            try
+                i2p_tunnel_srv:publish_lease_set(Identity, SPriv, in_len(Lengths)),
+                ok = register_lengths(Lengths, self()),
+                {ok, State}
+            catch
+                _:Reason ->
+                    {stop, {publish_failed, Reason}}
+            end
+    end.
 
 handle_call({stream_connect, Target, Owner}, _From, State) ->
     {Result, State2} = do_stream_connect(Target, Owner, State),
@@ -215,8 +229,7 @@ register_lengths(Lengths, _Self) when map_size(Lengths) =:= 0 ->
 register_lengths(Lengths, Self) ->
     InLen = maps:get(in_len, Lengths, 3),
     OutLen = maps:get(out_len, Lengths, 3),
-    catch i2p_tunnel_srv:set_lengths(Self, InLen, OutLen),
-    ok.
+    i2p_tunnel_srv:set_lengths(Self, InLen, OutLen).
 
 do_stream_connect(Target, Owner, State) ->
     case resolve_target(Target) of
