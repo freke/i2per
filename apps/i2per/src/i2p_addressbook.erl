@@ -136,9 +136,17 @@ handle_call({resolve, Key}, _From, State) ->
         error -> {reply, {error, not_found}, State}
     end;
 handle_call({add, Name, DestB64}, _From, State) ->
-    Entries = maps:put(Name, DestB64, maps:get(entries, State)),
-    append_line(maps:get(file, State), Name, DestB64),
-    {reply, ok, State#{entries := Entries}};
+    Entries = maps:get(entries, State),
+    case maps:find(Name, Entries) of
+        {ok, DestB64} ->
+            %% Unchanged entry: do not touch the file, so a repeated
+            %% subscription refresh does not grow hosts.txt.
+            {reply, ok, State};
+        _ ->
+            NewEntries = maps:put(Name, DestB64, Entries),
+            append_line(maps:get(file, State), Name, DestB64),
+            {reply, ok, State#{entries := NewEntries}}
+    end;
 handle_call(snapshot, _From, State) ->
     {reply, {ok, maps:get(entries, State)}, State};
 handle_call({dump, Path}, _From, State) ->

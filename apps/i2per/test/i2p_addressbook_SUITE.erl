@@ -9,6 +9,8 @@
 
 -export([
     hosts_txt_roundtrip/1,
+    duplicate_add_does_not_grow_file/1,
+    changed_dest_appends_and_reloads/1,
     naming_lookup_via_book/1,
     subscription_fetch/1,
     a_refused_fetch_does_not_take_the_fetcher_down/1
@@ -20,6 +22,8 @@
 all() ->
     [
         hosts_txt_roundtrip,
+        duplicate_add_does_not_grow_file,
+        changed_dest_appends_and_reloads,
         naming_lookup_via_book,
         subscription_fetch,
         a_refused_fetch_does_not_take_the_fetcher_down
@@ -29,6 +33,8 @@ init_per_testcase(Case, Config) ->
     Timeout =
         case Case of
             hosts_txt_roundtrip -> 10_000;
+            duplicate_add_does_not_grow_file -> 10_000;
+            changed_dest_appends_and_reloads -> 10_000;
             naming_lookup_via_book -> 15_000;
             subscription_fetch -> 25_000;
             a_refused_fetch_does_not_take_the_fetcher_down -> 15_000
@@ -56,6 +62,40 @@ hosts_txt_roundtrip(_Config) ->
         {ok, <<"CCC3">>} = i2p_addressbook:resolve(<<"fresh.i2p">>),
         {ok, Stored} = file:read_file(Path),
         {_, _} = binary:match(Stored, <<"fresh.i2p=CCC3\n">>)
+    after
+        stop_book()
+    end.
+
+%% --------------------------------------------------------------------------
+%% Store + persistence
+%% --------------------------------------------------------------------------
+
+duplicate_add_does_not_grow_file(_Config) ->
+    Dir = temp_dir(),
+    Path = i2p_addressbook:hosts_file_for(Dir),
+    ok = file:write_file(Path, <<"stats.i2p=AAA1\n">>),
+    start_book(Path),
+    try
+        ok = i2p_addressbook:add(<<"stats.i2p">>, <<"AAA1">>),
+        ok = i2p_addressbook:add(<<"stats.i2p">>, <<"AAA1">>),
+        {ok, Stored} = file:read_file(Path),
+        %% Still exactly one data line.
+        Lines = [L || L <- binary:split(Stored, <<"\n">>, [global]), L =/= <<>>],
+        1 = length(Lines)
+    after
+        stop_book()
+    end.
+
+changed_dest_appends_and_reloads(_Config) ->
+    Dir = temp_dir(),
+    Path = i2p_addressbook:hosts_file_for(Dir),
+    ok = file:write_file(Path, <<"stats.i2p=AAA1\n">>),
+    start_book(Path),
+    try
+        ok = i2p_addressbook:add(<<"stats.i2p">>, <<"BBB2">>),
+        stop_book(),
+        start_book(Path),
+        {ok, <<"BBB2">>} = i2p_addressbook:resolve(<<"stats.i2p">>)
     after
         stop_book()
     end.
