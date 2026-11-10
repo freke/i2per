@@ -37,7 +37,7 @@ Rows are one verdict, not prose: **done** (implemented and exercised),
 | Static-key (NTCP1) crypto | absent | legacy, excluded |
 | Tunnel creation v0.1 (ECIES) | done | 3-hop outbound and inbound; tests: `i2p_tunnel_tests`, `i2p_tunnel_srv_SUITE` |
 | Tunnel build v2 (variable tunnels) | done | hop cap raised to 7 (i2pd parity, `NUM_HOPS`/`MAX_HOPS`); default build stays 3 hops; tests: `i2p_tunnel_tests` |
-| Transit tunnel participation | partial | available, bounded (transit_max_tunnels default 10, transit_bandwidth_kbps default 64; 0 disables); on by default with a small cap; tests: `i2p_tunnel_srv_SUITE` |
+| Transit tunnel participation | partial | available, bounded; off by default (no config: transit_max_tunnels defaults to 0); shipped profile enables a small bound (transit_max_tunnels 10, transit_bandwidth_kbps 64); 0 disables; tests: `i2p_tunnel_srv_SUITE` |
 | Inbound gateway role | done | tests: `i2p_tunnel_srv_SUITE` |
 | Outbound gateway role | done | client send runs in caller process (ADR 0003) |
 | Streaming protocol | done | implemented; field accessors read through and written around (#C252TF7); tests: `i2p_streaming_tests`, `i2p_stream_tests`, `i2p_stream_conn_SUITE` |

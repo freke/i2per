@@ -235,8 +235,8 @@ tunnel-build acceptance (`none` = unlimited).
     demands => #{pid() => length_demand()},
     demand_mons => #{pid() => reference()},
     next_tunnel_id := non_neg_integer(),
-    transit_bucket := i2p_token_bucket:bucket() | none,
-    build_bucket := i2p_token_bucket:bucket() | none
+    transit_bucket := i2p_token_bucket:bucket() | none | disabled,
+    build_bucket := i2p_token_bucket:bucket() | none | disabled
 }.
 
 -doc """
@@ -819,14 +819,17 @@ frag_delivery({tunnel, GatewayHash, TunID}) ->
     {tunnel, {TunID, GatewayHash}}.
 
 %% init_bucket/2 — build the token bucket pacing one of the two limited
-%% work streams from its config key, or `none` when the key is unset. The
-%% key's integer value is the rate in naturally-sized units (kilobytes per
-%% second for relay bandwidth, builds per second for build pacing);
-%% `TokensPerUnit` rescales to tokens per second. Burst capacity is four
-%% seconds' worth of tokens, so the token bucket never stalls a burst of
-%% less than four seconds' (unlimited uses) — and `none` stays unlimited.
+%% work streams from its config key. `none` means the key is unset and the
+%% stream is unlimited; `disabled` means the key is 0, the documented off
+%% switch, and every unit is refused. Otherwise the key's integer value is
+%% the rate in naturally-sized units (kilobytes per second for relay
+%% bandwidth, builds per second for build pacing); `TokensPerUnit` rescales
+%% to tokens per second. Burst capacity is four seconds' worth of tokens, so
+%% the token bucket never stalls a burst of less than four seconds'.
 init_bucket(Key, TokensPerUnit) ->
     case application:get_env(i2per, Key) of
+        {ok, 0} ->
+            disabled;
         {ok, V} when is_integer(V), V > 0 ->
             i2p_token_bucket:new(V * TokensPerUnit, V * TokensPerUnit * 4);
         _ ->

@@ -121,6 +121,8 @@ valid_values_test() ->
     %% Hot keys are applied and acknowledged ok; restart-required keys are
     %% acknowledged as pending. Both run through validate.
     Cases = [
+        {transit_max_tunnels, 0, ok},
+        {transit_bandwidth_kbps, 0, ok},
         {transit_max_tunnels, 4, ok},
         {transit_bandwidth_kbps, 100, ok},
         {tunnel_build_rate, 2, ok},
@@ -221,9 +223,7 @@ restore_env(Snapshot) ->
 
 invalid_values_test() ->
     Cases = [
-        {transit_max_tunnels, 0},
         {transit_max_tunnels, -3},
-        {transit_bandwidth_kbps, 0},
         {transit_bandwidth_kbps, -1},
         {tunnel_build_rate, 0},
         {floodfill, sometimes},

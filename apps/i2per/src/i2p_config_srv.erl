@@ -288,8 +288,8 @@ validate(Key, _Value) ->
 
 validate_value(Key, Value) ->
     case {Key, Value} of
-        {transit_max_tunnels, V} when is_integer(V), V > 0 -> ok;
-        {transit_bandwidth_kbps, V} when is_integer(V), V > 0 -> ok;
+        {transit_max_tunnels, V} when is_integer(V), V >= 0 -> ok;
+        {transit_bandwidth_kbps, V} when is_integer(V), V >= 0 -> ok;
         {tunnel_build_rate, V} when is_integer(V), V > 0 -> ok;
         {max_ntcp2_connections, V} when is_integer(V), V > 0 -> ok;
         {max_sam_sessions, V} when is_integer(V), V > 0 -> ok;

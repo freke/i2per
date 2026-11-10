@@ -57,7 +57,7 @@ ok = i2p_tunnel_relay:send_tunnel_data(FirstHopHash, Frame).
 
 -export_type([transit_denied_reason/0, store_result/0]).
 
--define(DEFAULT_MAX_TRANSIT, 1000).
+-define(DEFAULT_MAX_TRANSIT, 0).
 -define(REPLY_RET_OFFSET, 201).
 -define(TRANSIT_FRAME_BYTES, 1028).
 
@@ -357,6 +357,8 @@ maybe_deny(RecvID, Reason) ->
     {0 | 30, i2p_tunnel_srv:tunnel_srv_state()}.
 pace_build(#{build_bucket := none} = State) ->
     {0, State};
+pace_build(#{build_bucket := disabled} = State) ->
+    {30, State};
 pace_build(#{build_bucket := Bucket} = State) ->
     NowMs = erlang:system_time(millisecond),
     case i2p_token_bucket:consume(Bucket, 1, NowMs) of
@@ -445,6 +447,8 @@ relay_transit_data(Body, Info, State) ->
     {allow, i2p_tunnel_srv:tunnel_srv_state()} | deny.
 allow_transit_data(#{transit_bucket := none} = State) ->
     {allow, State};
+allow_transit_data(#{transit_bucket := disabled}) ->
+    deny;
 allow_transit_data(#{transit_bucket := Bucket} = State) ->
     NowMs = erlang:system_time(millisecond),
     case i2p_token_bucket:consume(Bucket, ?TRANSIT_FRAME_BYTES, NowMs) of

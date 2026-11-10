@@ -148,7 +148,6 @@ rate_limit_non_positive_rejected_test() ->
     {ok, Raw} =
         i2p_config:parse(
             <<
-                "transit_bandwidth_kbps = 0\n"
                 "tunnel_build_rate = -2\n"
                 "max_ntcp2_connections = 0\n"
                 "max_sam_sessions = -1\n"
@@ -314,6 +313,31 @@ load_default_explicit_path_test() ->
         application:unset_env(i2per, transit_max_tunnels),
         file:delete(Path)
     end.
+
+%% Transit is opt-in by default, and 0 is the documented off switch for both
+%% transit keys: the loader must accept it rather than refuse the value the
+%% README and docs/parity.md tell an operator to use.
+transit_zero_accepted_test() ->
+    {ok, Raw} =
+        i2p_config:parse(
+            <<
+                "transit_max_tunnels = 0\n"
+                "transit_bandwidth_kbps = 0\n"
+            >>
+        ),
+    {ok, Pairs} = i2p_config:validate(Raw),
+    ?assert(lists:member({transit_max_tunnels, 0}, Pairs)),
+    ?assert(lists:member({transit_bandwidth_kbps, 0}, Pairs)).
+
+transit_negative_rejected_test() ->
+    {ok, Raw} =
+        i2p_config:parse(
+            <<
+                "transit_max_tunnels = -1\n"
+                "transit_bandwidth_kbps = -1\n"
+            >>
+        ),
+    ?assertMatch({error, {bad_value, _, _}}, i2p_config:validate(Raw)).
 
 %% %%%%% %%% tunnels.conf %%%%% %%%
 

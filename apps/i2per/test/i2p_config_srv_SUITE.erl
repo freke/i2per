@@ -107,8 +107,10 @@ rate_limit_keys_set_hot(_Config) ->
 rate_limit_bad_values_rejected(_Config) ->
     Old = application:get_env(i2per, transit_bandwidth_kbps),
     try
+        %% 0 is the documented off switch (see `i2p_config_srv:valid_values_test/0`),
+        %% so the rejected forms are negative rates and non-integers.
         {error, {bad_value, transit_bandwidth_kbps, _}} =
-            i2p_config_srv:set(transit_bandwidth_kbps, 0),
+            i2p_config_srv:set(transit_bandwidth_kbps, -1),
         {error, {bad_value, tunnel_build_rate, _}} = i2p_config_srv:set(tunnel_build_rate, -1),
         {error, {bad_value, transit_bandwidth_kbps, _}} =
             i2p_config_srv:set(transit_bandwidth_kbps, <<"fast">>),

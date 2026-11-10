@@ -184,9 +184,11 @@ The project interoperates with I2P routers. It does not bundle code from
 - **Scope:** 0.9.0 anchors on parity, soak/live smoke and transport
   modularity; 1.0.0 parity target is frozen in docs/parity.md.
 
-The default profile is a local client. It does not contact the live network,
-publish a floodfill RouterInfo, or accept public transit unless an operator
-explicitly enables those choices.
+The default profile is a local client. It does not contact the live network
+or publish a floodfill RouterInfo unless an operator explicitly enables those
+choices. Transit participation is off by default (transit_max_tunnels defaults
+to 0); the shipped release profile enables a small bound (10 tunnels,
+64 kbit/s), and setting transit_max_tunnels = 0 disables it.
 
 ## Source
 
@@ -578,8 +580,8 @@ part of the normal gate. `just live-smoke` is an offline self-check. Use
 The 0.9.0 release does not implement NTCP1, SSU1, I2CP, or the legacy
 ElGamal/AES crypto formats. SSU2 path migration is outside this release.
 Floodfill and transit participation are available as bounded features, and
-transit gains an `auto` capacity mode plus expiry accounting; neither is
-enabled by the shipped default profile. Automatic NetDb-driven Charlie
+transit gains an `auto` capacity mode plus expiry accounting; transit is off
+by default and enabled with a small bound in the shipped profile. Automatic NetDb-driven Charlie
 selection is implemented, and the tunnel build accepts up to 7 hops. LeaseSet
 v1, EncryptedLeaseSet and MetaLeaseSet are implemented, Datagram2 (Proposal
 163) is implemented with replay protection, and addressbook publication is
