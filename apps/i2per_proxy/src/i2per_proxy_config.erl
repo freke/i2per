@@ -13,7 +13,8 @@ Reads app env of `i2per_proxy`. Defaults match i2pd's proxy ports.
     sam_host/0,
     sam_port/0,
     router_node/0,
-    relay_idle_timeout/0
+    relay_idle_timeout/0,
+    max_http_response_bytes/0
 ]).
 
 -spec listen_host() -> binary() | inet:ip_address().
@@ -74,4 +75,17 @@ relay_idle_timeout() ->
         {ok, infinity} -> infinity;
         {ok, Ms} when is_integer(Ms), Ms > 0 -> Ms;
         _ -> infinity
+    end.
+
+-doc """
+Maximum number of bytes the HTTP proxy will buffer/stream for a single
+response before aborting it. Guards against unbounded memory growth on
+large or malicious origins. Default 10 MiB. Set via the
+`max_http_response_bytes` key in the `i2per_proxy` app env.
+""".
+-spec max_http_response_bytes() -> pos_integer().
+max_http_response_bytes() ->
+    case application:get_env(i2per_proxy, max_http_response_bytes) of
+        {ok, N} when is_integer(N), N > 0 -> N;
+        _ -> 10 * 1024 * 1024
     end.

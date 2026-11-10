@@ -42,3 +42,44 @@ http_proxy_test_() ->
                 application:unset_env(i2per_proxy, router_node)
             end
         end}}.
+
+http_proxy_headers_body_test_() ->
+    {"HTTP proxy forwards headers and body verbatim",
+        {timeout, 30, fun() ->
+            Mock = i2per_proxy_mock_sam:start(fun(StreamSock) ->
+                {ok, Request} = gen_tcp:recv(StreamSock, 0, 5000),
+                ?assertNotEqual(nomatch, binary:match(Request, <<"POST /submit HTTP/1.1\r\n">>)),
+                ?assertNotEqual(nomatch, binary:match(Request, <<"X-Foo: bar\r\n">>)),
+                ?assertNotEqual(nomatch, binary:match(Request, <<"Cookie: a=b\r\n">>)),
+                ?assertNotEqual(nomatch, binary:match(Request, <<"\r\nhello body">>)),
+                ok = gen_tcp:send(
+                    StreamSock, <<"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok">>
+                )
+            end),
+            {_, SamPort, _} = Mock,
+            application:set_env(i2per_proxy, sam_port, SamPort),
+            application:set_env(i2per_proxy, sam_host, <<"127.0.0.1">>),
+            application:set_env(i2per_proxy, router_node, ?DEAD_NODE),
+            {ok, Pid} = i2per_proxy_listener:start_link(#{protocol => http, port => 0}),
+            try
+                BoundPort = i2per_proxy_listener:port(Pid),
+                {ok, ClientSock} = gen_tcp:connect(
+                    "127.0.0.1", BoundPort, [binary, {packet, raw}, {active, false}], 5000
+                ),
+                ok = gen_tcp:send(
+                    ClientSock,
+                    <<"POST http://peer.i2p/submit HTTP/1.1\r\n", "Host: peer.i2p\r\n",
+                        "X-Foo: bar\r\n", "Cookie: a=b\r\n", "Content-Length: 10\r\n", "\r\n",
+                        "hello body">>
+                ),
+                {ok, Resp} = gen_tcp:recv(ClientSock, 0, 5000),
+                ?assertNotEqual(nomatch, binary:match(Resp, <<"ok">>)),
+                gen_tcp:close(ClientSock)
+            after
+                i2per_proxy_listener:stop(Pid),
+                i2per_proxy_mock_sam:stop(Mock),
+                application:unset_env(i2per_proxy, sam_port),
+                application:unset_env(i2per_proxy, sam_host),
+                application:unset_env(i2per_proxy, router_node)
+            end
+        end}}.
