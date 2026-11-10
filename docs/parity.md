@@ -59,7 +59,7 @@ Rows are one verdict, not prose: **done** (implemented and exercised),
 | TUN interface | partial (separate app) | `i2per_tun` companion app (ADR 0001), shape (a) flow translator (SAM STREAM + RAW/DATAGRAM helpers); the packet data path is out of 1.0.0 scope - it writes raw stream payload into the packet-oriented TUN device (no TCP termination / IP synthesis; see `T57SS4F`); tests: `i2per_tun_*_tests` |
 | SOCKS / HTTP proxy / BOB / I2PControl | partial (separate app) | SOCKS and HTTP proxy implemented and shipped as `i2per_proxy`; BOB protocol and I2PControl not implemented (I2PControl is 3.x work, see `TZFYB9R`); tests: `i2per_proxy_*_tests` |
 | In-built status monitor | done (separate app) | `i2per_status` presentation app; held fields rendered (peers/tunnels/netdb/config/SAM), derived rates and reachability ladder; absent: graceful shutdown, non-SAM service rows, peer-test error reasons; tests: `i2per_status_*_tests` |
-| UPnP / NAT traversal service | done (separate app) | `i2p_upnp_srv` (off by default, hot-switchable); SSDP discovery, SOAP port mapping with renewal; tests: `i2p_upnp_srv_tests` |
+| UPnP / NAT traversal service | partial (separate app) | `i2p_upnp_srv` (off by default, hot-switchable); SSDP discovery, SOAP port mapping with renewal; opens the pinhole only and does not discover or publish the gateway's external address: the operator must set app env `i2per` -> `host` to the gateway's external address and `ntcp2_published` to `true` for a reachable RouterAddress (see `A21WPAC`); tests: `i2p_upnp_srv_tests` |
 
 ## 1.0.0 material explicitly listed
 
