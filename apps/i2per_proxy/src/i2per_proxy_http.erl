@@ -409,10 +409,11 @@ recv_stream_sam(Sock, ClientSock, Total) ->
 stream_to_client(ClientSock, Data, Total) ->
     Cap = i2per_proxy_config:max_http_response_bytes(),
     Remaining = Cap - Total,
-    Allowed = case Remaining > 0 of
-        true -> erlang:min(byte_size(Data), Remaining);
-        false -> 0
-    end,
+    Allowed =
+        case Remaining > 0 of
+            true -> erlang:min(byte_size(Data), Remaining);
+            false -> 0
+        end,
     if
         Allowed >= byte_size(Data) ->
             _ = gen_tcp:send(ClientSock, Data),

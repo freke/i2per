@@ -23,8 +23,6 @@ init_per_suite(Config) ->
             {skip, "set I2PER_TUN_PRIVILEGED=1 (needs CAP_NET_ADMIN)"}
     end.
 
-
-
 destructor_cancels_armed_select(_Config) ->
     %% Stress the destructor race: create a resource, arm it, drop all
     %% references and force collection without an explicit stop/1, so the
@@ -58,7 +56,8 @@ destructor_cancels_armed_select(_Config) ->
             end,
             erlang:garbage_collect()
         end,
-        lists:seq(1, N)),
+        lists:seq(1, N)
+    ),
     ok.
 
 end_per_suite(_Config) ->

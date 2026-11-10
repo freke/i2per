@@ -13,7 +13,8 @@
     changed_dest_appends_and_reloads/1,
     naming_lookup_via_book/1,
     subscription_fetch/1,
-    a_refused_fetch_does_not_take_the_fetcher_down/1
+    a_refused_fetch_does_not_take_the_fetcher_down/1,
+    completion_releases_the_conn_and_ignores_the_old_one/1
 ]).
 
 -define(APP, i2per).
@@ -26,7 +27,8 @@ all() ->
         changed_dest_appends_and_reloads,
         naming_lookup_via_book,
         subscription_fetch,
-        a_refused_fetch_does_not_take_the_fetcher_down
+        a_refused_fetch_does_not_take_the_fetcher_down,
+        completion_releases_the_conn_and_ignores_the_old_one
     ].
 
 init_per_testcase(Case, Config) ->
@@ -37,7 +39,8 @@ init_per_testcase(Case, Config) ->
             changed_dest_appends_and_reloads -> 10_000;
             naming_lookup_via_book -> 15_000;
             subscription_fetch -> 25_000;
-            a_refused_fetch_does_not_take_the_fetcher_down -> 15_000
+            a_refused_fetch_does_not_take_the_fetcher_down -> 15_000;
+            completion_releases_the_conn_and_ignores_the_old_one -> 30_000
         end,
     [{timetrap, Timeout} | Config].
 
@@ -160,13 +163,12 @@ subscription_fetch(_Config) ->
         start_book(undefined),
         SubsOpts = #{subscriptions => [#{host => <<"mysite.i2p">>, dest_b64 => SiteB64}]},
         {ok, _} = i2p_addressbook_subs:start_link(SubsOpts),
-        put(site_crypto_privs, [maps:get(crypto_priv, Site)]),
 
         %% Transport leg: trigger the pipeline; the fetcher opens a stream
         %% toward the site and emits a signed SYN whose replay hash binds
         %% the site's hash.
         ok = i2p_addressbook_subs:fetch_now(),
-        {SynPkt, _Seen} = await_syn(Site),
+        {SynPkt, _Seen} = await_syn(maps:get(crypto_priv, Site)),
         true = i2p_streaming:has_flag(SynPkt, i2p_streaming:flag_synchronize()),
         SiteHash = i2p_keys:hash(SiteIdent),
         {ok, SiteHash} = i2p_streaming:replay_hash(SynPkt),
@@ -241,7 +243,6 @@ a_refused_fetch_does_not_take_the_fetcher_down(_Config) ->
     application:set_env(?APP, max_stream_connections, 0),
     start_book(undefined),
     {ok, Fetcher} = i2p_addressbook_subs:start_link(#{subscriptions => Subs}),
-    put(site_crypto_privs, [maps:get(crypto_priv, Site)]),
 
     MRef = erlang:monitor(process, Fetcher),
     Baseline = i2p_sam_sup:stream_conn_count(),
@@ -263,6 +264,245 @@ a_refused_fetch_does_not_take_the_fetcher_down(_Config) ->
         kill_sam_sup(),
         stop_book(),
         app_teardown()
+    end.
+
+%% --------------------------------------------------------------------------
+%% One fetch finishing does not disturb the next
+%% --------------------------------------------------------------------------
+
+%% A fetch that completes by Content-Length closes its own connection instead of
+%% waiting for the peer's FIN, so the stream admission slot comes back before the
+%% next subscription starts. And once that connection is gone, traffic that was
+%% queued behind it -- a data fragment, a half-closed notification, a fired
+%% timeout -- cannot finish or abort the subscription that is current now.
+%%
+%% This is the end-to-end version of #94XG2E0's unit cases: two live
+%% `i2p_stream_conn` processes, one per subscription, a real HTTP response
+%% delivered through the streaming stack, and the admission count read from the
+%% supervisor rather than inferred.
+completion_releases_the_conn_and_ignores_the_old_one(_Config) ->
+    setup_app(),
+    process_flag(trap_exit, true),
+    SiteA = subscription_site(<<"first.i2p">>, <<"AAAA1">>),
+    SiteB = subscription_site(<<"second.i2p">>, <<"BBBB2">>),
+    Subs = [
+        #{host => <<"first.i2p">>, dest_b64 => maps:get(b64, SiteA)},
+        #{host => <<"second.i2p">>, dest_b64 => maps:get(b64, SiteB)}
+    ],
+    start_sam_sup(),
+    application:set_env(?APP, addressbook, #{subscriptions => Subs}),
+    start_book(undefined),
+    {ok, Fetcher} = i2p_addressbook_subs:start_link(#{subscriptions => Subs}),
+    try
+        Baseline = i2p_sam_sup:stream_conn_count(),
+        %% --- subscription 1 ---
+        {Conn1, SynA, SeenA} = start_fetch(Fetcher, SiteA),
+        %% The slot is held while the fetch is in flight, not before and not after.
+        1 = i2p_sam_sup:stream_conn_count() - Baseline,
+        SiteConnA = start_site_conn(SiteA, SynA),
+        reset_site_accumulators(),
+        SeenA1 = pump_until(Fetcher, SiteConnA, maps:get(priv, SiteA), SeenA, fun() ->
+            binary:match(site_buf(), <<"\r\n\r\n">>) =/= nomatch
+        end),
+        %% A Content-Length response is what the fetcher completes on.
+        ok = i2p_stream_conn:send(
+            SiteConnA,
+            http_response(<<"first.i2p=AAAA1\n">>)
+        ),
+        _SeenA2 = pump_until(Fetcher, SiteConnA, maps:get(priv, SiteA), SeenA1, fun() ->
+            site_closed() andalso not is_process_alive(Conn1)
+        end),
+        {ok, <<"AAAA1">>} = i2p_addressbook:resolve(<<"first.i2p">>),
+        %% The fetcher closed its own side on completion, so the process is gone
+        %% and the slot it held is back.
+        false = is_process_alive(Conn1),
+        %% --- subscription 2 starts on its own; do not kick the pipeline again ---
+        {SynB, _} = await_syn(maps:get(priv, SiteB)),
+        Conn2 = await_fetch_conn(Fetcher, 5000),
+        true = Conn2 =/= Conn1,
+        %% Everything the finished fetch left behind arrives now, while the next
+        %% subscription is in flight.
+        Fetcher ! {stream_data, Conn1, <<"stale.i2p=ZZZZ9\n">>},
+        Fetcher ! {stream_closed, Conn1},
+        Fetcher ! {timeout, make_ref(), fetch_timeout},
+        #{fetch := #{conn := Conn2}} = sys:get_state(Fetcher),
+        SiteConnB = start_site_conn(SiteB, SynB),
+        reset_site_accumulators(),
+        SeenB = max_frame_n(),
+        SeenB1 = pump_until(Fetcher, SiteConnB, maps:get(priv, SiteB), SeenB, fun() ->
+            binary:match(site_buf(), <<"\r\n\r\n">>) =/= nomatch
+        end),
+        ok = i2p_stream_conn:send(
+            SiteConnB,
+            http_response(<<"second.i2p=BBBB2\n">>)
+        ),
+        _SeenB2 = pump_until(Fetcher, SiteConnB, maps:get(priv, SiteB), SeenB1, fun() ->
+            site_closed() andalso i2p_sam_sup:stream_conn_count() =:= Baseline
+        end),
+        %% The second fetch finished with its own body, and the stale traffic from
+        %% the first never reached it.
+        {ok, <<"BBBB2">>} = i2p_addressbook:resolve(<<"second.i2p">>),
+        {error, not_found} = i2p_addressbook:resolve(<<"stale.i2p">>),
+        ok
+    after
+        catch i2p_addressbook_subs:stop(),
+        kill_sam_sup(),
+        stop_book(),
+        app_teardown()
+    end.
+
+%% A site we hold keys for, published as a LeaseSet whose gateway is our own
+%% inbound tunnel, so `route_to` resolves it.
+subscription_site(Host, Dest) ->
+    Site = i2p_keys:generate_with_privkeys(),
+    Ident = maps:get(identity, Site),
+    NowSec = erlang:system_time(second),
+    LS =
+        i2p_leaset:build(
+            Ident,
+            NowSec,
+            7,
+            [#{gateway => get(local_hash), tunnel_id => 4321, end_date => (NowSec + 3600) * 1000}],
+            maps:get(sign_priv, Site)
+        ),
+    added = i2p_netdb_srv:store_ls(LS, NowSec),
+    #{
+        host => Host,
+        dest => Dest,
+        b64 => i2p_keys:encode_b64(i2p_keys:dest_blob(Site)),
+        dest_bin => i2p_keys:to_binary(Ident),
+        hash => i2p_keys:hash(Ident),
+        priv => maps:get(crypto_priv, Site),
+        seed => maps:get(sign_priv, Site)
+    }.
+
+%% Wait for the fetcher's own pipeline to open a connection to `Site`, and
+%% return that connection together with the SYN the accept side needs. The
+%% pipeline is not kicked here: a second `fetch_now/0` would open a second
+%% connection beside the one already in flight.
+start_fetch(Fetcher, Site) ->
+    {SynPkt, _Seen} = await_syn(maps:get(priv, Site)),
+    Conn = await_fetch_conn(Fetcher, 5000),
+    {Conn, SynPkt, max_frame_n()}.
+
+await_fetch_conn(Fetcher, Timeout) ->
+    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    await_fetch_conn_loop(Fetcher, Deadline).
+
+await_fetch_conn_loop(Fetcher, Deadline) ->
+    case catch sys:get_state(Fetcher) of
+        #{fetch := #{conn := Conn}} ->
+            Conn;
+        _ ->
+            case erlang:monotonic_time(millisecond) >= Deadline of
+                true ->
+                    ct:fail(fetch_conn_not_started);
+                false ->
+                    timer:sleep(10),
+                    await_fetch_conn_loop(Fetcher, Deadline)
+            end
+    end.
+
+%% The other end: an accept-role connection owned by this test process, whose
+%% outbound packets are posted to us as `{site_wire, Pid, Wire}` rather than
+%% going through the router.
+start_site_conn(Site, SynPkt) ->
+    Parent = self(),
+    {ok, Conn} = i2p_stream_conn:start_link(#{
+        role => accept,
+        syn => SynPkt,
+        owner => Parent,
+        send_fn => fun(Wire) -> Parent ! {site_wire, self(), Wire} end,
+        local_seed => maps:get(seed, Site),
+        local_dest_bin => maps:get(dest_bin, Site),
+        local_dest_hash => maps:get(hash, Site)
+    }),
+    Conn.
+
+http_response(Body) ->
+    iolist_to_binary([
+        <<"HTTP/1.0 200 OK\r\nContent-Length: ">>,
+        integer_to_binary(byte_size(Body)),
+        <<"\r\n\r\n">>,
+        Body
+    ]).
+
+reset_site_accumulators() ->
+    put(site_buf, <<>>),
+    put(site_closed, false).
+
+site_buf() ->
+    case get(site_buf) of
+        undefined -> <<>>;
+        Buf -> Buf
+    end.
+
+site_closed() ->
+    get(site_closed) =:= true.
+
+%% Drive both directions until `Pred` holds. Every iteration pumps the fetcher's
+%% outbound frames into the site connection, forwards the site's frames to the
+%% fetcher, and folds the site's owner messages into the accumulators.
+pump_until(Fetcher, SiteConn, Priv, Seen, Pred) ->
+    Pumped = pump_step(Fetcher, SiteConn, Priv, Seen),
+    case Pred() of
+        true ->
+            Pumped;
+        false ->
+            timer:sleep(10),
+            pump_until(Fetcher, SiteConn, Priv, Pumped, Pred)
+    end.
+
+pump_step(Fetcher, SiteConn, Priv, Seen) ->
+    ok = collect_site_messages(Fetcher, SiteConn),
+    pump_frames(SiteConn, Priv, Seen).
+
+collect_site_messages(Fetcher, SiteConn) ->
+    receive
+        {site_wire, SiteConn, Wire} ->
+            Fetcher ! {stream_data, Wire},
+            collect_site_messages(Fetcher, SiteConn);
+        {site_wire, _OtherConn, _Wire} ->
+            collect_site_messages(Fetcher, SiteConn);
+        {stream_data, SiteConn, Data} ->
+            put(site_buf, <<(site_buf())/binary, Data/binary>>),
+            collect_site_messages(Fetcher, SiteConn);
+        {stream_closed, SiteConn} ->
+            put(site_closed, true),
+            collect_site_messages(Fetcher, SiteConn);
+        {stream_reset, SiteConn} ->
+            put(site_closed, true),
+            collect_site_messages(Fetcher, SiteConn);
+        {stream_started, SiteConn, _Id} ->
+            collect_site_messages(Fetcher, SiteConn);
+        {stream_established, SiteConn, _Hash} ->
+            collect_site_messages(Fetcher, SiteConn)
+    after 0 ->
+        ok
+    end.
+
+%% Feed every frame this site has not seen yet, unwrapped from the garlic the
+%% fetcher addressed to it, into the site connection.
+pump_frames(SiteConn, Priv, Seen) ->
+    lists:foldl(
+        fun
+            ({N, _Hash, Body}, Last) when N > Last ->
+                case unwrap_wire(Body, Priv) of
+                    {ok, Wire} -> ok = i2p_stream_conn:handle_packet(SiteConn, Wire);
+                    false -> ok
+                end,
+                N;
+            (_Frame, Last) ->
+                Last
+        end,
+        Seen,
+        lists:sort(ets:tab2list(ab_frames))
+    ).
+
+max_frame_n() ->
+    case [N || {N, _Hash, _Body} <- ets:tab2list(ab_frames)] of
+        [] -> 0;
+        Ns -> lists:max(Ns)
     end.
 
 %% The liveness assertion, named so the failure says what was being claimed. A
@@ -492,14 +732,17 @@ inject_outbound_entry(TunID, Entry) ->
     end),
     ok.
 
-await_syn(Site) ->
+%% Wait for a SYN addressed to one site. The garlic is unlocked with that
+%% site's own key, so another site's SYN -- still sitting in `ab_frames` -- is
+%% passed over rather than mistaken for this one.
+await_syn(Priv) ->
     Deadline = erlang:monotonic_time(millisecond) + 6000,
-    await_syn(Site, 0, Deadline).
+    await_syn(Priv, 0, Deadline).
 
-await_syn(Site, Seen, Deadline) ->
+await_syn(Priv, Seen, Deadline) ->
     All = lists:sort(ets:tab2list(ab_frames)),
     Unseen = [{N, H, B} || {N, H, B} <- All, N > Seen],
-    case first_syn(Unseen, Site) of
+    case first_syn(Unseen, Priv) of
         {ok, SynPkt, Consumed} ->
             {SynPkt, Seen + Consumed};
         false ->
@@ -508,37 +751,44 @@ await_syn(Site, Seen, Deadline) ->
                     error({frames_timeout, length(Unseen)});
                 false ->
                     timer:sleep(25),
-                    await_syn(Site, Seen, Deadline)
+                    await_syn(Priv, Seen, Deadline)
             end
     end.
 
-first_syn([{_N, _H, Body} | Rest], Site) ->
-    case syn_wire(Body) of
+first_syn([{_N, _H, Body} | Rest], Priv) ->
+    case unwrap_wire(Body, Priv) of
         {ok, Wire} ->
             case i2p_streaming:decode(Wire) of
                 {ok, Pkt} ->
                     case i2p_streaming:has_flag(Pkt, i2p_streaming:flag_synchronize()) of
                         true -> {ok, Pkt, 1};
-                        false -> first_syn(Rest, Site)
+                        false -> first_syn(Rest, Priv)
                     end;
                 _ ->
-                    first_syn(Rest, Site)
+                    first_syn(Rest, Priv)
             end;
         false ->
-            first_syn(Rest, Site)
+            first_syn(Rest, Priv)
     end;
-first_syn([], _Site) ->
+first_syn([], _Priv) ->
     false.
 
-syn_wire(Body) ->
-    Frags = reassemble(Body),
-    case [F || F <- Frags, maps:get(type, F) =:= first] of
-        [First] ->
-            case i2p_i2np:decode_std(maps:get(data, First)) of
-                {ok, #{body := GarlicBody}} ->
-                    i2p_client:unwrap_payload(
-                        hd(get(site_crypto_privs)), GarlicBody
-                    );
+%% Unwrap one outbound (garlic-wrapped) frame back to the streaming wire that was
+%% sealed into it. `false` when this frame is not addressed to `Priv`.
+unwrap_wire(Body, Priv) ->
+    case reassemble(Body) of
+        [First | _] ->
+            case maps:get(type, First) of
+                first ->
+                    case i2p_i2np:decode_std(maps:get(data, First)) of
+                        {ok, #{body := GarlicBody}} ->
+                            case i2p_client:unwrap_payload(Priv, GarlicBody) of
+                                {ok, Wire} -> {ok, Wire};
+                                error -> false
+                            end;
+                        _ ->
+                            false
+                    end;
                 _ ->
                     false
             end;

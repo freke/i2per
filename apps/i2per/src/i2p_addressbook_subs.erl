@@ -40,13 +40,15 @@ sessions (`f:client_destinations/0`, consulted by `m:i2p_tunnel_srv`).
 
 -doc """
 Server state: configured options, the internal signing seed, the refresh
-timer, the in-flight fetch context and the running entry total.
+timer, the in-flight fetch context, the live streaming connections by demux
+key and the running entry total.
 """.
 -opaque state() :: #{
     opts := map(),
     sign_seed := binary(),
     timer := reference() | undefined,
     fetch := undefined | map(),
+    conns => #{non_neg_integer() => pid()},
     total => non_neg_integer()
 }.
 -export_type([state/0]).
@@ -118,7 +120,15 @@ init([Opts]) ->
     IntervalMin = maps:get(interval_min, Opts, 60),
     Timer = erlang:send_after(IntervalMin * 60_000, self(), refresh),
     %% Timeout 0: run the first fetch on the next scheduler slot.
-    {ok, #{opts => Opts, sign_seed => SignSeed, timer => Timer, fetch => undefined}, 0}.
+    {ok,
+        #{
+            opts => Opts,
+            sign_seed => SignSeed,
+            timer => Timer,
+            fetch => undefined,
+            conns => #{}
+        },
+        0}.
 
 -spec handle_call(term(), gen_server:from(), map()) -> {reply, ok, map()}.
 handle_call(fetch_now, _From, State) ->
@@ -149,7 +159,7 @@ handle_info({start_pipeline, Done}, State) ->
             self() ! {fetch_sub, Sub, Rest},
             {noreply, State}
     end;
-handle_info({fetch_sub, Sub, Rest}, State = #{sign_seed := SignSeed}) ->
+handle_info({fetch_sub, Sub, Done}, State = #{sign_seed := SignSeed}) ->
     #{host := Host, dest_b64 := DestB64} = Sub,
     case route_to(DestB64) of
         {ok, Route} ->
@@ -161,34 +171,53 @@ handle_info({fetch_sub, Sub, Rest}, State = #{sign_seed := SignSeed}) ->
             %% a refusal leaves no stray `fetch_timeout` behind.
             case start_http_conn(Route, Host, SignSeed) of
                 {ok, Conn} ->
-                    TimeoutRef = erlang:send_after(?FETCH_TIMEOUT_MS, self(), fetch_timeout),
+                    Mon = erlang:monitor(process, Conn),
+                    %% `start_timer/3` names itself in the message it sends, so a
+                    %% timer belonging to a fetch that has already finished can be
+                    %% told apart from the current fetch's timer and ignored. A
+                    %% bare `send_after` would let one fetch's timeout abort the
+                    %% next subscription.
+                    TimeoutRef = erlang:start_timer(
+                        ?FETCH_TIMEOUT_MS, self(), fetch_timeout
+                    ),
                     {noreply, State#{
                         fetch => #{
                             host => Host,
-                            rest => Rest,
+                            done => Done,
                             buf => <<>>,
                             count => 0,
                             timeout_ref => TimeoutRef,
+                            mon => Mon,
                             conn => Conn
                         }
                     }};
                 {error, _Refused} ->
-                    self() ! {start_pipeline, Rest},
+                    self() ! {start_pipeline, [Host | Done]},
                     {noreply, State}
             end;
         error ->
-            self() ! {start_pipeline, Rest},
+            self() ! {start_pipeline, [Host | Done]},
             {noreply, State}
     end;
-%% Inbound wire from try_stream_delivery: exactly one streaming connection
-%% is active per fetch, so every wire goes straight into it.
-handle_info({stream_data, WireBin}, State = #{fetch := #{conn := Conn}}) when
-    is_binary(WireBin)
-->
-    ok = i2p_stream_conn:handle_packet(Conn, WireBin),
+%% A connection announces its demux key as its first act: the peer puts that
+%% key in the sendStreamId of every packet it addresses here, so it is what
+%% inbound wires are routed by.
+handle_info({stream_started, Conn, MyId}, State) ->
+    Conns = maps:get(conns, State, #{}),
+    {noreply, State#{conns => maps:put(MyId, Conn, Conns)}};
+%% Inbound wire from try_stream_delivery: route it to the connection it names.
+%% A fetch can finish and start the next subscription while the peer's CLOSE
+%% for the finished one is still in flight, so "the current fetch's conn" is not
+%% the only live connection and is not always the right one. Dispatching by
+%% demux key also keeps a late packet from a finished connection out of the
+%% next fetch's buffer.
+handle_info({stream_data, WireBin}, State) when is_binary(WireBin) ->
+    deliver_wire(WireBin, State),
     {noreply, State};
 %% Data delivered by the connection itself after reassembly.
-handle_info({stream_data, _Conn, Payload}, State = #{fetch := #{buf := Buf} = Fetch}) when
+handle_info(
+    {stream_data, Conn, Payload}, State = #{fetch := #{conn := Conn, buf := Buf} = Fetch}
+) when
     is_binary(Payload)
 ->
     Buf1 = <<Buf/binary, Payload/binary>>,
@@ -196,29 +225,61 @@ handle_info({stream_data, _Conn, Payload}, State = #{fetch := #{buf := Buf} = Fe
         true -> finish_fetch(State#{fetch := Fetch#{buf := Buf1}});
         false -> {noreply, State#{fetch := Fetch#{buf := Buf1}}}
     end;
-handle_info({stream_closed, _Conn}, State) ->
+handle_info({stream_closed, Conn}, State = #{fetch := #{conn := Conn}}) ->
     finish_fetch(State);
-handle_info({stream_reset, _Conn}, State) ->
+handle_info({stream_reset, Conn}, State = #{fetch := #{conn := Conn}}) ->
     abandon_fetch(State);
-handle_info(fetch_timeout, State) ->
+handle_info({timeout, Ref, fetch_timeout}, State = #{fetch := #{timeout_ref := Ref}}) ->
     abandon_fetch(State);
-handle_info({'DOWN', _MRef, process, _ConnPid, _Reason}, State = #{fetch := Fetch}) when
-    Fetch =/= undefined
-->
-    %% The streaming connection died: abandon this subscription and move on.
-    self() ! {start_pipeline, maps:get(rest, Fetch)},
-    {noreply, State#{fetch => undefined}};
+handle_info(
+    {'DOWN', Mon, process, Conn, _Reason},
+    State = #{fetch := #{mon := Mon, conn := Conn, host := Host, done := Done}}
+) ->
+    %% The fetch's own streaming connection died: abandon this subscription and
+    %% move on.
+    cancel_fetch_timeout(State),
+    self() ! {start_pipeline, [Host | Done]},
+    {noreply, State#{
+        fetch => undefined,
+        conns => forget_conn(Conn, maps:get(conns, State, #{}))
+    }};
+handle_info({'DOWN', _Mon, process, Conn, _Reason}, State) ->
+    %% A connection from a fetch that has already finished. Its CLOSE exchange
+    %% is over (or gave up); forget the demux entry so the map does not grow.
+    {noreply, State#{conns => forget_conn(Conn, maps:get(conns, State, #{}))}};
 handle_info(_Info, State) ->
     {noreply, State}.
 
 %%%%%%% %%% Internal %%%%%%%
 
-next_target(Subs, Done) when length(Subs) =:= length(Done) -> done;
+%% deliver_wire/2 - hand one inbound streaming wire to the connection whose
+%% demux key it carries. Undecodable payloads and packets for a connection that
+%% has already gone are dropped: they cannot belong to a live stream.
+deliver_wire(WireBin, State) ->
+    case i2p_streaming:decode(WireBin) of
+        {ok, Pkt} ->
+            case maps:find(i2p_streaming:send_id(Pkt), maps:get(conns, State, #{})) of
+                {ok, Conn} -> ok = i2p_stream_conn:handle_packet(Conn, WireBin);
+                error -> ok
+            end;
+        {error, _Reason} ->
+            ok
+    end.
+
+%% forget_conn/2 - drop a connection's demux entry once its process is gone.
+forget_conn(Conn, Conns) ->
+    maps:filter(fun(_MyId, C) -> C =/= Conn end, Conns).
+
+%% next_target/2 - the first configured subscription not yet tried in this pass,
+%% or `done` when every one has been. `Done` is the list of hosts already tried,
+%% carried in the fetch map and extended when the fetch finishes, times out or
+%% dies: a failed subscription must not be retried immediately or the pipeline
+%% never reaches the ones after it.
 next_target(Subs, Done) ->
-    DoneHosts = [Host || #{host := Host} <- Done],
-    [Sub = #{host := _Host} | Rest] =
-        lists:dropwhile(fun(#{host := H}) -> lists:member(H, DoneHosts) end, Subs),
-    {Sub, Rest ++ Done}.
+    case lists:dropwhile(fun(#{host := H}) -> lists:member(H, Done) end, Subs) of
+        [] -> done;
+        [Sub | _] -> {Sub, Done}
+    end.
 
 %% route_to/1 - LeaseSet + outbound tunnel for a subscription destination
 %% (see `f:i2p_client:route_to_dest/1`).
@@ -250,7 +311,9 @@ start_http_conn(Route, Host, SignSeed) ->
     },
     case i2p_sam_sup:start_stream_conn(ConnOpts) of
         {ok, Conn} ->
-            erlang:monitor(process, Conn),
+            %% No monitor here: the caller stores the ref in the fetch map and is
+            %% the only place that can cancel it. A second monitor would fire a
+            %% DOWN nobody can match.
             %% Buffered while connecting; flushed automatically once established.
             Request = [
                 <<"GET / HTTP/1.0\r\n">>,
@@ -302,18 +365,40 @@ content_length(Head) ->
         end,
     lists:foldl(Fold, unknown, Lines).
 
-finish_fetch(State = #{fetch := #{buf := Buf, rest := Rest, count := Count0}}) ->
+finish_fetch(
+    State = #{
+        fetch := #{
+            conn := Conn, buf := Buf, host := Host, done := Done, count := Count0
+        }
+    }
+) ->
     Count1 = Count0 + ingest_hosts(Buf),
-    self() ! {start_pipeline, Rest},
+    ok = i2p_stream_conn:close(Conn),
+    %% The monitor stays: its DOWN is what removes the connection's demux entry
+    %% once the CLOSE exchange ends. The DOWN handler still compares `Mon`
+    %% before abandoning a fetch, so the monitor cannot disturb the next one.
+    cancel_fetch_timeout(State),
+    self() ! {start_pipeline, [Host | Done]},
     {noreply, State#{fetch => undefined, total => Count1}};
 finish_fetch(State) ->
     {noreply, State}.
 
-abandon_fetch(State = #{fetch := #{rest := Rest}}) ->
-    self() ! {start_pipeline, Rest},
+abandon_fetch(State = #{fetch := #{conn := Conn, host := Host, done := Done}}) ->
+    ok = i2p_stream_conn:close(Conn),
+    cancel_fetch_timeout(State),
+    self() ! {start_pipeline, [Host | Done]},
     {noreply, State#{fetch => undefined}};
 abandon_fetch(State) ->
     {noreply, State}.
+
+%% cancel_fetch_timeout/1 - drop the in-flight fetch's timeout so it cannot fire
+%% into the next subscription. The ref check in the handler already makes a stale
+%% timer harmless; cancelling keeps it out of the mailbox entirely.
+cancel_fetch_timeout(#{fetch := #{timeout_ref := Ref}}) ->
+    _ = erlang:cancel_timer(Ref),
+    ok;
+cancel_fetch_timeout(_State) ->
+    ok.
 
 %% ingest_hosts/1 - strip HTTP headers, feed hosts.txt lines to the book.
 ingest_hosts(Body) ->
