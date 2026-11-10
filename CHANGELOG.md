@@ -8,6 +8,59 @@ CI refuses a tag that disagrees.
 
 _(nothing yet)_
 
+## [0.10.0] — 2026-11-10
+
+**The hardening release.** 0.10.0 carries the 0.9.0 hardening programme —
+parity audit, soak and live smoke, transport modularity, SAM refactor — and
+the fixes under Fixed. No wire-format change over 0.8.0, so an 0.8.0
+`data_dir` is read unchanged.
+
+### Added
+
+- **Subscription fetcher end to end.** The addressbook subscription fetcher now
+  ties inbound stream messages to the streaming connection the fetch is bound to,
+  by demux key, so a fetch that completes (Content-Length) while the peer's CLOSE is
+  still in flight tears the connection down and lets the next subscription fetch
+  without the old connection's traffic reaching the new one (#94XG2E0).
+
+### Fixed
+
+- Addressbook hosts.txt grows without bound because every add appends a line
+  (#DPKX73F).
+- Client sessions and stream connections leak when their owner dies (#22QEB1A).
+- i2p_client_session reports success even when its LeaseSet cannot be
+  published (#XNZJQHB).
+- SAM create_destination ignores sig_type and every other option (#2CPZVEC).
+- EncryptedLeaseSet and MetaLeaseSet expire on an insertion ceiling, not on
+  lease validity (#4XKN2ZZ).
+- Pending lookups keyed by hash alone let a LeaseSet resolve a RouterInfo
+  lookup (#2SEWQ4R).
+- SSU2 NetDb-driven Charlie selection docs/parity claim (#S10GRTM).
+- Relays hard-close every connection after 5 minutes regardless of activity
+  (#DAC8DQT).
+- HTTP proxy discards client request headers and supports only GET/HEAD
+  (#6EKN0P1).
+- HTTP proxy buffers each whole response in memory and never bounds it
+  (#KSAXJ91).
+- SOCKS5 proxy rejects IPv6 destinations (#XVXHGJS).
+- NIF resource destructor closes the fd without deselecting it (#G6C9MCK).
+- UPnP opens a pinhole but never discovers or publishes the gateway's
+  external address (#A21WPAC).
+- Transit has no off switch and is enabled by the shipped profile, contradicting
+  README and parity (#JG1F136).
+- Malformed or out-of-order tunnel fragments crash the tunnel manager
+  (#Z9K8HX7).
+- parse_tunnel_data discards the fragment map built by parse_fragments
+  (#W88ZB2V).
+- i2p_stream_conn can be made to allocate an arbitrary sequence list from a
+  peer packet (#SCX0S7G).
+- just dialyzer is red: unmatched `{tun_write, ...}` returns in
+  i2per_tun_flow (#506FG99).
+- i2per_tun held sessions retain every received byte forever (#GJC9NWC).
+- TUN data path has no end-to-end test (#B0BGEZJ).
+- i2p_admission_SUITE is red: the stream fixture owner exits and takes the
+  connection with it (#DMB60CP).
+
 ## [0.9.0] — 2026-11-02
 
 **The parity-and-hardening release.** 0.8.0 landed the operator surface; 0.9.0

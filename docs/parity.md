@@ -10,7 +10,7 @@ are not in scope and do not change 1.0.0. See `3M0RBXX` for the decision and
 
 - **i2pd version:** 2.61.0
 - **Date taken:** 2026-10-07
-- **i2per release at snapshot:** 0.9.0
+- **i2per release at snapshot:** 0.10.0
 - **Source of the capability list:** i2pd 2.61.0 release notes plus the
   capabilities exercised by `scripts/interop_i2pd.sh` and
   `docs/protocol.md`.
@@ -63,7 +63,7 @@ Rows are one verdict, not prose: **done** (implemented and exercised),
 
 ## 1.0.0 material explicitly listed
 
-None as of 0.9.0: operator console shipped as a companion app; `i2per_tun` ships as a companion app but its packet data path is out of 1.0.0 scope (flow translator writes raw stream payload to a packet-oriented device; no TCP termination / IP synthesis - see `T57SS4F`); LeaseSet v1 / EncryptedLeaseSet / MetaLeaseSet partials are bounded by design (publishing not supported) and tracked in their rows above; BOB / I2PControl and the TUN packet data path are out of 1.0.0 scope.
+None as of 0.10.0: operator console shipped as a companion app; `i2per_tun` ships as a companion app but its packet data path is out of 1.0.0 scope (flow translator writes raw stream payload to a packet-oriented device; no TCP termination / IP synthesis - see `T57SS4F`); LeaseSet v1 / EncryptedLeaseSet / MetaLeaseSet partials are bounded by design (publishing not supported) and tracked in their rows above; BOB / I2PControl and the TUN packet data path are out of 1.0.0 scope.
 
 ## Freshness
 
