@@ -442,30 +442,59 @@ arm_timer(Composite) ->
 %%
 %% A lookup that succeeds publishes nothing. The event is about failure, and one that
 %% also fired on success could not be counted without a subtraction.
-resolve_stored(Key, Kind, Outcome, State = #{pending := Pending}) ->
+resolve_stored(Key, Kind, Outcome, State0 = #{pending := Pending0}) ->
     Composite = {Kind, Key},
-    case maps:find(Composite, Pending) of
-        error ->
-            State;
-        {ok, P} ->
-            cancel_timer(P),
-            case cached(maps:get(kind, P), Key) of
-                {ok, _R} = Hit ->
-                    reply_all(maps:get(callers, P), Hit),
-                    State#{pending := maps:remove(Composite, Pending)};
+    State1 =
+        case maps:find(Composite, Pending0) of
+            error ->
+                State0;
+            {ok, P} ->
+                cancel_timer(P),
+                case cached(maps:get(kind, P), Key) of
+                    {ok, _R} = Hit ->
+                        reply_all(maps:get(callers, P), Hit),
+                        State0#{pending := maps:remove(Composite, Pending0)};
+                    error ->
+                        Reason = stored_failure(Kind, Outcome),
+                        i2p_events:notify({lookup_failed, Key, Kind, Reason}),
+                        i2p_log:debug(lookup_failed, #{key => Key, kind => Kind, reason => Reason}),
+                        reply_all(
+                            maps:get(callers, P), {error, {lookup_failed, Reason}}
+                        ),
+                        State0#{pending := maps:remove(Composite, Pending0)}
+                end
+        end,
+    %% A store of one LeaseSet format also tells us the destination is not the
+    %% other format. Fail any pending lookup of the sibling format promptly
+    %% instead of letting it wait for a store that will never arrive.
+    Sibling =
+        case Kind of
+            lease -> lease_v1;
+            lease_v1 -> lease;
+            _ -> undefined
+        end,
+    case {Sibling, Outcome} of
+        {undefined, _} ->
+            State1;
+        {_, stored} ->
+            SiblingComposite = {Sibling, Key},
+            Pending1 = maps:get(pending, State1),
+            case maps:find(SiblingComposite, Pending1) of
                 error ->
-                    %% The wake-up arrived, the key is not usable. Two different
-                    %% things produce this and they are not the same event: the NetDb
-                    %% refused the record, or it took it and the key still does not
-                    %% hold what this lookup wanted.
-                    Reason = stored_failure(Kind, Outcome),
-                    i2p_events:notify({lookup_failed, Key, Kind, Reason}),
-                    i2p_log:debug(lookup_failed, #{key => Key, kind => Kind, reason => Reason}),
+                    State1;
+                {ok, SP} ->
+                    cancel_timer(SP),
+                    i2p_events:notify({lookup_failed, Key, Sibling, not_resolved}),
+                    i2p_log:debug(lookup_failed, #{
+                        key => Key, kind => Sibling, reason => not_resolved
+                    }),
                     reply_all(
-                        maps:get(callers, P), {error, {lookup_failed, Reason}}
+                        maps:get(callers, SP), {error, {lookup_failed, not_resolved}}
                     ),
-                    State#{pending := maps:remove(Composite, Pending)}
-            end
+                    State1#{pending := maps:remove(SiblingComposite, Pending1)}
+            end;
+        _ ->
+            State1
     end.
 
 %% Why a wake-up left the key unusable.

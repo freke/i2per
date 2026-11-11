@@ -127,23 +127,28 @@ fetch_via_sam(StreamSock, ClientSock, Request) ->
     Runner = self(),
     {Worker, Mon} =
         spawn_monitor(fun() ->
-            Runner ! {proxy_fetch, self(), fetch_over_sam(StreamSock, ClientSock, Request)}
+            Runner ! {proxy_fetch, self(), fetch_over_sam(StreamSock, ClientSock, Request, Runner)}
         end),
+    fetch_via_sam_recv(Worker, Mon, 0).
+
+fetch_via_sam_recv(Worker, Mon, Total) ->
     receive
+        {proxy_progress, Worker, NewTotal} ->
+            fetch_via_sam_recv(Worker, Mon, NewTotal);
         {proxy_fetch, Worker, Result} ->
             erlang:demonitor(Mon, [flush]),
             Result;
         {'DOWN', Mon, process, Worker, Reason} ->
-            {error, Reason, 0}
+            {error, Reason, Total}
     after 30000 ->
         exit(Worker, kill),
         erlang:demonitor(Mon, [flush]),
-        {error, fetch_timeout, 0}
+        {error, fetch_timeout, Total}
     end.
 
-fetch_over_sam(StreamSock, ClientSock, Request) ->
+fetch_over_sam(StreamSock, ClientSock, Request, Runner) ->
     ok = gen_tcp:send(StreamSock, Request),
-    recv_stream_sam(StreamSock, ClientSock, 0).
+    recv_stream_sam(StreamSock, ClientSock, 0, Runner).
 
 %% ---- CONNECT tunneling ----
 
@@ -185,15 +190,16 @@ connect_sam_http(ClientSock, Host) ->
     end.
 
 relay_core(ClientSock, ConnPid, Node) ->
+    Timeout = i2per_proxy_config:relay_idle_timeout(),
     _ = inet:setopts(ClientSock, [{active, once}, {keepalive, true}]),
-    relay_core_loop(ClientSock, ConnPid, Node).
+    relay_core_loop(ClientSock, ConnPid, Node, Timeout).
 
-relay_core_loop(ClientSock, ConnPid, Node) ->
+relay_core_loop(ClientSock, ConnPid, Node, Timeout) ->
     receive
         {tcp, ClientSock, Data} ->
             _ = catch erpc:call(Node, i2p_sam_api, stream_send, [ConnPid, Data]),
             _ = inet:setopts(ClientSock, [{active, once}]),
-            relay_core_loop(ClientSock, ConnPid, Node);
+            relay_core_loop(ClientSock, ConnPid, Node, Timeout);
         {tcp_closed, ClientSock} ->
             _ = catch erpc:call(Node, i2p_sam_api, stream_close, [ConnPid]),
             ok;
@@ -202,12 +208,12 @@ relay_core_loop(ClientSock, ConnPid, Node) ->
             ok;
         {stream_data, ConnPid, Bytes} ->
             _ = gen_tcp:send(ClientSock, Bytes),
-            relay_core_loop(ClientSock, ConnPid, Node);
+            relay_core_loop(ClientSock, ConnPid, Node, Timeout);
         {stream_closed, ConnPid} ->
             ok;
         {stream_reset, ConnPid} ->
             ok
-    after 30000 ->
+    after Timeout ->
         _ = catch erpc:call(Node, i2p_sam_api, stream_close, [ConnPid]),
         ok
     end.
@@ -307,30 +313,117 @@ recv_exact(Sock, N, Acc) when N > 0 ->
     end.
 
 recv_chunked(Sock, Acc) ->
-    case binary:match(Acc, <<"\r\n0\r\n\r\n">>) of
-        {Pos, _Len} ->
-            {ok, binary:part(Acc, 0, Pos + 7)};
-        nomatch ->
+    case chunked_complete(Acc) of
+        {ok, N} ->
+            {ok, binary:part(Acc, 0, N)};
+        incomplete ->
             case gen_tcp:recv(Sock, 0, 5000) of
                 {ok, Data} when byte_size(Data) > 0 ->
                     recv_chunked(Sock, <<Acc/binary, Data/binary>>);
                 {ok, <<>>} ->
-                    case binary:match(Acc, <<"\r\n0\r\n">>) of
-                        {_, _} -> {ok, Acc};
-                        nomatch -> error
+                    case chunked_complete(Acc) of
+                        {ok, N} ->
+                            {ok, binary:part(Acc, 0, N)};
+                        _ ->
+                            case binary:match(Acc, <<"0\r\n">>) of
+                                {_, _} -> {ok, Acc};
+                                nomatch -> error
+                            end
                     end;
                 {error, timeout} ->
-                    case binary:match(Acc, <<"\r\n0\r\n">>) of
+                    case binary:match(Acc, <<"0\r\n">>) of
                         {_, _} -> {ok, Acc};
                         nomatch -> error
                     end;
                 {error, _} ->
                     error
-            end
+            end;
+        error ->
+            error
+    end.
+
+chunked_complete(Bin) ->
+    chunked_complete(Bin, 0).
+
+chunked_complete(Bin, Offset) ->
+    Size = byte_size(Bin),
+    case find_crlf(Bin, Offset) of
+        {Pos, _} ->
+            RawSize = binary:part(Bin, Offset, Pos - Offset),
+            SizeHex = trim(binary:part(RawSize, 0, byte_size(RawSize))),
+            ExtSplit = binary:split(SizeHex, <<";">>),
+            Hex = hd(ExtSplit),
+            case parse_hex(Hex) of
+                {ok, 0} ->
+                    After = Pos + 2,
+                    case Size >= After + 2 of
+                        true ->
+                            case binary:part(Bin, After, 2) of
+                                <<"\r\n">> ->
+                                    {ok, After + 2};
+                                _ ->
+                                    case
+                                        binary:match(Bin, <<"\r\n\r\n">>, [
+                                            {scope, {After, Size - After}}
+                                        ])
+                                    of
+                                        {T, _} -> {ok, T + 4};
+                                        nomatch -> incomplete
+                                    end
+                            end;
+                        false ->
+                            incomplete
+                    end;
+                {ok, N} when N > 0 ->
+                    DataStart = Pos + 2,
+                    DataEnd = DataStart + N,
+                    Needed = DataEnd + 2,
+                    case Size >= Needed of
+                        true ->
+                            case binary:part(Bin, DataEnd, 2) of
+                                <<"\r\n">> -> chunked_complete(Bin, Needed);
+                                _ -> error
+                            end;
+                        false ->
+                            incomplete
+                    end;
+                _ ->
+                    error
+            end;
+        nomatch ->
+            incomplete
+    end.
+
+find_crlf(Bin, Offset) ->
+    Size = byte_size(Bin),
+    case Offset < Size of
+        true ->
+            case binary:match(Bin, <<"\r\n">>, [{scope, {Offset, Size - Offset}}]) of
+                {Pos, 2} -> {Pos, 2};
+                nomatch -> nomatch
+            end;
+        false ->
+            nomatch
+    end.
+
+trim(B) ->
+    string:trim(B).
+
+parse_hex(<<>>) ->
+    {ok, 0};
+parse_hex(Hex) ->
+    try
+        {ok, binary_to_integer(Hex, 16)}
+    catch
+        _:_ -> error
     end.
 
 content_length(HeadersBin) ->
-    case re:run(HeadersBin, <<"Content-Length:\\s*(\\d+)">>, [caseless, {capture, [1], binary}]) of
+    case
+        re:run(HeadersBin, <<"^Content-Length:\\s*(\\d+)">>, [
+            caseless, multiline, {capture, [1], binary}
+        ])
+    of
         {match, [N]} ->
             try
                 binary_to_integer(N)
@@ -342,19 +435,39 @@ content_length(HeadersBin) ->
     end.
 
 transfer_encoding_chunked(HeadersBin) ->
-    case re:run(HeadersBin, <<"Transfer-Encoding:">>, [caseless]) of
-        {match, _} ->
-            case re:run(HeadersBin, <<"chunked">>, [caseless]) of
-                {match, _} -> true;
-                _ -> false
-            end;
-        _ ->
-            false
+    case re:run(HeadersBin, <<"^Transfer-Encoding:[^\\r\\n]*chunked">>, [caseless, multiline]) of
+        {match, _} -> true;
+        _ -> false
     end.
 
 build_request(Method, Path, Version, HeadersBin, BodyBin) ->
     ReqLine = <<Method/binary, " ", Path/binary, " ", Version/binary, "\r\n">>,
-    <<ReqLine/binary, HeadersBin/binary, BodyBin/binary>>.
+    Filtered = filter_hop_by_hop_headers(HeadersBin),
+    <<ReqLine/binary, Filtered/binary, BodyBin/binary>>.
+
+filter_hop_by_hop_headers(HeadersBin) ->
+    Lines = binary:split(HeadersBin, <<"\r\n">>, [global]),
+    Kept = [L || L <- Lines, L =/= <<>>, not is_hop_by_hop_header(L)],
+    WithConn = Kept ++ [<<"Connection: close">>],
+    iolist_to_binary([<<L/binary, "\r\n">> || L <- WithConn] ++ [<<"\r\n">>]).
+
+is_hop_by_hop_header(Line) ->
+    case binary:split(Line, <<":">>) of
+        [Name, _] ->
+            Lower = string:lowercase(string:trim(Name)),
+            lists:member(Lower, [
+                <<"connection">>,
+                <<"keep-alive">>,
+                <<"proxy-authenticate">>,
+                <<"proxy-authorization">>,
+                <<"te">>,
+                <<"trailers">>,
+                <<"upgrade">>,
+                <<"proxy-connection">>
+            ]);
+        _ ->
+            false
+    end.
 
 parse_url(<<"http://", Rest/binary>>) ->
     case binary:split(Rest, <<"/">>) of
@@ -387,23 +500,35 @@ status_text(400) -> <<"Bad Request">>;
 status_text(502) -> <<"Bad Gateway">>;
 status_text(503) -> <<"Service Unavailable">>.
 
-recv_stream_sam(Sock, ClientSock, Total) ->
-    case gen_tcp:recv(Sock, 0, 2000) of
-        {ok, Data} when byte_size(Data) > 0 ->
-            case stream_to_client(ClientSock, Data, Total) of
-                {ok, NewTotal} ->
-                    recv_stream_sam(Sock, ClientSock, NewTotal);
-                {error, cap_exceeded, NewTotal} ->
-                    {error, response_too_large, NewTotal}
-            end;
-        {ok, <<>>} ->
-            {ok, Total};
-        {error, closed} ->
-            {ok, Total};
-        {error, timeout} ->
+recv_stream_sam(Sock, ClientSock, Total, Runner) ->
+    recv_stream_sam(Sock, ClientSock, Total, Runner, erlang:monotonic_time(millisecond) + 30000).
+
+recv_stream_sam(Sock, ClientSock, Total, Runner, Deadline) ->
+    Now = erlang:monotonic_time(millisecond),
+    Remaining = Deadline - Now,
+    case Remaining =< 0 of
+        true ->
             {error, timeout, Total};
-        {error, Reason} ->
-            {error, Reason, Total}
+        false ->
+            Wait = erlang:min(Remaining, 2000),
+            case gen_tcp:recv(Sock, 0, Wait) of
+                {ok, Data} when byte_size(Data) > 0 ->
+                    case stream_to_client(ClientSock, Data, Total) of
+                        {ok, NewTotal} ->
+                            _ = Runner ! {proxy_progress, self(), NewTotal},
+                            recv_stream_sam(Sock, ClientSock, NewTotal, Runner, Deadline);
+                        {error, cap_exceeded, NewTotal} ->
+                            {error, response_too_large, NewTotal}
+                    end;
+                {ok, <<>>} ->
+                    {ok, Total};
+                {error, closed} ->
+                    {ok, Total};
+                {error, timeout} ->
+                    recv_stream_sam(Sock, ClientSock, Total, Runner, Deadline);
+                {error, Reason} ->
+                    {error, Reason, Total}
+            end
     end.
 
 stream_to_client(ClientSock, Data, Total) ->

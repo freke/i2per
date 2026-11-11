@@ -390,10 +390,9 @@ dispatch_db_store_malformed_test() ->
         {ignored, undecodable_store}, i2p_garlic:dispatch_db_message(Msg, 0)
     ).
 
-%% Store types 5 (EncryptedLeaseSet) and 7 (MetaLeaseSet) decode successfully
-%% — `f:i2p_i2np:decode_db_store/1` reports every byte on the wire — so before
-%% the catch-all clause they matched no clause here and raised `case_clause`,
-%% taking the tunnel manager down with them. Both reference routers can emit 5.
+%% Store types 5 (EncryptedLeaseSet) and 7 (MetaLeaseSet) now decode into
+%% `{store, ls5, ...}` and `{store, ls7, ...}`. Any other store type this
+%% router does not implement yields `{ignored, {unsupported_type, Type}}`.
 dispatch_db_store_unimplemented_type_test_() ->
     [
         ?_assertEqual(
@@ -402,15 +401,23 @@ dispatch_db_store_unimplemented_type_test_() ->
      || Type <- [2, 4, 6, 8, 255]
     ].
 
-dispatch_db_store_unknown_byte_test_() ->
-    %% Any other store type this router does not implement, not just the two
-    %% the references are known to emit.
-    [
-        ?_assertEqual(
-            {ignored, {unsupported_type, Type}}, dispatch_unimplemented_db_store(Type)
-        )
-     || Type <- [2, 4, 6, 8, 255]
-    ].
+dispatch_db_store_ls5_test() ->
+    Key = crypto:strong_rand_bytes(32),
+    Data = crypto:strong_rand_bytes(64),
+    Body = <<Key/binary, 5:8, 0:32/big, Data/binary>>,
+    Msg = #{type => 1, msg_id => <<1, 2, 3, 4>>, expiration => 1800000000, body => Body},
+    ?assertEqual(
+        {store, ls5, Key, Data, 0, 0}, i2p_garlic:dispatch_db_message(Msg, 0)
+    ).
+
+dispatch_db_store_ls7_test() ->
+    Key = crypto:strong_rand_bytes(32),
+    Data = crypto:strong_rand_bytes(64),
+    Body = <<Key/binary, 7:8, 0:32/big, Data/binary>>,
+    Msg = #{type => 1, msg_id => <<1, 2, 3, 4>>, expiration => 1800000000, body => Body},
+    ?assertEqual(
+        {store, ls7, Key, Data, 0}, i2p_garlic:dispatch_db_message(Msg, 0)
+    ).
 
 dispatch_unimplemented_db_store(Type) ->
     Key = crypto:strong_rand_bytes(32),

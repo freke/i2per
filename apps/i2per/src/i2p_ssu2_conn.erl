@@ -178,7 +178,7 @@ clearing `remote_ri` in isolation once made every Charlie reply sign over
 %%
 %% **It is a floor rather than the value**, because this wait covers the direct
 %% handshake with Bob *and then* the relay phase. A flat 15 s would therefore
-%% contain the whole of Bob's retransmit budget, which at the default is 9 s,
+%% contain the whole of Bob's retransmit budget, which at the default is 10 s,
 %% leaving the relay itself about six — and an operator who raised
 %% `handshake_max_resends` would have the leg killed before Bob's handshake
 %% could finish. A bound that degrades as it is tuned toward working is not a

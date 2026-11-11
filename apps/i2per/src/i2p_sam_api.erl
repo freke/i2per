@@ -202,7 +202,7 @@ stream_connect(SessionMap, Target, Owner) when is_map(SessionMap) ->
     %% supplied identity and private keys rather than generating a new one.
     case maps:get(identity, SessionMap, undefined) of
         undefined ->
-            case create_session(#{ephemeral => true}) of
+            case create_session(#{ephemeral => true, owner => Owner}) of
                 {ok, Pid, _} -> stream_connect_ephemeral(Pid, Target, Owner);
                 {error, R} -> {error, R}
             end;
@@ -212,7 +212,8 @@ stream_connect(SessionMap, Target, Owner) when is_map(SessionMap) ->
                 crypto_priv => maps:get(crypto_priv, SessionMap),
                 sign_priv => maps:get(sign_priv, SessionMap),
                 tunnel_lengths => maps:get(tunnel_lengths, SessionMap, #{}),
-                ephemeral => true
+                ephemeral => true,
+                owner => Owner
             },
             case i2p_client_session:start(Args) of
                 {ok, Pid} ->
@@ -222,7 +223,7 @@ stream_connect(SessionMap, Target, Owner) when is_map(SessionMap) ->
             end
     end;
 stream_connect(_SessionMap, Target, Owner) ->
-    case create_session(#{ephemeral => true}) of
+    case create_session(#{ephemeral => true, owner => Owner}) of
         {ok, Pid, _} -> stream_connect_ephemeral(Pid, Target, Owner);
         {error, R} -> {error, R}
     end.
