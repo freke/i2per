@@ -51,11 +51,19 @@ stop_dev(Pid) ->
     catch gen_server:stop(Pid),
     ok.
 
+recv_until_closed(Sock) ->
+    case gen_tcp:recv(Sock, 0, 5000) of
+        {ok, _} ->
+            recv_until_closed(Sock);
+        {error, _} ->
+            ok
+    end.
+
 start_tcp_mock() ->
     Mock = i2per_tun_mock_sam:start(fun(StreamSock) ->
-        %% The device holds the flow for the life of the session; return when
-        %% the device closes it.
-        _ = gen_tcp:recv(StreamSock, 0, 5000),
+        %% The device holds the flow for the life of the session; keep
+        %% receiving until the device closes the socket (or times out).
+        recv_until_closed(StreamSock),
         ok
     end),
     {_, Port, _} = Mock,
