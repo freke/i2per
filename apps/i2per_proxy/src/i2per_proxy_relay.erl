@@ -23,8 +23,8 @@ relay(A, B, Timeout) ->
     keepalive(A),
     keepalive(B),
     Parent = self(),
-    P1 = spawn_link(fun() -> forward(A, B, Parent) end),
-    P2 = spawn_link(fun() -> forward(B, A, Parent) end),
+    P1 = spawn(fun() -> forward(A, B, Parent) end),
+    P2 = spawn(fun() -> forward(B, A, Parent) end),
     wait(P1, P2, Timeout).
 
 %% Without an application-level idle timeout, the OS keepalive is what notices

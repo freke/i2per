@@ -260,9 +260,9 @@ unparseable_store_is_reported_as_unreadable_not_as_a_timeout_test() ->
     end.
 
 %% A store that *was* taken but still left the key without what this lookup wanted.
-%% Reachable because the pending map is keyed by hash alone, so a LeaseSet can answer
-%% a pending RouterInfo lookup for the same hash. The reason says the record arrived
-%% and did not resolve the question, which is a third thing again.
+%% Pending entries are now keyed by {kind, hash}, so a store of a different kind
+%% no longer answers this lookup; the reason says the record arrived and did not
+%% resolve the question, which is a third thing again.
 taken_store_that_does_not_resolve_reports_not_resolved_test() ->
     Owner = ensure_netdb(),
     try

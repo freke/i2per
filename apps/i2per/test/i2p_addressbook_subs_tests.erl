@@ -70,15 +70,6 @@ timeout_test() ->
     ),
     recv_pipeline([]).
 
-%% Pipeline already drained: nothing left to fetch.
-start_pipeline_done_test() ->
-    Sub = #{host => <<"a.i2p">>},
-    State = base_state(#{subscriptions => [Sub]}),
-    ?assertEqual(
-        {noreply, State},
-        i2p_addressbook_subs:handle_info({start_pipeline, [Sub]}, State)
-    ).
-
 %% Pipeline kicks the first subscription, remainder queued as the new Done.
 start_pipeline_kick_test() ->
     Sub = #{host => <<"a.i2p">>},

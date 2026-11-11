@@ -416,7 +416,8 @@ Output: `{store, router | lease, Key :: binary(), Data :: binary(), non_neg_inte
 %% outcome, so a router could not tell "the network is not helping me" from "the
 %% network is helping me with something I cannot read".
 -spec dispatch_db_message(dispatch_msg(), integer()) ->
-    {store, router | lease | lease_v1 | ls5 | ls7, i2p_crypto:hash(), binary(), non_neg_integer()}
+    {store, ls5, i2p_crypto:hash(), binary(), non_neg_integer(), non_neg_integer()}
+    | {store, router | lease | lease_v1 | ls7, i2p_crypto:hash(), binary(), non_neg_integer()}
     | {lookup, i2p_i2np:db_lookup()}
     | {search_reply, i2p_i2np:db_search_reply()}
     | {ignored, ignore_reason()}.
@@ -430,8 +431,8 @@ dispatch_db_message(#{type := 1, body := Body}, NowMs) ->
         {ok, #{store_type := 3, key := Key, data := Data}} ->
             {store, lease, Key, Data, NowMs};
         %% Store type 5 is an EncryptedLeaseSet and 7 a MetaLeaseSet.
-        {ok, #{store_type := 5, key := Key, data := Data}} ->
-            {store, ls5, Key, Data, NowMs};
+        {ok, #{store_type := 5, key := Key, data := Data, reply_token := ReplyToken}} ->
+            {store, ls5, Key, Data, ReplyToken, NowMs};
         {ok, #{store_type := 7, key := Key, data := Data}} ->
             {store, ls7, Key, Data, NowMs};
         %% A store type this router has no parser for.

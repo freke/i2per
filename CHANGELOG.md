@@ -31,8 +31,8 @@ the fixes under Fixed. No wire-format change over 0.8.0, so an 0.8.0
 - i2p_client_session reports success even when its LeaseSet cannot be
   published (#XNZJQHB).
 - SAM create_destination ignores sig_type and every other option (#2CPZVEC).
-- EncryptedLeaseSet and MetaLeaseSet expire on an insertion ceiling, not on
-  lease validity (#4XKN2ZZ).
+- Document that EncryptedLeaseSet and MetaLeaseSet expire on an insertion
+  ceiling, not on lease validity (#4XKN2ZZ).
 - Pending lookups keyed by hash alone let a LeaseSet resolve a RouterInfo
   lookup (#2SEWQ4R).
 - SSU2 NetDb-driven Charlie selection docs/parity claim (#S10GRTM).
@@ -44,10 +44,14 @@ the fixes under Fixed. No wire-format change over 0.8.0, so an 0.8.0
   (#KSAXJ91).
 - SOCKS5 proxy rejects IPv6 destinations (#XVXHGJS).
 - NIF resource destructor closes the fd without deselecting it (#G6C9MCK).
-- UPnP opens a pinhole but never discovers or publishes the gateway's
-  external address (#A21WPAC).
+- UPnP documentation now states that it opens a pinhole but does not discover
+  or publish the gateway's external address (#A21WPAC).
 - Transit has no off switch and is enabled by the shipped profile, contradicting
   README and parity (#JG1F136).
+- Without a profile or configuration value for `transit_max_tunnels`, the
+  transit limit now defaults to 0 and transit builds are rejected; set a
+  positive limit to retain transit participation (the shipped profile sets 10)
+  (#JG1F136).
 - Malformed or out-of-order tunnel fragments crash the tunnel manager
   (#Z9K8HX7).
 - parse_tunnel_data discards the fragment map built by parse_fragments

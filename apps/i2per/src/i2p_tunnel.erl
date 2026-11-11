@@ -824,7 +824,7 @@ parse_delivery_instructions(<<Flag:8, Rest/binary>>, FragMap, Acc) ->
                         last => Last,
                         data => FragData
                     },
-                    FragMap1 = add_fragment(FragMap, MsgID, FragNum, FragData),
+                    FragMap1 = add_fragment(FragMap, MsgID, FragNum, FragData, Last),
                     parse_delivery_instructions(Rem, FragMap1, [Fragment | Acc]);
                 _ ->
                     error
@@ -881,7 +881,7 @@ first_fragment(
     true
 ) ->
     Fragment = fragment_map(Delivery, Extra, MsgID, FlagLast, FragData),
-    {ok, Fragment, Rem, add_fragment(FragMap, MsgID, 0, FragData)};
+    {ok, Fragment, Rem, add_fragment(FragMap, MsgID, 0, FragData, FlagLast)};
 first_fragment(
     <<_Size:16/big, FragData:_Size/binary, Rem/binary>>, FragMap, Delivery, Extra, _FlagLast, false
 ) ->
@@ -904,10 +904,15 @@ fragment_map(Delivery, Extra, MsgID, Last, Data) ->
     }).
 
 %% add_fragment/4 — add a fragment to the reassembly map.
-add_fragment(FragMap, MsgID, FragNum, Data) ->
+add_fragment(FragMap, MsgID, FragNum, Data, Last) ->
     MsgFrags = maps:get(MsgID, FragMap, #{}),
     MsgFrags1 = MsgFrags#{FragNum => Data},
-    FragMap#{MsgID => MsgFrags1}.
+    MsgFrags2 =
+        case Last of
+            true -> MsgFrags1#{last => FragNum};
+            false -> MsgFrags1
+        end,
+    FragMap#{MsgID => MsgFrags2}.
 
 %% random_nonzero_padding/1 — generate random nonzero bytes for padding.
 random_nonzero_padding(N) when N =< 0 ->

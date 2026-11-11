@@ -484,7 +484,7 @@ handle_packet(Pkt, State) ->
                                 case i2per_tun_ip:tcp_parse(maps:get(payload, Parsed, <<>>)) of
                                     {ok, #{payload := TcpPayload}} when byte_size(TcpPayload) > 0 ->
                                         Pid = maps:get(Key, State#state.sessions),
-                                        spawn(fun() -> _ = i2per_tun_flow:send(Pid, TcpPayload) end),
+                                        _ = i2per_tun_flow:send(Pid, TcpPayload),
                                         {State#state.sessions, State};
                                     _ ->
                                         {State#state.sessions, State}

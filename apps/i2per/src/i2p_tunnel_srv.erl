@@ -188,7 +188,8 @@ ok = i2p_tunnel_srv:stop().
     publish_lease_set/3,
     status/0,
     demands/0,
-    stop/0
+    stop/0,
+    clear_transit/0
 ]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
@@ -632,6 +633,11 @@ demands() ->
 stop() ->
     gen_server:cast(?MODULE, stop).
 
+-doc "Clear all active transit tunnels (used when transit is disabled at runtime).".
+-spec clear_transit() -> ok.
+clear_transit() ->
+    gen_server:call(?MODULE, clear_transit, 5000).
+
 %%%%%%% %%% gen_server callbacks %%%%%%%
 
 init([Local]) ->
@@ -660,6 +666,8 @@ handle_call(status, _From, State) ->
             [pending, pending_in, tunnels, inbound, transit, exploratory, exploratory_in], State
         ),
         State};
+handle_call(clear_transit, _From, State) ->
+    {reply, ok, State#{transit => #{}}};
 handle_call(demands, _From, #{demands := Demands} = State) ->
     {reply, Demands, State};
 handle_call({set_lengths, Pid, InLen, OutLen}, _From, State) ->
