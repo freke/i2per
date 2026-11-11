@@ -10,7 +10,7 @@ are not in scope and do not change 1.0.0. See `3M0RBXX` for the decision and
 
 - **i2pd version:** 2.61.0
 - **Date taken:** 2026-10-07
-- **i2per release at snapshot:** 0.9.0
+- **i2per release at snapshot:** 0.10.0
 - **Source of the capability list:** i2pd 2.61.0 release notes plus the
   capabilities exercised by `scripts/interop_i2pd.sh` and
   `docs/protocol.md`.
@@ -37,7 +37,7 @@ Rows are one verdict, not prose: **done** (implemented and exercised),
 | Static-key (NTCP1) crypto | absent | legacy, excluded |
 | Tunnel creation v0.1 (ECIES) | done | 3-hop outbound and inbound; tests: `i2p_tunnel_tests`, `i2p_tunnel_srv_SUITE` |
 | Tunnel build v2 (variable tunnels) | done | hop cap raised to 7 (i2pd parity, `NUM_HOPS`/`MAX_HOPS`); default build stays 3 hops; tests: `i2p_tunnel_tests` |
-| Transit tunnel participation | partial | available, bounded (transit_max_tunnels default 10, transit_bandwidth_kbps default 64; 0 disables); on by default with a small cap; tests: `i2p_tunnel_srv_SUITE` |
+| Transit tunnel participation | partial | available, bounded; off by default (no config: transit_max_tunnels defaults to 0); shipped profile enables a small bound (transit_max_tunnels 10, transit_bandwidth_kbps 64); 0 disables; tests: `i2p_tunnel_srv_SUITE` |
 | Inbound gateway role | done | tests: `i2p_tunnel_srv_SUITE` |
 | Outbound gateway role | done | client send runs in caller process (ADR 0003) |
 | Streaming protocol | done | implemented; field accessors read through and written around (#C252TF7); tests: `i2p_streaming_tests`, `i2p_stream_tests`, `i2p_stream_conn_SUITE` |
@@ -45,7 +45,7 @@ Rows are one verdict, not prose: **done** (implemented and exercised),
 | Floodfill participation | partial | available, off by default (floodfill env: true/false/auto; auto uses capacity_ok gate: bandwidth class O+ and published NTCP2); tests: `i2p_floodfill_tests`, `i2p_floodfill_SUITE` |
 | LeaseSet v2 | done | tests: `i2p_leaset_tests` |
 | LeaseSet v1 | partial | receive, store and serve (store type 1); publishing not supported (X25519 + Ed25519 forces LeaseSet2); tests: `i2p_leaset_v1_smoke_tests`, `i2p_netdb_v1_tests` |
-| Encrypted / Meta LeaseSets | partial | type 5 (EncryptedLeaseSet) stored, expired and served; type 7 (MetaLeaseSet) stored but not re-broadcast; publishing not supported; tests: `i2p_netdb_tests` |
+| Encrypted / Meta LeaseSets | partial | type 5 (EncryptedLeaseSet) and type 7 (MetaLeaseSet) stored and served verbatim, capacity- and age-bounded by a fixed 24 h insertion ceiling (`?RAW_LS_MAX_AGE_SEC` in `i2p_netdb`); no lease-validity expiry is decoded (the record's published/expires fields are not parsed), so the ceiling is the expiry; type 7 is not re-broadcast; publishing not supported; tests: `i2p_netdb_raw_tests` |
 | SAM v3 | done | `i2p_sam_srv`; tests: `i2p_sam_SUITE`, `i2p_sam_api_SUITE` |
 | I2CP | absent | excluded by maintainer decision |
 | Datagram2 | done | codec (`encode2`/`decode2`, signature over target hash) + options Mapping (flag bit 4) + offline signatures (flag bit 5, checked against the destination's own signing key) + bounded per-destination replay window + SAM `STYLE=DATAGRAM2` / `DATAGRAM2 SEND` with `DATAGRAM2 RECEIVED`; tests: `i2p_datagram_tests`, `i2p_datagram_replay_tests`, `i2p_sam_datagram_SUITE` |
@@ -56,14 +56,14 @@ Rows are one verdict, not prose: **done** (implemented and exercised),
 | Automatic NetDb-driven Charlie selection | done | SSU2 + peer_test + public address candidates; uniform random; one Charlie per cycle; per-Alice 60s rate limit; code-2 reject on failure; tests: `i2p_ssu2_peertest_SUITE` |
 | Peer testing | done | measured reachability ladder; tests: `i2p_peertest_tests`, `i2p_ssu2_peertest_SUITE` |
 | Measured reachability | done | see `CD7ZBVH`; tests: `i2p_ssu2_reachability_SUITE` |
-| TUN interface | done (separate app) | `i2per_tun` companion app (ADR 0001), shape (a) flow translator (SAM STREAM + RAW/DATAGRAM helpers); tests: `i2per_tun_*_tests` |
+| TUN interface | partial (separate app) | `i2per_tun` companion app (ADR 0001), shape (a) flow translator (SAM STREAM + RAW/DATAGRAM helpers); the packet data path is out of 1.0.0 scope - it writes raw stream payload into the packet-oriented TUN device (no TCP termination / IP synthesis; see `T57SS4F`); tests: `i2per_tun_*_tests` |
 | SOCKS / HTTP proxy / BOB / I2PControl | partial (separate app) | SOCKS and HTTP proxy implemented and shipped as `i2per_proxy`; BOB protocol and I2PControl not implemented (I2PControl is 3.x work, see `TZFYB9R`); tests: `i2per_proxy_*_tests` |
 | In-built status monitor | done (separate app) | `i2per_status` presentation app; held fields rendered (peers/tunnels/netdb/config/SAM), derived rates and reachability ladder; absent: graceful shutdown, non-SAM service rows, peer-test error reasons; tests: `i2per_status_*_tests` |
-| UPnP / NAT traversal service | done (separate app) | `i2p_upnp_srv` (off by default, hot-switchable); SSDP discovery, SOAP port mapping with renewal; tests: `i2p_upnp_srv_tests` |
+| UPnP / NAT traversal service | partial (separate app) | `i2p_upnp_srv` (off by default, hot-switchable); SSDP discovery, SOAP port mapping with renewal; opens the pinhole only and does not discover or publish the gateway's external address: the operator must set app env `i2per` -> `host` to the gateway's external address and `ntcp2_published` to `true` for a reachable RouterAddress (see `A21WPAC`); tests: `i2p_upnp_srv_tests` |
 
 ## 1.0.0 material explicitly listed
 
-None as of 0.9.0: operator console and TUN shipped as companion apps; LeaseSet v1 / EncryptedLeaseSet / MetaLeaseSet partials are bounded by design (publishing not supported) and tracked in their rows above; BOB / I2PControl are out of 1.0.0 scope.
+None as of 0.10.0: operator console shipped as a companion app; `i2per_tun` ships as a companion app but its packet data path is out of 1.0.0 scope (flow translator writes raw stream payload to a packet-oriented device; no TCP termination / IP synthesis - see `T57SS4F`); LeaseSet v1 / EncryptedLeaseSet / MetaLeaseSet partials are bounded by design (publishing not supported) and tracked in their rows above; BOB / I2PControl and the TUN packet data path are out of 1.0.0 scope.
 
 ## Freshness
 

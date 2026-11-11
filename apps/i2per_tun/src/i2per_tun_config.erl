@@ -9,7 +9,15 @@ the protocol has no automatic IP<->I2P mapping. Configured via the
 (e.g. <<"10.0.0.2">>) to a destination hostname (e.g. <<"peer.i2p">>).
 """.
 
--export([destinations/0, lookup/1, sam_host/0, sam_port/0, listen_port/0, router_node/0]).
+-export([
+    destinations/0,
+    lookup/1,
+    sam_host/0,
+    sam_port/0,
+    listen_port/0,
+    router_node/0,
+    relay_idle_timeout/0
+]).
 
 -spec destinations() -> #{binary() => binary()}.
 destinations() ->
@@ -51,4 +59,21 @@ listen_port() ->
     case application:get_env(i2per_tun, listen_port) of
         {ok, P} when is_integer(P), P > 0 -> P;
         _ -> 7657
+    end.
+
+-doc """
+Idle timeout for the flow relays, in milliseconds.
+
+The timeout is reset by any byte in either direction, so it closes a flow only
+when both directions have been quiet for the whole interval. The default is
+`infinity` (no idle cutoff), matching i2pd; `0` also disables it. A positive
+value enables it. Set the `relay_idle_timeout_ms` key in the `i2per_tun` app
+env.
+""".
+-spec relay_idle_timeout() -> infinity | pos_integer().
+relay_idle_timeout() ->
+    case application:get_env(i2per_tun, relay_idle_timeout_ms) of
+        {ok, infinity} -> infinity;
+        {ok, Ms} when is_integer(Ms), Ms > 0 -> Ms;
+        _ -> infinity
     end.

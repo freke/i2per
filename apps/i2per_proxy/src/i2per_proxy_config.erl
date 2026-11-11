@@ -6,7 +6,16 @@ Static configuration for `i2per_proxy`.
 Reads app env of `i2per_proxy`. Defaults match i2pd's proxy ports.
 """.
 
--export([listen_host/0, socks_port/0, http_port/0, sam_host/0, sam_port/0, router_node/0]).
+-export([
+    listen_host/0,
+    socks_port/0,
+    http_port/0,
+    sam_host/0,
+    sam_port/0,
+    router_node/0,
+    relay_idle_timeout/0,
+    max_http_response_bytes/0
+]).
 
 -spec listen_host() -> binary() | inet:ip_address().
 listen_host() ->
@@ -49,4 +58,34 @@ router_node() ->
     case application:get_env(i2per_proxy, router_node) of
         {ok, N} when is_atom(N) -> N;
         _ -> node()
+    end.
+
+-doc """
+Idle timeout for the byte relays, in milliseconds.
+
+The timeout is reset by any byte in either direction, so it closes a relay only
+when both directions have been quiet for the whole interval. The default is
+`infinity` (no idle cutoff), matching i2pd; `0` also disables it. A positive
+value enables it. Set the `relay_idle_timeout_ms` key in the `i2per_proxy` app
+env.
+""".
+-spec relay_idle_timeout() -> infinity | pos_integer().
+relay_idle_timeout() ->
+    case application:get_env(i2per_proxy, relay_idle_timeout_ms) of
+        {ok, infinity} -> infinity;
+        {ok, Ms} when is_integer(Ms), Ms > 0 -> Ms;
+        _ -> infinity
+    end.
+
+-doc """
+Maximum number of bytes the HTTP proxy will buffer/stream for a single
+response before aborting it. Guards against unbounded memory growth on
+large or malicious origins. Default 10 MiB. Set via the
+`max_http_response_bytes` key in the `i2per_proxy` app env.
+""".
+-spec max_http_response_bytes() -> pos_integer().
+max_http_response_bytes() ->
+    case application:get_env(i2per_proxy, max_http_response_bytes) of
+        {ok, N} when is_integer(N), N > 0 -> N;
+        _ -> 10 * 1024 * 1024
     end.

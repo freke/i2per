@@ -59,7 +59,7 @@
 -define(OBSERVE_RETRY_MS, 125).
 
 %% The fallback case's park, armed down through `arm_handshake/1`: two resends at
-%% 50 ms, so the SSU2 leg gives up in ~150 ms and the NTCP2 leg behind it is
+%% 125 ms, so the SSU2 leg gives up in ~375 ms and the NTCP2 leg behind it is
 %% reachable inside the case. Both are the production app-env levers an operator
 %% sets — the same argument `arm_sndbuf/1` makes — so the case reaches the stall
 %% through a configured product behaviour rather than a private mechanism.
@@ -67,7 +67,7 @@
 %% One timer fires per resend plus the one that gives up, which is why the count
 %% is `?FALLBACK_RESENDS + 1` and not `?FALLBACK_RESENDS`; see the note on the
 %% earliest budget in `arm_handshake/1`.
--define(FALLBACK_RETRY_MS, 50).
+-define(FALLBACK_RETRY_MS, 125).
 -define(FALLBACK_RESENDS, 2).
 -define(FALLBACK_PARK_MS, (?FALLBACK_RETRY_MS * (?FALLBACK_RESENDS + 1))).
 
@@ -162,7 +162,7 @@ arm_handshake(a_peer_parked_on_ssu2_reports_ssu2_not_ntcp2) ->
 %% The fallback case reads the whole policy — attempted, abandoned, second leg,
 %% ended on NTCP2 — and every step of it lands inside a park. At the default
 %% nine resends the park is ~9 s, so a case that asserts four things about it
-%% spends most of its time waiting to look. Armed down to ~150 ms it becomes a
+%% spends most of its time waiting to look. Armed down to ~375 ms it becomes a
 %% sub-second case, and it gets sharper rather than weaker: configured, it can
 %% now tell a correct derived bound from a reintroduced hardcoded literal,
 %% because a park that ignored these two keys would take the old ~11 s and miss
@@ -321,8 +321,8 @@ transport_ssu2_when_available(_Config) ->
 %%
 %% **Why this is not a timetrap.** It used to assert that a fallback happened
 %% inside a 60 s timetrap, which is a statement about the harness: a product
-%% bound of 59 seconds passed it, and a bound of 150 ms passed it identically.
-%% Now that the park is a configured ~150 ms, each step is a fact or an absence
+%% bound of 59 seconds passed it, and a bound of 375 ms passed it identically.
+%% Now that the park is a configured ~375 ms, each step is a fact or an absence
 %% that cannot be produced any other way:
 %%
 %% - `f:await_attempting_ssu2/2` is the attempt, read from the peer's own

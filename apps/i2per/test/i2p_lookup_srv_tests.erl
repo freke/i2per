@@ -86,7 +86,7 @@ resolve_stored_miss_test() ->
         From = {Me, Ref},
         Entry = P#{callers := [{From, Me, make_ref()}]},
         {noreply, State1} = i2p_lookup_srv:handle_info(
-            {db_stored, Key, router, stored}, State0#{pending := #{Key => Entry}}
+            {db_stored, Key, router, stored}, State0#{pending := #{{router, Key} => Entry}}
         ),
         ?assertEqual(#{}, maps:get(pending, State1)),
         %% The store was taken, so this is not a refusal — and because the key still
@@ -119,9 +119,9 @@ two_callers_shared_pending_test() ->
             i2p_lookup_srv:handle_call({find, Key, lease}, {Me, R1}, State),
         {noreply, State2} =
             i2p_lookup_srv:handle_call({find, Key, lease}, {Me, R2}, State1),
-        #{Key := Entry} = maps:get(pending, State2),
+        #{{lease, Key} := Entry} = maps:get(pending, State2),
         ?assertEqual(2, length(maps:get(callers, Entry))),
-        {noreply, State3} = i2p_lookup_srv:handle_info({next_attempt, Key}, State2),
+        {noreply, State3} = i2p_lookup_srv:handle_info({next_attempt, {lease, Key}}, State2),
         ?assertEqual(#{}, maps:get(pending, State3)),
         receive
             {R1, {error, {lookup_failed, no_answer}}} -> ok
@@ -146,7 +146,7 @@ exhausted_attempts_test() ->
     {ok, State0} = i2p_lookup_srv:init([?HASH]),
     Entry = (pending())#{attempts := 5},
     {noreply, State1} = i2p_lookup_srv:handle_info(
-        {next_attempt, Key}, State0#{pending := #{Key => Entry}}
+        {next_attempt, {router, Key}}, State0#{pending := #{{router, Key} => Entry}}
     ),
     ?assertEqual(#{}, maps:get(pending, State1)).
 
@@ -161,7 +161,7 @@ drop_caller_test() ->
     %% First waiter dies, second lives: entry survives with the live caller.
     S1 = State0#{
         pending := #{
-            Key => (pending())#{
+            {router, Key} => (pending())#{
                 callers := [
                     {{Me, make_ref()}, DeadPid, Ref},
                     {{Me, make_ref()}, Me, make_ref()}
@@ -170,13 +170,13 @@ drop_caller_test() ->
         }
     },
     {noreply, S2} = i2p_lookup_srv:handle_info({'DOWN', Ref, process, DeadPid, normal}, S1),
-    #{Key := K1} = maps:get(pending, S2),
+    #{{router, Key} := K1} = maps:get(pending, S2),
     ?assertEqual(1, length(maps:get(callers, K1))),
     %% The last waiter dies: the whole entry goes with it.
     RefLast = make_ref(),
     S3 = State0#{
         pending := #{
-            Key => K1#{
+            {router, Key} => K1#{
                 callers := [
                     {{Me, make_ref()}, Me, RefLast}
                 ]
@@ -260,9 +260,9 @@ unparseable_store_is_reported_as_unreadable_not_as_a_timeout_test() ->
     end.
 
 %% A store that *was* taken but still left the key without what this lookup wanted.
-%% Reachable because the pending map is keyed by hash alone, so a LeaseSet can answer
-%% a pending RouterInfo lookup for the same hash. The reason says the record arrived
-%% and did not resolve the question, which is a third thing again.
+%% Pending entries are now keyed by {kind, hash}, so a store of a different kind
+%% no longer answers this lookup; the reason says the record arrived and did not
+%% resolve the question, which is a third thing again.
 taken_store_that_does_not_resolve_reports_not_resolved_test() ->
     Owner = ensure_netdb(),
     try
@@ -278,6 +278,40 @@ taken_store_that_does_not_resolve_reports_not_resolved_test() ->
         ?assertEqual(
             [{lookup_failed, Key, router, not_resolved}], events_named(lookup_failed, Events)
         )
+    after
+        stop_netdb(Owner)
+    end.
+
+%% A LeaseSet store must not resolve a pending RouterInfo lookup for the same
+%% hash, and vice versa: pending entries are keyed by {kind, hash}.
+interleaved_kinds_do_not_cross_resolve_test() ->
+    Owner = ensure_netdb(),
+    try
+        Key = crypto:strong_rand_bytes(32),
+        {ok, State0} = i2p_lookup_srv:init([?HASH]),
+        Me = self(),
+        LRef = make_ref(),
+        RRef = make_ref(),
+        LFrom = {Me, LRef},
+        RFrom = {Me, RRef},
+        LeaseEntry = (pending())#{kind => lease, callers => [{LFrom, Me, make_ref()}]},
+        RouterEntry = (pending())#{kind => router, callers => [{RFrom, Me, make_ref()}]},
+        State1 = State0#{pending => #{{lease, Key} => LeaseEntry, {router, Key} => RouterEntry}},
+        {noreply, State2} = i2p_lookup_srv:handle_info({db_stored, Key, lease, stored}, State1),
+        ?assertEqual(false, maps:is_key({lease, Key}, maps:get(pending, State2))),
+        ?assert(maps:is_key({router, Key}, maps:get(pending, State2))),
+        receive
+            {LRef, {error, {lookup_failed, not_resolved}}} -> ok
+        after 0 ->
+            error(no_lease_reply)
+        end,
+        {noreply, State3} = i2p_lookup_srv:handle_info({db_stored, Key, router, stored}, State2),
+        ?assertEqual(false, maps:is_key({router, Key}, maps:get(pending, State3))),
+        receive
+            {RRef, {error, {lookup_failed, not_resolved}}} -> ok
+        after 0 ->
+            error(no_router_reply)
+        end
     after
         stop_netdb(Owner)
     end.
@@ -456,7 +490,7 @@ resolve_stored_with(Key, Kind, Outcome, From) ->
     {Pid, _Tag} = From,
     Entry = (pending())#{kind => Kind, callers => [{From, Pid, make_ref()}]},
     {noreply, _State1} = i2p_lookup_srv:handle_info(
-        {db_stored, Key, Kind, Outcome}, State0#{pending := #{Key => Entry}}
+        {db_stored, Key, Kind, Outcome}, State0#{pending := #{{Kind, Key} => Entry}}
     ),
     ok.
 
@@ -467,7 +501,7 @@ drive_give_up(Key) ->
     {ok, State0} = i2p_lookup_srv:init([?HASH]),
     Ref = make_ref(),
     {noreply, State1} = i2p_lookup_srv:handle_call({find, Key, lease}, {self(), Ref}, State0),
-    {noreply, _State2} = i2p_lookup_srv:handle_info({next_attempt, Key}, State1),
+    {noreply, _State2} = i2p_lookup_srv:handle_info({next_attempt, {lease, Key}}, State1),
     Ref.
 
 %% A pending entry's caller slot: `{From, Pid, MRef}`, where `From` is *itself* a
@@ -525,10 +559,10 @@ orchestration_give_up_test() ->
             i2p_lookup_srv:handle_call({find, Key, lease}, {self(), Ref}, InitState),
         Me = self(),
         ?assertMatch(
-            #{Key := #{kind := lease, attempts := 0, callers := [{_, Me, _}]}},
+            #{{lease, Key} := #{kind := lease, attempts := 0, callers := [{_, Me, _}]}},
             maps:get(pending, State1)
         ),
-        {noreply, State2} = i2p_lookup_srv:handle_info({next_attempt, Key}, State1),
+        {noreply, State2} = i2p_lookup_srv:handle_info({next_attempt, {lease, Key}}, State1),
         ?assertEqual(#{}, maps:get(pending, State2)),
         receive
             {Ref, {error, {lookup_failed, no_answer}}} ->
@@ -549,7 +583,7 @@ orchestration_give_up_test() ->
         },
         State3 = base_state(),
         {noreply, State4} = i2p_lookup_srv:handle_info(
-            {attempt_timeout, Key, Ref2}, State3#{pending := #{Key => Entry}}
+            {attempt_timeout, {router, Key}, Ref2}, State3#{pending := #{{router, Key} => Entry}}
         ),
         ?assertEqual(#{}, maps:get(pending, State4))
     after

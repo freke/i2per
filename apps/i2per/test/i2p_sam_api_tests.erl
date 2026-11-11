@@ -17,6 +17,21 @@ create_destination_opts_test() ->
     D = i2p_sam_api:create_destination(#{}),
     ?assert(is_binary(maps:get(dest_b64, D))).
 
+create_destination_accepts_ed25519_sig_type_test() ->
+    D = i2p_sam_api:create_destination(#{sig_type => 7}),
+    ?assert(maps:is_key(identity, D)),
+    ?assert(is_binary(maps:get(dest_b64, D))).
+
+create_destination_rejects_unsupported_sig_type_test() ->
+    ?assertEqual(
+        {error, {unsupported_sig_type, 0}},
+        i2p_sam_api:create_destination(#{sig_type => 0})
+    ),
+    ?assertEqual(
+        {error, {unsupported_sig_type, 11}},
+        i2p_sam_api:create_destination(#{sig_type => 11})
+    ).
+
 naming_lookup_b32_passthrough_test() ->
     D = i2p_sam_api:create_destination(),
     B64 = maps:get(dest_b64, D),

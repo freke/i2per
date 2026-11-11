@@ -254,6 +254,15 @@ store_runtime(peertest_coord, Value) ->
     apply_coordinator(peertest_coord, Value);
 store_runtime(upnp, Value) ->
     i2per_sup:apply_upnp(Value);
+store_runtime(transit_max_tunnels, Value) ->
+    application:set_env(i2per, transit_max_tunnels, Value),
+    case Value of
+        0 ->
+            catch i2p_tunnel_srv:clear_transit(),
+            ok;
+        _ ->
+            ok
+    end;
 store_runtime(Key, Value) ->
     application:set_env(i2per, Key, Value),
     ok.
@@ -288,8 +297,8 @@ validate(Key, _Value) ->
 
 validate_value(Key, Value) ->
     case {Key, Value} of
-        {transit_max_tunnels, V} when is_integer(V), V > 0 -> ok;
-        {transit_bandwidth_kbps, V} when is_integer(V), V > 0 -> ok;
+        {transit_max_tunnels, V} when is_integer(V), V >= 0 -> ok;
+        {transit_bandwidth_kbps, V} when is_integer(V), V >= 0 -> ok;
         {tunnel_build_rate, V} when is_integer(V), V > 0 -> ok;
         {max_ntcp2_connections, V} when is_integer(V), V > 0 -> ok;
         {max_sam_sessions, V} when is_integer(V), V > 0 -> ok;

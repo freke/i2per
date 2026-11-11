@@ -269,6 +269,27 @@ gateway_tunnel_multi_fragment_roundtrip_test() ->
     Reassembled = list_to_binary(AllData),
     ?assertEqual(Msg, Reassembled).
 
+%%%%%%%%% parse_tunnel_data + reassemble multi-fragment %%%%%%%%%
+
+parse_tunnel_data_reassemble_multi_fragment_test() ->
+    TunnelID = 42,
+    TargetHash = crypto:strong_rand_bytes(32),
+    Target = {9999, TargetHash},
+    Msg = crypto:strong_rand_bytes(2000),
+    FragMap0 = #{},
+    {ok, Wire1, State1} = i2p_tunnel:gateway(TunnelID, tunnel, Target, Msg, #{frag_map => FragMap0}),
+    {ok, Wire2, State2} = i2p_tunnel:gateway(TunnelID, tunnel, Target, <<>>, State1),
+    {ok, Wire3, State3} = i2p_tunnel:gateway(TunnelID, tunnel, Target, <<>>, State2),
+    ?assertEqual(done, i2p_tunnel:gateway(TunnelID, tunnel, Target, <<>>, State3)),
+    <<_:32/big, IV1:16/binary, Payload1:1008/binary>> = Wire1,
+    <<_:32/big, IV2:16/binary, Payload2:1008/binary>> = Wire2,
+    <<_:32/big, IV3:16/binary, Payload3:1008/binary>> = Wire3,
+    {ok, Frag1, FragMap1} = i2p_tunnel:parse_tunnel_data(Payload1, IV1, FragMap0),
+    {ok, Frag2, FragMap2} = i2p_tunnel:parse_tunnel_data(Payload2, IV2, FragMap1),
+    {ok, Frag3, FragMap3} = i2p_tunnel:parse_tunnel_data(Payload3, IV3, FragMap2),
+    {Msgs, _FragMap4} = i2p_tunnel_relay:reassemble(Frag1 ++ Frag2 ++ Frag3, FragMap3),
+    ?assertEqual([Msg], Msgs).
+
 %%%%%%%%% process_otbrm rejects mismatched lengths %%%%%%%%%
 
 process_otbrm_mismatched_lengths_test() ->
@@ -283,3 +304,52 @@ encrypt_layer_wrong_size_test() ->
 
 decrypt_layer_wrong_size_test() ->
     ?assertError(badarg, i2p_tunnel:decrypt_layer(<<0:100>>, <<0:32>>, <<0:32>>)).
+
+%%%%%%%%% Z9K8HX7: malformed/out-of-order fragments do not crash %%%%%%%%%
+
+%% A checksum-valid frame whose body has no 0x00 delimiter fails to parse.
+z9k8hx7_checksum_valid_bad_fragment_list_test() ->
+    IV = crypto:strong_rand_bytes(16),
+    Rest = binary:copy(<<1>>, 1004),
+    <<Cksum:4/binary, _/binary>> = crypto:hash(sha256, <<Rest/binary, IV/binary>>),
+    Payload = <<Cksum/binary, Rest/binary>>,
+    ?assertEqual(error, i2p_tunnel:parse_tunnel_data(Payload, IV, #{})).
+
+%% A follow-on flagged last with missing earlier fragments does not raise badkey.
+z9k8hx7_out_of_order_fragments_no_crash_test() ->
+    TunnelID = 42,
+    TargetHash = crypto:strong_rand_bytes(32),
+    Target = {9999, TargetHash},
+    Msg = crypto:strong_rand_bytes(2000),
+    FragMap0 = #{},
+    {ok, Wire1, State1} = i2p_tunnel:gateway(TunnelID, tunnel, Target, Msg, #{frag_map => FragMap0}),
+    {ok, Wire2, State2} = i2p_tunnel:gateway(TunnelID, tunnel, Target, <<>>, State1),
+    {ok, Wire3, State3} = i2p_tunnel:gateway(TunnelID, tunnel, Target, <<>>, State2),
+    ?assertEqual(done, i2p_tunnel:gateway(TunnelID, tunnel, Target, <<>>, State3)),
+    <<_:32/big, IV1:16/binary, Payload1:1008/binary>> = Wire1,
+    <<_:32/big, _IV2:16/binary, _Payload2:1008/binary>> = Wire2,
+    <<_:32/big, IV3:16/binary, Payload3:1008/binary>> = Wire3,
+    %% Parse first and last only, skipping the middle fragment.
+    {ok, Frag1, FragMap1} = i2p_tunnel:parse_tunnel_data(Payload1, IV1, FragMap0),
+    {ok, Frag3, FragMap3} = i2p_tunnel:parse_tunnel_data(Payload3, IV3, FragMap1),
+    %% Must not raise; incomplete piece set yields no message.
+    {Msgs, _} = i2p_tunnel_relay:reassemble(Frag1 ++ Frag3, FragMap3),
+    ?assertEqual([], Msgs).
+
+%% Only the last fragment arriving yields no message and no crash.
+z9k8hx7_last_fragment_alone_no_crash_test() ->
+    TunnelID = 42,
+    TargetHash = crypto:strong_rand_bytes(32),
+    Target = {9999, TargetHash},
+    Msg = crypto:strong_rand_bytes(2000),
+    FragMap0 = #{},
+    {ok, Wire1, State1} = i2p_tunnel:gateway(TunnelID, tunnel, Target, Msg, #{frag_map => FragMap0}),
+    {ok, Wire2, State2} = i2p_tunnel:gateway(TunnelID, tunnel, Target, <<>>, State1),
+    {ok, Wire3, State3} = i2p_tunnel:gateway(TunnelID, tunnel, Target, <<>>, State2),
+    ?assertEqual(done, i2p_tunnel:gateway(TunnelID, tunnel, Target, <<>>, State3)),
+    <<_:32/big, _IV1:16/binary, _Payload1:1008/binary>> = Wire1,
+    <<_:32/big, _IV2:16/binary, _Payload2:1008/binary>> = Wire2,
+    <<_:32/big, IV3:16/binary, Payload3:1008/binary>> = Wire3,
+    {ok, Frag3, FragMap3} = i2p_tunnel:parse_tunnel_data(Payload3, IV3, #{}),
+    {Msgs, _} = i2p_tunnel_relay:reassemble(Frag3, FragMap3),
+    ?assertEqual([], Msgs).

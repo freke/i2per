@@ -188,7 +188,8 @@ ok = i2p_tunnel_srv:stop().
     publish_lease_set/3,
     status/0,
     demands/0,
-    stop/0
+    stop/0,
+    clear_transit/0
 ]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
@@ -235,8 +236,8 @@ tunnel-build acceptance (`none` = unlimited).
     demands => #{pid() => length_demand()},
     demand_mons => #{pid() => reference()},
     next_tunnel_id := non_neg_integer(),
-    transit_bucket := i2p_token_bucket:bucket() | none,
-    build_bucket := i2p_token_bucket:bucket() | none
+    transit_bucket := i2p_token_bucket:bucket() | none | disabled,
+    build_bucket := i2p_token_bucket:bucket() | none | disabled
 }.
 
 -doc """
@@ -632,6 +633,11 @@ demands() ->
 stop() ->
     gen_server:cast(?MODULE, stop).
 
+-doc "Clear all active transit tunnels (used when transit is disabled at runtime).".
+-spec clear_transit() -> ok.
+clear_transit() ->
+    gen_server:call(?MODULE, clear_transit, 5000).
+
 %%%%%%% %%% gen_server callbacks %%%%%%%
 
 init([Local]) ->
@@ -660,6 +666,8 @@ handle_call(status, _From, State) ->
             [pending, pending_in, tunnels, inbound, transit, exploratory, exploratory_in], State
         ),
         State};
+handle_call(clear_transit, _From, State) ->
+    {reply, ok, State#{transit => #{}}};
 handle_call(demands, _From, #{demands := Demands} = State) ->
     {reply, Demands, State};
 handle_call({set_lengths, Pid, InLen, OutLen}, _From, State) ->
@@ -819,14 +827,17 @@ frag_delivery({tunnel, GatewayHash, TunID}) ->
     {tunnel, {TunID, GatewayHash}}.
 
 %% init_bucket/2 — build the token bucket pacing one of the two limited
-%% work streams from its config key, or `none` when the key is unset. The
-%% key's integer value is the rate in naturally-sized units (kilobytes per
-%% second for relay bandwidth, builds per second for build pacing);
-%% `TokensPerUnit` rescales to tokens per second. Burst capacity is four
-%% seconds' worth of tokens, so the token bucket never stalls a burst of
-%% less than four seconds' (unlimited uses) — and `none` stays unlimited.
+%% work streams from its config key. `none` means the key is unset and the
+%% stream is unlimited; `disabled` means the key is 0, the documented off
+%% switch, and every unit is refused. Otherwise the key's integer value is
+%% the rate in naturally-sized units (kilobytes per second for relay
+%% bandwidth, builds per second for build pacing); `TokensPerUnit` rescales
+%% to tokens per second. Burst capacity is four seconds' worth of tokens, so
+%% the token bucket never stalls a burst of less than four seconds'.
 init_bucket(Key, TokensPerUnit) ->
     case application:get_env(i2per, Key) of
+        {ok, 0} ->
+            disabled;
         {ok, V} when is_integer(V), V > 0 ->
             i2p_token_bucket:new(V * TokensPerUnit, V * TokensPerUnit * 4);
         _ ->

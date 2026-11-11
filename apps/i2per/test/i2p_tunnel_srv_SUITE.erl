@@ -51,6 +51,8 @@
     transit_denial_reports_duplicate_receive_id/1,
     transit_denial_reports_build_budget_drained/1,
     transit_acceptance_announces_no_denial/1,
+    transit_off_by_default/1,
+    transit_zero_disables/1,
     publish_lease_stores_ls/1,
     leaseset_publish_with_no_floodfill_reports_failure/1,
     leaseset_publish_with_no_inbound_tunnel_reports_failure/1,
@@ -105,6 +107,8 @@ all() ->
         transit_denial_reports_duplicate_receive_id,
         transit_denial_reports_build_budget_drained,
         transit_acceptance_announces_no_denial,
+        transit_off_by_default,
+        transit_zero_disables,
         publish_lease_stores_ls,
         leaseset_publish_with_no_floodfill_reports_failure,
         leaseset_publish_with_no_inbound_tunnel_reports_failure,
@@ -141,6 +145,7 @@ stb_transit_accept_and_forward(_Config) ->
         fun(R) -> store_netdb(maps:get(ri, R)) end,
         AllRouters
     ),
+    ok = application:set_env(?APP, transit_max_tunnels, 1000),
     {Pid, _Local} = start_tunnel_srv(OurRouter),
     try
         CreatorHash = crypto:strong_rand_bytes(32),
@@ -199,6 +204,7 @@ build_pacing_limits_transit_acceptance(_Config) ->
         fun(R) -> store_netdb(maps:get(ri, R)) end,
         AllRouters
     ),
+    ok = application:set_env(?APP, transit_max_tunnels, 1000),
     {Pid, _Local} = start_tunnel_srv(OurRouter),
     try
         lists:foreach(
@@ -233,6 +239,7 @@ transit_bandwidth_unlimited_by_default(_Config) ->
         fun(R) -> store_netdb(maps:get(ri, R)) end,
         [Router, Next]
     ),
+    ok = application:set_env(?APP, transit_max_tunnels, 1000),
     {Pid, _Local} = start_tunnel_srv(Router),
     TestPid = self(),
     try
@@ -264,6 +271,7 @@ transit_bandwidth_drops_over_budget_frames(_Config) ->
         fun(R) -> store_netdb(maps:get(ri, R)) end,
         [Router, Next]
     ),
+    ok = application:set_env(?APP, transit_max_tunnels, 1000),
     {Pid, _Local} = start_tunnel_srv(Router),
     TestPid = self(),
     try
@@ -311,6 +319,7 @@ transit_bytes_counted_per_carried_frame(_Config) ->
         fun(R) -> store_netdb(maps:get(ri, R)) end,
         [Router, Next]
     ),
+    ok = application:set_env(?APP, transit_max_tunnels, 1000),
     {Pid, _Local} = start_tunnel_srv(Router),
     TestPid = self(),
     try
@@ -355,6 +364,7 @@ transit_bytes_counted_when_budget_allows_every_frame(_Config) ->
         fun(R) -> store_netdb(maps:get(ri, R)) end,
         [Router, Next]
     ),
+    ok = application:set_env(?APP, transit_max_tunnels, 1000),
     {Pid, _Local} = start_tunnel_srv(Router),
     TestPid = self(),
     try
@@ -518,6 +528,7 @@ stb_endpoint_role_accepted(_Config) ->
         fun(R) -> store_netdb(maps:get(ri, R)) end,
         AllRouters
     ),
+    ok = application:set_env(?APP, transit_max_tunnels, 1000),
     {Pid, _Local} = start_tunnel_srv(OurRouter),
     try
         CreatorHash = crypto:strong_rand_bytes(32),
@@ -579,6 +590,7 @@ stb_unaddressed_dropped(_Config) ->
         fun(R) -> store_netdb(maps:get(ri, R)) end,
         [Router, Other]
     ),
+    ok = application:set_env(?APP, transit_max_tunnels, 1000),
     {Pid, _Local} = start_tunnel_srv(Router),
     try
         ObepPos = 0,
@@ -978,6 +990,7 @@ tg_gateway_injection(_Config) ->
     Router = make_router(),
     Next = make_router(),
     lists:foreach(fun(R) -> store_netdb(maps:get(ri, R)) end, [Router, Next]),
+    ok = application:set_env(?APP, transit_max_tunnels, 1000),
     {Pid, _Local} = start_tunnel_srv(Router),
     try
         RecvID = 800,
@@ -1009,6 +1022,7 @@ tg_gateway_injection(_Config) ->
 %% RouterInfo in the NetDb after the status() barrier.
 garlic_db_store_router_dispatch(_Config) ->
     Router = make_router(),
+    ok = application:set_env(?APP, transit_max_tunnels, 1000),
     {Pid, _Local} = start_tunnel_srv(Router),
     try
         {RiHash, Clove} = db_router_store_clove(),
@@ -1024,6 +1038,7 @@ garlic_db_store_router_dispatch(_Config) ->
 %% without crashing the tunnel server (lease payloads are opaque here).
 garlic_db_store_lease_dispatch(_Config) ->
     Router = make_router(),
+    ok = application:set_env(?APP, transit_max_tunnels, 1000),
     {Pid, _Local} = start_tunnel_srv(Router),
     try
         DestHash = crypto:strong_rand_bytes(32),
@@ -1046,6 +1061,7 @@ garlic_db_store_lease_dispatch(_Config) ->
 %% state appears.
 garlic_unknown_clove_ignored(_Config) ->
     Router = make_router(),
+    ok = application:set_env(?APP, transit_max_tunnels, 1000),
     {Pid, _Local} = start_tunnel_srv(Router),
     try
         Clove = #{
@@ -1279,6 +1295,7 @@ wire_layer(Layers, [_GwRecvID, NextID | _] = TunnelIds, Frame0) ->
 %% A freshly started tunnel server has empty pending and active maps.
 fresh_status(_Config) ->
     Router = make_router(),
+    ok = application:set_env(?APP, transit_max_tunnels, 1000),
     {Pid, _Local} = start_tunnel_srv(Router),
     try
         #{pending := Pending, tunnels := Tunnels, transit := Transit} =
@@ -1293,6 +1310,7 @@ fresh_status(_Config) ->
 %% A build_timeout message clears the pending build under its MsgID.
 build_timeout_clears_pending(_Config) ->
     Router = make_router(),
+    ok = application:set_env(?APP, transit_max_tunnels, 1000),
     {Pid, _Local} = start_tunnel_srv(Router),
     try
         MsgID = crypto:strong_rand_bytes(4),
@@ -1399,6 +1417,7 @@ otbrm_roundtrip(_Config) ->
 %% With no tunnel_pool env, the pool tick does nothing and picks fail.
 pool_disabled_without_env(_Config) ->
     Router = make_router(),
+    ok = application:set_env(?APP, transit_max_tunnels, 1000),
     {Pid, _Local} = start_tunnel_srv(Router),
     try
         seed_netdb(3),
@@ -1416,6 +1435,7 @@ pool_disabled_without_env(_Config) ->
 %% a second tick must not duplicate it.
 pool_queues_builds_to_target(_Config) ->
     Router = make_router(),
+    ok = application:set_env(?APP, transit_max_tunnels, 1000),
     {Pid, _Local} = start_tunnel_srv(Router),
     try
         ok = application:set_env(?APP, tunnel_pool, #{outbound => 1, inbound => 1}),
@@ -1435,6 +1455,7 @@ pool_queues_builds_to_target(_Config) ->
 %% An injected outbound entry is returned by pick_outbound/0.
 pick_returns_active_entry(_Config) ->
     Router = make_router(),
+    ok = application:set_env(?APP, transit_max_tunnels, 1000),
     {Pid, _Local} = start_tunnel_srv(Router),
     try
         Entry = entry(10, 3),
@@ -1448,6 +1469,7 @@ pick_returns_active_entry(_Config) ->
 %% tunnel of the demanded hop count; the outbound arm waits.
 demand_builds_demanded_inbound_length(_Config) ->
     Router = make_router(),
+    ok = application:set_env(?APP, transit_max_tunnels, 1000),
     {Pid, _Local} = start_tunnel_srv(Router),
     try
         seed_netdb(4),
@@ -1466,6 +1488,7 @@ demand_builds_demanded_inbound_length(_Config) ->
 %% outbound demand at its exact hop count.
 demand_builds_demanded_outbound_length(_Config) ->
     Router = make_router(),
+    ok = application:set_env(?APP, transit_max_tunnels, 1000),
     {Pid, _Local} = start_tunnel_srv(Router),
     try
         seed_netdb(4),
@@ -1493,6 +1516,7 @@ demand_builds_demanded_outbound_length(_Config) ->
 %% The demand disappears with its session process: no builds afterwards.
 demand_cleared_on_session_death(_Config) ->
     Router = make_router(),
+    ok = application:set_env(?APP, transit_max_tunnels, 1000),
     {Pid, _Local} = start_tunnel_srv(Router),
     try
         seed_netdb(4),
@@ -1520,6 +1544,7 @@ demand_cleared_on_session_death(_Config) ->
 %% and fall back to any tunnel when no entry matches.
 preferred_pick_by_length(_Config) ->
     Router = make_router(),
+    ok = application:set_env(?APP, transit_max_tunnels, 1000),
     {Pid, _Local} = start_tunnel_srv(Router),
     try
         OneHop = entry(700, 1),
@@ -2022,6 +2047,7 @@ transit_denial_reports_duplicate_receive_id(_Config) ->
         fun(R) -> store_netdb(maps:get(ri, R)) end,
         [OurRouter | HopRouters]
     ),
+    ok = application:set_env(?APP, transit_max_tunnels, 1000),
     {Pid, _Local} = start_tunnel_srv(OurRouter),
     try
         Events = with_events(
@@ -2053,6 +2079,7 @@ transit_denial_reports_build_budget_drained(_Config) ->
         fun(R) -> store_netdb(maps:get(ri, R)) end,
         [OurRouter | HopRouters]
     ),
+    ok = application:set_env(?APP, transit_max_tunnels, 1000),
     {Pid, _Local} = start_tunnel_srv(OurRouter),
     try
         Bases = [630, 640, 650, 660, 670],
@@ -2077,6 +2104,7 @@ transit_acceptance_announces_no_denial(_Config) ->
         fun(R) -> store_netdb(maps:get(ri, R)) end,
         [OurRouter | HopRouters]
     ),
+    ok = application:set_env(?APP, transit_max_tunnels, 1000),
     {Pid, _Local} = start_tunnel_srv(OurRouter),
     try
         Events = with_events(
@@ -2089,6 +2117,53 @@ transit_acceptance_announces_no_denial(_Config) ->
         ?assert(maps:is_key(650, Transit))
     after
         unregister_peer(),
+        stop_tunnel_srv(Pid)
+    end.
+
+%%%%%%%%% Transit is opt-in: unset or 0 refuses every build %%%%%%%%%
+
+%% With no `transit_max_tunnels` in the environment the cap falls back to 0, so
+%% the router accepts no public transit. This is the documented default that a
+%% bare boot (test run, or an operator using only `i2per.conf`) must have.
+transit_off_by_default(_Config) ->
+    application:unset_env(?APP, transit_max_tunnels),
+    [OurRouter | HopRouters] = [make_router() || _ <- lists:seq(1, 3)],
+    lists:foreach(
+        fun(R) -> store_netdb(maps:get(ri, R)) end,
+        [OurRouter | HopRouters]
+    ),
+    {Pid, _Local} = start_tunnel_srv(OurRouter),
+    try
+        Events = with_events(
+            fun() ->
+                deliver_stbs(OurRouter, HopRouters, [700])
+            end
+        ),
+        ?assertEqual([{transit_denied, 700, capacity}], denials(Events)),
+        ?assertEqual(#{}, transit_status())
+    after
+        stop_tunnel_srv(Pid)
+    end.
+
+%% An explicit 0 is the documented off switch, accepted by both the config loader
+%% and `i2p_config_srv`, and it refuses every build just like the unset default.
+transit_zero_disables(_Config) ->
+    ok = application:set_env(?APP, transit_max_tunnels, 0),
+    [OurRouter | HopRouters] = [make_router() || _ <- lists:seq(1, 3)],
+    lists:foreach(
+        fun(R) -> store_netdb(maps:get(ri, R)) end,
+        [OurRouter | HopRouters]
+    ),
+    {Pid, _Local} = start_tunnel_srv(OurRouter),
+    try
+        Events = with_events(
+            fun() ->
+                deliver_stbs(OurRouter, HopRouters, [710])
+            end
+        ),
+        ?assertEqual([{transit_denied, 710, capacity}], denials(Events)),
+        ?assertEqual(#{}, transit_status())
+    after
         stop_tunnel_srv(Pid)
     end.
 

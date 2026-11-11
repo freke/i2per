@@ -1,6 +1,6 @@
 # Protocol Reference
 
-This document describes the I2P wire formats implemented by i2per 0.9.0.
+This document describes the I2P wire formats implemented by i2per 0.10.0.
 Unsupported formats and release limitations are listed explicitly.
 
 All multi-byte integers in I2P are big-endian unless otherwise noted. Ed25519
@@ -12,7 +12,7 @@ in the [I2P documentation](https://i2p.net/en/docs/).
 
 ## Release boundaries
 
-The 0.9.0 release does not implement NTCP1, SSU1, I2CP, or the legacy
+The 0.10.0 release does not implement NTCP1, SSU1, I2CP, or the legacy
 ElGamal/AES garlic formats. SSU2 path migration is also outside this release.
 LeaseSet v1 (store type 1), EncryptedLeaseSet (store type 5) and
 MetaLeaseSet (store type 7) are implemented (#VANCF02, #3G0Z06C), and
@@ -26,11 +26,11 @@ requester's signature, checks the asserted endpoint, and punches, and the
 relay accept now grants a session token that Bob validates on the redirect
 (see #BFKFGY0, #98GAVQK). Automatic NetDb-driven Charlie selection is
 implemented (#6TGF083), and the tunnel build accepts up to 7 hops (#K62PQHJ).
-The sections below describe only behavior that is present in 0.9.0. 0.9.0 makes
+The sections below describe only behavior that is present in 0.10.0. 0.10.0 makes
 no wire-format changes over 0.8.0: the work is a parity audit against the tree,
 transport modularity (behaviour + registry), the SAM TCP listener becoming a
 thin translator onto i2p_sam_api, hermetic tests for the proxy/tun direct-call
-path, and interop fixes; automatic Charlie selection and the raised hop cap are
+path, interop fixes and the 0.10.0 hardening; automatic Charlie selection and the raised hop cap are
 control-plane behaviour rather than wire format; the Charlie RelayResponse and
 HolePunch
 blocks and the measured-reachability caps remain as shipped in 0.3.0.
@@ -1770,7 +1770,7 @@ the firewalled-remote path.
 #### Seeing a park while it is happening
 
 The counter and the event are reported *after* a park ends. A park runs for up to
-`handshake_retry_ms` x `handshake_max_resends` on a direct dial, and up to
+`handshake_retry_ms` x (`handshake_max_resends` + 1) on a direct dial, and up to
 `f:i2p_ssu2_conn:dial_budget_ms/0` through an introducer, and for that whole time
 the peer is still `connecting` — so the read API has to describe the attempt in
 progress, not only its outcome.

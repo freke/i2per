@@ -16,9 +16,9 @@
 //! production device layer. Every close path (destructor, stop callback) and
 //! every fd user (read, write, arm) serialize on the device's `io_lock`, so a
 //! syscall never lands on a closed — and possibly reused — descriptor. The
-//! gap that remains is the destructor closing an fd a select may still be
-//! armed on; the production pass must close only from the stop callback
-//! (`ERL_NIF_SELECT_STOP`) and deselect explicitly on every other path.
+//! destructor no longer closes an fd a select may still be armed on: it
+//! requests `ERL_NIF_SELECT_STOP` first and lets the stop callback own the
+//! close, closing directly only when no select is active.
 
 #![allow(non_snake_case)]
 
@@ -62,6 +62,8 @@ struct IfReq {
 const SEL_READ: ErlNifSelectFlags = 1; // ERL_NIF_SELECT_READ
 const SEL_STOP: ErlNifSelectFlags = 4; // ERL_NIF_SELECT_STOP
 const SEL_CUSTOM_MSG: ErlNifSelectFlags = 16; // ERL_NIF_SELECT_CUSTOM_MSG
+const RET_STOP_CALLED: ErlNifSelectFlags = 1; // ERL_NIF_SELECT_STOP_CALLED
+const RET_STOP_SCHEDULED: ErlNifSelectFlags = 2; // ERL_NIF_SELECT_STOP_SCHEDULED
 const RET_INVALID_EVENT: ErlNifSelectFlags = 4;
 const RET_FAILED: ErlNifSelectFlags = 8;
 const RET_NOTSUP: ErlNifSelectFlags = 128;
@@ -204,10 +206,31 @@ unsafe extern "C" fn nif_load(
 
 // ---- lifecycle callbacks ----
 
-/// GC close. The `io_lock` keeps this from racing an in-flight read/write;
-/// what stays spike-grade is closing without deselecting first (crate doc).
-unsafe extern "C" fn res_dtor(_env: *mut ErlNifEnv, obj: *mut c_void) {
+/// GC close. Cancel any armed select before closing, so the runtime cannot
+/// deliver readiness for a reused fd and the select teardown cannot race the
+/// close. `enif_select(SEL_STOP)` is invoked lock-free (like `nif_stop`):
+/// it may run `res_stop` synchronously on this thread, and `res_stop` takes
+/// `io_lock`, so holding the lock here would self-deadlock. When the stop
+/// callback runs — synchronously or later on a dirty scheduler — it owns the
+/// close; otherwise there was no active select and we close directly.
+unsafe extern "C" fn res_dtor(env: *mut ErlNifEnv, obj: *mut c_void) {
     let dev = &*(obj as *mut TunDev);
+    let fd = dev.fd.load(Ordering::Acquire);
+    if fd >= 0 {
+        let rc = enif_select(
+            env,
+            fd,
+            SEL_STOP,
+            obj as *const c_void,
+            std::ptr::null(),
+            0,
+        );
+        if rc & (RET_STOP_CALLED | RET_STOP_SCHEDULED) != 0 {
+            // res_stop ran or will run and owns the close. Do not close here.
+            return;
+        }
+        // No active select (or a failed stop request): close directly.
+    }
     let _io = dev.io_lock.lock().unwrap();
     let fd = dev.fd.swap(-1, Ordering::AcqRel);
     if fd >= 0 {
@@ -216,8 +239,9 @@ unsafe extern "C" fn res_dtor(_env: *mut ErlNifEnv, obj: *mut c_void) {
 }
 
 /// Stop delivery for `enif_select`. Runs on a dirty scheduler when the runtime
-/// tears the monitor down; the fd close happens here so a selected fd is never
-/// silently leaked.
+/// tears the monitor down (or synchronously from `res_dtor`/`nif_stop`); the
+/// fd close happens here so a selected fd is never silently leaked. Idempotent:
+/// a descriptor already closed by another path is left alone.
 unsafe extern "C" fn res_stop(
     _env: *mut ErlNifEnv,
     obj: *mut c_void,

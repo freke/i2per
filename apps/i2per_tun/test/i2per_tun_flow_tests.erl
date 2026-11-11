@@ -84,3 +84,101 @@ tcp_pair() ->
     {ok, Host} = gen_tcp:accept(LSock, 5000),
     gen_tcp:close(LSock),
     {Client, Host}.
+
+%% The flow relay's timeout is idle, not absolute: six ticks 100 ms apart span
+%% 600 ms, longer than the 200 ms timeout, so an absolute timer would cut it.
+relay_idle_timeout_is_reset_by_traffic_test_() ->
+    {"the flow relay outlives its idle timeout while bytes keep flowing",
+        {timeout, 30, fun relay_idle_timeout_is_reset_by_traffic/0}}.
+
+relay_idle_timeout_is_reset_by_traffic() ->
+    Saved = application:get_env(i2per_tun, relay_idle_timeout_ms),
+    application:set_env(i2per_tun, relay_idle_timeout_ms, 200),
+    {RelayA, PeerA} = tcp_pair(),
+    {RelayB, PeerB} = tcp_pair(),
+    Relay = spawn(fun() -> i2per_tun_flow:relay(RelayA, RelayB) end),
+    try
+        lists:foreach(
+            fun(N) ->
+                timer:sleep(100),
+                ok = gen_tcp:send(PeerA, <<N:8>>),
+                {ok, <<N:8>>} = gen_tcp:recv(PeerB, 1, 2000)
+            end,
+            lists:seq(1, 6)
+        ),
+        ?assert(is_process_alive(Relay))
+    after
+        exit(Relay, kill),
+        close_all([PeerA, PeerB, RelayA, RelayB]),
+        restore_env(relay_idle_timeout_ms, Saved)
+    end.
+
+relay_survives_silence_when_idle_timeout_is_disabled_test_() ->
+    {"the flow relay survives silence and resumes when traffic returns",
+        {timeout, 30, fun relay_survives_silence/0}}.
+
+relay_survives_silence() ->
+    Saved = application:get_env(i2per_tun, relay_idle_timeout_ms),
+    application:unset_env(i2per_tun, relay_idle_timeout_ms),
+    ?assertEqual(infinity, i2per_tun_config:relay_idle_timeout()),
+    {RelayA, PeerA} = tcp_pair(),
+    {RelayB, PeerB} = tcp_pair(),
+    Relay = spawn(fun() -> i2per_tun_flow:relay(RelayA, RelayB) end),
+    try
+        timer:sleep(300),
+        ?assert(is_process_alive(Relay)),
+        ok = gen_tcp:send(PeerA, <<"after-silence">>),
+        {ok, <<"after-silence">>} = gen_tcp:recv(PeerB, 13, 2000)
+    after
+        exit(Relay, kill),
+        close_all([PeerA, PeerB, RelayA, RelayB]),
+        restore_env(relay_idle_timeout_ms, Saved)
+    end.
+
+close_all(Socks) ->
+    lists:foreach(fun(S) -> _ = gen_tcp:close(S) end, Socks).
+
+restore_env(Key, {ok, Value}) ->
+    application:set_env(i2per_tun, Key, Value);
+restore_env(Key, undefined) ->
+    application:unset_env(i2per_tun, Key).
+
+dev_collect_loop(Parent) ->
+    dev_collect_loop(Parent, <<>>).
+
+dev_collect_loop(Parent, Acc) ->
+    receive
+        {tun_write, Bytes} ->
+            Parent ! {dev_received, Bytes},
+            dev_collect_loop(Parent, <<Acc/binary, Bytes/binary>>);
+        stop ->
+            ok
+    end.
+
+held_session_devpid_forwards_and_retains_nothing_test_() ->
+    {"a held SAM session with a DevPid forwards bytes and retains nothing",
+        {timeout, 30, fun() ->
+            Self = self(),
+            DevPid = spawn(fun() -> dev_collect_loop(Self) end),
+            Mock = i2per_tun_mock_sam:start(fun(StreamSock) ->
+                gen_tcp:send(StreamSock, <<"hello-bytes">>),
+                timer:sleep(200)
+            end),
+            {_, SamPort, _} = Mock,
+            try
+                {ok, _SessionId, Pid} = i2per_tun_flow:run_session(
+                    <<"peer.i2p">>, <<"127.0.0.1">>, SamPort, 5000, DevPid
+                ),
+                receive
+                    {dev_received, Bytes} ->
+                        ?assertEqual(<<"hello-bytes">>, Bytes)
+                after 5000 ->
+                    ?assert(false)
+                end,
+                ?assertEqual(<<>>, i2per_tun_flow:received(Pid)),
+                i2per_tun_flow:stop_session(Pid)
+            after
+                i2per_tun_mock_sam:stop(Mock),
+                exit(DevPid, kill)
+            end
+        end}}.

@@ -73,9 +73,9 @@ reason no path can produce.
 -type lookup_failed_reason() ::
     {not_stored, i2p_peer:store_not_stored_reason()}
     %% A responder's record for this key arrived, was handled, and the key still does
-    %% not hold what was asked for. Reachable when a LeaseSet resolves a pending
-    %% RouterInfo lookup for the same hash: the pending map is keyed by hash alone,
-    %% so the two kinds share one entry.
+    %% not hold what was asked for. Distinct from `no_answer`: somebody answered,
+    %% but the record could not be used. Pending lookups are keyed by {kind, hash},
+    %% so a record of the wrong kind no longer resolves a lookup of another kind.
     | not_resolved
     %% Attempts or the overall deadline ran out with no store for this key arriving.
     | no_answer
@@ -107,7 +107,9 @@ closer peers to chase, and the retry/deadline bookkeeping.
     timer := undefined | reference()
 }.
 
--opaque state() :: #{pending := #{i2p_crypto:hash() => pending()}, our_hash := i2p_crypto:hash()}.
+-opaque state() :: #{
+    pending := #{{kind(), i2p_crypto:hash()} => pending()}, our_hash := i2p_crypto:hash()
+}.
 -export_type([state/0]).
 
 -doc """
@@ -221,22 +223,23 @@ init([OurHash]) ->
 -spec handle_call(term(), gen_server:from(), state()) ->
     {noreply, state()} | {reply, term(), state()}.
 handle_call({find, Key, Kind}, From, State = #{pending := Pending}) ->
+    Composite = {Kind, Key},
     case cached(Kind, Key) of
         {ok, _Result} = Hit ->
             {reply, Hit, State};
         error ->
             _ =
-                case maps:is_key(Key, Pending) of
+                case maps:is_key(Composite, Pending) of
                     false ->
                         %% First waiter arms the machinery.
-                        self() ! {next_attempt, Key};
+                        self() ! {next_attempt, Composite};
                     true ->
                         ok
                 end,
             CallerPid = element(1, From),
             MRef = erlang:monitor(process, CallerPid),
             Entry0 =
-                case maps:find(Key, Pending) of
+                case maps:find(Composite, Pending) of
                     {ok, P} ->
                         P;
                     error ->
@@ -252,7 +255,7 @@ handle_call({find, Key, Kind}, From, State = #{pending := Pending}) ->
                         }
                 end,
             Entry = Entry0#{callers := [{From, CallerPid, MRef} | maps:get(callers, Entry0)]},
-            {noreply, State#{pending := maps:put(Key, Entry, Pending)}}
+            {noreply, State#{pending := maps:put(Composite, Entry, Pending)}}
     end;
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
@@ -262,16 +265,16 @@ handle_cast(_Msg, State) ->
     {noreply, State}.
 
 -spec handle_info(term(), state()) -> {noreply, state()}.
-handle_info({next_attempt, Key}, State) ->
-    {noreply, attempt(Key, State)};
+handle_info({next_attempt, Composite}, State) ->
+    {noreply, attempt(Composite, State)};
 handle_info({db_stored, Key, Kind, Outcome}, State) ->
     {noreply, resolve_stored(Key, Kind, Outcome, State)};
 handle_info({search_reply, Key, Peers}, State) ->
-    {noreply, chase(Key, Peers, State)};
-handle_info({attempt_timeout, Key, Ref}, State) ->
+    {noreply, chase_all(Key, Peers, State)};
+handle_info({attempt_timeout, Composite, Ref}, State) ->
     %% Stale-timeout guard: only advance when the fired timer is still the
     %% pending one (a search reply may already have moved the lookup on).
-    {noreply, attempt_timeout(Key, Ref, State)};
+    {noreply, attempt_timeout(Composite, Ref, State)};
 handle_info({'DOWN', MRef, process, _Pid, _Reason}, State) ->
     {noreply, drop_caller(MRef, State)};
 handle_info(_Info, State) ->
@@ -296,15 +299,18 @@ cached(router, Key) ->
     end.
 
 %% attempt_timeout/3 — advance only when the fired timer is still current.
-attempt_timeout(Key, Ref, State = #{pending := Pending}) ->
-    case maps:find(Key, Pending) of
-        {ok, #{timer := Ref}} -> attempt(Key, State);
+attempt_timeout(Composite, Ref, State = #{pending := Pending}) ->
+    case maps:find(Composite, Pending) of
+        {ok, #{timer := Ref}} -> attempt(Composite, State);
         _Other -> State
     end.
 
 %% attempt/2 — send the next DatabaseLookup for Key, or give up.
-attempt(Key, State = #{pending := Pending}) ->
-    case maps:find(Key, Pending) of
+attempt(Composite, State) when not (is_tuple(Composite) andalso tuple_size(Composite) =:= 2) ->
+    State;
+attempt(Composite, State = #{pending := Pending}) ->
+    Key = element(2, Composite),
+    case maps:find(Composite, Pending) of
         error ->
             State;
         {ok, P} ->
@@ -312,16 +318,16 @@ attempt(Key, State = #{pending := Pending}) ->
             Exhausted = maps:get(attempts, P) >= ?MAX_ATTEMPTS,
             case DeadlineHit orelse Exhausted of
                 true ->
-                    fail(Key, State);
+                    fail(Composite, State);
                 false ->
                     case next_target(Key, P) of
                         {ok, Hash, P1} ->
-                            Timer = arm_timer(Key),
+                            Timer = arm_timer(Composite),
                             P2 = P1#{attempts := maps:get(attempts, P1) + 1, timer := Timer},
                             _ = send_lookup(P2, Key, Hash, maps:get(our_hash, State)),
-                            State#{pending := maps:put(Key, P2, Pending)};
+                            State#{pending := maps:put(Composite, P2, Pending)};
                         error ->
-                            fail(Key, State)
+                            fail(Composite, State)
                     end
             end
     end.
@@ -421,9 +427,9 @@ flag_for(lease) -> i2p_i2np:lookup_type_leaseset();
 flag_for(lease_v1) -> i2p_i2np:lookup_type_leaseset();
 flag_for(router) -> i2p_i2np:lookup_type_routerinfo().
 
-arm_timer(Key) ->
+arm_timer(Composite) ->
     Ref = erlang:make_ref(),
-    erlang:send_after(?ATTEMPT_TIMEOUT_MS, self(), {attempt_timeout, Key, Ref}),
+    erlang:send_after(?ATTEMPT_TIMEOUT_MS, self(), {attempt_timeout, Composite, Ref}),
     Ref.
 
 %% resolve_stored/4 — a responder sent us a store for a pending key.
@@ -436,29 +442,59 @@ arm_timer(Key) ->
 %%
 %% A lookup that succeeds publishes nothing. The event is about failure, and one that
 %% also fired on success could not be counted without a subtraction.
-resolve_stored(Key, Kind, Outcome, State = #{pending := Pending}) ->
-    case maps:find(Key, Pending) of
-        error ->
-            State;
-        {ok, P} ->
-            cancel_timer(P),
-            case cached(maps:get(kind, P), Key) of
-                {ok, _R} = Hit ->
-                    reply_all(maps:get(callers, P), Hit),
-                    State#{pending := maps:remove(Key, Pending)};
+resolve_stored(Key, Kind, Outcome, State0 = #{pending := Pending0}) ->
+    Composite = {Kind, Key},
+    State1 =
+        case maps:find(Composite, Pending0) of
+            error ->
+                State0;
+            {ok, P} ->
+                cancel_timer(P),
+                case cached(maps:get(kind, P), Key) of
+                    {ok, _R} = Hit ->
+                        reply_all(maps:get(callers, P), Hit),
+                        State0#{pending := maps:remove(Composite, Pending0)};
+                    error ->
+                        Reason = stored_failure(Kind, Outcome),
+                        i2p_events:notify({lookup_failed, Key, Kind, Reason}),
+                        i2p_log:debug(lookup_failed, #{key => Key, kind => Kind, reason => Reason}),
+                        reply_all(
+                            maps:get(callers, P), {error, {lookup_failed, Reason}}
+                        ),
+                        State0#{pending := maps:remove(Composite, Pending0)}
+                end
+        end,
+    %% A store of one LeaseSet format also tells us the destination is not the
+    %% other format. Fail any pending lookup of the sibling format promptly
+    %% instead of letting it wait for a store that will never arrive.
+    Sibling =
+        case Kind of
+            lease -> lease_v1;
+            lease_v1 -> lease;
+            _ -> undefined
+        end,
+    case {Sibling, Outcome} of
+        {undefined, _} ->
+            State1;
+        {_, stored} ->
+            SiblingComposite = {Sibling, Key},
+            Pending1 = maps:get(pending, State1),
+            case maps:find(SiblingComposite, Pending1) of
                 error ->
-                    %% The wake-up arrived, the key is not usable. Two different
-                    %% things produce this and they are not the same event: the NetDb
-                    %% refused the record, or it took it and the key still does not
-                    %% hold what this lookup wanted.
-                    Reason = stored_failure(Kind, Outcome),
-                    i2p_events:notify({lookup_failed, Key, Kind, Reason}),
-                    i2p_log:debug(lookup_failed, #{key => Key, kind => Kind, reason => Reason}),
+                    State1;
+                {ok, SP} ->
+                    cancel_timer(SP),
+                    i2p_events:notify({lookup_failed, Key, Sibling, not_resolved}),
+                    i2p_log:debug(lookup_failed, #{
+                        key => Key, kind => Sibling, reason => not_resolved
+                    }),
                     reply_all(
-                        maps:get(callers, P), {error, {lookup_failed, Reason}}
+                        maps:get(callers, SP), {error, {lookup_failed, not_resolved}}
                     ),
-                    State#{pending := maps:remove(Key, Pending)}
-            end
+                    State1#{pending := maps:remove(SiblingComposite, Pending1)}
+            end;
+        _ ->
+            State1
     end.
 
 %% Why a wake-up left the key unusable.
@@ -472,16 +508,22 @@ stored_failure(_Kind, stored) ->
     not_resolved.
 
 %% chase/3 — a search reply contributed closer routers to try.
-chase(Key, Peers, State = #{pending := Pending}) ->
-    case maps:find(Key, Pending) of
+chase(Composite, Peers, State = #{pending := Pending}) ->
+    case maps:find(Composite, Pending) of
         error ->
             State;
         {ok, P} ->
             cancel_timer(P),
             P1 = P#{chase := Peers ++ maps:get(chase, P)},
-            _ = self() ! {next_attempt, Key},
-            State#{pending := maps:put(Key, P1, Pending)}
+            _ = self() ! {next_attempt, Composite},
+            State#{pending := maps:put(Composite, P1, Pending)}
     end.
+
+%% chase_all/3 — a search reply carries no kind, so chase every pending
+%% lookup whose hash matches, across kinds.
+chase_all(Key, Peers, State = #{pending := Pending}) ->
+    Matching = [C || C <- maps:keys(Pending), element(2, C) =:= Key],
+    lists:foldl(fun(C, S) -> chase(C, Peers, S) end, State, Matching).
 
 drop_caller(MRef, State = #{pending := Pending0}) ->
     Pending =
@@ -501,8 +543,9 @@ drop_caller(MRef, State = #{pending := Pending0}) ->
 
 %% fail/2 — the lookup has run out of attempts or has passed its deadline.
 %%
-fail(Key, State = #{pending := Pending}) ->
-    case maps:find(Key, Pending) of
+fail(Composite, State = #{pending := Pending}) ->
+    Key = element(2, Composite),
+    case maps:find(Composite, Pending) of
         error ->
             State;
         {ok, P} ->
@@ -520,7 +563,7 @@ fail(Key, State = #{pending := Pending}) ->
             i2p_events:notify({lookup_failed, Key, Kind, Reason}),
             i2p_log:debug(lookup_failed, #{key => Key, kind => Kind, reason => Reason}),
             reply_all(maps:get(callers, P), {error, {lookup_failed, Reason}}),
-            State#{pending := maps:remove(Key, Pending)}
+            State#{pending := maps:remove(Composite, Pending)}
     end.
 
 reply_all(Callers, Reply) ->

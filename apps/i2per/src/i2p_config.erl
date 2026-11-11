@@ -25,7 +25,7 @@ max_stream_connections = 128
 ntcp2_keepalive_interval_ms = 60000
 log_level = notice           # one of the eight OTP levels, hot
 caps.bandwidth = L
-transit_bandwidth_kbps = 256   # per-hop relay cap, whole kbit/s bucket fill
+transit_bandwidth_kbps = 64    # per-hop relay cap, whole kbit/s bucket fill
 tunnel_build_rate = 2          # accepted build decisions per second
 
 [tunnel_pool]
@@ -392,11 +392,11 @@ coerce_scalar(K, V) when
     K =:= <<"sam_port">>;
     K =:= <<"ssu2_port">>;
     K =:= <<"net_id">>;
-    K =:= <<"transit_max_tunnels">>
+    K =:= <<"transit_max_tunnels">>;
+    K =:= <<"transit_bandwidth_kbps">>
 ->
     coerce_int(env_key(K), V);
 coerce_scalar(K, V) when
-    K =:= <<"transit_bandwidth_kbps">>;
     K =:= <<"tunnel_build_rate">>;
     K =:= <<"max_ntcp2_connections">>;
     K =:= <<"max_sam_sessions">>;

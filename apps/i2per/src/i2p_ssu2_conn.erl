@@ -178,7 +178,7 @@ clearing `remote_ri` in isolation once made every Charlie reply sign over
 %%
 %% **It is a floor rather than the value**, because this wait covers the direct
 %% handshake with Bob *and then* the relay phase. A flat 15 s would therefore
-%% contain the whole of Bob's retransmit budget, which at the default is 9 s,
+%% contain the whole of Bob's retransmit budget, which at the default is 10 s,
 %% leaving the relay itself about six — and an operator who raised
 %% `handshake_max_resends` would have the leg killed before Bob's handshake
 %% could finish. A bound that degrades as it is tuned toward working is not a
@@ -441,14 +441,14 @@ connect_via_introducer(LocalKeys, BobOpts, RIBlock, Listener, Relay) ->
 %% app-env keys an operator actually sets.
 -spec handshake_budget_ms() -> pos_integer().
 handshake_budget_ms() ->
-    handshake_retry_ms() * handshake_max_resends().
+    handshake_retry_ms() * (handshake_max_resends() + 1).
 
 -doc """
 The longest a single SSU2 leg of one outbound dial can block, in milliseconds.
 
 Two legs exist and they are bounded differently. A direct handshake is bounded by
 its SessionRequest retransmit budget: `handshake_retry_ms` times
-`handshake_max_resends`, both app-env keys on the `i2per` application. The
+`handshake_max_resends() + 1`, both app-env keys on the `i2per` application. The
 indirect leg through an introducer is bounded by a wait with a 15 s floor. The
 longer of the two is what a caller bounding the *whole* dial needs, so it is
 asked for here rather than restated, and it moves when an operator retunes the
@@ -1494,10 +1494,14 @@ handle_keepalive(Blocks, State) ->
 %% The SSU2 PeerTest (transport-level reachability probe) carried as a block
 %% (type 10) inside Data messages for messages 1-4 (see `m:i2p_peertest` and
 %% `docs/protocol.md`). In-session responses and explicit Alice initiation are
-%% implemented. Automatic NetDb-driven Charlie selection is not implemented in
-%% this release. The dispatch keys off the session's peer-test discriminator
-%% (`f:peertest_discriminator/2`): an explicit peer-test role when the session
-%% carries one, otherwise the default handshake-role-and-message inference.
+%% implemented. On Bob's side, when a peer-test coordinator owns this session
+%% the message-1 block is deferred to it, which forwards Alice's request to a
+%% NetDb-selected Charlie session (or replies with the deterministic code-2
+%% reject "no Charlie available" if none is reachable); without a coordinator
+%% the same code-2 reject is returned directly. The dispatch keys off the
+%% session's peer-test discriminator (`f:peertest_discriminator/2`): an
+%% explicit peer-test role when the session carries one, otherwise the default
+%% handshake-role-and-message inference.
 handle_peertest(Blocks, State) ->
     Block = lists:keyfind(peertest, 1, Blocks),
     case {peertest_discriminator(Block, State), Block} of

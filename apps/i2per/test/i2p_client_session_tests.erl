@@ -93,6 +93,26 @@ caller_owned_session_survives_its_conn_dying_test() ->
         end)
     end).
 
+%% A companion app that dies without calling close_session must not leave the
+%% session, its connections, or the resources behind them alive.
+owner_death_stops_session_and_conns_test() ->
+    with_sam_sup(fun() ->
+        with_fake_client(fun() ->
+            Owner = spawn(fun() ->
+                receive
+                    stop -> ok
+                end
+            end),
+            {ok, Pid, DestB64} = i2p_sam_api:create_session(#{owner => Owner}),
+            {ok, ConnPid} = i2p_sam_api:stream_connect(Pid, DestB64, self()),
+            ?assert(is_process_alive(Pid)),
+            ?assert(is_process_alive(ConnPid)),
+            exit(Owner, kill),
+            wait_until_dead(Pid, 100),
+            wait_until_dead(ConnPid, 100)
+        end)
+    end).
+
 %% The full eunit run shares one node, so the supervisor may already be up: take
 %% it if it is not, and stop only a supervisor this case started. Leaving one
 %% behind is what made every later core test fail on `already_started`.

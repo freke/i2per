@@ -51,12 +51,13 @@ ok = i2p_tunnel_relay:send_tunnel_data(FirstHopHash, Frame).
 
 -export([
     handle_routed_i2np/4,
-    send_tunnel_data/2
+    send_tunnel_data/2,
+    reassemble/2
 ]).
 
 -export_type([transit_denied_reason/0, store_result/0]).
 
--define(DEFAULT_MAX_TRANSIT, 1000).
+-define(DEFAULT_MAX_TRANSIT, 0).
 -define(REPLY_RET_OFFSET, 201).
 -define(TRANSIT_FRAME_BYTES, 1028).
 
@@ -356,6 +357,8 @@ maybe_deny(RecvID, Reason) ->
     {0 | 30, i2p_tunnel_srv:tunnel_srv_state()}.
 pace_build(#{build_bucket := none} = State) ->
     {0, State};
+pace_build(#{build_bucket := disabled} = State) ->
+    {30, State};
 pace_build(#{build_bucket := Bucket} = State) ->
     NowMs = erlang:system_time(millisecond),
     case i2p_token_bucket:consume(Bucket, 1, NowMs) of
@@ -444,6 +447,8 @@ relay_transit_data(Body, Info, State) ->
     {allow, i2p_tunnel_srv:tunnel_srv_state()} | deny.
 allow_transit_data(#{transit_bucket := none} = State) ->
     {allow, State};
+allow_transit_data(#{transit_bucket := disabled}) ->
+    deny;
 allow_transit_data(#{transit_bucket := Bucket} = State) ->
     NowMs = erlang:system_time(millisecond),
     case i2p_token_bucket:consume(Bucket, ?TRANSIT_FRAME_BYTES, NowMs) of
@@ -527,6 +532,12 @@ dispatch_local_message(StdMsg, State) ->
                     notify_lookup(Key, lease, store_lease(LsBin));
                 {store, router, Key, RiBin, _Ts} ->
                     notify_lookup(Key, router, store_router(RiBin));
+                {store, ls5, Key, LsBin, _Token, _Ts} ->
+                    _ = store_ls5(Key, LsBin),
+                    ok;
+                {store, ls7, Key, LsBin, _Ts} ->
+                    _ = store_ls7(Key, LsBin),
+                    ok;
                 {search_reply, #{key := Key, peers := Peers}} ->
                     notify_search_reply(Key, Peers);
                 {ignored, _Reason} ->
@@ -588,6 +599,13 @@ store_lease(LsBin) ->
 store_lease_v1(LsBin) ->
     outcome(i2p_netdb_srv:store_ls_v1_binary(LsBin, erlang:system_time(second))).
 
+-spec store_ls5(i2p_crypto:hash(), binary()) -> store_result().
+store_ls5(Key, LsBin) ->
+    outcome(i2p_netdb_srv:store_ls_5_binary(Key, LsBin, erlang:system_time(second))).
+
+-spec store_ls7(i2p_crypto:hash(), binary()) -> store_result().
+store_ls7(Key, LsBin) ->
+    outcome(i2p_netdb_srv:store_ls_7_binary(Key, LsBin, erlang:system_time(second))).
 %% Two accepted shapes and two refused ones, across two NetDb entry points that do not
 %% spell the vocabulary identically: `store_binary/2` says `too_old` where
 %% `store_ls_binary/2` says `expired`.
@@ -706,9 +724,12 @@ inject_at_gateway(StdMsg, Info, Entry, State) ->
     Entry1 = Entry#{gw_state => GwState},
     State#{transit := maps:update(TunnelID, Entry1, maps:get(transit, State))}.
 
-%% reassemble/2 — turn parsed fragments into complete standard-header I2NP
-%% messages. Single-frame messages pass straight through; fragmented ones
-%% are concatenated from the fragment map once their last piece arrives.
+-doc """
+Turn parsed fragments into complete standard-header I2NP messages.
+
+Single-frame messages pass straight through; fragmented ones are
+concatenated from the fragment map once their last piece arrives.
+""".
 -spec reassemble(
     [map()], #{i2p_i2np:message_id() => #{non_neg_integer() => binary()}}
 ) ->
@@ -728,14 +749,48 @@ reassemble(Fragments, FragMap0) ->
 %% complete_fragment/2 — emit a message when this fragment completes it.
 complete_fragment(#{type := first, msg_id := MsgID, last := true, data := Data}, Map) ->
     {ok, Data, maps:remove(MsgID, Map)};
-complete_fragment(#{type := follow_on, msg_id := MsgID, last := true}, Map) ->
+complete_fragment(#{msg_id := MsgID} = Fragment, Map) ->
     case maps:find(MsgID, Map) of
-        {ok, Pieces} when map_size(Pieces) > 0 ->
-            Num = maps:size(Pieces),
-            Msg =
-                <<<<(maps:get(I, Pieces))/binary>> || I <- lists:seq(0, Num - 1)>>,
-            {ok, Msg, maps:remove(MsgID, Map)};
-        _ ->
+        {ok, Pieces} ->
+            %% The last fragment may have arrived earlier (or in this frame);
+            %% its index is stored in `Pieces` under `last`.
+            LastIdx =
+                case maps:get(last, Pieces, undefined) of
+                    N when is_integer(N) -> N;
+                    _ ->
+                        case Fragment of
+                            #{last := true, frag_num := FN} -> FN;
+                            _ -> undefined
+                        end
+                end,
+            case LastIdx of
+                undefined ->
+                    none;
+                _ ->
+                    %% Store a late-arriving last index before checking.
+                    Pieces1 =
+                        case Fragment of
+                            #{last := true, frag_num := FN2} ->
+                                Pieces#{last => FN2};
+                            _ ->
+                                Pieces
+                        end,
+                    Total = LastIdx + 1,
+                    Indices = lists:seq(0, Total - 1),
+                    PieceCount = maps:size(maps:without([last], Pieces1)),
+                    case
+                        PieceCount >= Total andalso
+                            lists:all(fun(I) -> maps:is_key(I, Pieces1) end, Indices)
+                    of
+                        true ->
+                            Msg =
+                                <<<<(maps:get(I, Pieces1))/binary>> || I <- Indices>>,
+                            {ok, Msg, maps:remove(MsgID, Map)};
+                        false ->
+                            none
+                    end
+            end;
+        error ->
             none
     end;
 complete_fragment(_, _) ->
@@ -854,6 +909,17 @@ dispatch_one_clove(_ConnPid, PeerHash, #{type := T, data := Data}, State) when
             Outcome = store_lease(LsBin),
             replicate_clove_store(1, Key, LsBin, PeerHash, State),
             notify_lookup(Key, lease, Outcome),
+            State;
+        {store, ls5, Key, LsBin, ReplyToken, _Ts} ->
+            _ = store_ls5(Key, LsBin),
+            case i2p_floodfill:flood_requested(ReplyToken) of
+                true ->
+                    replicate_clove_store(5, Key, LsBin, PeerHash, State);
+                false ->
+                    State
+            end;
+        {store, ls7, Key, LsBin, _Ts} ->
+            _ = store_ls7(Key, LsBin),
             State;
         {lookup, Parsed} ->
             OurHash = maps:get(hash, maps:get(local, State)),

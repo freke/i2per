@@ -587,8 +587,12 @@ parse_tunnel_data(Payload, IV, FragMap) when
     %% test — a head clause here would silently rebind it instead.
     case checksum(Rest, IV) of
         Cksum ->
-            Fragments = parse_fragments(Rest, FragMap, []),
-            {ok, Fragments, FragMap};
+            case parse_fragments(Rest, FragMap, []) of
+                {ok, Fragments, FragMap1} ->
+                    {ok, Fragments, FragMap1};
+                error ->
+                    error
+            end;
         _ ->
             error
     end;
@@ -713,9 +717,16 @@ write_fragment_body(DeliveryType, Target, Msg, FragNum, MsgID) ->
     DataSize = min(byte_size(Msg), MaxData),
     FragmentData = binary:part(Msg, 0, DataSize),
     Remaining = binary:part(Msg, DataSize, byte_size(Msg) - DataSize),
-    {Flag, ExtraHeader} = fragment_header(
+    {Flag0, ExtraHeader} = fragment_header(
         DeliveryType, Target, FragNum, IsFirst, IsFragmented, MsgID1Actual
     ),
+    Last = Remaining =:= <<>>,
+    Flag =
+        Flag0 bor
+            (case Last of
+                true -> 1;
+                false -> 0
+            end),
     Instructions = <<Flag:8, ExtraHeader/binary, DataSize:16/big, FragmentData/binary>>,
     %% Total payload body (rest after checksum) = 0x00 + padding + instructions = 1004 bytes
     TargetSize = 1003 - byte_size(Instructions),
@@ -787,8 +798,8 @@ scan_delimiter(<<_:8, Rest/binary>>) -> scan_delimiter(Rest).
 
 %% parse_delivery_instructions/3 — parse one or more fragments from the
 %% instructions portion (after the 0x00 delimiter).
-parse_delivery_instructions(<<>>, _FragMap, Acc) ->
-    lists:reverse(Acc);
+parse_delivery_instructions(<<>>, FragMap, Acc) ->
+    {ok, lists:reverse(Acc), FragMap};
 parse_delivery_instructions(<<Flag:8, Rest/binary>>, FragMap, Acc) ->
     IsFirst = (Flag band 16#80) =:= 0,
     DeliveryType = (Flag bsr 5) band 16#03,
@@ -813,7 +824,7 @@ parse_delivery_instructions(<<Flag:8, Rest/binary>>, FragMap, Acc) ->
                         last => Last,
                         data => FragData
                     },
-                    FragMap1 = add_fragment(FragMap, MsgID, FragNum, FragData),
+                    FragMap1 = add_fragment(FragMap, MsgID, FragNum, FragData, Last),
                     parse_delivery_instructions(Rem, FragMap1, [Fragment | Acc]);
                 _ ->
                     error
@@ -870,7 +881,7 @@ first_fragment(
     true
 ) ->
     Fragment = fragment_map(Delivery, Extra, MsgID, FlagLast, FragData),
-    {ok, Fragment, Rem, add_fragment(FragMap, MsgID, 0, FragData)};
+    {ok, Fragment, Rem, add_fragment(FragMap, MsgID, 0, FragData, FlagLast)};
 first_fragment(
     <<_Size:16/big, FragData:_Size/binary, Rem/binary>>, FragMap, Delivery, Extra, _FlagLast, false
 ) ->
@@ -893,10 +904,15 @@ fragment_map(Delivery, Extra, MsgID, Last, Data) ->
     }).
 
 %% add_fragment/4 — add a fragment to the reassembly map.
-add_fragment(FragMap, MsgID, FragNum, Data) ->
+add_fragment(FragMap, MsgID, FragNum, Data, Last) ->
     MsgFrags = maps:get(MsgID, FragMap, #{}),
     MsgFrags1 = MsgFrags#{FragNum => Data},
-    FragMap#{MsgID => MsgFrags1}.
+    MsgFrags2 =
+        case Last of
+            true -> MsgFrags1#{last => FragNum};
+            false -> MsgFrags1
+        end,
+    FragMap#{MsgID => MsgFrags2}.
 
 %% random_nonzero_padding/1 — generate random nonzero bytes for padding.
 random_nonzero_padding(N) when N =< 0 ->

@@ -222,6 +222,9 @@ handle_cast(_Request, State) ->
 %% One readiness notification per arm; drain until eagain, then re-arm.
 handle_info({?READY_TAG, Dev}, #state{dev = Dev} = State) ->
     {noreply, drain(State)};
+handle_info({tun_write, Bytes}, State) when is_binary(Bytes) ->
+    _ = (State#state.tun_mod):write(State#state.dev, Bytes),
+    {noreply, State};
 handle_info({session_ready, Key, HoldPid}, State) when is_pid(HoldPid) ->
     MonRef =
         case maps:find(Key, State#state.inflight) of
@@ -376,8 +379,9 @@ maybe_spawn_raw_session(Key, Parsed, State) ->
 
 start_session_create(Key, DestHost, SamHost, SamPort, State) ->
     Parent = self(),
+    DevPid = self(),
     {Pid, MonRef} = spawn_monitor(fun() ->
-        case i2per_tun_flow:run_session(DestHost, SamHost, SamPort) of
+        case i2per_tun_flow:run_session(DestHost, SamHost, SamPort, 5000, DevPid) of
             {ok, _SessionId, HoldPid} ->
                 Parent ! {session_ready, Key, HoldPid};
             _ ->
@@ -389,8 +393,9 @@ start_session_create(Key, DestHost, SamHost, SamPort, State) ->
 
 start_raw_session_create(Key, DestHost, UdpPayload, SamHost, SamPort, State) ->
     Parent = self(),
+    DevPid = self(),
     {Pid, MonRef} = spawn_monitor(fun() ->
-        case i2per_tun_flow:run_raw_session(DestHost, SamHost, SamPort) of
+        case i2per_tun_flow:run_raw_session(DestHost, SamHost, SamPort, 5000, DevPid) of
             {ok, _SessionId, HoldPid} ->
                 _ = catch i2per_tun_flow:send_raw(HoldPid, UdpPayload),
                 Parent ! {session_ready, Key, HoldPid}
@@ -473,6 +478,15 @@ handle_packet(Pkt, State) ->
                                         _ = i2per_tun_flow:send_raw(Pid, UdpPayload),
                                         {State#state.sessions, State};
                                     {error, _} ->
+                                        {State#state.sessions, State}
+                                end;
+                            6 ->
+                                case i2per_tun_ip:tcp_parse(maps:get(payload, Parsed, <<>>)) of
+                                    {ok, #{payload := TcpPayload}} when byte_size(TcpPayload) > 0 ->
+                                        Pid = maps:get(Key, State#state.sessions),
+                                        _ = i2per_tun_flow:send(Pid, TcpPayload),
+                                        {State#state.sessions, State};
+                                    _ ->
                                         {State#state.sessions, State}
                                 end;
                             _ ->
